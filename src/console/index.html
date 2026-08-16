@@ -23,92 +23,107 @@ if (location.protocol === 'file:') {
 </script>
 </head>
 <body data-page="console">
-<header class="topbar">
-  <span class="brand">shinu<span class="brand-accent">.</span></span>
-  <span class="project-badge mono" id="project-badge"></span>
-  <span class="grow"></span>
-  <span class="muted" id="user-email"></span>
-  <button class="btn small" id="logout-btn" type="button">Log out</button>
-</header>
+<div class="container">
+  <header class="masthead">
+    <h1 class="brand">shinu<span class="brand-accent">.</span></h1>
+    <p class="tagline">Rewindable sandboxes. Break things, check out back.</p>
+  </header>
 
-<div class="page">
-  <div id="notice-area" aria-live="polite"></div>
+  <nav class="navbar" aria-label="Session">
+    <span class="nav-item mono" id="project-badge"></span>
+    <span class="grow"></span>
+    <span class="nav-item" id="user-email"></span>
+    <button class="nav-item" id="logout-btn" type="button">Log out</button>
+  </nav>
 
-  <section class="panel" id="quota-panel" aria-label="Quota and usage">
-    <div class="panel-head"><h2>Quota &amp; usage</h2></div>
-    <div class="meters" id="meters">
-      <div class="state"><span class="spin"></span>Loading&hellip;</div>
-    </div>
-    <p class="usage-line muted" id="usage-line"></p>
-  </section>
+  <div class="main">
+    <nav class="sidemenu" aria-label="Console sections">
+      <button type="button" class="menu-item active" data-view="spaces" aria-pressed="true">Spaces</button>
+      <button type="button" class="menu-item" data-view="commits" aria-pressed="false">Commits</button>
+      <button type="button" class="menu-item" data-view="tokens" aria-pressed="false">Tokens</button>
+      <button type="button" class="menu-item" data-view="quota" aria-pressed="false">Quota &amp; Usage</button>
+    </nav>
 
-  <div class="layout">
-    <section class="panel" id="spaces-panel" aria-label="Spaces">
-      <div class="panel-head">
-        <h2>Spaces</h2>
-        <button class="btn small" id="refresh-btn" type="button">Refresh</button>
-      </div>
-      <form class="inline-form" id="create-form" novalidate>
-        <input type="text" id="create-name" placeholder="new space name" autocomplete="off">
-        <button class="btn primary" type="submit" id="create-btn">Create</button>
-      </form>
-      <p class="form-error" id="create-error" role="alert" hidden></p>
-      <div id="spaces-list">
-        <div class="state"><span class="spin"></span>Loading&hellip;</div>
-      </div>
-    </section>
+    <div class="content">
+      <div id="notice-area" aria-live="polite"></div>
 
-    <section class="panel" id="detail-panel" aria-label="Space detail">
-      <div class="state" id="detail-empty">
-        <p>Select a space to see its save points.</p>
-        <p class="muted">Spaces are branches; commits are save points. Checking out an
-        older save point archives the current state first, so nothing is lost.</p>
-      </div>
-      <div id="detail-main" hidden>
+      <section class="panel" id="spaces-panel" aria-label="Spaces">
         <div class="panel-head">
-          <h2 id="detail-title"></h2>
-          <div class="row-actions" id="detail-actions"></div>
+          <h2>Spaces</h2>
+          <button class="btn small" id="refresh-btn" type="button">Refresh</button>
         </div>
-        <form class="inline-form" id="commit-form" novalidate>
-          <input type="text" id="commit-note" placeholder="note for this save point" autocomplete="off">
-          <label class="check-row" title="Checkpoint while the space keeps running">
-            <input type="checkbox" id="commit-hot">hot
-          </label>
-          <button class="btn primary" type="submit" id="commit-btn">Commit</button>
+        <form class="inline-form" id="create-form" novalidate>
+          <input type="text" id="create-name" placeholder="new space name" autocomplete="off">
+          <button class="btn primary" type="submit" id="create-btn">Create</button>
         </form>
-        <p class="form-hint" id="commit-hint"></p>
-        <p class="form-error" id="commit-error" role="alert" hidden></p>
-        <div class="tabs" role="tablist">
-          <button type="button" id="tab-log" role="tab" aria-selected="true" class="active">History</button>
-          <button type="button" id="tab-reflog" role="tab" aria-selected="false">Archive</button>
-        </div>
-        <p class="tab-hint" id="tab-hint"></p>
-        <div id="commit-list">
+        <p class="form-error" id="create-error" role="alert" hidden></p>
+        <div id="spaces-list">
           <div class="state"><span class="spin"></span>Loading&hellip;</div>
         </div>
-      </div>
-    </section>
+      </section>
+
+      <section class="panel" id="detail-panel" aria-label="Space detail" hidden>
+        <div class="state" id="detail-empty">
+          <p>Select a space to see its save points.</p>
+          <p class="muted">Spaces are branches; commits are save points. Checking out an
+          older save point archives the current state first, so nothing is lost.</p>
+        </div>
+        <div id="detail-main" hidden>
+          <div class="panel-head">
+            <h2 id="detail-title"></h2>
+            <div class="row-actions" id="detail-actions"></div>
+          </div>
+          <form class="inline-form" id="commit-form" novalidate>
+            <input type="text" id="commit-note" placeholder="note for this save point" autocomplete="off">
+            <label class="check-row" title="Checkpoint while the space keeps running">
+              <input type="checkbox" id="commit-hot">hot
+            </label>
+            <button class="btn primary" type="submit" id="commit-btn">Commit</button>
+          </form>
+          <p class="form-hint" id="commit-hint"></p>
+          <p class="form-error" id="commit-error" role="alert" hidden></p>
+          <div class="tabs" role="tablist">
+            <button type="button" id="tab-log" role="tab" aria-selected="true" class="active">History</button>
+            <button type="button" id="tab-reflog" role="tab" aria-selected="false">Archive</button>
+          </div>
+          <p class="tab-hint" id="tab-hint"></p>
+          <div id="commit-list">
+            <div class="state"><span class="spin"></span>Loading&hellip;</div>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel" id="tokens-panel" aria-label="API tokens" hidden>
+        <div class="panel-head">
+          <h2>API tokens</h2>
+          <button class="btn small primary" id="new-token-btn" type="button">New token</button>
+        </div>
+        <div class="token-reveal" id="token-reveal" hidden>
+          <p class="reveal-warn">Copy this token now. It is shown only once and cannot be recovered.</p>
+          <div class="token-line">
+            <code class="token-value" id="token-value"></code>
+            <button class="btn small" id="copy-token-btn" type="button">Copy</button>
+            <button class="btn small" id="dismiss-token-btn" type="button">Done</button>
+          </div>
+        </div>
+        <div id="tokens-list">
+          <div class="state"><span class="spin"></span>Loading&hellip;</div>
+        </div>
+        <p class="panel-foot">Tokens authenticate the CLI and MCP clients via
+        <span class="mono">Authorization: Bearer &lt;token&gt;</span>.</p>
+      </section>
+
+      <section class="panel" id="quota-panel" aria-label="Quota and usage" hidden>
+        <div class="panel-head"><h2>Quota &amp; usage</h2></div>
+        <div id="meters">
+          <div class="state"><span class="spin"></span>Loading&hellip;</div>
+        </div>
+        <p class="usage-line" id="usage-line"></p>
+      </section>
+    </div>
   </div>
 
-  <section class="panel" id="tokens-panel" aria-label="API tokens">
-    <div class="panel-head">
-      <h2>API tokens</h2>
-      <button class="btn small primary" id="new-token-btn" type="button">New token</button>
-    </div>
-    <div class="token-reveal" id="token-reveal" hidden>
-      <p class="reveal-warn">Copy this token now. It is shown only once and cannot be recovered.</p>
-      <div class="token-line">
-        <code class="token-value" id="token-value"></code>
-        <button class="btn small" id="copy-token-btn" type="button">Copy</button>
-        <button class="btn small" id="dismiss-token-btn" type="button">Done</button>
-      </div>
-    </div>
-    <div id="tokens-list">
-      <div class="state"><span class="spin"></span>Loading&hellip;</div>
-    </div>
-    <p class="panel-foot">Tokens authenticate the CLI and MCP clients via
-    <span class="mono">Authorization: Bearer &lt;token&gt;</span>.</p>
-  </section>
+  <footer class="footer">shinu console &middot; spaces are branches, commits are save points</footer>
 </div>
 
 <div id="modal-root" hidden></div>

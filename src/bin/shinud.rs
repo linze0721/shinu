@@ -1308,7 +1308,7 @@ fn authenticate_optional(ctx: &Ctx<'_>, request: &http::Request) -> Option<Calle
 fn origin_host(origin: &str) -> Option<&str> {
     let (_, authority) = origin.split_once("://")?;
     let end = authority
-        .find(|character| matches!(character, '/' | '?' | '#'))
+        .find(['/', '?', '#'])
         .unwrap_or(authority.len());
     let authority = &authority[..end];
     if authority.is_empty()

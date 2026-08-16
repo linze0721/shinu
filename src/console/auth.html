@@ -25,29 +25,33 @@ if (location.protocol === 'file:') {
 <body data-page="auth">
 <main class="auth-wrap">
   <div class="auth-card">
-    <div class="brand">shinu<span class="brand-accent">.</span></div>
-    <p class="tagline">Rewindable sandboxes. Break things, check out back.</p>
-
-    <div class="mode-tabs" role="tablist">
-      <button type="button" id="tab-login" role="tab" aria-selected="true">Log in</button>
-      <button type="button" id="tab-register" role="tab" aria-selected="false">Register</button>
+    <div class="auth-masthead">
+      <span class="brand">shinu<span class="brand-accent">.</span></span>
+      <span class="tagline">Rewindable sandboxes. Break things, check out back.</span>
     </div>
 
-    <form id="auth-form" novalidate>
-      <label class="field">
-        <span>Email</span>
-        <input type="email" id="email" autocomplete="email" required>
-      </label>
-      <label class="field">
-        <span>Password</span>
-        <input type="password" id="password" autocomplete="current-password" required>
-      </label>
-      <p class="form-hint" id="password-hint" hidden>At least 12 characters.</p>
-      <p class="form-error" id="form-error" role="alert" hidden></p>
-      <button type="submit" class="btn primary block" id="submit-btn">Log in</button>
-    </form>
+    <div class="auth-body">
+      <div class="mode-tabs" role="tablist">
+        <button type="button" id="tab-login" role="tab" aria-selected="true">Log in</button>
+        <button type="button" id="tab-register" role="tab" aria-selected="false">Register</button>
+      </div>
 
-    <p class="auth-foot">Registering creates your account and a dedicated project.</p>
+      <form id="auth-form" novalidate>
+        <label class="field">
+          <span>Email</span>
+          <input type="email" id="email" autocomplete="email" required>
+        </label>
+        <label class="field">
+          <span>Password</span>
+          <input type="password" id="password" autocomplete="current-password" required>
+        </label>
+        <p class="form-hint" id="password-hint" hidden>At least 12 characters.</p>
+        <p class="form-error" id="form-error" role="alert" hidden></p>
+        <button type="submit" class="btn primary block" id="submit-btn">Log in</button>
+      </form>
+
+      <p class="auth-foot">Registering creates your account and a dedicated project.</p>
+    </div>
   </div>
 </main>
 <script src="/assets/app.js" defer></script>

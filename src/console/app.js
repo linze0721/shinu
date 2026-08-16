@@ -359,28 +359,35 @@
           '<p class="muted">Create one above to start experimenting.</p></div>';
         return;
       }
-      list.innerHTML = state.spaces
-        .map(function (s) {
-          var status = s.running ? 'running' : 'stopped';
-          var head = s.head ? 'head ' + shortId(s.head) : 'no commits yet';
-          var sub = status + ' · ' + head + ' · ' + fmtBytes(s.exclusive || 0);
-          return (
-            '<button type="button" class="space-row' +
-            (s.name === state.selected ? ' selected' : '') +
-            '" data-action="select-space" data-name="' +
-            esc(s.name) +
-            '" title="created ' +
-            esc(absTime(s.created_at)) +
-            '"><span class="dot' +
-            (s.running ? ' running' : '') +
-            '"></span><span class="space-main"><span class="space-name">' +
-            esc(s.name) +
-            '</span><span class="space-sub mono">' +
-            esc(sub) +
-            '</span></span></button>'
-          );
-        })
-        .join('');
+      list.innerHTML =
+        '<table class="data-table"><thead><tr><th>Name</th><th>State</th>' +
+        '<th>HEAD</th><th>Disk</th></tr></thead><tbody>' +
+        state.spaces
+          .map(function (s) {
+            return (
+              '<tr class="space-row' +
+              (s.name === state.selected ? ' selected' : '') +
+              '" data-action="select-space" data-name="' +
+              esc(s.name) +
+              '" title="created ' +
+              esc(absTime(s.created_at)) +
+              /* the name cell carries a real button so the row stays
+                 keyboard-operable; closest('[data-action]') finds it first */
+              '"><td><button type="button" class="rowlink" data-action="select-space" data-name="' +
+              esc(s.name) +
+              '">' +
+              esc(s.name) +
+              '</button></td><td>' +
+              (s.running ? '<span class="green">running</span>' : 'stopped') +
+              '</td><td class="mono">' +
+              (s.head ? esc(shortId(s.head)) : '&mdash;') +
+              '</td><td class="mono nobr">' +
+              esc(fmtBytes(s.exclusive || 0)) +
+              '</td></tr>'
+            );
+          })
+          .join('') +
+        '</tbody></table>';
     }
 
     function renderDetailHead(force) {
@@ -437,55 +444,61 @@
             : '<div class="state"><p>The archive is empty.</p></div>';
         return;
       }
-      list.innerHTML = rows
-        .map(function (c) {
-          var badges = '';
-          if (c.id === s.head) badges += ' <span class="badge head">HEAD</span>';
-          if (c.auto) badges += ' <span class="badge auto">auto</span>';
-          return (
-            '<div class="commit-row"><div class="commit-main">' +
-            '<div class="commit-top"><span class="commit-id mono" title="' +
-            esc(c.id) +
-            '">' +
-            esc(shortId(c.id)) +
-            '</span>' +
-            badges +
-            '<span class="commit-time" title="' +
-            esc(absTime(c.created_at)) +
-            '">' +
-            esc(timeAgo(c.created_at)) +
-            '</span></div><div class="commit-note">' +
-            esc(c.note || '') +
-            '</div></div><div class="row-actions">' +
-            '<button class="btn small" type="button" data-action="checkout-commit" data-id="' +
-            esc(c.id) +
-            '">Check out</button>' +
-            '<button class="btn small" type="button" data-action="fork-commit" data-id="' +
-            esc(c.id) +
-            '">Fork</button></div></div>'
-          );
-        })
-        .join('');
+      list.innerHTML =
+        '<table class="data-table"><thead><tr><th>Id</th><th>When</th>' +
+        '<th>Note</th><th>Actions</th></tr></thead><tbody>' +
+        rows
+          .map(function (c) {
+            var badges = '';
+            if (c.id === s.head) badges += ' <span class="badge head">HEAD</span>';
+            if (c.auto) badges += ' <span class="badge auto">auto</span>';
+            return (
+              '<tr class="commit-row"><td class="commit-id mono nobr" title="' +
+              esc(c.id) +
+              '">' +
+              esc(shortId(c.id)) +
+              badges +
+              '</td><td class="commit-time nobr" title="' +
+              esc(absTime(c.created_at)) +
+              '">' +
+              esc(timeAgo(c.created_at)) +
+              '</td><td class="commit-note">' +
+              esc(c.note || '') +
+              '</td><td><div class="row-actions">' +
+              '<button class="btn small" type="button" data-action="checkout-commit" data-id="' +
+              esc(c.id) +
+              '">Check out</button>' +
+              '<button class="btn small" type="button" data-action="fork-commit" data-id="' +
+              esc(c.id) +
+              '">Fork</button></div></td></tr>'
+            );
+          })
+          .join('') +
+        '</tbody></table>';
     }
 
-    function meterCard(label, used, max, fmt) {
+    /* One quota row: label, "used / limit" as text (red near the cap), and a
+       hard-edged bar — solid fill, square corners, no animation. */
+    function meterRow(label, used, max, fmt) {
       used = Number(used) || 0;
       max = Number(max) || 0;
       var pct =
         max > 0 ? Math.min(100, Math.round((used / max) * 100)) : used > 0 ? 100 : 0;
       var cls = pct >= 100 ? ' full' : pct >= 80 ? ' warn' : '';
       return (
-        '<div class="meter-card"><div class="meter-head"><span>' +
+        '<tr><td>' +
         esc(label) +
-        '</span><span class="meter-val">' +
+        '</td><td class="mono nobr' +
+        (pct >= 80 ? ' red' : '') +
+        '">' +
         esc(fmt(used)) +
         ' / ' +
         esc(fmt(max)) +
-        '</span></div><div class="meter' +
+        '</td><td class="quota-bar-cell"><div class="meter' +
         cls +
         '"><div class="fill" style="width:' +
         pct +
-        '%"></div></div></div>'
+        '%"></div></div></td></tr>'
       );
     }
 
@@ -493,13 +506,15 @@
       var L = state.limits;
       if (!L) return;
       $('#meters').innerHTML =
-        meterCard('Spaces', L.used.spaces, L.max_spaces, String) +
-        meterCard('Disk', L.used.disk_mib, L.max_disk_mib, fmtMib) +
-        meterCard('Running VMs', L.used.running, L.max_running, String) +
-        '<div class="meter-card"><div class="meter-head"><span>API rate</span>' +
-        '<span class="meter-val">' +
+        '<table class="data-table quota-table"><thead><tr><th>Resource</th>' +
+        '<th>Used / limit</th><th>Usage</th></tr></thead><tbody>' +
+        meterRow('Spaces', L.used.spaces, L.max_spaces, String) +
+        meterRow('Disk', L.used.disk_mib, L.max_disk_mib, fmtMib) +
+        meterRow('Running VMs', L.used.running, L.max_running, String) +
+        '<tr><td>API rate</td><td class="mono nobr">' +
         esc(String(L.api_per_min)) +
-        ' / min</span></div><div class="meter-note">per-minute request limit</div></div>';
+        ' / min</td><td class="muted">per-minute request limit</td></tr>' +
+        '</tbody></table>';
       var U = state.usage;
       if (U) {
         $('#usage-line').textContent =
@@ -524,21 +539,25 @@
           '<p class="muted">Create one to use the CLI or an MCP client.</p></div>';
         return;
       }
-      list.innerHTML = state.tokens
-        .map(function (t) {
-          return (
-            '<div class="token-row"><span class="token-prefix mono" title="token hash prefix">' +
-            esc(t.hash_prefix) +
-            '</span><span class="token-created" title="' +
-            esc(absTime(t.created_at)) +
-            '">created ' +
-            esc(timeAgo(t.created_at)) +
-            '</span><button class="btn small danger" type="button" data-action="revoke-token" data-prefix="' +
-            esc(t.hash_prefix) +
-            '">Revoke</button></div>'
-          );
-        })
-        .join('');
+      list.innerHTML =
+        '<table class="data-table"><thead><tr><th>Prefix</th><th>Created</th>' +
+        '<th>Actions</th></tr></thead><tbody>' +
+        state.tokens
+          .map(function (t) {
+            return (
+              '<tr class="token-row"><td class="token-prefix mono" title="token hash prefix">' +
+              esc(t.hash_prefix) +
+              '</td><td class="token-created" title="' +
+              esc(absTime(t.created_at)) +
+              '">created ' +
+              esc(timeAgo(t.created_at)) +
+              '</td><td><button class="btn small danger" type="button" data-action="revoke-token" data-prefix="' +
+              esc(t.hash_prefix) +
+              '">Revoke</button></td></tr>'
+            );
+          })
+          .join('') +
+        '</tbody></table>';
     }
 
     /* ---------- data loading ---------- */
@@ -635,6 +654,31 @@
 
     /* ---------- interactions ---------- */
 
+    /* ---------- view switching (sidemenu) ----------
+       The four panels are views: exactly one is visible at a time. Purely
+       presentational — all data loading/polling runs regardless of which
+       view is shown. */
+
+    var views = {
+      spaces: $('#spaces-panel'),
+      commits: $('#detail-panel'),
+      tokens: $('#tokens-panel'),
+      quota: $('#quota-panel'),
+    };
+    var menuItems = document.querySelectorAll('.menu-item');
+
+    function setView(name) {
+      if (!views[name]) return;
+      Object.keys(views).forEach(function (key) {
+        views[key].hidden = key !== name;
+      });
+      for (var i = 0; i < menuItems.length; i += 1) {
+        var active = menuItems[i].getAttribute('data-view') === name;
+        menuItems[i].classList.toggle('active', active);
+        menuItems[i].setAttribute('aria-pressed', String(active));
+      }
+    }
+
     function selectSpace(name) {
       if (!name || name === state.selected) return;
       state.selected = name;
@@ -651,6 +695,9 @@
       $('#tab-reflog').setAttribute('aria-selected', 'false');
       renderSpaces();
       renderDetail();
+      /* selecting a space jumps to its save points, mirroring the old
+         side-by-side layout where the detail appeared on selection */
+      setView('commits');
       loadHistory('log');
     }
 
@@ -1075,6 +1122,12 @@
       var run = actions[el.getAttribute('data-action')];
       if (run) run(el);
     });
+
+    for (var mi = 0; mi < menuItems.length; mi += 1) {
+      menuItems[mi].addEventListener('click', function () {
+        setView(this.getAttribute('data-view'));
+      });
+    }
 
     $('#refresh-btn').addEventListener('click', refreshAll);
     $('#logout-btn').addEventListener('click', onLogout);

@@ -1,0 +1,19 @@
+#!/bin/sh
+# runit restarts this automatically when it exits, which is the intended
+# recovery path: the daemon holds no VM state in memory. Running microVMs are
+# re-parented to init by `setsid`, so a restart leaves them alive and they are
+# picked up again from `<root>/vm/<uuid>/fc.pid`.
+exec 2>&1
+
+# Defaults are compiled in; uncomment to override.
+# export SHINU_ROOT=/var/lib/shinu
+# Tokens travel in cleartext, so keep this on loopback unless a TLS terminator
+# sits in front of it.
+# export SHINU_LISTEN=127.0.0.1:7878
+# export SHINU_REFLOG_DAYS=7          # retention for automatic checkout commits
+# export SHINU_VCPUS=2
+# export SHINU_MEM_MIB=1024
+# export SHINU_IDLE_SECS=600
+# export SHINU_DISK_MIB=2048          # only read when base.ext4 is first built
+
+exec /usr/local/bin/shinud

@@ -1,0 +1,1620 @@
+use chrono::Utc;
+use clap::Parser;
+use serde_json::{Value, json};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, MutexGuard, mpsc};
+use std::thread;
+use std::time::Duration;
+use uuid::Uuid;
+
+use shinu::{
+    http,
+    proto::Req,
+    registry::Registry,
+    state::{Ckpt, Space, State},
+};
+
+#[derive(Parser)]
+#[command(name = "shinud")]
+struct Cli {
+    #[arg(long)]
+    root: Option<PathBuf>,
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = Cli::parse();
+    let root = shinu::resolve_root(cli.root.as_deref());
+    shinu::init_layout(&root)?;
+    // Fetch VM assets first: a host without network must fail before spending
+    // minutes building an image it could never boot.
+    shinu::ensure_assets(&root)?;
+    shinu::ensure_base(&root, &shinu::BaseConfig::from_env()?)?;
+    let vm_cfg = shinu::VmConfig::from_env();
+    let net_cfg = shinu::NetConfig::from_env()?;
+
+    let listen = std::env::var("SHINU_LISTEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "127.0.0.1:7878".to_owned());
+    let listener = TcpListener::bind(&listen)?;
+    let root = Arc::new(root);
+    let vm_cfg = Arc::new(vm_cfg);
+    let net_cfg = Arc::new(net_cfg);
+    let registry = Arc::new(Registry::new());
+
+    let sweep_root = Arc::clone(&root);
+    let sweep_vm_cfg = Arc::clone(&vm_cfg);
+    let sweep_net_cfg = Arc::clone(&net_cfg);
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_secs(30));
+        match shinu::vm::sweep_idle(
+            sweep_root.as_path(),
+            sweep_vm_cfg.idle_secs,
+            sweep_net_cfg.as_ref(),
+        ) {
+            Ok(stopped) => {
+                for dir in stopped {
+                    eprintln!("idle sweep stopped {}", dir.display());
+                }
+            }
+            Err(error) => eprintln!("idle sweep: {error}"),
+        }
+    });
+
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let connection_root = Arc::clone(&root);
+                let connection_vm_cfg = Arc::clone(&vm_cfg);
+                let connection_net_cfg = Arc::clone(&net_cfg);
+                let connection_registry = Arc::clone(&registry);
+                thread::spawn(move || {
+                    if let Err(error) = serve_connection(
+                        stream,
+                        connection_root.as_path(),
+                        connection_vm_cfg.as_ref(),
+                        connection_net_cfg.as_ref(),
+                        connection_registry.as_ref(),
+                    ) {
+                        eprintln!("connection: {error}");
+                    }
+                });
+            }
+            Err(error) => eprintln!("accept: {error}"),
+        }
+    }
+}
+
+struct Ctx<'a> {
+    root: &'a Path,
+    vm_cfg: &'a shinu::VmConfig,
+    net_cfg: &'a shinu::NetConfig,
+    registry: &'a Registry,
+}
+
+fn lock_state(registry: &Registry) -> MutexGuard<'_, ()> {
+    registry
+        .state_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn snapshot(root: &Path, registry: &Registry) -> shinu::Result<State> {
+    let _state_guard = lock_state(registry);
+    State::load(root)
+}
+
+fn update_state<T>(
+    root: &Path,
+    registry: &Registry,
+    update: impl FnOnce(&mut State) -> shinu::Result<T>,
+) -> shinu::Result<T> {
+    let _state_guard = lock_state(registry);
+    let mut state = State::load(root)?;
+    let value = update(&mut state)?;
+    state.store(root)?;
+    Ok(value)
+}
+
+fn check_name(state: &State, name: &str, project: &str) -> shinu::Result<()> {
+    if name.trim().is_empty() {
+        return Err(shinu::Error::Invalid("space name cannot be empty".into()));
+    }
+    if state
+        .spaces
+        .iter()
+        .any(|space| space.project == project && space.name == name)
+    {
+        return Err(shinu::Error::Invalid(format!(
+            "space name already exists: {name}"
+        )));
+    }
+    Ok(())
+}
+
+fn require_checkpoint_note(note: &str) -> shinu::Result<()> {
+    if note.trim().is_empty() {
+        return Err(shinu::Error::Invalid("checkpoint needs a note".into()));
+    }
+    Ok(())
+}
+
+fn append_checkpoint(
+    state: &mut State,
+    space_id: Uuid,
+    project: &str,
+    id: Uuid,
+    note: String,
+    auto: bool,
+    update_head: bool,
+) -> shinu::Result<Ckpt> {
+    let space_index = state
+        .spaces
+        .iter()
+        .position(|space| space.id == space_id && space.project == project)
+        .ok_or_else(|| shinu::Error::NotFound(space_id.to_string()))?;
+    let parent = state.spaces[space_index].head;
+    let checkpoint = Ckpt {
+        id,
+        space: space_id,
+        project: project.to_owned(),
+        parent,
+        auto,
+        note,
+        created_at: Utc::now(),
+    };
+    state.ckpts.push(checkpoint.clone());
+    if update_head {
+        state.spaces[space_index].head = Some(id);
+    }
+    Ok(checkpoint)
+}
+
+fn set_head(state: &mut State, space_id: Uuid, project: &str, head: Uuid) -> shinu::Result<()> {
+    let space = state
+        .spaces
+        .iter_mut()
+        .find(|space| space.id == space_id && space.project == project)
+        .ok_or_else(|| shinu::Error::NotFound(space_id.to_string()))?;
+    space.head = Some(head);
+    Ok(())
+}
+
+fn create_space(
+    root: &Path,
+    project: &str,
+    name: String,
+    registry: &Registry,
+) -> shinu::Result<Value> {
+    {
+        let state = snapshot(root, registry)?;
+        check_name(&state, &name, project)?;
+    }
+    let id = Uuid::new_v4();
+    let space_guard = registry.space_lock(id);
+    let _space_guard = space_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let image = shinu::space_image(root, id);
+    shinu::btrfs::clone_for(&shinu::base_path(root), &image, 0, 0)?;
+    let mount = root.join(format!("authorize.{id}.mnt"));
+    let result = (|| -> shinu::Result<Value> {
+        let public_key = shinu::vm::prepare(&shinu::vm_dir(root, id), 0, 0)?;
+        // Each image gets its own key: the base is the common ancestor of every
+        // space, so a key baked into it would be shared by all spaces.
+        shinu::vm::authorize(&image, &public_key, &mount)?;
+        let space = update_state(root, registry, |state| {
+            check_name(state, &name, project)?;
+            let space = Space {
+                id,
+                name: name.clone(),
+                project: project.to_owned(),
+                parent: None,
+                head: None,
+                created_at: Utc::now(),
+            };
+            state.spaces.push(space.clone());
+            Ok(space)
+        })?;
+        Ok(serde_json::to_value(space)?)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&image);
+        let _ = std::fs::remove_dir_all(shinu::vm_dir(root, id));
+        let _ = std::fs::remove_dir_all(&mount);
+    }
+    result
+}
+
+fn fork_space(
+    root: &Path,
+    project: &str,
+    ckpt: Uuid,
+    name: String,
+    registry: &Registry,
+) -> shinu::Result<Value> {
+    let source = {
+        let state = snapshot(root, registry)?;
+        check_name(&state, &name, project)?;
+        shinu::find_ckpt(&state, ckpt, project)?.id
+    };
+    let id = Uuid::new_v4();
+    let space_guard = registry.space_lock(id);
+    let _space_guard = space_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let image = shinu::space_image(root, id);
+    shinu::btrfs::clone_for(&shinu::ckpt_image(root, source), &image, 0, 0)?;
+    let mount = root.join(format!("authorize.{id}.mnt"));
+    let result = (|| -> shinu::Result<Value> {
+        let public_key = shinu::vm::prepare(&shinu::vm_dir(root, id), 0, 0)?;
+        // A fork gets a distinct VM key because it is an independent space even
+        // though its first filesystem state is shared by reflink.
+        shinu::vm::authorize(&image, &public_key, &mount)?;
+        let space = update_state(root, registry, |state| {
+            check_name(state, &name, project)?;
+            shinu::find_ckpt(state, source, project)?;
+            let space = Space {
+                id,
+                name: name.clone(),
+                project: project.to_owned(),
+                parent: Some(source),
+                head: Some(source),
+                created_at: Utc::now(),
+            };
+            state.spaces.push(space.clone());
+            Ok(space)
+        })?;
+        Ok(serde_json::to_value(space)?)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&image);
+        let _ = std::fs::remove_dir_all(shinu::vm_dir(root, id));
+        let _ = std::fs::remove_dir_all(&mount);
+    }
+    result
+}
+
+fn commit_space(
+    ctx: &Ctx<'_>,
+    project: &str,
+    space: String,
+    note: String,
+    hot: bool,
+) -> shinu::Result<Value> {
+    require_checkpoint_note(&note)?;
+    let (space_id, space_name) = {
+        let state = snapshot(ctx.root, ctx.registry)?;
+        let entry = shinu::find(&state, &space, project)?;
+        (entry.id, entry.name.clone())
+    };
+    let space_guard = ctx.registry.space_lock(space_id);
+    let _space_guard = space_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let vm_dir = shinu::vm_dir(ctx.root, space_id);
+    let running = shinu::vm::is_running(&vm_dir);
+    if running && !hot {
+        return Err(shinu::Error::Invalid(format!(
+            "stop the space before checkpointing it: {space_name}"
+        )));
+    }
+    if running {
+        // A hot commit flushes once, but writes after sync and before reflink
+        // completion remain outside the image by design.
+        let status = shinu::exec_in_vm(
+            &shinu::vm::vsock_path(&vm_dir),
+            &shinu::vm::key_path(&vm_dir),
+            shinu::VSOCK_SSH_PORT,
+            &["sync".to_owned()],
+        )?;
+        if status != 0 {
+            return Err(shinu::Error::Invalid(format!(
+                "sync failed for running space {space_name} (exit status {status})"
+            )));
+        }
+    }
+    let id = Uuid::new_v4();
+    let image = shinu::ckpt_image(ctx.root, id);
+    shinu::btrfs::clone_for(&shinu::space_image(ctx.root, space_id), &image, 0, 0)?;
+    let result = update_state(ctx.root, ctx.registry, |state| {
+        let checkpoint = append_checkpoint(state, space_id, project, id, note, false, true)?;
+        Ok(serde_json::to_value(checkpoint)?)
+    });
+    if result.is_err() {
+        let _ = std::fs::remove_file(image);
+    }
+    result
+}
+
+fn checkout_space(
+    root: &Path,
+    project: &str,
+    space: String,
+    commit: Uuid,
+    net_cfg: &shinu::NetConfig,
+    registry: &Registry,
+) -> shinu::Result<Value> {
+    let (space_id, space_name) = {
+        let state = snapshot(root, registry)?;
+        let entry = shinu::find(&state, &space, project)?;
+        (entry.id, entry.name.clone())
+    };
+    let space_guard = registry.space_lock(space_id);
+    let _space_guard = space_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (target, current_head) = {
+        let state = snapshot(root, registry)?;
+        let entry = shinu::find(&state, &space_name, project)?;
+        let vm_dir = shinu::vm_dir(root, entry.id);
+        if shinu::vm::is_running(&vm_dir) {
+            return Err(shinu::Error::Invalid(format!(
+                "stop the space before checking it out: {space_name}"
+            )));
+        }
+        let target = shinu::find_ckpt(&state, commit, project)?.clone();
+        (target, entry.head)
+    };
+
+    let auto_id = Uuid::new_v4();
+    let auto_image = shinu::ckpt_image(root, auto_id);
+    shinu::btrfs::clone_for(
+        &shinu::space_image(root, space_id),
+        &auto_image,
+        0,
+        0,
+    )?;
+    let short_id = commit.to_string().chars().take(8).collect::<String>();
+    let auto_note = format!("auto before checkout {short_id}");
+    let auto_checkpoint = update_state(root, registry, |state| {
+        let entry = shinu::find(state, &space_name, project)?;
+        if entry.id != space_id {
+            return Err(shinu::Error::NotFound(space_name.clone()));
+        }
+        let checkpoint = Ckpt {
+            id: auto_id,
+            space: space_id,
+            project: project.to_owned(),
+            parent: current_head,
+            auto: true,
+            note: auto_note.clone(),
+            created_at: Utc::now(),
+        };
+        state.ckpts.push(checkpoint.clone());
+        Ok(checkpoint)
+    })?;
+
+    // Keep the VM directory and keypair: changing that identity would invalidate
+    // credentials already used by the daemon to reach this space.
+    let vm_dir = shinu::vm_dir(root, space_id);
+    let public_key = std::fs::read_to_string(shinu::vm::key_path(&vm_dir).with_extension("pub"))?;
+    let image = shinu::space_image(root, space_id);
+    shinu::btrfs::clone_for(&shinu::ckpt_image(root, target.id), &image, 0, 0)?;
+    let mount = root.join(format!("authorize.checkout.{space_id}.mnt"));
+    shinu::vm::authorize(&image, &public_key, &mount)?;
+    update_state(root, registry, |state| {
+        shinu::find_ckpt(state, target.id, project)?;
+        set_head(state, space_id, project, target.id)?;
+        Ok(())
+    })?;
+    let _ = net_cfg;
+    Ok(json!({ "head": target.id, "auto_commit": auto_checkpoint.id }))
+}
+
+fn remove_space(
+    root: &Path,
+    project: &str,
+    name: String,
+    net_cfg: &shinu::NetConfig,
+    registry: &Registry,
+) -> shinu::Result<Value> {
+    let (id, resolved_name) = {
+        let state = snapshot(root, registry)?;
+        let entry = shinu::find(&state, &name, project)?;
+        (entry.id, entry.name.clone())
+    };
+    let space_guard = registry.space_lock(id);
+    let _space_guard = space_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    shinu::vm::stop(&shinu::vm_dir(root, id), net_cfg)?;
+    let image = shinu::space_image(root, id);
+    match std::fs::remove_file(&image) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    match std::fs::remove_dir_all(shinu::vm_dir(root, id)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    update_state(root, registry, |state| {
+        state.spaces.retain(|space| space.id != id);
+        Ok(())
+    })?;
+    Ok(json!({ "removed": resolved_name, "id": id }))
+}
+
+fn remove_checkpoint(
+    root: &Path,
+    project: &str,
+    id: Uuid,
+    registry: &Registry,
+) -> shinu::Result<Value> {
+    let state = snapshot(root, registry)?;
+    let checkpoint = shinu::find_ckpt(&state, id, project)?;
+    let referenced = shinu::is_referenced(&state, checkpoint.id);
+    if !referenced.is_empty() {
+        return Err(shinu::Error::Invalid(format!(
+            "checkpoint {id} is still referenced by: {}",
+            referenced.join(", ")
+        )));
+    }
+    let image = shinu::ckpt_image(root, id);
+    match std::fs::remove_file(&image) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    update_state(root, registry, |state| {
+        let checkpoint = shinu::find_ckpt(state, id, project)?;
+        if !shinu::is_referenced(state, checkpoint.id).is_empty() {
+            return Err(shinu::Error::Invalid(format!(
+                "checkpoint {id} is still referenced"
+            )));
+        }
+        state.ckpts.retain(|entry| entry.id != id);
+        Ok(())
+    })?;
+    Ok(json!({ "removed": id }))
+}
+
+fn list_spaces(root: &Path, project: &str, registry: &Registry) -> shinu::Result<Value> {
+    let state = snapshot(root, registry)?;
+    let mut spaces = Vec::new();
+    for space in state.spaces.iter().filter(|space| space.project == project) {
+        let mut value = serde_json::to_value(space)?;
+        if let Some(object) = value.as_object_mut() {
+            let size = shinu::btrfs::exclusive(&shinu::space_image(root, space.id)).unwrap_or(0);
+            object.insert("exclusive".into(), Value::from(size));
+            object.insert(
+                "running".into(),
+                Value::from(shinu::vm::is_running(&shinu::vm_dir(root, space.id))),
+            );
+        }
+        spaces.push(value);
+    }
+    let mut checkpoints = Vec::new();
+    for checkpoint in state.ckpts.iter().filter(|checkpoint| checkpoint.project == project) {
+        let mut value = serde_json::to_value(checkpoint)?;
+        if let Some(object) = value.as_object_mut() {
+            let size = shinu::btrfs::exclusive(&shinu::ckpt_image(root, checkpoint.id)).unwrap_or(0);
+            object.insert("exclusive".into(), Value::from(size));
+        }
+        checkpoints.push(value);
+    }
+    Ok(json!({ "spaces": spaces, "ckpts": checkpoints }))
+}
+
+fn start_space(
+    root: &Path,
+    project: &str,
+    name: String,
+    vm_cfg: &shinu::VmConfig,
+    net_cfg: &shinu::NetConfig,
+    registry: &Registry,
+) -> shinu::Result<Value> {
+    let id = {
+        let state = snapshot(root, registry)?;
+        shinu::find(&state, &name, project)?.id
+    };
+    let space_guard = registry.space_lock(id);
+    let _space_guard = space_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (_, booted) = shinu::vm::start(root, id, 0, 0, vm_cfg, net_cfg)?;
+    Ok(json!({ "booted": booted }))
+}
+
+fn stop_space(
+    root: &Path,
+    project: &str,
+    name: String,
+    net_cfg: &shinu::NetConfig,
+    registry: &Registry,
+) -> shinu::Result<Value> {
+    let id = {
+        let state = snapshot(root, registry)?;
+        shinu::find(&state, &name, project)?.id
+    };
+    let space_guard = registry.space_lock(id);
+    let _space_guard = space_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let was_running = shinu::vm::stop(&shinu::vm_dir(root, id), net_cfg)?;
+    Ok(json!({ "was_running": was_running }))
+}
+
+fn touch_space(
+    root: &Path,
+    project: &str,
+    name: String,
+    registry: &Registry,
+) -> shinu::Result<Value> {
+    let id = {
+        let state = snapshot(root, registry)?;
+        shinu::find(&state, &name, project)?.id
+    };
+    let space_guard = registry.space_lock(id);
+    let _space_guard = space_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    shinu::vm::touch(&shinu::vm_dir(root, id))?;
+    Ok(json!({ "ok": true }))
+}
+
+fn gc(
+    root: &Path,
+    project: &str,
+    free_below: u64,
+    dry_run: bool,
+    registry: &Registry,
+) -> shinu::Result<Value> {
+    let available = shinu::avail_bytes(root)?;
+    if available >= free_below {
+        return Ok(json!({ "dry_run": dry_run, "reclaimed": 0, "deleted": [] }));
+    }
+    let state = snapshot(root, registry)?;
+    let retention_days = std::env::var("SHINU_REFLOG_DAYS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(7);
+    let retention_secs = retention_days.saturating_mul(24 * 60 * 60);
+    let now = Utc::now();
+    let mut candidates = Vec::new();
+    for checkpoint in state
+        .ckpts
+        .iter()
+        .filter(|checkpoint| checkpoint.project == project && checkpoint.auto)
+    {
+        let age = now
+            .signed_duration_since(checkpoint.created_at)
+            .num_seconds();
+        if age <= i64::try_from(retention_secs).unwrap_or(i64::MAX)
+            || !shinu::is_referenced(&state, checkpoint.id).is_empty()
+        {
+            continue;
+        }
+        let exclusive = shinu::btrfs::exclusive(&shinu::ckpt_image(root, checkpoint.id))?;
+        candidates.push((checkpoint.id, checkpoint.note.clone(), exclusive));
+    }
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.2));
+    if dry_run {
+        let deleted = candidates
+            .iter()
+            .map(|(id, note, exclusive)| json!({ "id": id, "note": note, "exclusive": exclusive }))
+            .collect::<Vec<_>>();
+        return Ok(json!({ "dry_run": true, "reclaimed": 0, "deleted": deleted }));
+    }
+    let need = free_below.saturating_sub(available);
+    // Claim before deleting. The candidate list was computed from a snapshot
+    // taken without the state lock, so a concurrent fork or commit may have
+    // started referencing one of these commits in the meantime. Removing the
+    // rows inside the lock — re-checking `is_referenced` against the authoritative
+    // state as we go — makes the claim atomic: once a commit is gone from the
+    // state, `find_ckpt` fails for every later request, so no new reference to
+    // it can appear while the images are being unlinked outside the lock.
+    //
+    // Deleting first and pruning afterwards was the other option and is worse:
+    // it leaves a window where a space's `parent`/`head` points at a commit whose
+    // image is already gone. Crashing between the claim and the unlink instead
+    // leaks an unreferenced image file, which is recoverable garbage.
+    let claimed = update_state(root, registry, |state| {
+        let mut claimed = Vec::new();
+        let mut budget = 0u64;
+        for (id, note, exclusive) in &candidates {
+            if budget >= need {
+                break;
+            }
+            let still_present = state
+                .ckpts
+                .iter()
+                .any(|checkpoint| checkpoint.id == *id && checkpoint.project == project);
+            if !still_present || !shinu::is_referenced(state, *id).is_empty() {
+                continue;
+            }
+            state.ckpts.retain(|checkpoint| checkpoint.id != *id);
+            budget += exclusive;
+            claimed.push((*id, note.clone(), *exclusive));
+        }
+        Ok(claimed)
+    })?;
+
+    let mut reclaimed = 0;
+    let mut deleted = Vec::new();
+    for (id, note, exclusive) in claimed {
+        let image = shinu::ckpt_image(root, id);
+        match std::fs::remove_file(&image) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        reclaimed += exclusive;
+        deleted.push(json!({ "id": id, "note": note, "exclusive": exclusive }));
+    }
+    Ok(json!({ "dry_run": false, "reclaimed": reclaimed, "deleted": deleted }))
+}
+
+fn checkpoint_json(checkpoint: &Ckpt) -> shinu::Result<Value> {
+    Ok(serde_json::to_value(checkpoint)?)
+}
+
+fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
+    match req {
+        Req::New { name } => create_space(ctx.root, project, name, ctx.registry),
+        Req::Fork { ckpt, name } => fork_space(ctx.root, project, ckpt, name, ctx.registry),
+        Req::Commit { space, note, hot } => commit_space(ctx, project, space, note, hot),
+        Req::Checkout { space, commit } => {
+            checkout_space(ctx.root, project, space, commit, ctx.net_cfg, ctx.registry)
+        }
+        Req::Log { space } => {
+            let state = snapshot(ctx.root, ctx.registry)?;
+            let entry = shinu::find(&state, &space, project)?;
+            let commits = shinu::log_chain(&state, entry)
+                .into_iter()
+                .map(checkpoint_json)
+                .collect::<shinu::Result<Vec<_>>>()?;
+            Ok(json!({ "commits": commits }))
+        }
+        Req::Reflog { space } => {
+            let state = snapshot(ctx.root, ctx.registry)?;
+            let entry = shinu::find(&state, &space, project)?;
+            let entries = shinu::reflog_entries(&state, entry)
+                .into_iter()
+                .map(checkpoint_json)
+                .collect::<shinu::Result<Vec<_>>>()?;
+            Ok(json!({ "entries": entries }))
+        }
+        Req::Rm { space } => remove_space(ctx.root, project, space, ctx.net_cfg, ctx.registry),
+        Req::RmCkpt { ckpt } => remove_checkpoint(ctx.root, project, ckpt, ctx.registry),
+        Req::Ls => list_spaces(ctx.root, project, ctx.registry),
+        Req::Start { space } => start_space(
+            ctx.root,
+            project,
+            space,
+            ctx.vm_cfg,
+            ctx.net_cfg,
+            ctx.registry,
+        ),
+        Req::Stop { space } => stop_space(ctx.root, project, space, ctx.net_cfg, ctx.registry),
+        Req::Touch { space } => touch_space(ctx.root, project, space, ctx.registry),
+        Req::Gc {
+            free_below,
+            dry_run,
+        } => gc(ctx.root, project, free_below, dry_run, ctx.registry),
+    }
+}
+
+#[derive(Debug)]
+enum Endpoint {
+    Spaces,
+    Rm(String),
+    Start(String),
+    Stop(String),
+    Exec(String),
+    Commit(String),
+    Log(String),
+    Reflog(String),
+    Checkout(String),
+    Fork(String),
+    RmCkpt(String),
+    Gc,
+}
+
+fn hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_segment(segment: &str) -> Option<String> {
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return None;
+            }
+            let high = hex_digit(bytes[index + 1])?;
+            let low = hex_digit(bytes[index + 2])?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+fn route(path: &str) -> Option<Endpoint> {
+    let segments = path
+        .split('/')
+        .map(decode_segment)
+        .collect::<Option<Vec<_>>>()?;
+    if segments.first().map(String::as_str) != Some("")
+        || segments.get(1).map(String::as_str) != Some("v1")
+    {
+        return None;
+    }
+    if segments.len() == 3 && segments[2] == "spaces" {
+        return Some(Endpoint::Spaces);
+    }
+    if segments.len() == 3 && segments[2] == "gc" {
+        return Some(Endpoint::Gc);
+    }
+    if segments.len() == 4 && segments[2] == "spaces" {
+        return Some(Endpoint::Rm(segments[3].clone()));
+    }
+    if segments.len() == 5 && segments[2] == "spaces" {
+        let name = segments[3].clone();
+        return match segments[4].as_str() {
+            "start" => Some(Endpoint::Start(name)),
+            "stop" => Some(Endpoint::Stop(name)),
+            "exec" => Some(Endpoint::Exec(name)),
+            "commits" => Some(Endpoint::Commit(name)),
+            "log" => Some(Endpoint::Log(name)),
+            "reflog" => Some(Endpoint::Reflog(name)),
+            "checkout" => Some(Endpoint::Checkout(name)),
+            _ => None,
+        };
+    }
+    if segments.len() == 4 && segments[2] == "commits" {
+        return Some(Endpoint::RmCkpt(segments[3].clone()));
+    }
+    if segments.len() == 5 && segments[2] == "commits" && segments[4] == "fork" {
+        return Some(Endpoint::Fork(segments[3].clone()));
+    }
+    None
+}
+
+fn method_allowed(endpoint: &Endpoint, method: &str) -> bool {
+    match endpoint {
+        Endpoint::Spaces => method == "GET" || method == "POST",
+        Endpoint::Log(_) | Endpoint::Reflog(_) => method == "GET",
+        Endpoint::Rm(_) | Endpoint::RmCkpt(_) => method == "DELETE",
+        Endpoint::Start(_)
+        | Endpoint::Stop(_)
+        | Endpoint::Exec(_)
+        | Endpoint::Commit(_)
+        | Endpoint::Checkout(_)
+        | Endpoint::Fork(_)
+        | Endpoint::Gc => method == "POST",
+    }
+}
+
+fn parse_body(body: &[u8]) -> shinu::Result<Value> {
+    if body.is_empty() {
+        return Err(shinu::Error::Invalid("request body is required".into()));
+    }
+    serde_json::from_slice(body)
+        .map_err(|error| shinu::Error::Invalid(format!("invalid JSON body: {error}")))
+}
+
+fn body_string(body: &[u8], field: &str) -> shinu::Result<String> {
+    let value = parse_body(body)?;
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| shinu::Error::Invalid(format!("body field {field} must be a string")))
+}
+
+fn body_bool(body: &[u8], field: &str) -> shinu::Result<bool> {
+    let value = parse_body(body)?;
+    value
+        .get(field)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| shinu::Error::Invalid(format!("body field {field} must be a boolean")))
+}
+
+fn body_u64(body: &[u8], field: &str) -> shinu::Result<u64> {
+    let value = parse_body(body)?;
+    value
+        .get(field)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| shinu::Error::Invalid(format!("body field {field} must be an unsigned integer")))
+}
+
+fn request_for(endpoint: Endpoint, method: &str, body: &[u8]) -> shinu::Result<(Req, u16)> {
+    match endpoint {
+        Endpoint::Spaces if method == "GET" => Ok((Req::Ls, 200)),
+        Endpoint::Spaces => Ok((Req::New { name: body_string(body, "name")? }, 201)),
+        Endpoint::Rm(space) => Ok((Req::Rm { space }, 200)),
+        Endpoint::Start(space) => Ok((Req::Start { space }, 200)),
+        Endpoint::Stop(space) => Ok((Req::Stop { space }, 200)),
+        Endpoint::Commit(space) => Ok((
+            Req::Commit {
+                space,
+                note: body_string(body, "note")?,
+                hot: body_bool(body, "hot")?,
+            },
+            201,
+        )),
+        Endpoint::Log(space) => Ok((Req::Log { space }, 200)),
+        Endpoint::Reflog(space) => Ok((Req::Reflog { space }, 200)),
+        Endpoint::Checkout(space) => Ok((
+            Req::Checkout {
+                space,
+                commit: Uuid::parse_str(&body_string(body, "commit")?)
+                    .map_err(|error| shinu::Error::Invalid(format!("invalid commit id: {error}")))?,
+            },
+            200,
+        )),
+        Endpoint::Fork(commit) => Ok((
+            Req::Fork {
+                ckpt: Uuid::parse_str(&commit)
+                    .map_err(|error| shinu::Error::Invalid(format!("invalid commit id: {error}")))?,
+                name: body_string(body, "name")?,
+            },
+            201,
+        )),
+        Endpoint::RmCkpt(commit) => Ok((
+            Req::RmCkpt {
+                ckpt: Uuid::parse_str(&commit)
+                    .map_err(|error| shinu::Error::Invalid(format!("invalid commit id: {error}")))?,
+            },
+            200,
+        )),
+        Endpoint::Gc => Ok((
+            Req::Gc {
+                free_below: body_u64(body, "free_below")?,
+                dry_run: body_bool(body, "dry_run")?,
+            },
+            200,
+        )),
+        Endpoint::Exec(_) => Err(shinu::Error::Invalid("exec requires a command".into())),
+    }
+}
+
+fn exec_command(body: &[u8]) -> shinu::Result<Vec<String>> {
+    let value = parse_body(body)?;
+    let command = value
+        .get("cmd")
+        .and_then(Value::as_array)
+        .ok_or_else(|| shinu::Error::Invalid("body field cmd must be an array".into()))?;
+    let command = command
+        .iter()
+        .map(|argument| {
+            argument
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| shinu::Error::Invalid("cmd arguments must be strings".into()))
+        })
+        .collect::<shinu::Result<Vec<_>>>()?;
+    if command.is_empty() {
+        return Err(shinu::Error::Invalid("exec needs a command".into()));
+    }
+    Ok(command)
+}
+
+fn respond_error(stream: &mut impl Write, status: u16, error: &shinu::Error) -> shinu::Result<()> {
+    http::respond(stream, status, &json!({ "error": error.to_string() }))?;
+    Ok(())
+}
+
+fn serve_connection(
+    mut stream: TcpStream,
+    root: &Path,
+    vm_cfg: &shinu::VmConfig,
+    net_cfg: &shinu::NetConfig,
+    registry: &Registry,
+) -> shinu::Result<()> {
+    let ctx = Ctx {
+        root,
+        vm_cfg,
+        net_cfg,
+        registry,
+    };
+    let parsed_request = {
+        let mut reader = BufReader::new(&mut stream);
+        http::parse(&mut reader)
+    };
+    let request = match parsed_request {
+        Ok(request) => request,
+        Err(error) => {
+            respond_error(&mut stream, http::status_for(&error), &error)?;
+            return Ok(());
+        }
+    };
+    let tokens = match shinu::token::load(ctx.root) {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            respond_error(&mut stream, http::status_for(&error), &error)?;
+            return Ok(());
+        }
+    };
+    let project = match request.token.as_deref() {
+        Some(plain) => match shinu::token::authenticate(&tokens, plain) {
+            Ok(project) => project,
+            Err(error) => {
+                respond_error(&mut stream, http::status_for(&error), &error)?;
+                return Ok(());
+            }
+        },
+        None => {
+            let error = shinu::Error::Auth("missing bearer token".into());
+            respond_error(&mut stream, http::status_for(&error), &error)?;
+            return Ok(());
+        }
+    };
+
+    let endpoint = match route(&request.path) {
+        Some(endpoint) => endpoint,
+        None => {
+            let error = shinu::Error::NotFound(request.path.clone());
+            respond_error(&mut stream, http::status_for(&error), &error)?;
+            return Ok(());
+        }
+    };
+    if !method_allowed(&endpoint, &request.method) {
+        let error = shinu::Error::Invalid("method not allowed".into());
+        respond_error(&mut stream, 405, &error)?;
+        return Ok(());
+    }
+    if let Endpoint::Exec(space) = &endpoint {
+        let command = match exec_command(&request.body) {
+            Ok(command) => command,
+            Err(error) => {
+                respond_error(&mut stream, http::status_for(&error), &error)?;
+                return Ok(());
+            }
+        };
+        if let Err(error) = execute_streaming(&mut stream, &ctx, project.as_str(), space.clone(), command) {
+            respond_error(&mut stream, http::status_for(&error), &error)?;
+        }
+        return Ok(());
+    }
+    let (req, status) = match request_for(endpoint, &request.method, &request.body) {
+        Ok(request) => request,
+        Err(error) => {
+            respond_error(&mut stream, http::status_for(&error), &error)?;
+            return Ok(());
+        }
+    };
+    match handle(&ctx, req, project.as_str()) {
+        Ok(value) => http::respond(&mut stream, status, &value)?,
+        Err(error) => respond_error(&mut stream, http::status_for(&error), &error)?,
+    }
+    Ok(())
+}
+
+
+struct StreamLine {
+    stream: &'static str,
+    data: String,
+}
+
+fn read_stream<R: Read + Send + 'static>(
+    stream: &'static str,
+    reader: R,
+    sender: mpsc::Sender<StreamLine>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if sender
+                        .send(StreamLine { stream, data: line })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+fn write_stream_line(stream: &mut impl Write, line: StreamLine) -> shinu::Result<()> {
+    http::respond_chunk(stream, &json!({ "stream": line.stream, "data": line.data }))?;
+    Ok(())
+}
+
+fn execute_streaming(
+    stream: &mut TcpStream,
+    ctx: &Ctx<'_>,
+    project: &str,
+    space: String,
+    command: Vec<String>,
+) -> shinu::Result<()> {
+    let space_id = {
+        let state = snapshot(ctx.root, ctx.registry)?;
+        shinu::find(&state, &space, project)?.id
+    };
+    let space_guard = ctx.registry.space_lock(space_id);
+    {
+        let _space_guard = space_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Start is serialized only with lifecycle/image operations. The SSH
+        // session itself runs after this guard is dropped so concurrent execs
+        // in one guest are not needlessly serialized.
+        shinu::vm::start(ctx.root, space_id, 0, 0, ctx.vm_cfg, ctx.net_cfg)?;
+    }
+    let vm_dir = shinu::vm_dir(ctx.root, space_id);
+    let helper = shinu::vsock_helper()?;
+    let proxy = format!(
+        "ProxyCommand={} {} {}",
+        shinu::shell_quote_word(&helper.to_string_lossy()),
+        shinu::shell_quote_word(&shinu::vm::vsock_path(&vm_dir).to_string_lossy()),
+        shinu::VSOCK_SSH_PORT
+    );
+    let mut child = Command::new("ssh")
+        .args([
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "LogLevel=ERROR",
+            "-o",
+            "IdentitiesOnly=yes",
+        ])
+        .arg("-o")
+        .arg(proxy)
+        .arg("-i")
+        .arg(shinu::vm::key_path(&vm_dir))
+        .arg("root@shinu")
+        .arg("--")
+        .arg(shinu::shell_quote(&command))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| shinu::Error::Invalid("ssh stdout pipe unavailable".into()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| shinu::Error::Invalid("ssh stderr pipe unavailable".into()))?;
+    let (sender, receiver) = mpsc::channel();
+    let stdout_reader = read_stream("stdout", stdout, sender.clone());
+    let stderr_reader = read_stream("stderr", stderr, sender);
+    http::respond_chunked_start(stream)?;
+
+    let mut readers = 2;
+    let mut child_status = None;
+    let mut stream_broken = false;
+    while readers > 0 || child_status.is_none() {
+        match receiver.recv_timeout(Duration::from_millis(50)) {
+            Ok(line) => {
+                if write_stream_line(stream, line).is_err() {
+                    stream_broken = true;
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => readers = 0,
+        }
+        if child_status.is_none() {
+            match child.try_wait() {
+                Ok(status) => child_status = status,
+                Err(_) => {
+                    stream_broken = true;
+                    break;
+                }
+            }
+        }
+    }
+    if !stream_broken {
+        while let Ok(line) = receiver.try_recv() {
+            if write_stream_line(stream, line).is_err() {
+                stream_broken = true;
+                break;
+            }
+        }
+    }
+    if stream_broken {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = stdout_reader.join();
+        let _ = stderr_reader.join();
+        return Ok(());
+    }
+    let exit = child_status
+        .and_then(|status| status.code())
+        .unwrap_or(255);
+    let _ = http::respond_chunk(stream, &json!({ "exit": exit }));
+    let _ = http::respond_chunked_end(stream);
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{append_checkpoint, handle, set_head};
+    use chrono::Utc;
+    use shinu::{
+        NetConfig, VmConfig,
+        proto::Req,
+        state::{Ckpt, Space, State},
+        vm,
+    };
+    use std::os::unix::fs::symlink;
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::thread;
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    fn test_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("shinu-{label}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create test root");
+        root
+    }
+
+    fn test_configs() -> (VmConfig, NetConfig) {
+        (
+            VmConfig {
+                vcpus: 1,
+                mem_mib: 1,
+                idle_secs: 1,
+            },
+            NetConfig {
+                enabled: false,
+                base: [172, 31],
+                uplink: String::new(),
+            },
+        )
+    }
+
+    fn registry() -> shinu::registry::Registry {
+        shinu::registry::Registry::new()
+    }
+    fn daemon_ctx<'a>(
+        root: &'a std::path::Path,
+        vm_cfg: &'a VmConfig,
+        net_cfg: &'a NetConfig,
+        registry: &'a shinu::registry::Registry,
+    ) -> super::Ctx<'a> {
+        super::Ctx {
+            root,
+            vm_cfg,
+            net_cfg,
+            registry,
+        }
+    }
+
+    #[test]
+    fn rejects_empty_snapshot_note() {
+        let root = test_root("empty-note");
+        let (vm_cfg, net_cfg) = test_configs();
+        let registry = registry();
+        let ctx = daemon_ctx(&root, &vm_cfg, &net_cfg, &registry);
+        let result = handle(
+            &ctx,
+            Req::Commit {
+                space: "missing".into(),
+                note: "  ".into(),
+                hot: false,
+            },
+            "project-a",
+        );
+        assert!(matches!(
+            result,
+            Err(shinu::Error::Invalid(message)) if message == "checkpoint needs a note"
+        ));
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    fn running_state(root: &std::path::Path, project: &str) -> (Uuid, Uuid, std::process::Child) {
+        let space_id = Uuid::new_v4();
+        let ckpt_id = Uuid::new_v4();
+        let name = "running";
+        let vm_dir = shinu::vm_dir(root, space_id);
+        std::fs::create_dir_all(&vm_dir).expect("create VM directory");
+        let config = vm_dir.join("fc.json");
+        std::fs::write(&config, "{}").expect("write fake config");
+        State {
+            spaces: vec![Space {
+                id: space_id,
+                name: name.into(),
+                project: project.into(),
+                parent: None,
+                head: None,
+                created_at: Utc::now(),
+            }],
+            ckpts: vec![Ckpt {
+                id: ckpt_id,
+                space: space_id,
+                project: project.into(),
+                parent: None,
+                auto: false,
+                note: "before".into(),
+                created_at: Utc::now(),
+            }],
+        }
+        .store(root)
+        .expect("write test state");
+        let fake_firecracker = root.join("firecracker");
+        symlink("/usr/bin/yes", &fake_firecracker).expect("link fake firecracker");
+        let child = Command::new(&fake_firecracker)
+            .arg(&config)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start fake firecracker");
+        std::fs::write(vm::pid_path(&vm_dir), child.id().to_string()).expect("write fake pid");
+        let running = (0..20).any(|_| {
+            if vm::is_running(&vm_dir) {
+                true
+            } else {
+                thread::sleep(Duration::from_millis(10));
+                false
+            }
+        });
+        assert!(running, "fake firecracker was not recognized as running");
+        (space_id, ckpt_id, child)
+    }
+
+    #[test]
+    fn checkout_rejects_running_space() {
+        let root = test_root("checkout-running");
+        let project = "project-a";
+        let (_space_id, ckpt_id, mut child) = running_state(&root, project);
+        let (vm_cfg, net_cfg) = test_configs();
+        let registry = registry();
+        let ctx = daemon_ctx(&root, &vm_cfg, &net_cfg, &registry);
+        let result = handle(
+            &ctx,
+            Req::Checkout {
+                space: "running".into(),
+                commit: ckpt_id,
+            },
+            project,
+        );
+        assert!(matches!(
+            result,
+            Err(shinu::Error::Invalid(message)) if message.contains("running")
+        ));
+        child.kill().expect("stop fake firecracker");
+        child.wait().expect("wait fake firecracker");
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn rejects_checkpoint_deletion_while_referenced() {
+        let root = test_root("rmckpt-referenced");
+        let project = "project-a";
+        let checkpoint_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        State {
+            spaces: vec![Space {
+                id: child_id,
+                name: "child-space".into(),
+                project: project.into(),
+                parent: Some(checkpoint_id),
+                head: None,
+                created_at: Utc::now(),
+            }],
+            ckpts: vec![Ckpt {
+                id: checkpoint_id,
+                space: child_id,
+                project: project.into(),
+                parent: None,
+                auto: false,
+                note: "base".into(),
+                created_at: Utc::now(),
+            }],
+        }
+        .store(&root)
+        .expect("write test state");
+        std::fs::create_dir_all(root.join("ckpts")).expect("create checkpoint directory");
+        std::fs::write(shinu::ckpt_image(&root, checkpoint_id), b"checkpoint")
+            .expect("write checkpoint image");
+        let (vm_cfg, net_cfg) = test_configs();
+        let registry = registry();
+        let ctx = daemon_ctx(&root, &vm_cfg, &net_cfg, &registry);
+        let result = handle(&ctx, Req::RmCkpt { ckpt: checkpoint_id }, project);
+        assert!(matches!(
+            result,
+            Err(shinu::Error::Invalid(message)) if message.contains("child-space")
+        ));
+        assert!(shinu::ckpt_image(&root, checkpoint_id).exists());
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn checkpoint_deletion_hides_foreign_project() {
+        let root = test_root("rmckpt-project");
+        let checkpoint_id = Uuid::new_v4();
+        State {
+            spaces: Vec::new(),
+            ckpts: vec![Ckpt {
+                id: checkpoint_id,
+                space: Uuid::new_v4(),
+                project: "project-b".into(),
+                parent: None,
+                auto: false,
+                note: "private".into(),
+                created_at: Utc::now(),
+            }],
+        }
+        .store(&root)
+        .expect("write test state");
+        let (vm_cfg, net_cfg) = test_configs();
+        let registry = registry();
+        let ctx = daemon_ctx(&root, &vm_cfg, &net_cfg, &registry);
+        let result = handle(
+            &ctx,
+            Req::RmCkpt { ckpt: checkpoint_id },
+            "project-a",
+        );
+        assert!(matches!(
+            result,
+            Err(shinu::Error::NotFound(message)) if message.contains(&checkpoint_id.to_string())
+        ));
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn cold_commit_rejects_running_space() {
+        let root = test_root("cold-running");
+        let project = "project-a";
+        let (_space_id, _ckpt_id, mut child) = running_state(&root, project);
+        let (vm_cfg, net_cfg) = test_configs();
+        let registry = registry();
+        let ctx = daemon_ctx(&root, &vm_cfg, &net_cfg, &registry);
+        let result = handle(
+            &ctx,
+            Req::Commit {
+                space: "running".into(),
+                note: "cold".into(),
+                hot: false,
+            },
+            project,
+        );
+        assert!(matches!(
+            result,
+            Err(shinu::Error::Invalid(message)) if message.contains("stop the space")
+        ));
+        child.kill().expect("stop fake firecracker");
+        child.wait().expect("wait fake firecracker");
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn commit_parent_chain_and_head_are_dag_ordered() {
+        let space_id = Uuid::new_v4();
+        let project = "project-a";
+        let mut state = State {
+            spaces: vec![Space {
+                id: space_id,
+                name: "web".into(),
+                project: project.into(),
+                parent: None,
+                head: None,
+                created_at: Utc::now(),
+            }],
+            ckpts: Vec::new(),
+        };
+        let first = append_checkpoint(
+            &mut state,
+            space_id,
+            project,
+            Uuid::new_v4(),
+            "first".into(),
+            false,
+            true,
+        )
+        .expect("first checkpoint");
+        let second = append_checkpoint(
+            &mut state,
+            space_id,
+            project,
+            Uuid::new_v4(),
+            "second".into(),
+            false,
+            true,
+        )
+        .expect("second checkpoint");
+        assert_eq!(second.parent, Some(first.id));
+        assert_eq!(state.spaces[0].head, Some(second.id));
+        let log = shinu::log_chain(&state, &state.spaces[0]);
+        assert_eq!(log.iter().map(|checkpoint| checkpoint.id).collect::<Vec<_>>(),
+                   vec![second.id, first.id]);
+    }
+
+    #[test]
+    fn checkout_records_reflog_before_moving_head() {
+        let space_id = Uuid::new_v4();
+        let project = "project-a";
+        let target_id = Uuid::new_v4();
+        let mut state = State {
+            spaces: vec![Space {
+                id: space_id,
+                name: "web".into(),
+                project: project.into(),
+                parent: None,
+                head: Some(target_id),
+                created_at: Utc::now(),
+            }],
+            ckpts: vec![Ckpt {
+                id: target_id,
+                space: space_id,
+                project: project.into(),
+                parent: None,
+                auto: false,
+                note: "target".into(),
+                created_at: Utc::now(),
+            }],
+        };
+        let auto = append_checkpoint(
+            &mut state,
+            space_id,
+            project,
+            Uuid::new_v4(),
+            format!("auto before checkout {}", &target_id.to_string()[..8]),
+            true,
+            false,
+        )
+        .expect("automatic checkpoint");
+        set_head(&mut state, space_id, project, target_id).expect("checkout head");
+        assert!(auto.auto);
+        assert_eq!(auto.parent, Some(target_id));
+        assert_eq!(state.spaces[0].head, Some(target_id));
+        assert_eq!(state.ckpts.len(), 2);
+    }
+
+    #[test]
+    fn reflog_finds_auto_commit_left_behind_by_checkout() {
+        let root = test_root("reflog");
+        let project = "project-a";
+        let space_id = Uuid::new_v4();
+        let old_id = Uuid::new_v4();
+        let auto_id = Uuid::new_v4();
+        State {
+            spaces: vec![Space {
+                id: space_id,
+                name: "web".into(),
+                project: project.into(),
+                parent: None,
+                head: Some(old_id),
+                created_at: Utc::now(),
+            }],
+            ckpts: vec![
+                Ckpt {
+                    id: old_id,
+                    space: space_id,
+                    project: project.into(),
+                    parent: None,
+                    auto: false,
+                    note: "before checkout".into(),
+                    created_at: Utc::now(),
+                },
+                Ckpt {
+                    id: auto_id,
+                    space: space_id,
+                    project: project.into(),
+                    parent: Some(old_id),
+                    auto: true,
+                    note: "auto before checkout".into(),
+                    created_at: Utc::now(),
+                },
+            ],
+        }
+        .store(&root)
+        .expect("write reflog state");
+        let (vm_cfg, net_cfg) = test_configs();
+        let registry = registry();
+        let ctx = daemon_ctx(&root, &vm_cfg, &net_cfg, &registry);
+
+        let reflog = handle(
+            &ctx,
+            Req::Reflog {
+                space: "web".into(),
+            },
+            project,
+        )
+        .expect("read reflog");
+        let log = handle(
+            &ctx,
+            Req::Log {
+                space: "web".into(),
+            },
+            project,
+        )
+        .expect("read log");
+        let entries = reflog["entries"].as_array().expect("reflog entries");
+        let auto_id_text = auto_id.to_string();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(log["commits"].as_array().unwrap().len(), 1);
+        assert!(entries.iter().any(|entry| {
+            entry["id"].as_str() == Some(auto_id_text.as_str())
+                && entry["auto"].as_bool().unwrap_or(false)
+        }));
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    /// `gc` computes its candidate list from a snapshot taken without the state
+    /// lock, so a fork or commit can start referencing a candidate before the
+    /// deletion commits. The claim step must re-check `is_referenced` against
+    /// the authoritative state and skip anything that gained a reference, or a
+    /// space is left pointing at a commit whose image has been unlinked.
+    #[test]
+    fn gc_claim_skips_a_commit_that_gained_a_reference() {
+        let project = "project-a";
+        let space_id = Uuid::new_v4();
+        let stale_id = Uuid::new_v4();
+        let raced_id = Uuid::new_v4();
+        let mut state = State {
+            spaces: vec![Space {
+                id: space_id,
+                name: "web".into(),
+                project: project.into(),
+                parent: None,
+                // The racing fork landed between the snapshot and the claim.
+                head: Some(raced_id),
+                created_at: Utc::now(),
+            }],
+            ckpts: vec![
+                Ckpt {
+                    id: stale_id,
+                    space: space_id,
+                    project: project.into(),
+                    parent: None,
+                    auto: true,
+                    note: "auto stale".into(),
+                    created_at: Utc::now(),
+                },
+                Ckpt {
+                    id: raced_id,
+                    space: space_id,
+                    project: project.into(),
+                    parent: None,
+                    auto: true,
+                    note: "auto raced".into(),
+                    created_at: Utc::now(),
+                },
+            ],
+        };
+        // Both looked collectable when the snapshot was taken.
+        let candidates = [stale_id, raced_id];
+        let mut claimed = Vec::new();
+        for id in candidates {
+            let present = state
+                .ckpts
+                .iter()
+                .any(|checkpoint| checkpoint.id == id && checkpoint.project == project);
+            if !present || !shinu::is_referenced(&state, id).is_empty() {
+                continue;
+            }
+            state.ckpts.retain(|checkpoint| checkpoint.id != id);
+            claimed.push(id);
+        }
+        assert_eq!(claimed, vec![stale_id], "raced commit must survive the claim");
+        assert!(
+            state.ckpts.iter().any(|checkpoint| checkpoint.id == raced_id),
+            "raced commit must stay in the state so its image is never unlinked"
+        );
+        assert_eq!(state.spaces[0].head, Some(raced_id));
+    }
+}

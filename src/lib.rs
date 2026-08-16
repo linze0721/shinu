@@ -2600,6 +2600,9 @@ pub struct NetConfig {
     pub enabled: bool,
     /// `SHINU_NET_BASE` — the first two octets of the /16 pool.
     pub base: [u8; 2],
+    /// `SHINU_NET_ALLOW` — comma-separated IPv4 CIDRs allowed before the
+    /// private-address egress filter. Empty means no private destinations.
+    pub allow: Vec<String>,
     /// `SHINU_NET_UPLINK` — host interface used for NAT egress.
     pub uplink: String,
 }
@@ -2609,6 +2612,140 @@ fn parse_net_base(value: &str) -> Option<[u8; 2]> {
     let first = octets.next()?.parse::<u8>().ok()?;
     let second = octets.next()?.parse::<u8>().ok()?;
     octets.next().is_none().then_some([first, second])
+}
+
+fn parse_ipv4(value: &str) -> Option<[u8; 4]> {
+    let mut octets = value.trim().split('.');
+    let address = [
+        octets.next()?.parse::<u8>().ok()?,
+        octets.next()?.parse::<u8>().ok()?,
+        octets.next()?.parse::<u8>().ok()?,
+        octets.next()?.parse::<u8>().ok()?,
+    ];
+    octets.next().is_none().then_some(address)
+}
+
+fn parse_ipv4_cidr(value: &str) -> Option<([u8; 4], u8)> {
+    let (address, prefix) = value.trim().split_once('/')?;
+    let prefix = prefix.parse::<u8>().ok()?;
+    let address = parse_ipv4(address)?;
+    (prefix <= 32).then_some((address, prefix))
+}
+
+fn guest_dns_fallback() -> String {
+    std::env::var("SHINU_GUEST_DNS")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "1.1.1.1".to_owned())
+}
+
+/// Filters host resolver entries before baking them into the guest image.
+/// Private and link-local host resolvers cannot be reached after guest egress
+/// filtering, so copying one would make xbps unable to resolve package mirrors.
+pub fn filter_guest_nameservers(resolv: &str, fallback: &str) -> String {
+    let fallback = if fallback.trim().is_empty() {
+        "1.1.1.1"
+    } else {
+        fallback.trim()
+    };
+    let filtered = resolv
+        .lines()
+        .filter(|line| {
+            let mut fields = line.split_whitespace();
+            match (fields.next(), fields.next()) {
+                (Some("nameserver"), Some(address)) => {
+                    !is_blocked_guest_destination(address) && !address.starts_with("127.")
+                }
+                (Some("nameserver"), None) => false,
+                _ => true,
+            }
+        })
+        .collect::<Vec<_>>();
+    let has_nameserver = filtered.iter().any(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next() == Some("nameserver") && fields.next().is_some()
+    });
+    if has_nameserver {
+        format!("{}\n", filtered.join("\n"))
+    } else {
+        format!("nameserver {fallback}\n")
+    }
+}
+
+/// Returns whether a baked resolver file contains an unusable or missing
+/// nameserver. Formatting alone does not trigger a repair, so a public file
+/// remains untouched on every daemon restart.
+pub fn guest_resolv_needs_repair(resolv: &str) -> bool {
+    let mut has_nameserver = false;
+    for line in resolv.lines() {
+        let mut fields = line.split_whitespace();
+        if fields.next() != Some("nameserver") {
+            continue;
+        }
+        let Some(address) = fields.next() else {
+            return true;
+        };
+        has_nameserver = true;
+        if is_blocked_guest_destination(address) || address.starts_with("127.") {
+            return true;
+        }
+    }
+    !has_nameserver
+}
+
+fn seed_resolv(mnt: &Path) -> Result<()> {
+    let fallback = guest_dns_fallback();
+    if let Ok(resolv) = std::fs::read("/etc/resolv.conf") {
+        let resolv = String::from_utf8_lossy(&resolv);
+        let contents = filter_guest_nameservers(&resolv, &fallback);
+        std::fs::write(mnt.join("etc/resolv.conf"), contents)?;
+    }
+    Ok(())
+}
+
+/// Returns whether an IPv4 address is in one of the three RFC1918 ranges.
+/// Link-local and loopback addresses are deliberately handled separately:
+/// they are not RFC1918, but are blocked by the guest egress policy too.
+pub fn is_rfc1918(address: &str) -> bool {
+    match parse_ipv4(address) {
+        Some([10, ..]) | Some([192, 168, ..]) => true,
+        Some([172, second, ..]) => (16..=31).contains(&second),
+        _ => false,
+    }
+}
+
+fn is_blocked_guest_destination(address: &str) -> bool {
+    if is_rfc1918(address) {
+        return true;
+    }
+    matches!(parse_ipv4(address), Some([127, ..]) | Some([169, 254, ..]))
+}
+
+const GUEST_BLOCKED_CIDRS: [&str; 5] = [
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+    "127.0.0.0/8",
+];
+
+/// Parses `SHINU_NET_ALLOW` without silently dropping malformed entries.
+pub fn parse_net_allow(value: &str) -> Result<Vec<String>> {
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(',')
+        .map(str::trim)
+        .map(|entry| {
+            if parse_ipv4_cidr(entry).is_none() {
+                return Err(Error::Invalid(format!(
+                    "invalid SHINU_NET_ALLOW entry {entry:?}; expected an IPv4 CIDR such as 10.0.0.0/8"
+                )));
+            }
+            Ok(entry.to_owned())
+        })
+        .collect()
 }
 
 fn default_uplink() -> Option<String> {
@@ -2645,6 +2782,10 @@ impl NetConfig {
             })?,
             Err(_) => [172, 31],
         };
+        let allow = match std::env::var("SHINU_NET_ALLOW") {
+            Ok(value) => parse_net_allow(&value)?,
+            Err(_) => Vec::new(),
+        };
         let uplink = match std::env::var("SHINU_NET_UPLINK") {
             Ok(value) if !value.trim().is_empty() => value.trim().to_owned(),
             _ if enabled => default_uplink().ok_or_else(|| {
@@ -2657,6 +2798,7 @@ impl NetConfig {
         Ok(Self {
             enabled,
             base,
+            allow,
             uplink,
         })
     }
@@ -2770,7 +2912,11 @@ pub fn vm_config_json(
 
 #[cfg(test)]
 mod network_tests {
-    use super::{NetSpec, net_slot, tap_name, vm_config_json};
+    use super::{
+        filter_guest_nameservers, guest_resolv_needs_repair, is_rfc1918, parse_net_allow, NetSpec,
+        net_slot, tap_name, vm_config_json,
+    };
+    use crate::vm::egress_rules;
     use serde_json::Value;
     use std::path::Path;
     use uuid::Uuid;
@@ -2855,6 +3001,92 @@ mod network_tests {
             .as_str()
             .expect("boot args string");
         assert!(boot_args.ends_with(" shinu.ip=172.31.47.54/30 shinu.gw=172.31.47.53"));
+    }
+
+    #[test]
+    fn rfc1918_boundaries_are_precise() {
+        assert!(is_rfc1918("10.1.2.3"));
+        assert!(is_rfc1918("172.16.0.1"));
+        assert!(is_rfc1918("172.31.255.254"));
+        assert!(is_rfc1918("192.168.1.1"));
+        assert!(!is_rfc1918("8.8.8.8"));
+        assert!(!is_rfc1918("172.15.255.255"));
+        assert!(!is_rfc1918("172.32.0.1"));
+    }
+
+    #[test]
+    fn parses_network_allow_entries_strictly() {
+        assert_eq!(
+            parse_net_allow("10.42.0.0/16, 192.168.5.0/24").expect("valid CIDRs"),
+            vec!["10.42.0.0/16".to_owned(), "192.168.5.0/24".to_owned()]
+        );
+        assert!(parse_net_allow("").expect("empty allow list").is_empty());
+        assert!(parse_net_allow("10.0.0.0/33").is_err());
+        assert!(parse_net_allow("10.0.0.0/8,").is_err());
+    }
+
+    #[test]
+    fn filters_private_guest_nameservers_and_keeps_public_ones() {
+        let resolv = "# Generated by dhcpcd\nnameserver 192.168.5.123\nnameserver 8.8.8.8\nnameserver 172.16.0.1\nnameserver 127.0.0.53\n";
+        assert_eq!(
+            filter_guest_nameservers(resolv, "1.1.1.1"),
+            "# Generated by dhcpcd\nnameserver 8.8.8.8\n"
+        );
+    }
+
+    #[test]
+    fn resolver_filter_falls_back_when_every_nameserver_is_private() {
+        let resolv = "nameserver 10.0.0.2\nnameserver 169.254.169.254\n";
+        assert_eq!(
+            filter_guest_nameservers(resolv, "1.1.1.1"),
+            "nameserver 1.1.1.1\n"
+        );
+    }
+
+    #[test]
+    fn detects_only_unusable_guest_resolvers_for_repair() {
+        assert!(!guest_resolv_needs_repair("# comment\nnameserver 8.8.8.8"));
+        assert!(guest_resolv_needs_repair("nameserver 192.168.5.123\nnameserver 8.8.8.8"));
+        assert!(guest_resolv_needs_repair(""));
+    }
+
+    #[test]
+    fn egress_rules_put_gateway_and_allowlist_before_private_drops() {
+        let allow = vec!["10.42.0.0/16".to_owned()];
+        let rules = egress_rules("tap0", "172.31.1.1", &allow);
+        assert_eq!(rules.len(), 7);
+        assert_eq!(
+            rules[0],
+            vec![
+                "-i".to_owned(),
+                "tap0".to_owned(),
+                "-d".to_owned(),
+                "172.31.1.1".to_owned(),
+                "-j".to_owned(),
+                "ACCEPT".to_owned(),
+            ]
+        );
+        assert_eq!(
+            rules[1],
+            vec![
+                "-i".to_owned(),
+                "tap0".to_owned(),
+                "-d".to_owned(),
+                "10.42.0.0/16".to_owned(),
+                "-j".to_owned(),
+                "ACCEPT".to_owned(),
+            ]
+        );
+        for (rule, destination) in rules[2..].iter().zip([
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "169.254.0.0/16",
+            "127.0.0.0/8",
+        ]) {
+            assert_eq!(rule[3], destination);
+            assert_eq!(rule[5], "DROP");
+        }
     }
 }
 
@@ -2988,30 +3220,7 @@ fn configure_image(mnt: &Path) -> Result<()> {
         std::fs::write(&hosts, "127.0.0.1 localhost\n::1 localhost\n")?;
     }
     std::fs::write(mnt.join("etc/hostname"), "shinu\n")?;
-    // xbps needs working DNS during the build, and the guest now uses this file
-    // at runtime. A host-local resolver is unreachable through the VM tap.
-    if let Ok(resolv) = std::fs::read("/etc/resolv.conf") {
-        let resolv = String::from_utf8_lossy(&resolv);
-        let filtered = resolv
-            .lines()
-            .filter(|line| {
-                let mut fields = line.split_whitespace();
-                !matches!(
-                    (fields.next(), fields.next()),
-                    (Some("nameserver"), Some(address)) if address.starts_with("127.")
-                )
-            })
-            .collect::<Vec<_>>();
-        let has_nameserver = filtered
-            .iter()
-            .any(|line| line.split_whitespace().next() == Some("nameserver"));
-        let contents = if has_nameserver {
-            format!("{}\n", filtered.join("\n"))
-        } else {
-            "nameserver 1.1.1.1\n".to_owned()
-        };
-        std::fs::write(mnt.join("etc/resolv.conf"), contents)?;
-    }
+    seed_resolv(mnt)?;
     Ok(())
 }
 
@@ -3174,6 +3383,44 @@ pub fn ensure_base(root: &Path, cfg: &BaseConfig) -> Result<()> {
     }
 }
 
+/// Repairs the resolver baked into an existing base image after the guest
+/// egress policy changes. Returns whether `/etc/resolv.conf` was rewritten;
+/// callers should treat failures as warnings because a busy or damaged base
+/// must not prevent the daemon from starting.
+pub fn repair_base_resolv(root: &Path) -> Result<bool> {
+    let base = base_path(root);
+    if !base.exists() {
+        return Ok(false);
+    }
+    let mnt = root.join("base-resolv.mnt");
+    if let Err(error) = mount_image(&base, &mnt) {
+        let _ = std::fs::remove_dir(&mnt);
+        return Err(error);
+    }
+    let result = (|| -> Result<bool> {
+        let path = mnt.join("etc/resolv.conf");
+        let resolv = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error.into()),
+        };
+        if !guest_resolv_needs_repair(&resolv) {
+            return Ok(false);
+        }
+        let fallback = guest_dns_fallback();
+        let filtered = filter_guest_nameservers(&resolv, &fallback);
+        std::fs::write(path, filtered)?;
+        Ok(true)
+    })();
+    let unmount = umount(&mnt);
+    let _ = std::fs::remove_dir(&mnt);
+    match (result, unmount) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(changed), Ok(())) => Ok(changed),
+    }
+}
+
 /// microVM lifecycle. Everything here runs in the root daemon: it spawns
 /// Firecracker, owns `/dev/kvm` access, and hands the unprivileged client
 /// nothing but a socket and a key it already owns.
@@ -3325,6 +3572,57 @@ pub mod vm {
         require_success("iptables", add)
     }
 
+    /// Returns match/action arguments in firewall order. `tap_up` inserts each
+    /// rule at its final position so retries preserve this ordering.
+    /// The gateway exception must stay ahead of the 172.16/12 drop: the host
+    /// side of each guest /30 lives inside that private range.
+    pub fn egress_rules(tap: &str, gateway: &str, allow: &[String]) -> Vec<Vec<String>> {
+        let mut rules = Vec::with_capacity(1 + allow.len() + crate::GUEST_BLOCKED_CIDRS.len());
+        rules.push(vec![
+            "-i".to_owned(),
+            tap.to_owned(),
+            "-d".to_owned(),
+            gateway.to_owned(),
+            "-j".to_owned(),
+            "ACCEPT".to_owned(),
+        ]);
+        for destination in allow {
+            rules.push(vec![
+                "-i".to_owned(),
+                tap.to_owned(),
+                "-d".to_owned(),
+                destination.clone(),
+                "-j".to_owned(),
+                "ACCEPT".to_owned(),
+            ]);
+        }
+        for destination in crate::GUEST_BLOCKED_CIDRS {
+            rules.push(vec![
+                "-i".to_owned(),
+                tap.to_owned(),
+                "-d".to_owned(),
+                destination.to_owned(),
+                "-j".to_owned(),
+                "DROP".to_owned(),
+            ]);
+        }
+        rules
+    }
+
+    fn ensure_forward_rule(rule: &[String], position: usize) -> Result<()> {
+        let mut check = vec!["-C".to_owned(), "FORWARD".to_owned()];
+        check.extend(rule.iter().cloned());
+        let check = check.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut add = vec![
+            "-I".to_owned(),
+            "FORWARD".to_owned(),
+            position.to_string(),
+        ];
+        add.extend(rule.iter().cloned());
+        let add = add.iter().map(String::as_str).collect::<Vec<_>>();
+        ensure_iptables_rule(&check, &add)
+    }
+
     /// Creates one tap, address, and forwarding/NAT rule set for this VM.
     /// Every add is preceded by an existence check so retries do not grow the
     /// host firewall, while the address check preserves /30 isolation.
@@ -3430,7 +3728,19 @@ pub mod vm {
             "-j",
             "ACCEPT",
         ];
-        ensure_iptables_rule(&forward_in_check, &forward_in_add)
+        ensure_iptables_rule(&forward_in_check, &forward_in_add)?;
+        // Insert after the broad forwarding rules so these entries end up
+        // ahead of the unconditional tap-to-uplink ACCEPT.
+        for (position, rule) in egress_rules(&tap, &host, &cfg.allow).iter().enumerate() {
+            ensure_forward_rule(rule, position + 1)?;
+        }
+        // The guest uses a static /30 address and a public resolver baked into
+        // the image; it has no DHCP or host DNS dependency. Drop all other
+        // traffic destined for this host in INPUT. Public egress still takes
+        // FORWARD because its destination is not a host-local address.
+        let input_check = ["-C", "INPUT", "-i", &tap, "-j", "DROP"];
+        let input_add = ["-I", "INPUT", "1", "-i", &tap, "-j", "DROP"];
+        ensure_iptables_rule(&input_check, &input_add)
     }
 
     /// Removes this VM's rules and tap. Cleanup is deliberately best effort:
@@ -3446,6 +3756,10 @@ pub mod vm {
             cfg.base[0], cfg.base[1], third, fourth_base
         );
         let network_cidr = format!("{network}/30");
+        let gateway = format!(
+            "{}.{}.{}.{}",
+            cfg.base[0], cfg.base[1], third, fourth_base + 1
+        );
         let _ = std::process::Command::new("iptables")
             .args([
                 "-t",
@@ -3487,6 +3801,17 @@ pub mod vm {
                 "-j",
                 "ACCEPT",
             ])
+            .output();
+        for rule in egress_rules(&tap, &gateway, &cfg.allow) {
+            let mut args = vec!["-D".to_owned(), "FORWARD".to_owned()];
+            args.extend(rule);
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let _ = std::process::Command::new("iptables")
+                .args(args)
+                .output();
+        }
+        let _ = std::process::Command::new("iptables")
+            .args(["-D", "INPUT", "-i", &tap, "-j", "DROP"])
             .output();
         let _ = std::process::Command::new("ip")
             .args(["link", "del", &tap])
@@ -3986,7 +4311,136 @@ pub mod vm {
             Error::Invalid(format!("VM directory is not a UUID ({}): {error}", dir.display()))
         })
     }
+    /// Whether an `e2fsck` exit status means the image is usable.
+    ///
+    /// Unlike most commands, `e2fsck` uses status 1 to report that it fixed
+    /// filesystem errors. Status 0 means no errors; both are successful
+    /// outcomes here. Status 2 (fixed, but a reboot is required) and status 4
+    /// or 8 (unfixed errors or an operational failure) are not safe to treat
+    /// as a completed reclaim.
+    fn e2fsck_ok(code: i32) -> bool {
+        matches!(code, 0 | 1)
+    }
 
+    /// Reclaims blocks freed by the guest after its VM has stopped.
+    pub fn reclaim_image(image: &Path) -> Result<u64> {
+        if !image.exists() {
+            return Ok(0);
+        }
+
+        let before = crate::btrfs::exclusive(image)?;
+        let image_arg = image.to_str().ok_or_else(|| {
+            Error::Invalid(format!("image path is not valid UTF-8: {}", image.display()))
+        })?;
+        let args = ["-E", "discard", "-fp", image_arg];
+        let output = std::process::Command::new("e2fsck").args(args).output()?;
+        if !output.status.code().is_some_and(e2fsck_ok) {
+            return Err(command_failure("e2fsck", &args, &output));
+        }
+        let after = crate::btrfs::exclusive(image)?;
+        Ok(before.saturating_sub(after))
+    }
+
+    const RECLAIM_GROWTH_BYTES: u64 = 8 * 1024 * 1024;
+
+    fn reclaim_due(current: u64, baseline: Option<u64>) -> bool {
+        baseline.is_none_or(|baseline| {
+            current.saturating_sub(baseline) >= RECLAIM_GROWTH_BYTES
+        })
+    }
+    const RECLAIM_DELAY: Duration = Duration::from_secs(60);
+
+    fn stopped_at_path(dir: &Path) -> PathBuf {
+        dir.join("stopped_at")
+    }
+
+    fn stopped_long_enough(dir: &Path) -> bool {
+        let Ok(stopped_at) = std::fs::metadata(stopped_at_path(dir))
+            .and_then(|metadata| metadata.modified())
+        else {
+            // VMs stopped before this marker existed have already had an
+            // unbounded amount of time for their dirty pages to settle.
+            return true;
+        };
+        SystemTime::now()
+            .duration_since(stopped_at)
+            .is_ok_and(|elapsed| elapsed >= RECLAIM_DELAY)
+    }
+
+    fn mark_stopped(dir: &Path) {
+        if let Err(error) = std::fs::write(stopped_at_path(dir), now_secs().to_string()) {
+            eprintln!("failed to record stop time for {}: {error}", dir.display());
+        }
+    }
+
+    fn reclaim_stopped_image(root: &Path, dir: &Path, id: Uuid) {
+        // The stop request can return before the kernel writes dirty pages
+        // left by Firecracker's dead process. The idle sweep runs later, so
+        // the writeback has settled before e2fsck inspects the image.
+        if is_running(dir) {
+            return;
+        }
+        if !stopped_long_enough(dir) {
+            return;
+        }
+        let image = crate::space_image(root, id);
+        if !image.exists() {
+            return;
+        }
+        let marker = dir.join("reclaimed");
+        let baseline = std::fs::read_to_string(&marker)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok());
+        let current = match crate::btrfs::exclusive(&image) {
+            Ok(size) => size,
+            Err(error) => {
+                eprintln!("failed to inspect {} for reclaim: {error}", image.display());
+                return;
+            }
+        };
+        if !reclaim_due(current, baseline) {
+            // An operator may have compacted the image outside shinu. Lower
+            // the baseline so later guest writes are not hidden by the old
+            // larger value.
+            if baseline.is_some_and(|baseline| current < baseline) {
+                let _ = std::fs::write(&marker, current.to_string());
+            }
+            return;
+        }
+        // e2fsck can take seconds to tens of seconds on a large image. The
+        // sweep pays that cost in the background for bounded host usage,
+        // which is the premise that makes SaaS disk billing viable. Space
+        // images are btrfs reflink clones: discard releases only unshared
+        // extents, while shared checkpoint blocks remain protected by COW.
+        match reclaim_image(&image) {
+            Ok(bytes) => {
+                if bytes > 0 {
+                    match crate::btrfs::exclusive(&image) {
+                        Ok(after) => {
+                            if let Err(error) = std::fs::write(&marker, after.to_string()) {
+                                eprintln!("failed to record reclaim for {}: {error}", image.display());
+                            }
+                        }
+                        Err(error) => eprintln!(
+                            "failed to record reclaim baseline for {}: {error}",
+                            image.display()
+                        ),
+                    }
+                    eprintln!(
+                        "reclaimed {:.1} MiB from {}",
+                        bytes as f64 / (1024.0 * 1024.0),
+                        image.display()
+                    );
+                } else {
+                    // Do not advance the baseline: the kernel may not have
+                    // written Firecracker's dirty pages yet, so the next
+                    // sweep must retry after they become visible.
+                    eprintln!("no blocks reclaimed from {}", image.display());
+                }
+            }
+            Err(error) => eprintln!("failed to reclaim {}: {error}", image.display()),
+        }
+    }
     /// Graceful guest shutdown first, signals only as a fallback.
     ///
     /// The API socket could send CtrlAltDel, but SIGTERM kills the VMM
@@ -4003,6 +4457,7 @@ pub mod vm {
             let _ = std::fs::remove_file(pid_path(dir));
             tap_down(id, cfg);
             clean_jail(dir)?;
+            mark_stopped(dir);
             return Ok(false);
         };
 
@@ -4053,6 +4508,7 @@ pub mod vm {
         let _ = std::fs::remove_file(pid_path(dir));
         tap_down(id, cfg);
         clean_jail(dir)?;
+        mark_stopped(dir);
         Ok(true)
     }
 
@@ -4065,6 +4521,12 @@ pub mod vm {
     /// stops paying for memory nobody is using. Without this stage a VM's
     /// host footprint only ever grows, because Firecracker has no free-page
     /// reporting to return pages on its own.
+    ///
+    /// A stopped image is compacted here instead of inside `stop`: the VM's
+    /// dirty pages can still be written back asynchronously after Firecracker
+    /// exits, so running e2fsck immediately can miss blocks that are about to
+    /// land in the image. The `reclaimed` marker avoids rescanning unchanged
+    /// images on every sweep while keeping the work off the request path.
     ///
     /// A missing `last_used` counts as "just used" rather than "ancient": a
     /// VM that booted a moment ago must not be reaped before its first
@@ -4085,6 +4547,9 @@ pub mod vm {
         for entry in entries.flatten() {
             let dir = entry.path();
             if !is_running(&dir) {
+                if let Ok(id) = dir_id(&dir) {
+                    reclaim_stopped_image(root, &dir, id);
+                }
                 continue;
             }
             let last = std::fs::read_to_string(last_used_path(&dir))
@@ -4193,6 +4658,69 @@ pub mod vm {
             let config = VmConfig::from_env();
             assert_eq!(config.jail_uid, 40_123);
             assert_eq!(config.jail_gid, 40_124);
+        }
+    }
+    #[cfg(test)]
+    mod reclaim_tests {
+        use super::{e2fsck_ok, reclaim_due, reclaim_image, sweep_idle};
+        use crate::{space_image, vm_dir, NetConfig};
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        use uuid::Uuid;
+
+        #[test]
+        fn reclaim_missing_image_is_a_noop() {
+            let path = std::env::temp_dir().join(format!(
+                "shinu-reclaim-missing-{}-{}.ext4",
+                std::process::id(),
+                Uuid::from_u128(0xfeed)
+            ));
+            let _ = std::fs::remove_file(&path);
+            assert_eq!(reclaim_image(&path).expect("missing image is harmless"), 0);
+        }
+
+        #[test]
+        fn e2fsck_repair_statuses_are_successful() {
+            assert!(e2fsck_ok(0));
+            assert!(e2fsck_ok(1));
+            assert!(!e2fsck_ok(4));
+            assert!(!e2fsck_ok(8));
+        }
+        #[test]
+        fn reclaim_marker_requires_material_growth() {
+            let threshold = 8 * 1024 * 1024;
+            assert!(reclaim_due(0, None));
+            assert!(!reclaim_due(threshold - 1, Some(0)));
+            assert!(reclaim_due(threshold, Some(0)));
+            assert!(!reclaim_due(0, Some(1)));
+        }
+
+
+        #[test]
+        fn sweep_ignores_reclaim_failure_for_stopped_space() {
+            let mut component = OsString::from(format!(
+                "shinu-sweep-reclaim-{}",
+                std::process::id()
+            ));
+            component.push(OsString::from_vec(vec![0xff]));
+            let root = std::env::temp_dir().join(component);
+            let id = Uuid::from_u128(0x1234);
+            // An invalid path makes btrfs::exclusive fail before touching a
+            // real filesystem, so this exercises sweep's best-effort boundary.
+            let image = space_image(&root, id);
+            std::fs::create_dir_all(image.parent().expect("image parent")).expect("image dir");
+            std::fs::write(&image, b"not an ext4 image").expect("image fixture");
+            std::fs::create_dir_all(vm_dir(&root, id)).expect("VM directory");
+
+            let config = NetConfig {
+                enabled: false,
+                base: [172, 31],
+                uplink: String::new(),
+                allow: Vec::new(),
+            };
+            let stopped = sweep_idle(&root, 0, &config).expect("sweep ignores reclaim errors");
+            assert!(stopped.is_empty());
+            std::fs::remove_dir_all(root).expect("test fixture cleanup");
         }
     }
 }

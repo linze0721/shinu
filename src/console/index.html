@@ -26,7 +26,7 @@ if (location.protocol === 'file:') {
 <div class="container">
   <header class="masthead">
     <h1 class="brand">shinu<span class="brand-accent">.</span></h1>
-    <p class="tagline">Rewindable sandboxes. Break things, check out back.</p>
+
   </header>
 
   <nav class="navbar" aria-label="Session">
@@ -65,8 +65,6 @@ if (location.protocol === 'file:') {
       <section class="panel" id="detail-panel" aria-label="Space detail" hidden>
         <div class="state" id="detail-empty">
           <p>Select a space to see its save points.</p>
-          <p class="muted">Spaces are branches; commits are save points. Checking out an
-          older save point archives the current state first, so nothing is lost.</p>
         </div>
         <div id="detail-main" hidden>
           <div class="panel-head">
@@ -109,8 +107,7 @@ if (location.protocol === 'file:') {
         <div id="tokens-list">
           <div class="state"><span class="spin"></span>Loading&hellip;</div>
         </div>
-        <p class="panel-foot">Tokens authenticate the CLI and MCP clients via
-        <span class="mono">Authorization: Bearer &lt;token&gt;</span>.</p>
+        <p class="panel-foot"><span class="mono">Authorization: Bearer &lt;token&gt;</span></p>
       </section>
 
       <section class="panel" id="quota-panel" aria-label="Quota and usage" hidden>
@@ -123,7 +120,7 @@ if (location.protocol === 'file:') {
     </div>
   </div>
 
-  <footer class="footer">shinu console &middot; spaces are branches, commits are save points</footer>
+  <footer class="footer">shinu console</footer>
 </div>
 
 <div id="modal-root" hidden></div>

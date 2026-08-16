@@ -354,9 +354,7 @@
       spacesCacheKey = key;
       var list = $('#spaces-list');
       if (state.spaces.length === 0) {
-        list.innerHTML =
-          '<div class="state"><p>No spaces yet.</p>' +
-          '<p class="muted">Create one above to start experimenting.</p></div>';
+        list.innerHTML = '<div class="state"><p>No spaces yet.</p></div>';
         return;
       }
       list.innerHTML =
@@ -405,7 +403,7 @@
         '<button class="btn small danger" type="button" data-action="delete-space">Delete</button>';
       $('#commit-hint').textContent = s.running
         ? 'Space is running — a commit must be hot, or stop the space first.'
-        : 'Saves a checkpoint of the current disk and moves HEAD to it.';
+        : '';
     }
 
     function renderDetail() {
@@ -421,10 +419,7 @@
     function renderCommitList() {
       var s = selectedSpace();
       if (!s) return;
-      $('#tab-hint').textContent =
-        state.tab === 'log'
-          ? 'Ancestor chain from HEAD — the story of this space.'
-          : 'Every checkpoint of this space, automatic ones included.';
+      $('#tab-hint').textContent = '';
       var list = $('#commit-list');
       if (state.historyError) {
         list.innerHTML = errorState(state.historyError, 'retry-history');
@@ -439,8 +434,7 @@
       if (rows.length === 0) {
         list.innerHTML =
           state.tab === 'log'
-            ? '<div class="state"><p>No commits yet.</p>' +
-              '<p class="muted">Commit above to create the first save point.</p></div>'
+            ? '<div class="state"><p>No commits yet.</p></div>'
             : '<div class="state"><p>The archive is empty.</p></div>';
         return;
       }
@@ -513,12 +507,12 @@
         meterRow('Running VMs', L.used.running, L.max_running, String) +
         '<tr><td>API rate</td><td class="mono nobr">' +
         esc(String(L.api_per_min)) +
-        ' / min</td><td class="muted">per-minute request limit</td></tr>' +
+        ' / min</td><td></td></tr>' +
         '</tbody></table>';
       var U = state.usage;
       if (U) {
         $('#usage-line').textContent =
-          'All time: ' +
+          '' +
           U.spaces_created +
           ' spaces created · ' +
           fmtDuration(U.vm_seconds) +
@@ -534,9 +528,7 @@
       if (!state.tokens) return;
       var list = $('#tokens-list');
       if (state.tokens.length === 0) {
-        list.innerHTML =
-          '<div class="state"><p>No tokens yet.</p>' +
-          '<p class="muted">Create one to use the CLI or an MCP client.</p></div>';
+        list.innerHTML = '<div class="state"><p>No tokens yet.</p></div>';
         return;
       }
       list.innerHTML =

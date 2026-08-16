@@ -53,6 +53,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // minutes building an image it could never boot.
     shinu::ensure_assets(&root)?;
     shinu::ensure_base(&root, &shinu::BaseConfig::from_env()?)?;
+    // A base built before egress filtering existed carries the host's private
+    // resolver, which the guest firewall now blocks; that silently breaks
+    // package installation inside every new VM. Repair is best effort because a
+    // busy or damaged base is an operator problem, not a reason to refuse
+    // service.
+    match shinu::repair_base_resolv(&root) {
+        Ok(true) => eprintln!("rewrote base.ext4 resolv.conf to a reachable resolver"),
+        Ok(false) => {}
+        Err(error) => eprintln!("base resolv repair: {error}"),
+    }
     let vm_cfg = shinu::VmConfig::from_env();
     let net_cfg = shinu::NetConfig::from_env()?;
     let limits = Limits::from_env();
@@ -1980,6 +1990,7 @@ mod tests {
             NetConfig {
                 enabled: false,
                 base: [172, 31],
+                allow: Vec::new(),
                 uplink: String::new(),
             },
         )
@@ -2606,6 +2617,7 @@ mod tests {
         static NET_CONFIG: LazyLock<NetConfig> = LazyLock::new(|| NetConfig {
             enabled: false,
             base: [172, 31],
+            allow: Vec::new(),
             uplink: String::new(),
         });
         super::Ctx {

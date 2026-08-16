@@ -5,7 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -992,6 +992,8 @@ enum Endpoint {
     Start(String),
     Stop(String),
     Exec(String),
+    Push(String),
+    Pull(String),
     Commit(String),
     Log(String),
     Reflog(String),
@@ -1054,6 +1056,8 @@ fn route(path: &str) -> Option<Endpoint> {
             "start" => Some(Endpoint::Start(name)),
             "stop" => Some(Endpoint::Stop(name)),
             "exec" => Some(Endpoint::Exec(name)),
+            "push" => Some(Endpoint::Push(name)),
+            "pull" => Some(Endpoint::Pull(name)),
             "commits" => Some(Endpoint::Commit(name)),
             "log" => Some(Endpoint::Log(name)),
             "reflog" => Some(Endpoint::Reflog(name)),
@@ -1151,10 +1155,12 @@ fn method_allowed(endpoint: &Endpoint, method: &str) -> bool {
         Endpoint::Start(_)
         | Endpoint::Stop(_)
         | Endpoint::Exec(_)
+        | Endpoint::Push(_)
         | Endpoint::Commit(_)
         | Endpoint::Checkout(_)
         | Endpoint::Fork(_)
         | Endpoint::Gc => method == "POST",
+        Endpoint::Pull(_) => method == "GET",
     }
 }
 fn parse_body(body: &[u8]) -> shinu::Result<Value> {
@@ -1250,7 +1256,7 @@ fn request_for(
     }
 }
 
-fn exec_command(body: &[u8]) -> shinu::Result<Vec<String>> {
+fn exec_command(body: &[u8]) -> shinu::Result<(Vec<String>, Option<String>)> {
     let value = parse_body(body)?;
     let command = value
         .get("cmd")
@@ -1268,7 +1274,330 @@ fn exec_command(body: &[u8]) -> shinu::Result<Vec<String>> {
     if command.is_empty() {
         return Err(shinu::Error::Invalid("exec needs a command".into()));
     }
-    Ok(command)
+    let stdin = match value.get("stdin") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_str().ok_or_else(|| {
+            shinu::Error::Invalid("stdin must be a string".into())
+        })?.to_owned()),
+    };
+    Ok((command, stdin))
+}
+
+fn transfer_path(path: &str) -> shinu::Result<String> {
+    let query = path
+        .split_once('?')
+        .map(|(_, query)| query)
+        .ok_or_else(|| shinu::Error::Invalid("path query parameter is required".into()))?;
+    let mut guest_path = None;
+    for pair in query.split('&') {
+        let (raw_key, raw_value) = pair
+            .split_once('=')
+            .ok_or_else(|| shinu::Error::Invalid("transfer query must use key=value".into()))?;
+        let key = decode_segment(raw_key)
+            .ok_or_else(|| shinu::Error::Invalid("transfer query is not valid UTF-8".into()))?;
+        let value = decode_segment(raw_value)
+            .ok_or_else(|| shinu::Error::Invalid("transfer path is not valid UTF-8".into()))?;
+        if key != "path" {
+            return Err(shinu::Error::Invalid(format!(
+                "unknown transfer query key: {key}"
+            )));
+        }
+        if guest_path.replace(value).is_some() {
+            return Err(shinu::Error::Invalid("duplicate transfer query key: path".into()));
+        }
+    }
+    let guest_path = guest_path
+        .ok_or_else(|| shinu::Error::Invalid("path query parameter is required".into()))?;
+    if !guest_path.starts_with('/') {
+        return Err(shinu::Error::Invalid("path must be absolute".into()));
+    }
+    Ok(guest_path)
+}
+fn upload_length(content_length: Option<usize>) -> shinu::Result<usize> {
+    match content_length {
+        None => Err(shinu::Error::Invalid(
+            "Content-Length is required for push".into(),
+        )),
+        Some(length) if length > shinu::MAX_UPLOAD_BYTES => Err(shinu::Error::Invalid(
+            "Content-Length exceeds 256 MiB".into(),
+        )),
+        Some(length) => Ok(length),
+    }
+}
+
+
+struct SshTarget {
+    vm_dir: PathBuf,
+    proxy: String,
+}
+
+fn prepare_ssh(ctx: &Ctx<'_>, project: &str, space: &str) -> shinu::Result<SshTarget> {
+    let space_id = find_space(ctx.db, space, project)?.id;
+    let limits = effective_limits(ctx, project)?;
+    let space_guard = ctx.registry.space_lock(space_id);
+    {
+        let _space_guard = space_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Hold the state lock through the quota check and spawn so concurrent
+        // transfers cannot all observe the same free running-VM slot.
+        let _state_guard = lock_state(ctx.registry);
+        let connection = lock_db(ctx.db);
+        let state = state::load(&connection)?;
+        if !shinu::vm::is_running(&shinu::vm_dir(ctx.root, space_id)) {
+            quota::check_running_limit(count_running(ctx.root, &state, project), &limits)?;
+        }
+        drop(connection);
+        shinu::vm::start(ctx.root, space_id, 0, 0, ctx.vm_cfg, ctx.net_cfg)?;
+    }
+    let vm_dir = shinu::vm_dir(ctx.root, space_id);
+    let helper = shinu::vsock_helper()?;
+    let proxy = format!(
+        "ProxyCommand={} {} {}",
+        shinu::shell_quote_word(&helper.to_string_lossy()),
+        shinu::shell_quote_word(&shinu::vm::vsock_path(&vm_dir).to_string_lossy()),
+        shinu::VSOCK_SSH_PORT
+    );
+    Ok(SshTarget { vm_dir, proxy })
+}
+
+fn ssh_command(target: &SshTarget, remote: &[String]) -> Command {
+    let mut command = Command::new("ssh");
+    command
+        .args([
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "LogLevel=ERROR",
+            "-o",
+            "IdentitiesOnly=yes",
+        ])
+        .arg("-o")
+        .arg(&target.proxy)
+        .arg("-i")
+        .arg(shinu::vm::key_path(&target.vm_dir))
+        .arg("root@shinu")
+        .arg("--")
+        .arg(shinu::shell_quote(remote));
+    command
+}
+
+fn spawn_ssh(
+    target: &SshTarget,
+    remote: &[String],
+    stdin: Stdio,
+    stdout: Stdio,
+    stderr: Stdio,
+) -> shinu::Result<Child> {
+    Ok(ssh_command(target, remote)
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()?)
+}
+
+fn ssh_output(target: &SshTarget, remote: &[String]) -> shinu::Result<std::process::Output> {
+    Ok(ssh_command(target, remote)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?)
+}
+
+fn remote_path_command(prefix: &str, path: &str) -> Vec<String> {
+    vec![
+        "sh".into(),
+        "-c".into(),
+        format!("{prefix} {}", shinu::shell_quote_word(path)),
+    ]
+}
+
+fn guest_stderr(stderr: Vec<u8>, exit: Option<i32>) -> String {
+    let message = String::from_utf8_lossy(&stderr).trim().to_owned();
+    if message.is_empty() {
+        format!(
+            "guest command failed with exit status {}",
+            exit.unwrap_or(255)
+        )
+    } else {
+        message
+    }
+}
+
+fn push_file(
+    reader: &mut impl Read,
+    target: &SshTarget,
+    path: &str,
+    length: usize,
+) -> shinu::Result<usize> {
+    let remote = remote_path_command("cat >", path);
+    let mut child = spawn_ssh(
+        target,
+        &remote,
+        Stdio::piped(),
+        Stdio::null(),
+        Stdio::piped(),
+    )?;
+    let mut stdin = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            abort_child(&mut child);
+            return Err(shinu::Error::Invalid("ssh stdin pipe unavailable".into()));
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            abort_child(&mut child);
+            return Err(shinu::Error::Invalid("ssh stderr pipe unavailable".into()));
+        }
+    };
+    let stderr_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = BufReader::new(stderr).read_to_end(&mut output);
+        output
+    });
+    let mut remaining = length;
+    let mut buffer = [0u8; 64 * 1024];
+    let copy_result = (|| -> shinu::Result<()> {
+        while remaining > 0 {
+            let read_len = remaining.min(buffer.len());
+            let count = reader.read(&mut buffer[..read_len])?;
+            if count == 0 {
+                return Err(shinu::Error::Invalid(
+                    "request body is shorter than Content-Length".into(),
+                ));
+            }
+            stdin.write_all(&buffer[..count])?;
+            remaining -= count;
+        }
+        Ok(())
+    })();
+    if let Err(error) = copy_result {
+        drop(stdin);
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = stderr_reader.join();
+        return Err(error);
+    }
+    // Closing stdin is the guest command's EOF signal; without it `cat` waits
+    // forever even after the declared request body has been copied.
+    drop(stdin);
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = stderr_reader.join();
+            return Err(error.into());
+        }
+    };
+    let stderr = stderr_reader
+        .join()
+        .unwrap_or_else(|_| b"guest stderr reader failed".to_vec());
+    if !status.success() {
+        return Err(shinu::Error::Invalid(guest_stderr(stderr, status.code())));
+    }
+    Ok(length)
+}
+fn abort_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+
+enum PullFailure {
+    BeforeResponse(shinu::Error),
+    AfterResponse,
+}
+
+fn pull_file(stream: &mut TcpStream, target: &SshTarget, path: &str) -> Result<(), PullFailure> {
+    let probe = ssh_output(target, &remote_path_command("test -f", path))
+        .map_err(PullFailure::BeforeResponse)?;
+    if !probe.status.success() {
+        let exists = ssh_output(target, &remote_path_command("test -e", path))
+            .map_err(PullFailure::BeforeResponse)?;
+        if exists.status.success() {
+            return Err(PullFailure::BeforeResponse(shinu::Error::Invalid(
+                "path is a directory; tar it first".into(),
+            )));
+        }
+        return Err(PullFailure::BeforeResponse(shinu::Error::NotFound(
+            path.to_owned(),
+        )));
+    }
+
+    let mut child = spawn_ssh(
+        target,
+        &remote_path_command("cat", path),
+        Stdio::null(),
+        Stdio::piped(),
+        Stdio::piped(),
+    )
+    .map_err(PullFailure::BeforeResponse)?;
+    let mut stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            abort_child(&mut child);
+            return Err(PullFailure::BeforeResponse(shinu::Error::Invalid(
+                "ssh stdout pipe unavailable".into(),
+            )));
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            abort_child(&mut child);
+            return Err(PullFailure::BeforeResponse(shinu::Error::Invalid(
+                "ssh stderr pipe unavailable".into(),
+            )));
+        }
+    };
+    let stderr_reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = BufReader::new(stderr).read_to_end(&mut output);
+        output
+    });
+    if http::respond_chunked_binary_start(stream).is_err() {
+        abort_child(&mut child);
+        let _ = stderr_reader.join();
+        return Err(PullFailure::AfterResponse);
+    }
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = match stdout.read(&mut buffer) {
+            Ok(count) => count,
+            Err(_) => {
+                abort_child(&mut child);
+                let _ = stderr_reader.join();
+                return Err(PullFailure::AfterResponse);
+            }
+        };
+        if count == 0 {
+            break;
+        }
+        if http::respond_chunk_bytes(stream, &buffer[..count]).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stderr_reader.join();
+            return Err(PullFailure::AfterResponse);
+        }
+    }
+    let status = match child.wait() {
+        Ok(status) => status,
+        Err(_) => {
+            abort_child(&mut child);
+            let _ = stderr_reader.join();
+            return Err(PullFailure::AfterResponse);
+        }
+    };
+    let _stderr = stderr_reader
+        .join()
+        .unwrap_or_else(|_| b"guest stderr reader failed".to_vec());
+    if !status.success() {
+        return Err(PullFailure::AfterResponse);
+    }
+    http::respond_chunked_end(stream).map_err(|_| PullFailure::AfterResponse)
 }
 #[derive(Debug)]
 enum Caller {
@@ -1565,39 +1894,61 @@ fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
         .peer_addr()
         .map(|address| address.ip().to_string())
         .unwrap_or_else(|_| "unknown".to_owned());
-    let parsed_request = {
-        let mut reader = BufReader::new(&mut stream);
-        http::parse(&mut reader)
-    };
-    let request = match parsed_request {
-        Ok(request) => request,
+    let mut reader = Some(BufReader::new(&mut stream));
+    let head = match http::parse_head(reader.as_mut().expect("request reader present")) {
+        Ok(head) => head,
         Err(error) => {
+            let _ = reader.take();
             respond_error(&mut stream, http::status_for(&error), &error)?;
             return Ok(());
         }
     };
-    let endpoint = match route(&request.path) {
+    let endpoint = match route(&head.path) {
         Some(endpoint) => endpoint,
         None => {
-            let error = shinu::Error::NotFound(request.path.clone());
+            let error = shinu::Error::NotFound(head.path.clone());
+            let _ = reader.take();
             respond_error(&mut stream, http::status_for(&error), &error)?;
             return Ok(());
         }
     };
-    if !method_allowed(&endpoint, &request.method) {
+    if !method_allowed(&endpoint, &head.method) {
         let error = shinu::Error::Invalid("method not allowed".into());
+        let _ = reader.take();
         respond_error(&mut stream, 405, &error)?;
         return Ok(());
     }
+    let content_length = head.content_length;
+    let metadata = head.clone().into_request(Vec::new());
     // Register and login have no Caller yet, so the console path itself is the
     // trust boundary for CSRF. This also covers logout and token mutations.
-    if is_console_path(&request.path)
-        && is_state_changing(&request.method)
-        && let Err(error) = check_console_csrf(&request)
+    if is_console_path(&head.path)
+        && is_state_changing(&head.method)
+        && let Err(error) = check_console_csrf(&metadata)
     {
+        let _ = reader.take();
         respond_error(&mut stream, 403, &error)?;
         return Ok(());
     }
+
+    let is_transfer = matches!(&endpoint, Endpoint::Push(_) | Endpoint::Pull(_));
+    let request = if is_transfer {
+        metadata
+    } else {
+        let body = match http::read_body(
+            reader.as_mut().expect("request reader present"),
+            content_length,
+        ) {
+            Ok(body) => body,
+            Err(error) => {
+                let _ = reader.take();
+                respond_error(&mut stream, http::status_for(&error), &error)?;
+                return Ok(());
+            }
+        };
+        let _ = reader.take();
+        head.into_request(body)
+    };
 
     match &endpoint {
         Endpoint::Root => {
@@ -1749,28 +2100,101 @@ fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
         return Ok(());
     }
 
-    let (from, to) = match usage_query(&request.path) {
-        Ok(range) => range,
-        Err(error) => {
-            respond_error(&mut stream, http::status_for(&error), &error)?;
-            return Ok(());
+    let (from, to) = if matches!(&endpoint, Endpoint::Usage) {
+        match usage_query(&request.path) {
+            Ok(range) => range,
+            Err(error) => {
+                respond_error(&mut stream, http::status_for(&error), &error)?;
+                return Ok(());
+            }
         }
+    } else {
+        (None, None)
     };
     if let Endpoint::Exec(space) = &endpoint {
-        let command = match exec_command(&request.body) {
+        let (command, stdin) = match exec_command(&request.body) {
             Ok(command) => command,
             Err(error) => {
                 respond_error(&mut stream, http::status_for(&error), &error)?;
                 return Ok(());
             }
         };
-        match execute_streaming(&mut stream, ctx, project, space.clone(), command) {
+        match execute_streaming(&mut stream, ctx, project, space.clone(), command, stdin) {
             Ok(()) => {
                 record_usage(ctx.db, project, "api_call", None, 1)?;
             }
             Err(error) => {
                 respond_error(&mut stream, http::status_for(&error), &error)?;
             }
+        }
+        return Ok(());
+    }
+    if let Endpoint::Push(space) = &endpoint {
+        let path = match transfer_path(&request.path) {
+            Ok(path) => path,
+            Err(error) => {
+                let _ = reader.take();
+                respond_error(&mut stream, http::status_for(&error), &error)?;
+                return Ok(());
+            }
+        };
+        let length = match upload_length(content_length) {
+            Ok(length) => length,
+            Err(error) => {
+                let _ = reader.take();
+                respond_error(&mut stream, 400, &error)?;
+                return Ok(());
+            }
+        };
+        let target = match prepare_ssh(ctx, project, space) {
+            Ok(target) => target,
+            Err(error) => {
+                let _ = reader.take();
+                respond_error(&mut stream, http::status_for(&error), &error)?;
+                return Ok(());
+            }
+        };
+        let result = push_file(
+            reader.as_mut().expect("request reader present"),
+            &target,
+            &path,
+            length,
+        );
+        let _ = reader.take();
+        match result {
+            Ok(bytes) => {
+                record_usage(ctx.db, project, "api_call", None, 1)?;
+                http::respond(&mut stream, 200, &json!({ "path": path, "bytes": bytes }))?;
+            }
+            Err(error) => respond_error(&mut stream, http::status_for(&error), &error)?,
+        }
+        return Ok(());
+    }
+    if let Endpoint::Pull(space) = &endpoint {
+        let path = match transfer_path(&request.path) {
+            Ok(path) => path,
+            Err(error) => {
+                let _ = reader.take();
+                respond_error(&mut stream, http::status_for(&error), &error)?;
+                return Ok(());
+            }
+        };
+        let _ = reader.take();
+        let target = match prepare_ssh(ctx, project, space) {
+            Ok(target) => target,
+            Err(error) => {
+                respond_error(&mut stream, http::status_for(&error), &error)?;
+                return Ok(());
+            }
+        };
+        match pull_file(&mut stream, &target, &path) {
+            Ok(()) => {
+                record_usage(ctx.db, project, "api_call", None, 1)?;
+            }
+            Err(PullFailure::BeforeResponse(error)) => {
+                respond_error(&mut stream, http::status_for(&error), &error)?;
+            }
+            Err(PullFailure::AfterResponse) => {}
         }
         return Ok(());
     }
@@ -1833,60 +2257,21 @@ fn execute_streaming(
     project: &str,
     space: String,
     command: Vec<String>,
+    stdin_data: Option<String>,
 ) -> shinu::Result<()> {
-    let space_id = {
-        let connection = lock_db(ctx.db);
-        state::find_space(&connection, &space, project)?
-            .ok_or_else(|| shinu::Error::NotFound(space.clone()))?
-            .id
+    let target = prepare_ssh(ctx, project, &space)?;
+    let stdin_mode = if stdin_data.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
     };
-    let limits = effective_limits(ctx, project)?;
-    let space_guard = ctx.registry.space_lock(space_id);
-    {
-        let _space_guard = space_guard
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Hold the state lock through the check and spawn so concurrent execs
-        // cannot all observe a free running-VM slot.
-        let _state_guard = lock_state(ctx.registry);
-        let connection = lock_db(ctx.db);
-        let state = state::load(&connection)?;
-        if !shinu::vm::is_running(&shinu::vm_dir(ctx.root, space_id)) {
-            quota::check_running_limit(count_running(ctx.root, &state, project), &limits)?;
-        }
-        drop(connection);
-        shinu::vm::start(ctx.root, space_id, 0, 0, ctx.vm_cfg, ctx.net_cfg)?;
-    }
-    let vm_dir = shinu::vm_dir(ctx.root, space_id);
-    let helper = shinu::vsock_helper()?;
-    let proxy = format!(
-        "ProxyCommand={} {} {}",
-        shinu::shell_quote_word(&helper.to_string_lossy()),
-        shinu::shell_quote_word(&shinu::vm::vsock_path(&vm_dir).to_string_lossy()),
-        shinu::VSOCK_SSH_PORT
-    );
-    let mut child = Command::new("ssh")
-        .args([
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-o",
-            "LogLevel=ERROR",
-            "-o",
-            "IdentitiesOnly=yes",
-        ])
-        .arg("-o")
-        .arg(proxy)
-        .arg("-i")
-        .arg(shinu::vm::key_path(&vm_dir))
-        .arg("root@shinu")
-        .arg("--")
-        .arg(shinu::shell_quote(&command))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let mut child = spawn_ssh(
+        &target,
+        &command,
+        stdin_mode,
+        Stdio::piped(),
+        Stdio::piped(),
+    )?;
     let stdout = child
         .stdout
         .take()
@@ -1898,6 +2283,25 @@ fn execute_streaming(
     let (sender, receiver) = mpsc::channel();
     let stdout_reader = read_stream("stdout", stdout, sender.clone());
     let stderr_reader = read_stream("stderr", stderr, sender);
+    if let Some(stdin_data) = stdin_data {
+        let mut child_stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| shinu::Error::Invalid("ssh stdin pipe unavailable".into()))?;
+        // Exec JSON is capped at 1 MiB, so this write can block only for a
+        // bounded amount of input while the reader threads drain SSH output.
+        if let Err(error) = child_stdin.write_all(stdin_data.as_bytes()) {
+            drop(child_stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(error.into());
+        }
+        // EOF tells commands such as `cat` that the complete stdin payload has
+        // arrived; retaining this handle would leave them waiting forever.
+        drop(child_stdin);
+    }
     http::respond_chunked_start(stream)?;
 
     let mut readers = 2;
@@ -2046,6 +2450,58 @@ mod tests {
             register_rate: test_register_rate(),
             registry,
         }
+    }
+
+    #[test]
+    fn exec_command_accepts_absent_and_present_stdin() {
+        let (command, stdin) = super::exec_command(br#"{"cmd":["sh","-c","cat"]}"#)
+            .expect("exec without stdin");
+        assert_eq!(command, vec!["sh", "-c", "cat"]);
+        assert_eq!(stdin, None);
+        let (_, stdin) = super::exec_command(br#"{"cmd":["cat"],"stdin":"payload"}"#)
+            .expect("exec with stdin");
+        assert_eq!(stdin.as_deref(), Some("payload"));
+        let (_, stdin) = super::exec_command(br#"{"cmd":["cat"],"stdin":null}"#)
+            .expect("exec with null stdin");
+        assert_eq!(stdin, None);
+    }
+
+    #[test]
+    fn exec_command_rejects_non_string_stdin() {
+        assert!(matches!(
+            super::exec_command(br#"{"cmd":["cat"],"stdin":7}"#),
+            Err(shinu::Error::Invalid(message)) if message == "stdin must be a string"
+        ));
+    }
+
+    #[test]
+    fn transfer_routes_and_methods_are_explicit() {
+        let push = super::route("/v1/spaces/demo/push?path=%2Ftmp%2Ffile")
+            .expect("push route");
+        let pull = super::route("/v1/spaces/demo/pull?path=%2Ftmp%2Ffile")
+            .expect("pull route");
+        assert!(matches!(&push, super::Endpoint::Push(name) if name == "demo"));
+        assert!(matches!(&pull, super::Endpoint::Pull(name) if name == "demo"));
+        assert!(super::method_allowed(&push, "POST"));
+        assert!(!super::method_allowed(&push, "GET"));
+        assert!(super::method_allowed(&pull, "GET"));
+        assert!(!super::method_allowed(&pull, "POST"));
+    }
+
+    #[test]
+    fn push_rejects_relative_paths_and_invalid_lengths() {
+        assert!(matches!(
+            super::transfer_path("/v1/spaces/demo/push?path=relative"),
+            Err(shinu::Error::Invalid(message)) if message == "path must be absolute"
+        ));
+        assert!(matches!(
+            super::upload_length(None),
+            Err(shinu::Error::Invalid(message)) if message.contains("Content-Length")
+        ));
+        assert!(matches!(
+            super::upload_length(Some(shinu::MAX_UPLOAD_BYTES + 1)),
+            Err(shinu::Error::Invalid(message)) if message.contains("256 MiB")
+        ));
     }
     #[test]
     fn rejects_empty_snapshot_note() {

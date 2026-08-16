@@ -27,7 +27,7 @@ graph TD
 
 - **Control Plane & Protocol** — `shinud` is a blocking HTTP/1.1 daemon listening by default on `127.0.0.1:7878`.
   Request routing is handled in `src/bin/shinud.rs:268-360`.
-  The wire format for standard REST actions is JSON. The `exec` action streams NDJSON chunks via `Transfer-Encoding: chunked`, ending with an explicit exit status line `{"exit": N}` (`src/bin/shinud.rs:1186-1215`).
+  The wire format for standard REST actions is JSON. The `exec` action streams NDJSON chunks via `Transfer-Encoding: chunked`, ending with an explicit exit status line `{"exit": N}` (`src/bin/shinud.rs:1186-1215`). Execution spawns host `ssh` using `ProxyCommand=shinu-vsock <uds> 2222`, tunnelled through Firecracker's AF_VSOCK device to an in-guest `socat` listener (`VSOCK-LISTEN:2222`) forwarding to guest `sshd` (`127.0.0.1:22`). Because execution routes entirely over vsock, guests can be firewalled off host networks while remaining reachable. Data transfer uses `exec` `stdin` for pasting text (within the 1 MiB JSON request limit), `push` (`POST /v1/spaces/{name}/push?path=...`) and `pull` (`GET /v1/spaces/{name}/pull?path=...`) for streaming binary files up to 256 MiB, and `tar` over `exec` for directories.
   Adding an operation requires touching:
   1. `proto::Req` in `src/lib.rs:4261`
   2. CLI `Command` enum in `src/bin/shinu.rs:26`
@@ -164,7 +164,9 @@ CLI Subcommand Surface (`src/bin/shinu.rs:26`):
 - `rm <space>`
 - `start <space>`
 - `stop <space>`
-- `exec <space> -- <cmd...>`
+- `exec <space> [--stdin <text>] -- <cmd...>`
+- `push <space> <local-path> <guest-path>`
+- `pull <space> <guest-path> <local-path>`
 - `commit <space> --note <note> [--hot]`
 - `log <space> [--json]`
 - `reflog <space> [--json]`

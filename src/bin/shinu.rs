@@ -2,9 +2,12 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use shinu::token::{self, Token};
-use std::io::{self, BufRead, BufReader, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::process;
+use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:7878";
@@ -42,8 +45,20 @@ enum Command {
     },
     Exec {
         space: String,
+        #[arg(long, value_name = "FILE")]
+        stdin: Option<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
+    },
+    Push {
+        space: String,
+        local_file: String,
+        guest_path: String,
+    },
+    Pull {
+        space: String,
+        guest_path: String,
+        local_file: String,
     },
     Commit {
         space: String,
@@ -268,16 +283,33 @@ impl HttpClient {
         path: &str,
         body: Option<&[u8]>,
     ) -> Result<(BufReader<TcpStream>, ResponseHead), String> {
-        let stream = TcpStream::connect(self.endpoint.connect_address())
+        let content_length = body.map_or(0, |body| body.len() as u64);
+        let mut stream = self.start_request(
+            method,
+            path,
+            content_length,
+            body.map(|_| "application/json"),
+        )?;
+        if let Some(body) = body {
+            stream.write_all(body).map_err(|error| error.to_string())?;
+        }
+        stream.flush().map_err(|error| error.to_string())?;
+        Self::read_response(stream)
+    }
+
+    fn start_request(
+        &self,
+        method: &str,
+        path: &str,
+        content_length: u64,
+        content_type: Option<&str>,
+    ) -> Result<TcpStream, String> {
+        let mut stream = TcpStream::connect(self.endpoint.connect_address())
             .map_err(|error| format!("could not connect to {}: {error}", self.endpoint.authority))?;
-        let mut stream = stream;
         let target = self.endpoint.target(path);
-        let content_length = body.map_or(0, <[u8]>::len);
-        let content_type = if body.is_some() {
-            "Content-Type: application/json\r\n"
-        } else {
-            ""
-        };
+        let content_type = content_type
+            .map(|value| format!("Content-Type: {value}\r\n"))
+            .unwrap_or_default();
         let request = format!(
             "{method} {target} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n{content_type}Content-Length: {content_length}\r\n\r\n",
             self.endpoint.authority, self.token
@@ -285,22 +317,30 @@ impl HttpClient {
         stream
             .write_all(request.as_bytes())
             .map_err(|error| error.to_string())?;
-        if let Some(body) = body {
-            stream.write_all(body).map_err(|error| error.to_string())?;
-        }
-        stream.flush().map_err(|error| error.to_string())?;
+        Ok(stream)
+    }
 
+    fn read_response(stream: TcpStream) -> Result<(BufReader<TcpStream>, ResponseHead), String> {
         let mut reader = BufReader::new(stream);
         let head = read_response_head(&mut reader)?;
         Ok((reader, head))
     }
 
-    fn stream_exec(&self, space: &str, command: &[String]) -> Result<i32, String> {
-        let body = json!({ "cmd": command });
+    fn stream_exec(
+        &self,
+        space: &str,
+        command: &[String],
+        stdin_path: Option<&str>,
+    ) -> Result<i32, String> {
+        let mut body = json!({ "cmd": command });
+        if let Some(path) = stdin_path {
+            body["stdin"] = Value::String(read_exec_stdin(path)?);
+        }
+        let encoded = serde_json::to_vec(&body).map_err(|error| error.to_string())?;
         let (mut reader, head) = self.open_request(
             "POST",
             &format!("/v1/spaces/{}/exec", encode_path_segment(space)),
-            Some(&serde_json::to_vec(&body).map_err(|error| error.to_string())?),
+            Some(&encoded),
         )?;
         if !(200..300).contains(&head.status) {
             let response_body = read_body(&mut reader, &head.headers)?;
@@ -314,6 +354,157 @@ impl HttpClient {
             &mut stdout,
             &mut stderr,
         )
+    }
+
+    fn push_file(&self, space: &str, local_path: &str, guest_path: &str) -> Result<u64, String> {
+        let mut source = upload_source(local_path)?;
+        let target = format!(
+            "/v1/spaces/{}/push?path={}",
+            encode_path_segment(space),
+            encode_query_value(guest_path)
+        );
+        let mut stream = self.start_request("POST", &target, source.length, None)?;
+        copy_upload(&mut source.file, &mut stream, source.length)?;
+        stream.flush().map_err(|error| error.to_string())?;
+        let (mut reader, head) = Self::read_response(stream)?;
+        let response_body = read_body(&mut reader, &head.headers)?;
+        if !(200..300).contains(&head.status) {
+            return Err(http_error(head.status, &response_body));
+        }
+        let response = response_value_from_body(&response_body)?;
+        response
+            .get("bytes")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| "push response did not include a byte count".to_string())
+    }
+
+    fn pull_file(&self, space: &str, guest_path: &str, local_path: &str) -> Result<u64, String> {
+        let target = format!(
+            "/v1/spaces/{}/pull?path={}",
+            encode_path_segment(space),
+            encode_query_value(guest_path)
+        );
+        let (mut reader, head) = self.open_request("GET", &target, None)?;
+        if !(200..300).contains(&head.status) {
+            let response_body = read_body(&mut reader, &head.headers)?;
+            return Err(http_error(head.status, &response_body));
+        }
+        if local_path == "-" {
+            let stdout = io::stdout();
+            let mut output = stdout.lock();
+            stream_body(&mut reader, &head.headers, &mut output)
+        } else {
+            let mut output = File::create(local_path)
+                .map_err(|error| format!("could not create {local_path:?}: {error}"))?;
+            stream_body(&mut reader, &head.headers, &mut output)
+        }
+    }
+}
+
+struct UploadSource {
+    file: File,
+    length: u64,
+    temporary_path: Option<PathBuf>,
+}
+
+impl Drop for UploadSource {
+    fn drop(&mut self) {
+        if let Some(path) = &self.temporary_path {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn upload_source(path: &str) -> Result<UploadSource, String> {
+    if path == "-" {
+        // Content-Length is mandatory on push; disk spooling keeps stdin streaming without a memory-sized buffer.
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| format!("could not generate temporary upload name: {error}"))?
+            .as_nanos();
+        let mut temporary_path = None;
+        let mut file = None;
+        for attempt in 0..16 {
+            let candidate = std::env::temp_dir().join(format!(
+                "shinu-push-{}-{timestamp}-{attempt}",
+                process::id()
+            ));
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(opened) => {
+                    file = Some(opened);
+                    temporary_path = Some(candidate);
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(format!("could not create temporary upload file: {error}"));
+                }
+            }
+        }
+        let mut file = file.ok_or_else(|| "could not create a unique temporary upload file".to_string())?;
+        let stdin = io::stdin();
+        let mut input = stdin.lock();
+        let length = io::copy(&mut input, &mut file)
+            .map_err(|error| format!("could not read stdin: {error}"))?;
+        file.flush()
+            .map_err(|error| format!("could not flush temporary upload file: {error}"))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| format!("could not rewind temporary upload file: {error}"))?;
+        return Ok(UploadSource {
+            file,
+            length,
+            temporary_path,
+        });
+    }
+
+    let file = File::open(path).map_err(|error| format!("could not open {path:?}: {error}"))?;
+    let length = file
+        .metadata()
+        .map_err(|error| format!("could not inspect {path:?}: {error}"))?
+        .len();
+    Ok(UploadSource {
+        file,
+        length,
+        temporary_path: None,
+    })
+}
+
+fn copy_upload(source: &mut File, target: &mut TcpStream, length: u64) -> Result<(), String> {
+    let mut remaining = length;
+    let mut buffer = [0u8; 8192];
+    while remaining > 0 {
+        let amount = remaining.min(buffer.len() as u64) as usize;
+        let count = source
+            .read(&mut buffer[..amount])
+            .map_err(|error| format!("could not read upload source: {error}"))?;
+        if count == 0 {
+            return Err("upload source ended before its advertised length".to_string());
+        }
+        target
+            .write_all(&buffer[..count])
+            .map_err(|error| format!("could not send upload: {error}"))?;
+        remaining -= count as u64;
+    }
+    Ok(())
+}
+
+fn read_exec_stdin(path: &str) -> Result<String, String> {
+    if path == "-" {
+        let stdin = io::stdin();
+        let mut input = stdin.lock();
+        let mut content = String::new();
+        input
+            .read_to_string(&mut content)
+            .map_err(|error| format!("could not read stdin: {error}"))?;
+        Ok(content)
+    } else {
+        std::fs::read_to_string(path)
+            .map_err(|error| format!("could not read exec stdin file {path:?}: {error}"))
     }
 }
 
@@ -407,9 +598,29 @@ fn run_command(client: &HttpClient, command: Command) -> Result<i32, String> {
                 println!("not running {stopped}");
             }
         }
-        Command::Exec { space, cmd } => {
-            return client.stream_exec(&space, &cmd);
+        Command::Exec { space, stdin, cmd } => {
+            return client.stream_exec(&space, &cmd, stdin.as_deref());
         }
+        Command::Push {
+            space,
+            local_file,
+            guest_path,
+        } => {
+            let bytes = client.push_file(&space, &local_file, &guest_path)?;
+            println!("pushed {bytes} bytes to {guest_path}");
+        }
+        Command::Pull {
+            space,
+            guest_path,
+            local_file,
+        } => {
+            let bytes = client.pull_file(&space, &guest_path, &local_file)?;
+            if local_file == "-" {
+                eprintln!("pulled {bytes} bytes");
+            } else {
+                println!("pulled {bytes} bytes to {local_file}");
+            }
+         }
         Command::Commit { space, note, hot } => {
             let data = response_value(client.request(
                 "POST",
@@ -881,6 +1092,18 @@ fn encode_path_segment(value: &str) -> String {
     }
     encoded
 }
+fn encode_query_value(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
 
 fn read_response_head<R: BufRead>(reader: &mut R) -> Result<ResponseHead, String> {
     let mut status_line = String::new();
@@ -982,6 +1205,51 @@ fn read_body<R: BufRead>(reader: &mut R, headers: &[(String, String)]) -> Result
         .map_err(|error| error.to_string())?;
     Ok(body)
 }
+fn stream_body<R: BufRead, W: Write>(
+    reader: &mut R,
+    headers: &[(String, String)],
+    output: &mut W,
+) -> Result<u64, String> {
+    let mut total = 0u64;
+    let mut write_fragment = |fragment: &[u8]| {
+        output
+            .write_all(fragment)
+            .map_err(|error| format!("could not write pull output: {error}"))?;
+        total = total
+            .checked_add(fragment.len() as u64)
+            .ok_or_else(|| "pull response was too large".to_string())?;
+        Ok(())
+    };
+    if is_chunked(headers) {
+        read_chunked(reader, &mut write_fragment)?;
+    } else if let Some(length) = content_length(headers)? {
+        let mut remaining = length;
+        let mut buffer = [0u8; 8192];
+        while remaining > 0 {
+            let amount = remaining.min(buffer.len());
+            let count = reader
+                .read(&mut buffer[..amount])
+                .map_err(|error| error.to_string())?;
+            if count == 0 {
+                return Err("pull HTTP body ended before Content-Length".to_string());
+            }
+            write_fragment(&buffer[..count])?;
+            remaining -= count;
+        }
+    } else {
+        let mut buffer = [0u8; 8192];
+        loop {
+            let count = reader.read(&mut buffer).map_err(|error| error.to_string())?;
+            if count == 0 {
+                break;
+            }
+            write_fragment(&buffer[..count])?;
+        }
+    }
+    output.flush().map_err(|error| format!("could not flush pull output: {error}"))?;
+    Ok(total)
+}
+
 
 fn read_chunked<R: BufRead, F>(reader: &mut R, mut on_chunk: F) -> Result<(), String>
 where
@@ -1019,10 +1287,16 @@ where
                 }
             }
         }
-        let mut chunk = vec![0u8; size];
-        reader
-            .read_exact(&mut chunk)
-            .map_err(|error| error.to_string())?;
+        let mut remaining = size;
+        let mut buffer = [0u8; 8192];
+        while remaining > 0 {
+            let amount = remaining.min(buffer.len());
+            reader
+                .read_exact(&mut buffer[..amount])
+                .map_err(|error| error.to_string())?;
+            on_chunk(&buffer[..amount])?;
+            remaining -= amount;
+        }
         let mut line_end = [0u8; 2];
         reader
             .read_exact(&mut line_end)
@@ -1030,7 +1304,6 @@ where
         if line_end != *b"\r\n" {
             return Err("chunked HTTP body is missing its CRLF".to_string());
         }
-        on_chunk(&chunk)?;
     }
 }
 
@@ -1198,6 +1471,14 @@ mod tests {
     fn parses_http_status_code() {
         assert_eq!(parse_status_line("HTTP/1.1 201 Created\r\n").unwrap(), 201);
     }
+    #[test]
+    fn encodes_query_values_without_leaking_reserved_path_bytes() {
+        assert_eq!(
+            encode_query_value("/root/a b?x&y=#%é"),
+            "%2Froot%2Fa%20b%3Fx%26y%3D%23%25%C3%A9"
+        );
+    }
+
 
     #[test]
     fn dispatches_ndjson_streams_and_exit() {

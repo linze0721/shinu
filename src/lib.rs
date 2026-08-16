@@ -15,6 +15,8 @@ pub const KERNEL_URL: &str =
     "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.13/x86_64/vmlinux-6.1.141";
 /// Guest vsock port the in-VM socat bridge listens on; forwarded to sshd.
 pub const VSOCK_SSH_PORT: u16 = 2222;
+/// Raw uploads use a separate cap because they stream bytes instead of the 1 MiB JSON body.
+pub const MAX_UPLOAD_BYTES: usize = 256 * 1024 * 1024;
 
 /// Seconds between idle-sweep passes.
 ///
@@ -5359,7 +5361,37 @@ pub mod http {
         cookies
     }
 
-    pub fn parse(stream: &mut impl BufRead) -> crate::Result<Request> {
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RequestHead {
+        pub method: String,
+        pub path: String,
+        pub token: Option<String>,
+        pub content_length: Option<usize>,
+        pub cookies: std::collections::HashMap<String, String>,
+        pub origin: Option<String>,
+        pub forwarded_proto: Option<String>,
+        pub host: Option<String>,
+    }
+
+    impl RequestHead {
+        pub fn into_request(self, body: Vec<u8>) -> Request {
+            Request {
+                method: self.method,
+                path: self.path,
+                token: self.token,
+                body,
+                cookies: self.cookies,
+                origin: self.origin,
+                forwarded_proto: self.forwarded_proto,
+                host: self.host,
+            }
+        }
+    }
+
+    fn parse_head_inner(
+        stream: &mut impl BufRead,
+        max_body_bytes: Option<usize>,
+    ) -> crate::Result<RequestHead> {
         let mut header_bytes = 0;
         let request_line = read_line(stream, &mut header_bytes)?
             .ok_or_else(|| invalid("missing HTTP request line"))?;
@@ -5428,9 +5460,9 @@ pub mod http {
                 let length = value
                     .parse::<usize>()
                     .map_err(|_| invalid("invalid Content-Length"))?;
-                // JSON requests are deliberately bounded before allocation;
-                // this also keeps a bogus length from exhausting the daemon.
-                if length > MAX_BODY_BYTES {
+                // The normal parser supplies the JSON cap; streaming routes
+                // deliberately omit it so they can enforce their own limit.
+                if max_body_bytes.is_some_and(|max| length > max) {
                     return Err(invalid("Content-Length exceeds 1 MiB"));
                 }
                 content_length = Some(length);
@@ -5449,24 +5481,46 @@ pub mod http {
                 host = Some(bytes_to_string(value, "Host")?);
             }
         }
+        Ok(RequestHead {
+            method,
+            path,
+            token,
+            content_length,
+            cookies,
+            origin,
+            forwarded_proto,
+            host,
+        })
+    }
 
-        let mut body = vec![0; content_length.unwrap_or(0)];
+    /// Reads only the request line and headers, leaving the body in `stream`.
+    pub fn parse_head(stream: &mut impl BufRead) -> crate::Result<RequestHead> {
+        parse_head_inner(stream, None)
+    }
+
+    /// Reads a buffered request body while retaining the historical 1 MiB cap.
+    pub fn read_body(
+        stream: &mut impl BufRead,
+        content_length: Option<usize>,
+    ) -> crate::Result<Vec<u8>> {
+        let length = content_length.unwrap_or(0);
+        if length > MAX_BODY_BYTES {
+            return Err(invalid("Content-Length exceeds 1 MiB"));
+        }
+        let mut body = vec![0; length];
         if let Err(error) = stream.read_exact(&mut body) {
             if error.kind() == io::ErrorKind::UnexpectedEof {
                 return Err(invalid("request body is shorter than Content-Length"));
             }
             return Err(crate::Error::Io(error));
         }
-        Ok(Request {
-            method,
-            path,
-            token,
-            body,
-            cookies,
-            origin,
-            forwarded_proto,
-            host,
-        })
+        Ok(body)
+    }
+
+    pub fn parse(stream: &mut impl BufRead) -> crate::Result<Request> {
+        let head = parse_head_inner(stream, Some(MAX_BODY_BYTES))?;
+        let body = read_body(stream, head.content_length)?;
+        Ok(head.into_request(body))
     }
 
     fn reason_phrase(status: u16) -> &'static str {
@@ -5589,12 +5643,31 @@ pub mod http {
         format!("{name}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
     }
 
-    pub fn respond_chunked_start(writer: &mut impl Write) -> io::Result<()> {
-        writer.write_all(
-            b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+    fn respond_chunked_start_with_type(
+        writer: &mut impl Write,
+        content_type: &str,
+    ) -> io::Result<()> {
+        write!(
+            writer,
+            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
         )?;
         // Flush the headers before the VM command starts so clients can begin
         // consuming the stream without waiting for its first output line.
+        writer.flush()
+    }
+
+    pub fn respond_chunked_start(writer: &mut impl Write) -> io::Result<()> {
+        respond_chunked_start_with_type(writer, "application/x-ndjson")
+    }
+
+    pub fn respond_chunked_binary_start(writer: &mut impl Write) -> io::Result<()> {
+        respond_chunked_start_with_type(writer, "application/octet-stream")
+    }
+
+    pub fn respond_chunk_bytes(writer: &mut impl Write, payload: &[u8]) -> io::Result<()> {
+        write!(writer, "{:x}\r\n", payload.len())?;
+        writer.write_all(payload)?;
+        writer.write_all(b"\r\n")?;
         writer.flush()
     }
 
@@ -5604,12 +5677,9 @@ pub mod http {
     ) -> io::Result<()> {
         let mut payload = serde_json::to_vec(line).map_err(json_io_error)?;
         payload.push(b'\n');
-        write!(writer, "{:x}\r\n", payload.len())?;
-        writer.write_all(&payload)?;
-        writer.write_all(b"\r\n")?;
-        // Without a flush each chunk can remain buffered until exec exits,
-        // defeating NDJSON streaming for the agent.
-        writer.flush()
+        // JSON is serialized to bytes first; binary callers use
+        // `respond_chunk_bytes` so no UTF-8 conversion can corrupt payloads.
+        respond_chunk_bytes(writer, &payload)
     }
 
     pub fn respond_chunked_end(writer: &mut impl Write) -> io::Result<()> {
@@ -5644,6 +5714,26 @@ pub mod http {
             assert_eq!(request.path, "/v1/spaces");
             assert_eq!(request.token, None);
             assert!(request.body.is_empty());
+        }
+
+        #[test]
+        fn head_and_body_split_matches_parse() {
+            let raw = b"POST /v1/spaces HTTP/1.1\r\nContent-Length: 7\r\nAuthorization: Bearer abc\r\n\r\npayloadtrailing";
+            let expected = parse(&mut Cursor::new(raw)).expect("buffered parse");
+            let mut split_input = Cursor::new(raw);
+            let head = parse_head(&mut split_input).expect("head parse");
+            let body = read_body(&mut split_input, head.content_length).expect("body parse");
+            assert_eq!(head.into_request(body), expected);
+        }
+
+        #[test]
+        fn head_parse_reports_upload_sized_content_length() {
+            let raw = format!(
+                "POST /v1/spaces/demo/push?path=/tmp/file HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                MAX_BODY_BYTES + 1
+            );
+            let head = parse_head(&mut Cursor::new(raw.as_bytes())).expect("uncapped head parse");
+            assert_eq!(head.content_length, Some(MAX_BODY_BYTES + 1));
         }
 
         #[test]
@@ -5849,6 +5939,18 @@ pub mod http {
             expected_tail.extend_from_slice(&payload);
             expected_tail.extend_from_slice(b"\r\n0\r\n\r\n");
             assert!(output.ends_with(&expected_tail));
+        }
+
+        #[test]
+        fn binary_chunks_preserve_non_utf8_bytes() {
+            let payload = [0u8, 0xff, b'\n', 0x80];
+            let mut output = Vec::new();
+            respond_chunked_binary_start(&mut output).unwrap();
+            respond_chunk_bytes(&mut output, &payload).unwrap();
+            respond_chunked_end(&mut output).unwrap();
+            let frame = b"4\r\n\0\xff\n\x80\r\n";
+            assert!(output.windows(frame.len()).any(|window| window == frame));
+            assert!(output.starts_with(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"));
         }
 
         #[test]

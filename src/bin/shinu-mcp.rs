@@ -1,4 +1,5 @@
 use serde_json::{json, Map, Value};
+use shinu::shell_quote_word;
 use std::env;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -45,6 +46,57 @@ impl Server {
             "shinu_create_space" => {
                 let name = required_string(arguments, "name")?;
                 client.request_text("POST", "/v1/spaces", Some(json!({ "name": name })))
+            }
+            "shinu_start" => {
+                let space = required_string(arguments, "space")?;
+                let path = format!("/v1/spaces/{}/start", encode_path_segment(&space));
+                client.request_text("POST", &path, None)
+            }
+            "shinu_stop" => {
+                let space = required_string(arguments, "space")?;
+                let path = format!("/v1/spaces/{}/stop", encode_path_segment(&space));
+                client.request_text("POST", &path, None)
+            }
+            "shinu_write_file" => {
+                let space = required_string(arguments, "space")?;
+                let path = required_string(arguments, "path")?;
+                let content = required_text(arguments, "content")?;
+                let command = vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("cat > {}", shell_quote_word(&path)),
+                ];
+                let request_path = format!(
+                    "/v1/spaces/{}/exec",
+                    encode_path_segment(&space)
+                );
+                let response = client.request(
+                    "POST",
+                    &request_path,
+                    Some(json!({ "cmd": command, "stdin": content })),
+                )?;
+                if !(200..300).contains(&response.status) {
+                    return Err(http_error(response.status, &response.body));
+                }
+                aggregate_exec(&response.body)
+            }
+            "shinu_read_file" => {
+                let space = required_string(arguments, "space")?;
+                let path = required_string(arguments, "path")?;
+                let command = vec!["cat".to_string(), path];
+                let request_path = format!(
+                    "/v1/spaces/{}/exec",
+                    encode_path_segment(&space)
+                );
+                let response = client.request(
+                    "POST",
+                    &request_path,
+                    Some(json!({ "cmd": command })),
+                )?;
+                if !(200..300).contains(&response.status) {
+                    return Err(http_error(response.status, &response.body));
+                }
+                aggregate_stdout(&response.body)
             }
             "shinu_exec" => {
                 let space = required_string(arguments, "space")?;
@@ -313,6 +365,14 @@ fn required_string(arguments: &Map<String, Value>, field: &str) -> Result<String
         None => Err(format!("missing required argument {field}")),
     }
 }
+fn required_text(arguments: &Map<String, Value>, field: &str) -> Result<String, String> {
+    match arguments.get(field) {
+        Some(Value::String(value)) => Ok(value.clone()),
+        Some(_) => Err(format!("argument {field} must be a string")),
+        None => Err(format!("missing required argument {field}")),
+    }
+}
+
 
 fn required_bool(arguments: &Map<String, Value>, field: &str) -> Result<bool, String> {
     arguments
@@ -351,6 +411,21 @@ fn validate_arguments(name: &str, arguments: &Map<String, Value>) -> Result<(), 
         "shinu_list_spaces" => Ok(()),
         "shinu_create_space" => {
             required_string(arguments, "name")?;
+            Ok(())
+        }
+        "shinu_start" | "shinu_stop" => {
+            required_string(arguments, "space")?;
+            Ok(())
+        }
+        "shinu_write_file" => {
+            required_string(arguments, "space")?;
+            required_string(arguments, "path")?;
+            required_text(arguments, "content")?;
+            Ok(())
+        }
+        "shinu_read_file" => {
+            required_string(arguments, "space")?;
+            required_string(arguments, "path")?;
             Ok(())
         }
         "shinu_exec" => {
@@ -475,6 +550,59 @@ fn aggregate_exec(body: &[u8]) -> Result<String, String> {
     }
     result.push_str(&format!("exit: {exit}"));
     Ok(result)
+}
+fn aggregate_stdout(body: &[u8]) -> Result<String, String> {
+    let text = body_text(body)?;
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut exit = None;
+    for (index, raw_line) in text.split('\n').enumerate() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(line)
+            .map_err(|error| format!("invalid exec NDJSON line {}: {error}", index + 1))?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| format!("exec NDJSON line {} must be a JSON object", index + 1))?;
+        if let Some(stream) = object.get("stream") {
+            let stream = stream.as_str().ok_or_else(|| {
+                format!("exec stream on NDJSON line {} must be a string", index + 1)
+            })?;
+            let data = object
+                .get("data")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    format!("exec stream on NDJSON line {} is missing string data", index + 1)
+                })?;
+            match stream {
+                "stdout" => stdout.push_str(data),
+                "stderr" => stderr.push_str(data),
+                _ => return Err(format!("unknown exec stream {stream:?}")),
+            }
+        } else if let Some(value) = object.get("exit") {
+            let code = value
+                .as_i64()
+                .ok_or_else(|| format!("exec exit on NDJSON line {} must be an integer", index + 1))?;
+            if exit.replace(code).is_some() {
+                return Err("exec response contained multiple exit statuses".to_string());
+            }
+        } else {
+            return Err(format!(
+                "exec NDJSON line {} must contain stream or exit",
+                index + 1
+            ));
+        }
+    }
+    let exit = exit.ok_or_else(|| "exec response did not include an exit status".to_string())?;
+    if exit != 0 {
+        if stderr.is_empty() {
+            return Err(format!("guest command exited with status {exit}"));
+        }
+        return Err(format!("guest command exited with status {exit}: {stderr}"));
+    }
+    Ok(stdout)
 }
 
 fn parse_port_status(line: &str) -> Result<u16, String> {
@@ -651,6 +779,37 @@ fn tool_definitions() -> Vec<Value> {
             }), &["name"]),
         }),
         json!({
+            "name": "shinu_start",
+            "description": "在需要执行命令或继续实验时启动已停止的 space；需要 commit 或 checkout 时不要用它替代 shinu_stop。",
+            "inputSchema": schema(json!({
+                "space": {"type": "string", "minLength": 1, "description": "要启动的 space。"}
+            }), &["space"]),
+        }),
+        json!({
+            "name": "shinu_stop",
+            "description": "在 commit 或 checkout 前停止 space；这是满足后端停止状态要求的明确方式。",
+            "inputSchema": schema(json!({
+                "space": {"type": "string", "minLength": 1, "description": "要停止的 space。"}
+            }), &["space"]),
+        }),
+        json!({
+            "name": "shinu_write_file",
+            "description": "向 space 写入文本文件；此工具仅支持 JSON 文本内容，不适合二进制载荷，二进制请使用 CLI shinu push。",
+            "inputSchema": schema(json!({
+                "space": {"type": "string", "minLength": 1, "description": "目标 space。"},
+                "path": {"type": "string", "minLength": 1, "description": "guest 内目标文件路径。"},
+                "content": {"type": "string", "description": "要写入的文本内容；不支持二进制数据。"}
+            }), &["space", "path", "content"]),
+        }),
+        json!({
+            "name": "shinu_read_file",
+            "description": "从 space 读取文本文件并返回聚合后的 stdout；此工具仅支持文本，不适合二进制载荷，二进制请使用 CLI shinu pull。",
+            "inputSchema": schema(json!({
+                "space": {"type": "string", "minLength": 1, "description": "目标 space。"},
+                "path": {"type": "string", "minLength": 1, "description": "guest 内要读取的文件路径。"}
+            }), &["space", "path"]),
+        }),
+        json!({
             "name": "shinu_exec",
             "description": "在需要于隔离的 space 内执行不可信代码、构建命令或实验步骤时使用。响应会聚合 stdout、stderr 和退出码；长命令会一直阻塞到命令结束，因此不要用它期待流式的中间响应。",
             "inputSchema": schema(json!({
@@ -660,7 +819,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "shinu_commit",
-            "description": "在需要把当前实验状态存成可回滚的检查点、或在下一轮试错前保留安全副本时使用；hot 按后端要求选择是否保存运行中的 VM 状态。",
+            "description": "在需要把当前实验状态存成可回滚的检查点、或在下一轮试错前保留安全副本时使用；space 必须先停止，先调用 shinu_stop 后才能进行 commit。",
             "inputSchema": schema(json!({
                 "space": {"type": "string", "minLength": 1, "description": "要存档的 space。"},
                 "note": {"type": "string", "minLength": 1, "description": "描述这个存档用途的非空备注。"},
@@ -683,7 +842,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "shinu_checkout",
-            "description": "在需要把 space 回滚到某个 commit、复现旧状态或从安全存档继续试错时使用；checkout 前会自动存档当前状态，所以回滚是安全的，必要时可通过 reflog 找回它。",
+            "description": "在需要把 space 回滚到某个 commit、复现旧状态或从安全存档继续试错时使用；space 必须先停止，先调用 shinu_stop；commit 必须使用完整 UUID，列表中显示的 8 字符短 ID 会被拒绝；checkout 前会自动存档当前状态，所以回滚是安全的，必要时可通过 reflog 找回它。",
             "inputSchema": schema(json!({
                 "space": {"type": "string", "minLength": 1, "description": "要切换状态的 space。"},
                 "commit": {"type": "string", "minLength": 1, "description": "目标 commit 的 ID。"}
@@ -712,6 +871,10 @@ fn is_known_tool(name: &str) -> bool {
         name,
         "shinu_list_spaces"
             | "shinu_create_space"
+            | "shinu_start"
+            | "shinu_stop"
+            | "shinu_write_file"
+            | "shinu_read_file"
             | "shinu_exec"
             | "shinu_commit"
             | "shinu_log"
@@ -859,6 +1022,80 @@ fn main() {
                 eprintln!("shinu-mcp: could not read JSON-RPC request: {error}");
                 break;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn arguments(value: Value) -> Map<String, Value> {
+        value
+            .as_object()
+            .expect("test arguments must be an object")
+            .clone()
+    }
+
+    #[test]
+    fn validates_lifecycle_and_file_tools() {
+        assert!(validate_arguments("shinu_start", &arguments(json!({"space": "dev"}))).is_ok());
+        assert!(validate_arguments("shinu_stop", &arguments(json!({"space": "dev"}))).is_ok());
+        assert!(validate_arguments(
+            "shinu_write_file",
+            &arguments(json!({"space": "dev", "path": "/tmp/note", "content": ""}))
+        )
+        .is_ok());
+        assert!(validate_arguments(
+            "shinu_read_file",
+            &arguments(json!({"space": "dev", "path": "/tmp/note"}))
+        )
+        .is_ok());
+
+        assert!(validate_arguments("shinu_start", &Map::new()).is_err());
+        assert!(validate_arguments(
+            "shinu_write_file",
+            &arguments(json!({"space": "dev", "path": "/tmp/note"}))
+        )
+        .is_err());
+        assert!(validate_arguments(
+            "shinu_read_file",
+            &arguments(json!({"space": "dev", "path": 7}))
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn read_file_aggregation_returns_raw_stdout_and_reports_failures() {
+        let output = aggregate_stdout(
+            br#"{"stream":"stdout","data":"first\n"}
+{"stream":"stdout","data":"second"}
+{"exit":0}
+"#,
+        )
+        .unwrap();
+        assert_eq!(output, "first\nsecond");
+
+        let error = aggregate_stdout(
+            br#"{"stream":"stderr","data":"cat: missing\n"}
+{"exit":1}
+"#,
+        )
+        .unwrap_err();
+        assert!(error.contains("cat: missing"));
+        assert!(error.contains("status 1"));
+    }
+
+    #[test]
+    fn known_tools_match_tool_definitions() {
+        let definitions = tool_definitions();
+        assert_eq!(definitions.len(), 13);
+        for definition in definitions {
+            let name = definition
+                .get("name")
+                .and_then(Value::as_str)
+                .expect("tool definition name");
+            assert!(is_known_tool(name), "tool {name} missing from known-tool match");
         }
     }
 }

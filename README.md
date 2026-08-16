@@ -2,7 +2,7 @@
 
 Agent-first Firecracker microVM sandboxes with copy-on-write disk states and git-like snapshot, rollback, and branching workflows.
 
-A **space** is an ext4 guest disk image cloned from a golden base via btrfs reflink, bound to an isolated Firecracker microVM instance. `shinu exec <space> -- <cmd>` boots the VM on demand (~1.7 s cold), runs the command over SSH over vsock, and leaves the VM warm for subsequent calls (~0.4 s hot). Idle VMs release unused host memory via virtio-balloon and shut down automatically after an idle threshold.
+A **space** is an ext4 guest disk image cloned from a golden base via btrfs reflink, bound to an isolated Firecracker microVM instance. `shinu exec <space> -- <cmd>` boots the VM on demand (~1.7 s cold), runs the command over host `ssh` with `shinu-vsock` as `ProxyCommand`, tunnelled through Firecracker's AF_VSOCK device to an in-guest `socat` listener (`VSOCK-LISTEN:2222`) forwarding to guest `sshd` (`127.0.0.1:22`), leaving the VM warm for subsequent calls (~0.4 s hot). Because command execution travels strictly over vsock rather than host network interfaces, the guest can be firewalled off host networks while remaining reachable. Idle VMs release unused host memory via virtio-balloon and shut down automatically after an idle threshold.
 
 `shinud` exposes a HTTP/1.1 REST API where spaces support git-like operation semantics:
 - **`commits`** store CoW ext4 disk state snapshots (`hot` or cold).
@@ -194,7 +194,9 @@ All API routes require authentication header: `Authorization: Bearer <token>`.
 | `DELETE` | `/v1/spaces/{name}` | — | `200 OK` | Delete space and stop its VM if running |
 | `POST` | `/v1/spaces/{name}/start` | — | `200 OK` | Start Firecracker VM for space |
 | `POST` | `/v1/spaces/{name}/stop` | — | `200 OK` | Stop VM, flush disk, release memory |
-| `POST` | `/v1/spaces/{name}/exec` | `{"cmd":["sh","-c","..."]}` | `200 OK` Chunked NDJSON stream | Execute command inside VM, streaming output |
+| `POST` | `/v1/spaces/{name}/exec` | `{"cmd":["sh","-c","..."],"stdin":"..."}` | `200 OK` Chunked NDJSON stream | Execute command inside VM, streaming output (`stdin` optional text) |
+| `POST` | `/v1/spaces/{name}/push?path=<path>` | Raw bytes (up to 256 MiB) | `200 OK` `{"path":"...","bytes":N}` | Stream binary data directly into guest file |
+| `GET` | `/v1/spaces/{name}/pull?path=<path>` | — | `200 OK` Raw bytes (`application/octet-stream`) | Stream binary file out of guest (404 if missing, 400 if dir) |
 | `POST` | `/v1/spaces/{name}/commits` | `{"note":"...","hot":false}` | `201 Created` | Create CoW disk snapshot commit |
 | `GET` | `/v1/spaces/{name}/log` | — | `200 OK` `[{"id":"...","parent":...}]` | Fetch commit history chain starting from `head` |
 | `POST` | `/v1/spaces/{name}/checkout` | `{"commit":"<id>"}` | `200 OK` `{"head":"...","auto_commit":"..."}` | Rewind space to commit (auto-commits state first) |
@@ -203,6 +205,14 @@ All API routes require authentication header: `Authorization: Bearer <token>`.
 | `GET` | `/v1/usage[?from=&to=]` | — | `200 OK` | Query usage summary metrics for project |
 | `GET` | `/v1/limits` | — | `200 OK` | Query project quota limits and current resource usage |
 | `POST` | `/v1/gc` | `{"free_below":...,"dry_run":false}` | `200 OK` | Run garbage collection on unreferenced commits |
+### Data Transfer Mechanisms
+
+Shinu provides three mechanisms to move data into and out of guest spaces:
+
+1. **`exec` `stdin`**: Paste text strings directly into commands via `{"cmd":[...], "stdin":"..."}` on `POST /v1/spaces/{name}/exec`. This rides the standard 1 MiB JSON request body limit and closes stdin upon writing so the guest command receives clean EOF.
+2. **`push` / `pull`**: Stream binary files up to 256 MiB directly to or from absolute guest paths (`POST /v1/spaces/{name}/push?path=...` with raw request body, and `GET /v1/spaces/{name}/pull?path=...` returning `application/octet-stream`). `push` streams socket bytes to guest `cat > <quoted path>`, while `pull` checks file existence (`test -f`) before responding and streams `cat <quoted path>`. Both endpoints auto-start stopped VMs and record usage events. Directories return 400.
+3. **`tar` over `exec`**: Transfer directories or multi-file trees by piping `tar` archives through `exec` with stdin or stdout.
+
 ### Streaming `exec` Format (NDJSON)
 
 The `POST /v1/spaces/{name}/exec` endpoint uses `Transfer-Encoding: chunked` returning newline-delimited JSON (NDJSON) messages:
@@ -375,7 +385,8 @@ e2fsck -E discard -fp <root>/spaces/<uuid>.ext4
 
 Direct host path permissions on `<root>/spaces/`, `<root>/ckpts/`, `<root>/jail/`, and `<root>/vm/` are strictly restricted to `0700` owned by `root`. Clients interact exclusively over HTTP API endpoints.
 
----
+- **Host Path Isolation**: Control sockets, state directories, and ext4 image files are secured at mode `0700` owned by `root`. Non-root clients communicate solely over the `shinud` HTTP daemon proxy and cannot directly access or tamper with host disk files.
+- **MCP Server Integration**: `shinu-mcp` exposes Model Context Protocol (MCP) tools for agents (`shinu_list_spaces`, `shinu_create_space`, `shinu_start`, `shinu_stop`, `shinu_exec`, `shinu_write_file`, `shinu_read_file`, `shinu_commit`, `shinu_log`, `shinu_reflog`, `shinu_checkout`, `shinu_fork`, `shinu_delete_space`). Because MCP is a JSON protocol, file tools (`shinu_write_file` and `shinu_read_file`) operate strictly on text payloads; binary file transfers should use the `shinu push` and `shinu pull` CLI commands or HTTP endpoints.
 
 - **Bearer Token Authentication**: Authentication uses `Authorization: Bearer <token>`. `shinud` stores SHA-256 hashes of tokens in `<root>/shinu.db` (mode `0600`). Hashes are validated in constant time to prevent timing attacks. Token creation and management (`shinu token new/ls/rm`) must run host-locally as `root` and cannot be invoked over HTTP.
 - **Project Scope Isolation**: Every token maps to a single `project`. All space and commit lookup operations are strictly project-scoped. Accessing a space or commit belonging to another project returns `404 Not Found`, preventing project resource enumeration or existence leakage.

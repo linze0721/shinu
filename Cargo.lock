@@ -455,6 +455,79 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "shinu-core",
+ "shinu-crypto",
+ "shinu-image",
+ "shinu-proto",
+ "shinu-store",
+ "shinu-vm",
+ "uuid",
+]
+
+[[package]]
+name = "shinu-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "shinu-crypto"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "shinu-core",
+ "uuid",
+]
+
+[[package]]
+name = "shinu-image"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "shinu-core",
+ "uuid",
+]
+
+[[package]]
+name = "shinu-proto"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "shinu-core",
+ "uuid",
+]
+
+[[package]]
+name = "shinu-store"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "shinu-core",
+ "uuid",
+]
+
+[[package]]
+name = "shinu-vm"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "shinu-core",
+ "shinu-image",
  "uuid",
 ]
 

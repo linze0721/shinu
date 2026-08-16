@@ -1,7 +1,30 @@
-[package]
-name = "shinu"
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+
+# Declared once so a version bump cannot leave crates disagreeing.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+shinu-core = { path = "crates/shinu-core" }
+shinu-store = { path = "crates/shinu-store" }
+shinu-crypto = { path = "crates/shinu-crypto" }
+shinu-image = { path = "crates/shinu-image" }
+shinu-vm = { path = "crates/shinu-vm" }
+shinu-proto = { path = "crates/shinu-proto" }
+
+[package]
+name = "shinu"
+version.workspace = true
+edition.workspace = true
 
 [lib]
 name = "shinu"
@@ -24,9 +47,15 @@ name = "shinu-mcp"
 path = "src/bin/shinu-mcp.rs"
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-clap = { version = "4", features = ["derive"] }
-uuid = { version = "1", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+rusqlite.workspace = true
+shinu-core.workspace = true
+shinu-store.workspace = true
+shinu-crypto.workspace = true
+shinu-image.workspace = true
+shinu-vm.workspace = true
+shinu-proto.workspace = true

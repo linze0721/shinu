@@ -156,17 +156,6 @@ code,
   color: var(--text);
 }
 
-.btn.danger {
-  background: var(--bg);
-  color: var(--red);
-  border-color: var(--red);
-}
-
-.btn.danger:hover:not(:disabled) {
-  background: var(--red);
-  color: #ffffff;
-}
-
 .btn.small {
   font-size: 90%;
   padding: 1px 8px;
@@ -180,7 +169,6 @@ code,
 
 /* ---------- forms: sunken fields ---------- */
 
-input[type="text"],
 input[type="email"],
 input[type="password"] {
   font: inherit;
@@ -196,7 +184,6 @@ input::placeholder {
   color: var(--muted);
 }
 
-input[type="text"]:focus,
 input[type="email"]:focus,
 input[type="password"]:focus {
   outline: 2px solid var(--blue);
@@ -224,30 +211,8 @@ input[type="password"]:focus {
 }
 
 .auth-body .form-hint,
-.auth-body .form-error,
-.modal-body .form-error {
+.auth-body .form-error {
   padding: 4px 0 0;
-}
-
-.check-row {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  white-space: nowrap;
-  cursor: pointer;
-  user-select: none;
-}
-
-.check-row input {
-  margin: 0;
-}
-
-.inline-form {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  padding: 8px;
-  border-bottom: 1px solid var(--peri);
 }
 
 /* ---------- layout shell: masthead / navbar / sidemenu / footer ---------- */
@@ -276,11 +241,6 @@ input[type="password"]:focus {
 
 .brand-accent {
   color: var(--text);
-}
-
-.masthead .tagline {
-  display: inline;
-  margin-left: 12px;
 }
 
 .navbar {
@@ -477,16 +437,6 @@ input[type="password"]:focus {
   border-color: var(--red);
 }
 
-.notice.ok {
-  color: var(--green);
-  border-color: var(--green);
-}
-
-.notice.info {
-  color: var(--text);
-  border-color: var(--peri);
-}
-
 .notice-msg {
   flex: 1;
   min-width: 0;
@@ -580,6 +530,11 @@ tr.space-row.selected td:first-child {
   font-size: 90%;
 }
 
+.space-created {
+  color: var(--muted);
+  font-size: 90%;
+}
+
 .commit-note {
   overflow-wrap: break-word;
 }
@@ -599,12 +554,6 @@ tr.space-row.selected td:first-child {
 .badge.auto {
   background: var(--peri-sel);
   color: var(--text);
-}
-
-.row-actions {
-  display: flex;
-  gap: 6px;
-  white-space: nowrap;
 }
 
 /* ---------- tabs (History / Archive): same bevel idiom as the menu ---------- */
@@ -642,12 +591,6 @@ tr.space-row.selected td:first-child {
   color: var(--text);
   background: var(--peri-sel);
   border-style: inset;
-}
-
-.tab-hint {
-  font-size: 90%;
-  color: var(--muted);
-  padding: 6px 8px 2px;
 }
 
 /* ---------- quota: table + hard-edged bar, red near the limit ---------- */
@@ -717,55 +660,43 @@ tr.space-row.selected td:first-child {
   font-size: 90%;
 }
 
-/* ---------- modal: hard black frame, periwinkle title bar ---------- */
+/* ---------- CLI guidance: copyable commands on #CCCCFF chips ---------- */
 
-.modal-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 50;
+.cli-box {
+  padding: 8px 8px 6px;
+  border-bottom: 1px solid var(--peri);
+}
+
+.cli-box:empty,
+.cli-setup:empty {
+  display: none;
+}
+
+.cli-setup {
+  padding: 6px 8px 8px;
+  border-top: 1px solid var(--peri);
+}
+
+.cli-title {
+  font-size: 90%;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.cli-line {
   display: flex;
   align-items: center;
-  justify-content: center;
-  padding: 20px;
-  background: rgba(0, 0, 0, 0.35);
-}
-
-.modal {
-  width: 100%;
-  max-width: 460px;
-  background: var(--bg);
-  border: 2px solid var(--text);
-}
-
-.modal-head {
-  background: var(--peri);
-  color: var(--text);
-  font-family: var(--head);
-  font-size: 110%;
-  padding: 4px 10px;
-}
-
-.modal-body {
-  padding: 10px 12px;
-}
-
-.modal-body p + p {
-  margin-top: 8px;
-}
-
-.modal-body .field {
-  margin: 12px 0 0;
-}
-
-.modal-warn {
-  color: var(--red);
-}
-
-.modal-foot {
-  display: flex;
-  justify-content: flex-end;
   gap: 8px;
-  padding: 0 12px 12px;
+  padding: 1px 0;
+}
+
+.cli-line code {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  background: var(--peri-sel);
+  border: 1px solid var(--peri);
+  padding: 1px 6px;
 }
 
 /* ---------- auth page ---------- */
@@ -797,11 +728,6 @@ tr.space-row.selected td:first-child {
   font-size: 170%;
   /* large display text only, as in the console masthead */
   color: #ffffff;
-}
-
-.auth-masthead .tagline {
-  display: block;
-  margin-top: 2px;
 }
 
 .auth-body {
@@ -841,13 +767,6 @@ tr.space-row.selected td:first-child {
   color: var(--text);
   background: var(--peri-sel);
   border-style: inset;
-}
-
-.auth-foot {
-  font-size: 90%;
-  color: var(--muted);
-  margin-top: 14px;
-  text-align: center;
 }
 
 /* ---------- narrow screens: console assumes desktop, but stay usable ---------- */

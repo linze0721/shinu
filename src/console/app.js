@@ -110,18 +110,54 @@
     return isNaN(t.getTime()) ? String(iso || '') : t.toLocaleString();
   }
 
+  /* Copy-to-clipboard with button feedback. The async Clipboard API needs a
+     secure context; plain http installs fall back to selection-copy. */
+  function copyText(text, btn) {
+    var label = btn.textContent;
+    function done(ok) {
+      btn.textContent = ok ? 'Copied' : 'Copy failed — select the text manually';
+      setTimeout(function () {
+        btn.textContent = label;
+      }, 1600);
+    }
+    function legacyCopy() {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = false;
+      try {
+        ok = document.execCommand('copy');
+      } catch (_) {
+        ok = false;
+      }
+      ta.remove();
+      done(ok);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () {
+        done(true);
+      }, legacyCopy);
+    } else {
+      legacyCopy();
+    }
+  }
+
   /* ================= notices ================= */
 
-  function notify(kind, message) {
+  /* Every remaining notice is an error: the console performs no writes, and a
+     failed read stays on screen until dismissed. */
+  function notify(message) {
     var area = $('#notice-area');
     if (!area) return;
-    var sig = kind + ':' + message;
     for (var i = 0; i < area.children.length; i += 1) {
-      if (area.children[i].getAttribute('data-sig') === sig) return;
+      if (area.children[i].getAttribute('data-sig') === message) return;
     }
     var div = document.createElement('div');
-    div.className = 'notice ' + kind;
-    div.setAttribute('data-sig', sig);
+    div.className = 'notice error';
+    div.setAttribute('data-sig', message);
     var span = document.createElement('span');
     span.className = 'notice-msg';
     span.textContent = message;
@@ -136,64 +172,6 @@
     div.appendChild(span);
     div.appendChild(close);
     area.appendChild(div);
-    if (kind !== 'error') {
-      setTimeout(function () {
-        if (div.isConnected) div.remove();
-      }, 8000);
-    }
-  }
-
-  /* ================= modal ================= */
-
-  /* opts: { title, bodyHTML, actions: [{ label, kind, disabled, onClick(btn, close) }] }.
-     An action without onClick just closes. Used instead of window.confirm so the
-     destructive step can carry real context (what is deleted, what is archived). */
-  function openModal(opts) {
-    var root = $('#modal-root');
-    if (!root) return function () {};
-    root.innerHTML =
-      '<div class="modal-overlay"><div class="modal" role="dialog" aria-modal="true" aria-label="' +
-      esc(opts.title) +
-      '"><div class="modal-head">' +
-      esc(opts.title) +
-      '</div><div class="modal-body">' +
-      opts.bodyHTML +
-      '</div><div class="modal-foot"></div></div></div>';
-    root.hidden = false;
-    var overlay = root.firstElementChild;
-    var foot = root.querySelector('.modal-foot');
-
-    function close() {
-      root.hidden = true;
-      root.innerHTML = '';
-      document.removeEventListener('keydown', onKey);
-    }
-
-    opts.actions.forEach(function (action) {
-      var btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'btn' + (action.kind ? ' ' + action.kind : '');
-      btn.textContent = action.label;
-      if (action.disabled) btn.disabled = true;
-      btn.addEventListener('click', function () {
-        if (action.onClick) action.onClick(btn, close);
-        else close();
-      });
-      foot.appendChild(btn);
-    });
-
-    overlay.addEventListener('mousedown', function (ev) {
-      if (ev.target === overlay) close();
-    });
-    function onKey(ev) {
-      if (ev.key === 'Escape') close();
-    }
-    document.addEventListener('keydown', onKey);
-
-    var focusTarget =
-      root.querySelector('input') || foot.querySelector('.btn');
-    if (focusTarget) focusTarget.focus();
-    return close;
   }
 
   /* ================= auth page ================= */
@@ -311,7 +289,6 @@
       log: null,
       reflog: null,
       historyError: null,
-      actionBusy: false,
     };
     var spacesCacheKey = '';
     var headCacheKey = '';
@@ -354,12 +331,14 @@
       spacesCacheKey = key;
       var list = $('#spaces-list');
       if (state.spaces.length === 0) {
-        list.innerHTML = '<div class="state"><p>No spaces yet.</p></div>';
+        list.innerHTML =
+          '<div class="state"><p>No spaces yet.</p>' +
+          '<p>Create one from the CLI: <span class="mono">shinu new &lt;name&gt;</span></p></div>';
         return;
       }
       list.innerHTML =
         '<table class="data-table"><thead><tr><th>Name</th><th>State</th>' +
-        '<th>HEAD</th><th>Disk</th></tr></thead><tbody>' +
+        '<th>HEAD</th><th>Disk</th><th>Created</th></tr></thead><tbody>' +
         state.spaces
           .map(function (s) {
             return (
@@ -367,8 +346,6 @@
               (s.name === state.selected ? ' selected' : '') +
               '" data-action="select-space" data-name="' +
               esc(s.name) +
-              '" title="created ' +
-              esc(absTime(s.created_at)) +
               /* the name cell carries a real button so the row stays
                  keyboard-operable; closest('[data-action]') finds it first */
               '"><td><button type="button" class="rowlink" data-action="select-space" data-name="' +
@@ -381,6 +358,10 @@
               (s.head ? esc(shortId(s.head)) : '&mdash;') +
               '</td><td class="mono nobr">' +
               esc(fmtBytes(s.exclusive || 0)) +
+              '</td><td class="space-created nobr" title="' +
+              esc(absTime(s.created_at)) +
+              '">' +
+              esc(timeAgo(s.created_at)) +
               '</td></tr>'
             );
           })
@@ -388,22 +369,40 @@
         '</tbody></table>';
     }
 
-    function renderDetailHead(force) {
+    /* Lines of copyable CLI commands; data-action="copy-cmd" wires the button. */
+    function cliLines(commands) {
+      return commands
+        .map(function (cmd) {
+          var html = esc(cmd);
+          return (
+            '<div class="cli-line"><code>' +
+            html +
+            '</code><button class="btn small" type="button" data-action="copy-cmd" data-copy="' +
+            html +
+            '">Copy</button></div>'
+          );
+        })
+        .join('');
+    }
+
+    /* The console is read-only: the detail head shows the space name plus the
+       CLI commands that change it, so the path from seeing to doing is one
+       copy away. */
+    function renderDetailHead() {
       var s = selectedSpace();
       if (!s) return;
-      if (state.actionBusy && !force) return;
-      var key = s.name + '|' + s.running + '|' + (s.head || '');
-      if (!force && key === headCacheKey) return;
+      var key = s.name + '|' + s.running;
+      if (key === headCacheKey) return;
       headCacheKey = key;
       $('#detail-title').textContent = s.name;
-      $('#detail-actions').innerHTML =
-        (s.running
-          ? '<button class="btn small" type="button" data-action="stop-space">Stop</button>'
-          : '<button class="btn small primary" type="button" data-action="start-space">Start</button>') +
-        '<button class="btn small danger" type="button" data-action="delete-space">Delete</button>';
-      $('#commit-hint').textContent = s.running
-        ? 'Space is running — a commit must be hot, or stop the space first.'
-        : '';
+      $('#cli-box').innerHTML =
+        '<p class="cli-title">Manage this space from the CLI:</p>' +
+        cliLines([
+          'shinu exec ' + s.name + ' -- <command>',
+          'shinu commit ' + s.name + ' --note "..."',
+          'shinu checkout ' + s.name + ' <commit-id>',
+          s.running ? 'shinu stop ' + s.name : 'shinu start ' + s.name,
+        ]);
     }
 
     function renderDetail() {
@@ -411,7 +410,7 @@
       $('#detail-empty').hidden = !!s;
       $('#detail-main').hidden = !s;
       if (s) {
-        renderDetailHead(true);
+        renderDetailHead();
         renderCommitList();
       }
     }
@@ -419,7 +418,6 @@
     function renderCommitList() {
       var s = selectedSpace();
       if (!s) return;
-      $('#tab-hint').textContent = '';
       var list = $('#commit-list');
       if (state.historyError) {
         list.innerHTML = errorState(state.historyError, 'retry-history');
@@ -440,12 +438,14 @@
       }
       list.innerHTML =
         '<table class="data-table"><thead><tr><th>Id</th><th>When</th>' +
-        '<th>Note</th><th>Actions</th></tr></thead><tbody>' +
+        '<th>Note</th><th>Checkout from the CLI</th></tr></thead><tbody>' +
         rows
           .map(function (c) {
             var badges = '';
             if (c.id === s.head) badges += ' <span class="badge head">HEAD</span>';
             if (c.auto) badges += ' <span class="badge auto">auto</span>';
+            /* checkout takes a full UUID; the 8-char display id won't parse */
+            var checkout = 'shinu checkout ' + s.name + ' ' + c.id;
             return (
               '<tr class="commit-row"><td class="commit-id mono nobr" title="' +
               esc(c.id) +
@@ -458,13 +458,9 @@
               esc(timeAgo(c.created_at)) +
               '</td><td class="commit-note">' +
               esc(c.note || '') +
-              '</td><td><div class="row-actions">' +
-              '<button class="btn small" type="button" data-action="checkout-commit" data-id="' +
-              esc(c.id) +
-              '">Check out</button>' +
-              '<button class="btn small" type="button" data-action="fork-commit" data-id="' +
-              esc(c.id) +
-              '">Fork</button></div></td></tr>'
+              '</td><td>' +
+              cliLines([checkout]) +
+              '</td></tr>'
             );
           })
           .join('') +
@@ -533,7 +529,7 @@
       }
       list.innerHTML =
         '<table class="data-table"><thead><tr><th>Prefix</th><th>Created</th>' +
-        '<th>Actions</th></tr></thead><tbody>' +
+        '</tr></thead><tbody>' +
         state.tokens
           .map(function (t) {
             return (
@@ -543,13 +539,27 @@
               esc(absTime(t.created_at)) +
               '">created ' +
               esc(timeAgo(t.created_at)) +
-              '</td><td><button class="btn small danger" type="button" data-action="revoke-token" data-prefix="' +
-              esc(t.hash_prefix) +
-              '">Revoke</button></td></tr>'
+              '</td></tr>'
             );
           })
           .join('') +
         '</tbody></table>';
+    }
+
+    /* Tokens are the one thing the console still creates; show how they plug
+       into the CLI. location.origin keeps the endpoint right on any host.
+       file:// previews have no origin — show a placeholder instead. */
+    function renderCliSetup() {
+      var origin =
+        location.protocol.indexOf('http') === 0
+          ? location.origin
+          : '<host>:<port>';
+      $('#cli-setup').innerHTML =
+        '<p class="cli-title">Point the CLI at this server:</p>' +
+        cliLines([
+          'export SHINU_ENDPOINT=' + origin,
+          'export SHINU_TOKEN=<token>',
+        ]);
     }
 
     /* ---------- data loading ---------- */
@@ -570,11 +580,11 @@
             renderDetail();
           }
           renderSpaces();
-          renderDetailHead(false);
+          renderDetailHead();
         },
         function (err) {
           if (quiet && state.spaces) {
-            notify('error', err.message);
+            notify(err.message);
             return;
           }
           $('#spaces-list').innerHTML = errorState(err.message, 'retry-spaces');
@@ -591,7 +601,7 @@
         },
         function (err) {
           if (quiet && state.limits) {
-            notify('error', err.message);
+            notify(err.message);
             return;
           }
           $('#meters').innerHTML = errorState(err.message, 'retry-quota');
@@ -607,7 +617,7 @@
         },
         function (err) {
           if (quiet && state.tokens) {
-            notify('error', err.message);
+            notify(err.message);
             return;
           }
           $('#tokens-list').innerHTML = errorState(err.message, 'retry-tokens');
@@ -644,8 +654,6 @@
       if (state.selected) loadHistory(state.tab);
     }
 
-    /* ---------- interactions ---------- */
-
     /* ---------- view switching (sidemenu) ----------
        The four panels are views: exactly one is visible at a time. Purely
        presentational — all data loading/polling runs regardless of which
@@ -675,10 +683,6 @@
       if (!name || name === state.selected) return;
       state.selected = name;
       state.tab = 'log';
-      /* the commit form belongs to the previous space otherwise */
-      $('#commit-note').value = '';
-      $('#commit-hot').checked = false;
-      $('#commit-error').hidden = true;
       state.log = state.reflog = null;
       state.historyError = null;
       $('#tab-log').classList.add('active');
@@ -706,289 +710,6 @@
       if (tab === 'reflog' && !state.reflog) loadHistory('reflog');
     }
 
-    function setRunning(start) {
-      var s = selectedSpace();
-      if (!s || state.actionBusy) return;
-      state.actionBusy = true;
-      var buttons = $('#detail-actions').querySelectorAll('button');
-      for (var i = 0; i < buttons.length; i += 1) buttons[i].disabled = true;
-      capi(
-        'POST',
-        '/v1/spaces/' + encodeURIComponent(s.name) + (start ? '/start' : '/stop')
-      ).then(
-        function () {
-          notify('ok', 'Space ' + s.name + (start ? ' started.' : ' stopped.'));
-          refreshSpaces(true);
-          refreshQuota(true);
-        },
-        function (err) {
-          notify('error', err.message);
-        }
-      ).then(function () {
-        state.actionBusy = false;
-        renderDetailHead(true);
-      });
-    }
-
-    function askDeleteSpace() {
-      var s = selectedSpace();
-      if (!s) return;
-      openModal({
-        title: 'Delete space',
-        bodyHTML:
-          '<p>Delete space <strong>' +
-          esc(s.name) +
-          '</strong>?</p><p>The space is stopped and its working disk is removed. ' +
-          'Archived checkpoints are kept. This cannot be undone.</p>',
-        actions: [
-          { label: 'Cancel' },
-          {
-            label: 'Delete space',
-            kind: 'danger',
-            onClick: function (btn, close) {
-              btn.disabled = true;
-              capi('DELETE', '/v1/spaces/' + encodeURIComponent(s.name)).then(
-                function () {
-                  close();
-                  notify('ok', 'Space ' + s.name + ' deleted.');
-                  if (state.selected === s.name) {
-                    state.selected = null;
-                    state.log = state.reflog = null;
-                    renderDetail();
-                  }
-                  refreshSpaces(true);
-                  refreshQuota(true);
-                },
-                function (err) {
-                  close();
-                  notify('error', err.message);
-                }
-              );
-            },
-          },
-        ],
-      });
-    }
-
-    function askCheckout(commitId) {
-      var s = selectedSpace();
-      if (!s) return;
-      var short = shortId(commitId);
-      openModal({
-        title: 'Check out ' + short,
-        bodyHTML:
-          '<p>Space <strong>' +
-          esc(s.name) +
-          '</strong> switches to save point <span class="mono">' +
-          esc(short) +
-          '</span>.</p><p>The current state is archived automatically as an ' +
-          '<em>auto</em> checkpoint first — you can come back to it at any time. ' +
-          'Nothing is discarded.</p>' +
-          (s.running
-            ? '<p class="modal-warn">The space is running — stop it before checking out.</p>'
-            : ''),
-        actions: [
-          { label: 'Cancel' },
-          {
-            label: 'Check out',
-            kind: 'primary',
-            disabled: s.running,
-            onClick: function (btn, close) {
-              btn.disabled = true;
-              capi('POST', '/v1/spaces/' + encodeURIComponent(s.name) + '/checkout', {
-                commit: commitId,
-              }).then(
-                function (result) {
-                  close();
-                  var archived =
-                    result && result.auto_commit
-                      ? '; previous state archived as ' + shortId(result.auto_commit)
-                      : '';
-                  notify('ok', 'Checked out ' + short + archived + '.');
-                  state.log = state.reflog = null;
-                  refreshSpaces(true);
-                  loadHistory(state.tab);
-                  renderCommitList();
-                  refreshQuota(true);
-                },
-                function (err) {
-                  close();
-                  notify('error', err.message);
-                }
-              );
-            },
-          },
-        ],
-      });
-    }
-
-    function askFork(commitId) {
-      var s = selectedSpace();
-      if (!s) return;
-      var short = shortId(commitId);
-      openModal({
-        title: 'Fork ' + short,
-        bodyHTML:
-          '<p>Create a new space starting from save point <span class="mono">' +
-          esc(short) +
-          '</span>.</p><label class="field"><span>New space name</span>' +
-          '<input type="text" id="fork-name" autocomplete="off" placeholder="e.g. ' +
-          esc(s.name) +
-          '-experiment"></label>' +
-          '<p class="form-error" id="fork-error" hidden></p>',
-        actions: [
-          { label: 'Cancel' },
-          {
-            label: 'Fork',
-            kind: 'primary',
-            onClick: function (btn, close) {
-              var input = $('#fork-name');
-              var errBox = $('#fork-error');
-              var name = input.value.trim();
-              if (!name) {
-                errBox.textContent = 'Name the new space.';
-                errBox.hidden = false;
-                input.focus();
-                return;
-              }
-              btn.disabled = true;
-              capi('POST', '/v1/commits/' + encodeURIComponent(commitId) + '/fork', {
-                name: name,
-              }).then(
-                function () {
-                  close();
-                  notify('ok', 'Space ' + name + ' forked from ' + short + '.');
-                  /* quota errors surface inline below instead */
-                  refreshSpaces(true).then(function () {
-                    selectSpace(name);
-                  });
-                  refreshQuota(true);
-                },
-                function (err) {
-                  /* stays inside the modal: name conflicts and quota errors
-                     are fixable by editing the input */
-                  btn.disabled = false;
-                  errBox.textContent = err.message;
-                  errBox.hidden = false;
-                }
-              );
-            },
-          },
-        ],
-      });
-    }
-
-    function askRevokeToken(prefix) {
-      openModal({
-        title: 'Revoke token',
-        bodyHTML:
-          '<p>Revoke token <span class="mono">' +
-          esc(prefix) +
-          '</span>?</p><p>Any client authenticating with it loses access ' +
-          'immediately. This cannot be undone.</p>',
-        actions: [
-          { label: 'Cancel' },
-          {
-            label: 'Revoke',
-            kind: 'danger',
-            onClick: function (btn, close) {
-              btn.disabled = true;
-              capi('DELETE', '/console/tokens/' + encodeURIComponent(prefix)).then(
-                function () {
-                  close();
-                  notify('ok', 'Token ' + prefix + ' revoked.');
-                  refreshTokens(true);
-                },
-                function (err) {
-                  close();
-                  notify('error', err.message);
-                }
-              );
-            },
-          },
-        ],
-      });
-    }
-
-    function onCreateSpace(ev) {
-      ev.preventDefault();
-      var input = $('#create-name');
-      var errBox = $('#create-error');
-      var btn = $('#create-btn');
-      errBox.hidden = true;
-      var name = input.value.trim();
-      if (!name) {
-        errBox.textContent = 'Name the space first.';
-        errBox.hidden = false;
-        input.focus();
-        return;
-      }
-      btn.disabled = true;
-      capi('POST', '/v1/spaces', { name: name }).then(
-        function () {
-          input.value = '';
-          notify('ok', 'Space ' + name + ' created.');
-          refreshSpaces(true).then(function () {
-            selectSpace(name);
-          });
-          refreshQuota(true);
-        },
-        function (err) {
-          /* 429 quota errors arrive pre-written for users — show as-is. */
-          errBox.textContent = err.message;
-          errBox.hidden = false;
-        }
-      ).then(function () {
-        btn.disabled = false;
-      });
-    }
-
-    function onCommit(ev) {
-      ev.preventDefault();
-      var s = selectedSpace();
-      if (!s) return;
-      var errBox = $('#commit-error');
-      var noteInput = $('#commit-note');
-      var hotBox = $('#commit-hot');
-      var btn = $('#commit-btn');
-      errBox.hidden = true;
-      var note = noteInput.value.trim();
-      var hot = hotBox.checked;
-      if (!note) {
-        errBox.textContent = 'A note is required — describe what changed.';
-        errBox.hidden = false;
-        noteInput.focus();
-        return;
-      }
-      if (s.running && !hot) {
-        errBox.textContent = 'The space is running: check "hot" or stop it first.';
-        errBox.hidden = false;
-        return;
-      }
-      btn.disabled = true;
-      capi('POST', '/v1/spaces/' + encodeURIComponent(s.name) + '/commits', {
-        note: note,
-        hot: hot,
-      }).then(
-        function () {
-          noteInput.value = '';
-          hotBox.checked = false;
-          notify('ok', 'Checkpoint saved.');
-          state.log = state.reflog = null;
-          refreshSpaces(true);
-          loadHistory(state.tab);
-          renderCommitList();
-          refreshQuota(true);
-        },
-        function (err) {
-          errBox.textContent = err.message;
-          errBox.hidden = false;
-        }
-      ).then(function () {
-        btn.disabled = false;
-      });
-    }
-
     function onNewToken() {
       var btn = $('#new-token-btn');
       btn.disabled = true;
@@ -1002,7 +723,7 @@
           refreshTokens(true);
         },
         function (err) {
-          notify('error', err.message);
+          notify(err.message);
         }
       ).then(function () {
         btn.disabled = false;
@@ -1010,44 +731,7 @@
     }
 
     function onCopyToken() {
-      var btn = $('#copy-token-btn');
-      var token = $('#token-value').textContent;
-      function done(ok) {
-        btn.textContent = ok ? 'Copied' : 'Copy failed — select the text manually';
-        setTimeout(function () {
-          btn.textContent = 'Copy';
-        }, 1600);
-      }
-      /* The async Clipboard API needs a secure context; plain http installs
-         fall back to selection-copy. */
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(token).then(
-          function () {
-            done(true);
-          },
-          function () {
-            legacyCopy();
-          }
-        );
-      } else {
-        legacyCopy();
-      }
-      function legacyCopy() {
-        var ta = document.createElement('textarea');
-        ta.value = token;
-        ta.style.position = 'fixed';
-        ta.style.opacity = '0';
-        document.body.appendChild(ta);
-        ta.select();
-        var ok = false;
-        try {
-          ok = document.execCommand('copy');
-        } catch (_) {
-          ok = false;
-        }
-        ta.remove();
-        done(ok);
-      }
+      copyText($('#token-value').textContent, $('#copy-token-btn'));
     }
 
     function onLogout() {
@@ -1065,21 +749,8 @@
       'select-space': function (el) {
         selectSpace(el.getAttribute('data-name'));
       },
-      'start-space': function () {
-        setRunning(true);
-      },
-      'stop-space': function () {
-        setRunning(false);
-      },
-      'delete-space': askDeleteSpace,
-      'checkout-commit': function (el) {
-        askCheckout(el.getAttribute('data-id'));
-      },
-      'fork-commit': function (el) {
-        askFork(el.getAttribute('data-id'));
-      },
-      'revoke-token': function (el) {
-        askRevokeToken(el.getAttribute('data-prefix'));
+      'copy-cmd': function (el) {
+        copyText(el.getAttribute('data-copy'), el);
       },
       'retry-spaces': function () {
         $('#spaces-list').innerHTML =
@@ -1123,8 +794,6 @@
 
     $('#refresh-btn').addEventListener('click', refreshAll);
     $('#logout-btn').addEventListener('click', onLogout);
-    $('#create-form').addEventListener('submit', onCreateSpace);
-    $('#commit-form').addEventListener('submit', onCommit);
     $('#tab-log').addEventListener('click', function () {
       setTab('log');
     });
@@ -1137,6 +806,8 @@
       $('#token-reveal').hidden = true;
       $('#token-value').textContent = '';
     });
+
+    renderCliSetup();
 
     /* ---------- boot ---------- */
 
@@ -1159,7 +830,7 @@
         /* 401 already redirected inside capi. Anything else (daemon down,
            file:// preview) gets an explicit, retryable failure state. */
         if (err.status === 401) return;
-        notify('error', err.message);
+        notify(err.message);
         $('#spaces-list').innerHTML = errorState(err.message, 'retry-boot');
         $('#meters').innerHTML = errorState(err.message, 'retry-boot');
         $('#tokens-list').innerHTML = errorState(err.message, 'retry-boot');

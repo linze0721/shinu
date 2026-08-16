@@ -52,11 +52,6 @@ if (location.protocol === 'file:') {
           <h2>Spaces</h2>
           <button class="btn small" id="refresh-btn" type="button">Refresh</button>
         </div>
-        <form class="inline-form" id="create-form" novalidate>
-          <input type="text" id="create-name" placeholder="new space name" autocomplete="off">
-          <button class="btn primary" type="submit" id="create-btn">Create</button>
-        </form>
-        <p class="form-error" id="create-error" role="alert" hidden></p>
         <div id="spaces-list">
           <div class="state"><span class="spin"></span>Loading&hellip;</div>
         </div>
@@ -69,22 +64,12 @@ if (location.protocol === 'file:') {
         <div id="detail-main" hidden>
           <div class="panel-head">
             <h2 id="detail-title"></h2>
-            <div class="row-actions" id="detail-actions"></div>
           </div>
-          <form class="inline-form" id="commit-form" novalidate>
-            <input type="text" id="commit-note" placeholder="note for this save point" autocomplete="off">
-            <label class="check-row" title="Checkpoint while the space keeps running">
-              <input type="checkbox" id="commit-hot">hot
-            </label>
-            <button class="btn primary" type="submit" id="commit-btn">Commit</button>
-          </form>
-          <p class="form-hint" id="commit-hint"></p>
-          <p class="form-error" id="commit-error" role="alert" hidden></p>
+          <div class="cli-box" id="cli-box"></div>
           <div class="tabs" role="tablist">
             <button type="button" id="tab-log" role="tab" aria-selected="true" class="active">History</button>
             <button type="button" id="tab-reflog" role="tab" aria-selected="false">Archive</button>
           </div>
-          <p class="tab-hint" id="tab-hint"></p>
           <div id="commit-list">
             <div class="state"><span class="spin"></span>Loading&hellip;</div>
           </div>
@@ -107,6 +92,7 @@ if (location.protocol === 'file:') {
         <div id="tokens-list">
           <div class="state"><span class="spin"></span>Loading&hellip;</div>
         </div>
+        <div class="cli-setup" id="cli-setup"></div>
         <p class="panel-foot"><span class="mono">Authorization: Bearer &lt;token&gt;</span></p>
       </section>
 
@@ -122,8 +108,6 @@ if (location.protocol === 'file:') {
 
   <footer class="footer">shinu console</footer>
 </div>
-
-<div id="modal-root" hidden></div>
 
 <script src="/assets/app.js" defer></script>
 </body>

@@ -259,10 +259,31 @@ pub mod state {
             amount INTEGER NOT NULL,
             "at" INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            email TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS memberships (
+            user_id TEXT NOT NULL,
+            project TEXT NOT NULL,
+            role TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, project)
+        );
+        CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS spaces_project_name ON spaces(project, name);
         CREATE INDEX IF NOT EXISTS ckpts_project ON ckpts(project);
         CREATE INDEX IF NOT EXISTS ckpts_space ON ckpts(space);
         CREATE INDEX IF NOT EXISTS usage_events_project_at ON usage_events(project, "at");
+        CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
+        CREATE INDEX IF NOT EXISTS memberships_project ON memberships(project);
     "#;
 
     fn init_schema(conn: &Connection) -> crate::Result<()> {
@@ -490,6 +511,127 @@ pub mod state {
             .map_err(|error| crate::Error::Invalid(format!("space count out of range: {error}")))
     }
 
+    fn normalize_email(email: &str) -> String {
+        email.trim().to_lowercase()
+    }
+
+
+    pub fn create_user(
+        conn: &Connection,
+        email: &str,
+        password_hash: &str,
+    ) -> crate::Result<(String, String)> {
+        let email = normalize_email(email);
+        let user_id = Uuid::new_v4().to_string();
+        // A random UUID-derived project keeps email identity and user-controlled
+        // characters out of project paths.
+        let compact_id = user_id.replace('-', "");
+        let project = compact_id[..12].to_owned();
+        let created_at = Utc::now().to_rfc3339();
+        let tx = conn.unchecked_transaction()?;
+
+        if let Err(error) = tx.execute(
+            "INSERT INTO users (id, email, password_hash, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![user_id, email, password_hash, created_at],
+        ) {
+            if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
+                return Err(crate::Error::Invalid(
+                    "an account with this email already exists".into(),
+                ));
+            }
+            return Err(error.into());
+        }
+        tx.execute(
+            "INSERT INTO memberships (user_id, project, role, created_at) VALUES (?1, ?2, 'owner', ?3)",
+            params![user_id, project, created_at],
+        )?;
+        tx.commit()?;
+        Ok((user_id, project))
+    }
+
+    pub fn find_user_by_email(
+        conn: &Connection,
+        email: &str,
+    ) -> crate::Result<Option<(String, String)>> {
+        let email = normalize_email(email);
+        conn.query_row(
+            "SELECT id, password_hash FROM users WHERE email = ?1 LIMIT 1",
+            params![email],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn user_project(conn: &Connection, user_id: &str) -> crate::Result<Option<String>> {
+        conn.query_row(
+            "SELECT project FROM memberships WHERE user_id = ?1 ORDER BY created_at LIMIT 1",
+            params![user_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn user_email(conn: &Connection, user_id: &str) -> crate::Result<Option<String>> {
+        conn.query_row(
+            "SELECT email FROM users WHERE id = ?1 LIMIT 1",
+            params![user_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn create_session(
+        conn: &Connection,
+        token_hash: &str,
+        user_id: &str,
+        days: i64,
+    ) -> crate::Result<()> {
+        let created_at = Utc::now();
+        let expires_at = created_at + chrono::Duration::days(days);
+        conn.execute(
+            "INSERT INTO sessions (id, user_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                token_hash,
+                user_id,
+                created_at.to_rfc3339(),
+                expires_at.to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn lookup_session(
+        conn: &Connection,
+        token_hash: &str,
+    ) -> crate::Result<Option<String>> {
+        // Both timestamps use UTC's RFC3339 representation, whose fields are
+        // ordered from most to least significant, so lexical order is time order.
+        let now = Utc::now().to_rfc3339();
+        conn.query_row(
+            "SELECT user_id FROM sessions WHERE id = ?1 AND expires_at > ?2 LIMIT 1",
+            params![token_hash, now],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn delete_session(conn: &Connection, token_hash: &str) -> crate::Result<()> {
+        conn.execute("DELETE FROM sessions WHERE id = ?1", params![token_hash])?;
+        Ok(())
+    }
+
+    pub fn purge_expired_sessions(conn: &Connection) -> crate::Result<usize> {
+        let now = Utc::now().to_rfc3339();
+        Ok(conn.execute(
+            "DELETE FROM sessions WHERE expires_at <= ?1",
+            params![now],
+        )?)
+    }
+
 
     pub fn record_usage(
         conn: &Connection,
@@ -636,6 +778,145 @@ pub mod state {
             };
             (state, space, ckpt)
         }
+        #[test]
+        fn user_schema_is_idempotent_in_memory() {
+            let conn = Connection::open_in_memory().expect("open memory database");
+            init_schema(&conn).expect("create schema");
+            init_schema(&conn).expect("reapply schema");
+            for table in ["users", "memberships", "sessions"] {
+                let count: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                        params![table],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(count, 1, "table {table} should exist once");
+            }
+        }
+
+        #[test]
+        fn create_user_round_trips_identity_and_membership() {
+            let conn = db();
+            let (user_id, project) = create_user(&conn, "  Alice@Example.COM ", "password-hash")
+                .expect("create user");
+            assert_eq!(user_email(&conn, &user_id).unwrap().as_deref(), Some("alice@example.com"));
+            assert_eq!(user_project(&conn, &user_id).unwrap(), Some(project.clone()));
+            assert_eq!(
+                find_user_by_email(&conn, "alice@example.com").unwrap(),
+                Some((user_id.clone(), "password-hash".into()))
+            );
+            assert_eq!(project.len(), 12);
+            assert!(project.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            let role: String = conn
+                .query_row(
+                    "SELECT role FROM memberships WHERE user_id = ?1 AND project = ?2",
+                    params![user_id, project],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(role, "owner");
+        }
+
+        #[test]
+        fn create_user_rejects_duplicate_email() {
+            let conn = db();
+            create_user(&conn, "duplicate@example.com", "first-hash").expect("first user");
+            let result = create_user(&conn, "duplicate@example.com", "second-hash");
+            assert!(matches!(
+                result,
+                Err(crate::Error::Invalid(message))
+                    if message == "an account with this email already exists"
+            ));
+        }
+
+        #[test]
+        fn create_user_treats_case_variants_as_duplicate() {
+            let conn = db();
+            create_user(&conn, "Case@Example.com", "first-hash").expect("first user");
+            assert!(create_user(&conn, " case@example.COM ", "second-hash").is_err());
+        }
+
+        #[test]
+        fn find_user_by_email_is_case_insensitive() {
+            let conn = db();
+            let (user_id, _) = create_user(&conn, "Find@Example.com", "password-hash")
+                .expect("create user");
+            let found = find_user_by_email(&conn, "  fInD@eXAMPLE.COM ")
+                .expect("find user")
+                .expect("user exists");
+            assert_eq!(found, (user_id, "password-hash".into()));
+        }
+
+        #[test]
+        fn lookup_session_returns_user_for_active_session() {
+            let conn = db();
+            let (user_id, _) = create_user(&conn, "session@example.com", "password-hash")
+                .expect("create user");
+            create_session(&conn, "active-session", &user_id, 7).expect("create session");
+            assert_eq!(
+                lookup_session(&conn, "active-session").unwrap(),
+                Some(user_id)
+            );
+            delete_session(&conn, "active-session").expect("delete session");
+            assert!(lookup_session(&conn, "active-session").unwrap().is_none());
+        }
+
+        #[test]
+        fn lookup_session_rejects_expired_session() {
+            let conn = db();
+            let (user_id, _) = create_user(&conn, "expired@example.com", "password-hash")
+                .expect("create user");
+            let past = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+            conn.execute(
+                "INSERT INTO sessions (id, user_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+                params!["expired-session", user_id, past, past],
+            )
+            .unwrap();
+            assert!(lookup_session(&conn, "expired-session").unwrap().is_none());
+        }
+
+        #[test]
+        fn purge_expired_sessions_keeps_active_sessions() {
+            let conn = db();
+            let (user_id, _) = create_user(&conn, "purge@example.com", "password-hash")
+                .expect("create user");
+            let now = Utc::now();
+            let past = (now - chrono::Duration::days(1)).to_rfc3339();
+            let future = (now + chrono::Duration::days(1)).to_rfc3339();
+            conn.execute(
+                "INSERT INTO sessions (id, user_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+                params!["expired-session", user_id, past, past],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, user_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+                params!["active-session", user_id, now.to_rfc3339(), future],
+            )
+            .unwrap();
+            assert_eq!(purge_expired_sessions(&conn).unwrap(), 1);
+            assert!(lookup_session(&conn, "expired-session").unwrap().is_none());
+            assert!(lookup_session(&conn, "active-session").unwrap().is_some());
+        }
+
+        #[test]
+        fn create_user_rolls_back_when_membership_insert_fails() {
+            let conn = db();
+            conn.execute_batch(
+                "CREATE TRIGGER reject_membership BEFORE INSERT ON memberships BEGIN SELECT RAISE(ABORT, 'membership insert blocked'); END;",
+            )
+            .unwrap();
+            assert!(create_user(&conn, "rollback@example.com", "password-hash").is_err());
+            let users: i64 = conn
+                .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
+                .unwrap();
+            let memberships: i64 = conn
+                .query_row("SELECT COUNT(*) FROM memberships", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(users, 0);
+            assert_eq!(memberships, 0);
+        }
+
 
         #[test]
         fn open_is_idempotent_and_restricts_database_permissions() {
@@ -644,12 +925,12 @@ pub mod state {
             let conn = open(&root).expect("second open");
             let tables: i64 = conn
                 .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('spaces', 'ckpts', 'projects', 'usage_events')",
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('spaces', 'ckpts', 'projects', 'usage_events', 'users', 'memberships', 'sessions')",
                     [],
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(tables, 4);
+            assert_eq!(tables, 7);
             let journal_mode: String = conn
                 .query_row("PRAGMA journal_mode", [], |row| row.get(0))
                 .unwrap();
@@ -840,6 +1121,273 @@ pub mod registry {
     }
 }
 
+mod sha2 {
+    const INITIAL_STATE: [u32; 8] = [
+        0x6a09e667,
+        0xbb67ae85,
+        0x3c6ef372,
+        0xa54ff53a,
+        0x510e527f,
+        0x9b05688c,
+        0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    const ROUND_CONSTANTS: [u32; 64] = [
+        0x428a2f98,
+        0x71374491,
+        0xb5c0fbcf,
+        0xe9b5dba5,
+        0x3956c25b,
+        0x59f111f1,
+        0x923f82a4,
+        0xab1c5ed5,
+        0xd807aa98,
+        0x12835b01,
+        0x243185be,
+        0x550c7dc3,
+        0x72be5d74,
+        0x80deb1fe,
+        0x9bdc06a7,
+        0xc19bf174,
+        0xe49b69c1,
+        0xefbe4786,
+        0x0fc19dc6,
+        0x240ca1cc,
+        0x2de92c6f,
+        0x4a7484aa,
+        0x5cb0a9dc,
+        0x76f988da,
+        0x983e5152,
+        0xa831c66d,
+        0xb00327c8,
+        0xbf597fc7,
+        0xc6e00bf3,
+        0xd5a79147,
+        0x06ca6351,
+        0x14292967,
+        0x27b70a85,
+        0x2e1b2138,
+        0x4d2c6dfc,
+        0x53380d13,
+        0x650a7354,
+        0x766a0abb,
+        0x81c2c92e,
+        0x92722c85,
+        0xa2bfe8a1,
+        0xa81a664b,
+        0xc24b8b70,
+        0xc76c51a3,
+        0xd192e819,
+        0xd6990624,
+        0xf40e3585,
+        0x106aa070,
+        0x19a4c116,
+        0x1e376c08,
+        0x2748774c,
+        0x34b0bcb5,
+        0x391c0cb3,
+        0x4ed8aa4a,
+        0x5b9cca4f,
+        0x682e6ff3,
+        0x748f82ee,
+        0x78a5636f,
+        0x84c87814,
+        0x8cc70208,
+        0x90befffa,
+        0xa4506ceb,
+        0xbef9a3f7,
+        0xc67178f2,
+    ];
+
+    #[derive(Clone)]
+    pub struct Sha256State {
+        digest: [u32; 8],
+        block: [u8; 64],
+        block_len: usize,
+        message_len: u64,
+    }
+
+    impl Sha256State {
+        pub fn new() -> Self {
+            Self {
+                digest: INITIAL_STATE,
+                block: [0; 64],
+                block_len: 0,
+                message_len: 0,
+            }
+        }
+
+        pub fn update(&mut self, mut bytes: &[u8]) {
+            self.message_len = self.message_len.wrapping_add(bytes.len() as u64);
+            if self.block_len != 0 {
+                let copied = (64 - self.block_len).min(bytes.len());
+                self.block[self.block_len..self.block_len + copied]
+                    .copy_from_slice(&bytes[..copied]);
+                self.block_len += copied;
+                bytes = &bytes[copied..];
+                if self.block_len == 64 {
+                    compress(&mut self.digest, &self.block);
+                    self.block_len = 0;
+                }
+            }
+            while bytes.len() >= 64 {
+                compress(&mut self.digest, &bytes[..64]);
+                bytes = &bytes[64..];
+            }
+            if !bytes.is_empty() {
+                self.block[..bytes.len()].copy_from_slice(bytes);
+                self.block_len = bytes.len();
+            }
+        }
+
+        pub fn finish(mut self) -> [u8; 32] {
+            let bit_len = self.message_len.wrapping_mul(8);
+            self.block[self.block_len] = 0x80;
+            self.block_len += 1;
+            if self.block_len > 56 {
+                self.block[self.block_len..].fill(0);
+                compress(&mut self.digest, &self.block);
+                self.block = [0; 64];
+                self.block_len = 0;
+            }
+            self.block[self.block_len..56].fill(0);
+            self.block[56..].copy_from_slice(&bit_len.to_be_bytes());
+            compress(&mut self.digest, &self.block);
+
+            let mut output = [0; 32];
+            for (index, word) in self.digest.iter().enumerate() {
+                output[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
+            }
+            output
+        }
+    }
+
+    fn compress(state: &mut [u32; 8], block: &[u8]) {
+        let mut schedule = [0_u32; 64];
+        for (index, word) in schedule.iter_mut().take(16).enumerate() {
+            let offset = index * 4;
+            *word = u32::from_be_bytes([
+                block[offset],
+                block[offset + 1],
+                block[offset + 2],
+                block[offset + 3],
+            ]);
+        }
+        for index in 16..64 {
+            let small_sigma_0 = schedule[index - 15].rotate_right(7)
+                ^ schedule[index - 15].rotate_right(18)
+                ^ (schedule[index - 15] >> 3);
+            let small_sigma_1 = schedule[index - 2].rotate_right(17)
+                ^ schedule[index - 2].rotate_right(19)
+                ^ (schedule[index - 2] >> 10);
+            schedule[index] = schedule[index - 16]
+                .wrapping_add(small_sigma_0)
+                .wrapping_add(schedule[index - 7])
+                .wrapping_add(small_sigma_1);
+        }
+
+        let mut working = *state;
+        for (&constant, &word) in ROUND_CONSTANTS.iter().zip(schedule.iter()) {
+            let [a, b, c, d, e, f, g, h] = working;
+            let big_sigma_1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choose = (e & f) ^ ((!e) & g);
+            let temp_1 = h
+                .wrapping_add(big_sigma_1)
+                .wrapping_add(choose)
+                .wrapping_add(constant)
+                .wrapping_add(word);
+            let big_sigma_0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let temp_2 = big_sigma_0.wrapping_add(majority);
+            working = [
+                temp_1.wrapping_add(temp_2),
+                a,
+                b,
+                c,
+                d.wrapping_add(temp_1),
+                e,
+                f,
+                g,
+            ];
+        }
+        for (state_word, working_word) in state.iter_mut().zip(working) {
+            *state_word = state_word.wrapping_add(working_word);
+        }
+    }
+
+    pub fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+        let mut state = Sha256State::new();
+        state.update(bytes);
+        state.finish()
+    }
+
+
+    pub fn sha256_hex(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut output = String::with_capacity(64);
+        for byte in sha256_bytes(bytes) {
+            output.push(HEX[(byte >> 4) as usize] as char);
+            output.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        output
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{sha256_hex, Sha256State};
+
+        #[test]
+        fn nist_empty_message_vector() {
+            assert_eq!(
+                sha256_hex(b""),
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            );
+        }
+
+        #[test]
+        fn nist_abc_vector() {
+            assert_eq!(
+                sha256_hex(b"abc"),
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+            );
+        }
+
+        #[test]
+        fn incremental_updates_preserve_partial_blocks() {
+            let mut state = Sha256State::new();
+            state.update(b"a");
+            state.update(b"b");
+            state.update(b"c");
+            let digest = state.finish();
+            let expected = sha256_hex(b"abc");
+            let actual = digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            assert_eq!(actual, expected);
+        }
+
+        #[test]
+        fn nist_448_bit_vector() {
+            assert_eq!(
+                sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+                "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+            );
+        }
+
+        #[test]
+        fn nist_multi_block_vector() {
+            let message = vec![b'a'; 1_000_000];
+            assert_eq!(
+                sha256_hex(&message),
+                "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+            );
+        }
+    }
+}
+
+pub use sha2::sha256_hex;
+
 /// Project bearer-token persistence and authentication.
 ///
 /// Only SHA-256 hashes are stored in `<root>/tokens.json`; the plaintext token
@@ -848,10 +1396,9 @@ pub mod registry {
 pub mod token {
     use chrono::{DateTime, Utc};
     use serde::{Deserialize, Serialize};
-    use std::io::{Read, Write};
+    use std::io::Read;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
-    use std::process::{Command, Stdio};
 
     #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
     pub struct Token {
@@ -890,37 +1437,16 @@ pub mod token {
         Ok(token)
     }
 
-    fn sha256_stdin(plain: &str) -> crate::Result<String> {
-        let mut child = Command::new("sha256sum")
-            .arg("-")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()?;
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            crate::Error::Invalid("sha256sum stdin unavailable".to_owned())
-        })?;
-        stdin.write_all(plain.as_bytes())?;
-        drop(stdin);
-
-        let output = child.wait_with_output()?;
-        if !output.status.success() {
-            return Err(crate::Error::Invalid(format!(
-                "sha256sum failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
-        String::from_utf8_lossy(&output.stdout)
-            .split_whitespace()
-            .next()
-            .map(str::to_owned)
-            .ok_or_else(|| crate::Error::Invalid("empty sha256sum output".to_owned()))
-    }
 
     pub fn hash(plain: &str) -> String {
-        sha256_stdin(plain).unwrap_or_else(|error| panic!("sha256sum failed: {error}"))
+        // Token values are short and hashed for every request, so pure Rust
+        // avoids forking a process on each authentication attempt. The
+        // one-shot shell call in `sha256_file` below intentionally remains for
+        // streaming multi-gigabyte downloads without buffering them in memory.
+        crate::sha2::sha256_hex(plain.as_bytes())
     }
 
-    fn constant_time_eq(left: &str, right: &str) -> bool {
+    pub(super) fn constant_time_eq(left: &str, right: &str) -> bool {
         let left = left.as_bytes();
         let right = right.as_bytes();
         let mut difference = left.len() ^ right.len();
@@ -1017,6 +1543,296 @@ pub mod token {
                 & 0o777;
             assert_eq!(mode, 0o600);
             std::fs::remove_dir_all(root).expect("remove token test root");
+        }
+    }
+}
+/// Password hashing and browser-session token generation for console users.
+pub mod auth {
+    use std::io::Read;
+
+    const PASSWORD_ITERATIONS: u32 = 210_000;
+    const PASSWORD_SALT_BYTES: usize = 32;
+    const PASSWORD_HASH_BYTES: usize = 32;
+
+    fn hex_value(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    fn encode_hex(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut output = String::with_capacity(bytes.len() * 2);
+        for &byte in bytes {
+            output.push(HEX[(byte >> 4) as usize] as char);
+            output.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        output
+    }
+
+    fn decode_hex(value: &str) -> Option<Vec<u8>> {
+        let bytes = value.as_bytes();
+        if !bytes.len().is_multiple_of(2) {
+            return None;
+        }
+        let mut decoded = Vec::with_capacity(bytes.len() / 2);
+        for pair in bytes.chunks_exact(2) {
+            decoded.push((hex_value(pair[0])? << 4) | hex_value(pair[1])?);
+        }
+        Some(decoded)
+    }
+
+    struct HmacSha256 {
+        inner: crate::sha2::Sha256State,
+        outer: crate::sha2::Sha256State,
+    }
+
+    impl HmacSha256 {
+        fn new(key: &[u8]) -> Self {
+            let mut key_block = [0_u8; 64];
+            if key.len() > key_block.len() {
+                key_block[..32].copy_from_slice(&crate::sha2::sha256_bytes(key));
+            } else {
+                key_block[..key.len()].copy_from_slice(key);
+            }
+
+            let mut inner_pad = [0x36_u8; 64];
+            let mut outer_pad = [0x5c_u8; 64];
+            for index in 0..key_block.len() {
+                inner_pad[index] ^= key_block[index];
+                outer_pad[index] ^= key_block[index];
+            }
+
+            let mut inner = crate::sha2::Sha256State::new();
+            inner.update(&inner_pad);
+            let mut outer = crate::sha2::Sha256State::new();
+            outer.update(&outer_pad);
+            Self { inner, outer }
+        }
+
+        fn digest(&self, message: &[u8]) -> [u8; 32] {
+            let mut inner = self.inner.clone();
+            inner.update(message);
+            let inner_hash = inner.finish();
+            let mut outer = self.outer.clone();
+            outer.update(&inner_hash);
+            outer.finish()
+        }
+    }
+
+    fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+        HmacSha256::new(key).digest(message)
+    }
+
+    fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]) {
+        if iterations == 0 || out.is_empty() {
+            return;
+        }
+        let block_count = out.len() / 32 + usize::from(!out.len().is_multiple_of(32));
+        assert!(block_count <= u32::MAX as usize);
+        let hmac = HmacSha256::new(password);
+        for block_index in 1..=block_count {
+            let mut salt_block = Vec::with_capacity(salt.len() + 4);
+            salt_block.extend_from_slice(salt);
+            salt_block.extend_from_slice(&(block_index as u32).to_be_bytes());
+
+            let mut u = hmac_sha256(password, &salt_block);
+            let mut block = u;
+            for _ in 1..iterations {
+                u = hmac.digest(&u);
+                for (accumulator, next) in block.iter_mut().zip(u) {
+                    *accumulator ^= next;
+                }
+            }
+
+            let offset = (block_index - 1) * 32;
+            let length = (out.len() - offset).min(32);
+            out[offset..offset + length].copy_from_slice(&block[..length]);
+        }
+    }
+    /// Hashes a password with a self-describing PBKDF2-HMAC-SHA256 record.
+    pub fn hash_password(plain: &str) -> crate::Result<String> {
+        let mut salt = [0_u8; PASSWORD_SALT_BYTES];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut salt)?;
+        let mut derived = [0_u8; PASSWORD_HASH_BYTES];
+        pbkdf2_sha256(
+            plain.as_bytes(),
+            &salt,
+            PASSWORD_ITERATIONS,
+            &mut derived,
+        );
+        Ok(format!(
+            "pbkdf2${PASSWORD_ITERATIONS}${}${}",
+            encode_hex(&salt),
+            encode_hex(&derived)
+        ))
+    }
+
+    /// Verifies a password using the iteration count encoded in its record.
+    pub fn verify_password(plain: &str, stored: &str) -> bool {
+        let mut fields = stored.split('$');
+        if fields.next() != Some("pbkdf2") {
+            return false;
+        }
+        let Some(iterations) = fields.next().and_then(|value| value.parse::<u32>().ok()) else {
+            return false;
+        };
+        let Some(salt_hex) = fields.next() else {
+            return false;
+        };
+        let Some(hash_hex) = fields.next() else {
+            return false;
+        };
+        if fields.next().is_some()
+            || iterations == 0
+            || salt_hex.len() != PASSWORD_SALT_BYTES * 2
+            || hash_hex.len() != PASSWORD_HASH_BYTES * 2
+        {
+            return false;
+        }
+        let Some(salt) = decode_hex(salt_hex) else {
+            return false;
+        };
+        let Some(expected) = decode_hex(hash_hex) else {
+            return false;
+        };
+        if salt.len() != PASSWORD_SALT_BYTES || expected.len() != PASSWORD_HASH_BYTES {
+            return false;
+        }
+
+        let mut derived = [0_u8; PASSWORD_HASH_BYTES];
+        pbkdf2_sha256(plain.as_bytes(), &salt, iterations, &mut derived);
+        let derived_hex = encode_hex(&derived);
+        let expected_hex = encode_hex(&expected);
+        crate::token::constant_time_eq(&derived_hex, &expected_hex)
+    }
+
+    /// Creates a bearer-like random value for the browser session cookie.
+    pub fn new_session_token() -> crate::Result<String> {
+        // Keep session randomness identical to project-token randomness: both
+        // are 256-bit values read directly from the kernel CSPRNG.
+        crate::token::mint()
+    }
+
+    #[cfg(test)]
+    mod auth_tests {
+        use super::{
+            hash_password, hmac_sha256, new_session_token, pbkdf2_sha256, verify_password,
+            PASSWORD_HASH_BYTES, PASSWORD_SALT_BYTES,
+        };
+        use std::time::{Duration, Instant};
+
+        fn hex(bytes: &[u8]) -> String {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        }
+
+        #[test]
+        fn hmac_matches_rfc_4231_short_key_vector() {
+            let key = [0x0b_u8; 20];
+            let digest = hmac_sha256(&key, b"Hi There");
+            assert_eq!(
+                hex(&digest),
+                "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+            );
+        }
+
+        #[test]
+        fn hmac_matches_rfc_4231_long_key_vector() {
+            let key = [0xaa_u8; 131];
+            let digest = hmac_sha256(
+                &key,
+                b"Test Using Larger Than Block-Size Key - Hash Key First",
+            );
+            assert_eq!(
+                hex(&digest),
+                "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+            );
+        }
+
+        #[test]
+        fn pbkdf2_matches_sha256_vector_and_is_input_sensitive() {
+            let mut expected = [0_u8; 32];
+            pbkdf2_sha256(b"password", b"salt", 1, &mut expected);
+            assert_eq!(
+                hex(&expected),
+                "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b"
+            );
+
+            let mut same = [0_u8; 32];
+            pbkdf2_sha256(b"password", b"salt", 1, &mut same);
+            assert_eq!(expected, same);
+            let mut other_salt = [0_u8; 32];
+            pbkdf2_sha256(b"password", b"salt2", 1, &mut other_salt);
+            assert_ne!(expected, other_salt);
+            let mut other_iterations = [0_u8; 32];
+            pbkdf2_sha256(b"password", b"salt", 2, &mut other_iterations);
+            assert_ne!(expected, other_iterations);
+        }
+
+        #[test]
+        fn verification_uses_the_recorded_iteration_count() {
+            let salt = [0x42_u8; PASSWORD_SALT_BYTES];
+            let mut derived = [0_u8; PASSWORD_HASH_BYTES];
+            pbkdf2_sha256(b"recorded iterations", &salt, 1, &mut derived);
+            let stored = format!("pbkdf2$1${}${}", hex(&salt), hex(&derived));
+            assert!(verify_password("recorded iterations", &stored));
+        }
+
+        #[test]
+        fn password_records_round_trip_and_reject_tampering() {
+            let stored = hash_password("correct horse battery staple").expect("hash password");
+            assert!(verify_password("correct horse battery staple", &stored));
+            assert!(!verify_password("wrong password", &stored));
+
+            let mut tampered = stored.clone();
+            let index = tampered.rfind('$').expect("hash separator") + 1;
+            let replacement = if tampered.as_bytes()[index] == b'0' { '1' } else { '0' };
+            tampered.replace_range(index..index + 1, &replacement.to_string());
+            assert!(!verify_password("correct horse battery staple", &tampered));
+        }
+
+        #[test]
+        fn malformed_password_records_return_false() {
+            for stored in [
+                "",
+                "sha256$210000$00$00",
+                "pbkdf2$0$00$00",
+                "pbkdf2$not-a-number$00$00",
+                "pbkdf2$1$not-hex$00",
+                "pbkdf2$1$00$00",
+                "pbkdf2$1$0000000000000000000000000000000000000000000000000000000000000000$xyz",
+                "pbkdf2$1$0000000000000000000000000000000000000000000000000000000000000000$0000000000000000000000000000000000000000000000000000000000000000$extra",
+            ] {
+                assert!(!verify_password("anything", stored), "accepted {stored:?}");
+            }
+        }
+
+        #[test]
+        fn session_tokens_are_random_hex_values() {
+            let first = new_session_token().expect("first session token");
+            let second = new_session_token().expect("second session token");
+            assert_eq!(first.len(), 64);
+            assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+            assert_ne!(first, second);
+        }
+
+        #[test]
+        fn password_hashing_stays_below_two_seconds() {
+            let start = Instant::now();
+            let stored = hash_password("performance password").expect("hash password");
+            let elapsed = start.elapsed();
+            eprintln!("hash_password elapsed: {elapsed:?}");
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "hash_password took too long: {elapsed:?}"
+            );
+            assert!(verify_password("performance password", &stored));
         }
     }
 }
@@ -1515,6 +2331,8 @@ mod base_tests {
     }
 }
 
+// Large downloaded artifacts can be gigabytes, so let `sha256sum` stream the
+// file instead of buffering it through the in-memory token hashing helper.
 fn sha256_file(path: &Path) -> Result<String> {
     let output = std::process::Command::new("sha256sum").arg(path).output()?;
     if !output.status.success() {
@@ -3872,6 +4690,10 @@ pub mod http {
         pub path: String,
         pub token: Option<String>,
         pub body: Vec<u8>,
+        pub cookies: std::collections::HashMap<String, String>,
+        pub origin: Option<String>,
+        pub forwarded_proto: Option<String>,
+        pub host: Option<String>,
     }
 
     fn invalid(message: impl Into<String>) -> crate::Error {
@@ -3973,6 +4795,24 @@ pub mod http {
         String::from_utf8(token.to_vec()).ok()
     }
 
+    pub fn parse_cookies(header: &str) -> std::collections::HashMap<String, String> {
+        let mut cookies = std::collections::HashMap::new();
+        for part in header.split(';') {
+            let part = part.trim();
+            let Some((name, value)) = part.split_once('=') else {
+                continue;
+            };
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            // Split only at the first equals sign: cookie values may contain
+            // additional equals signs even though session tokens do not.
+            cookies.insert(name.to_owned(), value.trim().to_owned());
+        }
+        cookies
+    }
+
     pub fn parse(stream: &mut impl BufRead) -> crate::Result<Request> {
         let mut header_bytes = 0;
         let request_line = read_line(stream, &mut header_bytes)?
@@ -4001,6 +4841,10 @@ pub mod http {
         let method = bytes_to_string(method, "method")?;
         let path = bytes_to_string(path, "path")?;
         let mut token = None;
+        let mut cookies = std::collections::HashMap::new();
+        let mut origin = None;
+        let mut forwarded_proto = None;
+        let mut host = None;
         let mut content_length = None;
         let mut header_count = 0;
         loop {
@@ -4048,6 +4892,15 @@ pub mod http {
                 // A malformed scheme is left as no token so the auth layer
                 // returns its uniform 401 rather than exposing parser detail.
                 token = bearer_token(value);
+            } else if ascii_case_eq(name, b"Cookie") {
+                let value = bytes_to_string(value, "Cookie")?;
+                cookies.extend(parse_cookies(&value));
+            } else if ascii_case_eq(name, b"Origin") {
+                origin = Some(bytes_to_string(value, "Origin")?);
+            } else if ascii_case_eq(name, b"X-Forwarded-Proto") {
+                forwarded_proto = Some(bytes_to_string(value, "X-Forwarded-Proto")?);
+            } else if ascii_case_eq(name, b"Host") {
+                host = Some(bytes_to_string(value, "Host")?);
             }
         }
 
@@ -4063,12 +4916,17 @@ pub mod http {
             path,
             token,
             body,
+            cookies,
+            origin,
+            forwarded_proto,
+            host,
         })
     }
 
     fn reason_phrase(status: u16) -> &'static str {
         match status {
             200 => "OK",
+            302 => "Found",
             201 => "Created",
             400 => "Bad Request",
             401 => "Unauthorized",
@@ -4096,6 +4954,93 @@ pub mod http {
             body.len()
         )?;
         writer.write_all(&body)
+    }
+
+    pub fn respond_html(
+        writer: &mut impl Write,
+        status: u16,
+        body: &str,
+    ) -> io::Result<()> {
+        let body = body.as_bytes();
+        write!(
+            writer,
+            "HTTP/1.1 {status} {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            reason_phrase(status),
+            body.len()
+        )?;
+        writer.write_all(body)
+    }
+
+    fn asset_content_type(path: &str) -> &'static str {
+        let path = path.split_once('?').map_or(path, |(path, _)| path);
+        let extension = path.rsplit_once('.').map_or("", |(_, extension)| extension);
+        if extension.eq_ignore_ascii_case("html") {
+            "text/html; charset=utf-8"
+        } else if extension.eq_ignore_ascii_case("css") {
+            "text/css"
+        } else if extension.eq_ignore_ascii_case("js") {
+            "text/javascript"
+        } else if extension.eq_ignore_ascii_case("svg") {
+            "image/svg+xml"
+        } else if extension.eq_ignore_ascii_case("ico") {
+            "image/x-icon"
+        } else {
+            "application/octet-stream"
+        }
+    }
+
+    pub fn respond_asset(
+        writer: &mut impl Write,
+        path: &str,
+        body: &[u8],
+    ) -> io::Result<()> {
+        // Demo assets are embedded in the binary and change with each build;
+        // no-cache avoids pairing a cached JS bundle with a newer API.
+        write!(
+            writer,
+            "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            asset_content_type(path),
+            body.len()
+        )?;
+        writer.write_all(body)
+    }
+
+    pub fn respond_redirect(writer: &mut impl Write, location: &str) -> io::Result<()> {
+        write!(
+            writer,
+            "HTTP/1.1 302 {}\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            reason_phrase(302)
+        )
+    }
+
+    pub fn respond_with_cookie(
+        writer: &mut impl Write,
+        status: u16,
+        body: &serde_json::Value,
+        cookie: &str,
+    ) -> io::Result<()> {
+        let body = serde_json::to_vec(body).map_err(json_io_error)?;
+        write!(
+            writer,
+            "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nSet-Cookie: {cookie}\r\nConnection: close\r\n\r\n",
+            reason_phrase(status),
+            body.len()
+        )?;
+        writer.write_all(&body)
+    }
+
+    /// Build a session cookie. `Secure` must only be enabled for HTTPS
+    /// requests; adding it during local HTTP development makes browsers
+    /// discard the cookie and leaves a successful login immediately unauthenticated.
+    pub fn set_cookie(name: &str, value: &str, secure: bool, max_age: u64) -> String {
+        let secure_suffix = if secure { "; Secure" } else { "" };
+        format!(
+            "{name}={value}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}{secure_suffix}"
+        )
+    }
+
+    pub fn clear_cookie(name: &str) -> String {
+        format!("{name}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
     }
 
     pub fn respond_chunked_start(writer: &mut impl Write) -> io::Result<()> {
@@ -4172,6 +5117,131 @@ pub mod http {
             let request = parse(&mut input).unwrap();
             assert_eq!(request.body, b"xyz");
             assert_eq!(request.token.as_deref(), Some("abc"));
+        }
+
+        #[test]
+        fn parses_single_cookie() {
+            let cookies = parse_cookies("shinu_session=abc123");
+            assert_eq!(cookies.len(), 1);
+            assert_eq!(
+                cookies.get("shinu_session").map(String::as_str),
+                Some("abc123")
+            );
+        }
+
+        #[test]
+        fn parses_multiple_cookies() {
+            let cookies = parse_cookies("first=one; second=two; third=three");
+            assert_eq!(cookies.len(), 3);
+            assert_eq!(cookies.get("first").map(String::as_str), Some("one"));
+            assert_eq!(cookies.get("second").map(String::as_str), Some("two"));
+            assert_eq!(cookies.get("third").map(String::as_str), Some("three"));
+        }
+
+        #[test]
+        fn trims_cookie_names_and_values() {
+            let cookies = parse_cookies("  first = one  ;\tsecond=two\t");
+            assert_eq!(cookies.get("first").map(String::as_str), Some("one"));
+            assert_eq!(cookies.get("second").map(String::as_str), Some("two"));
+        }
+
+        #[test]
+        fn parses_empty_cookie_and_preserves_later_equals() {
+            let cookies = parse_cookies("empty=; encoded=a=b=c");
+            assert_eq!(cookies.get("empty").map(String::as_str), Some(""));
+            assert_eq!(
+                cookies.get("encoded").map(String::as_str),
+                Some("a=b=c")
+            );
+        }
+
+        #[test]
+        fn parses_console_request_metadata_case_insensitively() {
+            let mut input = Cursor::new(
+                b"GET /app HTTP/1.1\r\nhOsT: console.test:8080\r\noRiGiN: https://console.test\r\nx-fOrWaRdEd-PrOtO: https\r\ncOoKiE: shinu_session=abc123; theme=dark\r\n\r\n",
+            );
+            let request = parse(&mut input).unwrap();
+            assert_eq!(
+                request.cookies.get("shinu_session").map(String::as_str),
+                Some("abc123")
+            );
+            assert_eq!(request.cookies.get("theme").map(String::as_str), Some("dark"));
+            assert_eq!(request.origin.as_deref(), Some("https://console.test"));
+            assert_eq!(request.forwarded_proto.as_deref(), Some("https"));
+            assert_eq!(request.host.as_deref(), Some("console.test:8080"));
+        }
+
+        #[test]
+        fn omits_secure_attribute_for_http_cookie() {
+            assert_eq!(
+                set_cookie("shinu_session", "abc123", false, 604800),
+                "shinu_session=abc123; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800"
+            );
+        }
+
+        #[test]
+        fn adds_secure_attribute_for_https_cookie() {
+            let cookie = set_cookie("shinu_session", "abc123", true, 604800);
+            assert!(cookie.ends_with("; Secure"));
+            assert!(cookie.contains("Max-Age=604800"));
+        }
+
+        #[test]
+        fn clears_cookie_with_zero_max_age() {
+            assert_eq!(
+                clear_cookie("shinu_session"),
+                "shinu_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
+            );
+        }
+
+        #[test]
+        fn responds_with_asset_mime_types_and_no_cache() {
+            let cases = [
+                ("app.css", "text/css"),
+                ("app.js", "text/javascript"),
+                ("page.html", "text/html; charset=utf-8"),
+                ("data.bin", "application/octet-stream"),
+            ];
+            for (path, mime) in cases {
+                let mut output = Vec::new();
+                respond_asset(&mut output, path, b"asset").unwrap();
+                let response = String::from_utf8(output).unwrap();
+                assert!(response.contains(format!("Content-Type: {mime}\r\n").as_str()));
+                assert!(response.contains("Cache-Control: no-cache\r\n"));
+            }
+        }
+
+        #[test]
+        fn responds_with_html_content_type() {
+            let mut output = Vec::new();
+            respond_html(&mut output, 200, "<main>ok</main>").unwrap();
+            let response = String::from_utf8(output).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
+            assert!(response.contains("Content-Type: text/html; charset=utf-8\r\n"));
+            assert!(response.ends_with("<main>ok</main>"));
+        }
+
+        #[test]
+        fn responds_with_redirect_location() {
+            let mut output = Vec::new();
+            respond_redirect(&mut output, "/login").unwrap();
+            let response = String::from_utf8(output).unwrap();
+            assert!(response.starts_with("HTTP/1.1 302 Found\r\n"));
+            assert!(response.contains("Location: /login\r\n"));
+        }
+
+        #[test]
+        fn responds_with_cookie_and_json_byte_length() {
+            let body = json!({"ok": true});
+            let serialized = serde_json::to_vec(&body).unwrap();
+            let mut output = Vec::new();
+            respond_with_cookie(&mut output, 201, &body, "shinu_session=abc123; Path=/").unwrap();
+            let response = String::from_utf8_lossy(&output);
+            assert!(response.contains("Set-Cookie: shinu_session=abc123; Path=/\r\n"));
+            assert!(response.contains(
+                format!("Content-Length: {}\r\n", serialized.len()).as_str()
+            ));
+            assert!(output.ends_with(&serialized));
         }
 
         #[test]

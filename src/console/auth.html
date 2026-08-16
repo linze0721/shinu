@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>shinu — log in</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/assets/app.css">
+<script>
+/* Served by shinud from /assets/…. When the file is opened straight from
+   disk (file://) those absolute paths miss; fall back to the sibling files
+   so the page still renders for local preview. */
+if (location.protocol === 'file:') {
+  var fallbackCss = document.createElement('link');
+  fallbackCss.rel = 'stylesheet';
+  fallbackCss.href = 'app.css';
+  document.head.appendChild(fallbackCss);
+  var fallbackJs = document.createElement('script');
+  fallbackJs.src = 'app.js';
+  fallbackJs.defer = true;
+  document.head.appendChild(fallbackJs);
+}
+</script>
+</head>
+<body data-page="auth">
+<main class="auth-wrap">
+  <div class="auth-card">
+    <div class="brand">shinu<span class="brand-accent">.</span></div>
+    <p class="tagline">Rewindable sandboxes. Break things, check out back.</p>
+
+    <div class="mode-tabs" role="tablist">
+      <button type="button" id="tab-login" role="tab" aria-selected="true">Log in</button>
+      <button type="button" id="tab-register" role="tab" aria-selected="false">Register</button>
+    </div>
+
+    <form id="auth-form" novalidate>
+      <label class="field">
+        <span>Email</span>
+        <input type="email" id="email" autocomplete="email" required>
+      </label>
+      <label class="field">
+        <span>Password</span>
+        <input type="password" id="password" autocomplete="current-password" required>
+      </label>
+      <p class="form-hint" id="password-hint" hidden>At least 12 characters.</p>
+      <p class="form-error" id="form-error" role="alert" hidden></p>
+      <button type="submit" class="btn primary block" id="submit-btn">Log in</button>
+    </form>
+
+    <p class="auth-foot">Registering creates your account and a dedicated project.</p>
+  </div>
+</main>
+<script src="/assets/app.js" defer></script>
+</body>
+</html>

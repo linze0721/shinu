@@ -1,13 +1,14 @@
 use chrono::Utc;
 use clap::Parser;
 use serde_json::{Value, json};
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use rusqlite::Connection;
@@ -18,6 +19,20 @@ use shinu::{
     registry::Registry,
     state::{self, Ckpt, Space, State},
 };
+
+const AUTH_HTML: &str = include_str!("../console/auth.html");
+const APP_HTML: &str = include_str!("../console/index.html");
+const APP_CSS: &str = include_str!("../console/app.css");
+const APP_JS: &str = include_str!("../console/app.js");
+const SESSION_COOKIE: &str = "shinu_session";
+const SESSION_DEFAULT_DAYS: i64 = 7;
+const SESSION_MAX_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
+const REGISTER_REQUESTS_PER_HOUR: usize = 5;
+const LOGIN_FAILURE_MESSAGE: &str = "invalid email or password";
+const DUMMY_PASSWORD_HASH: &str =
+    "pbkdf2$210000$0000000000000000000000000000000000000000000000000000000000000000$0000000000000000000000000000000000000000000000000000000000000000";
+
+
 
 #[derive(Parser)]
 #[command(name = "shinud")]
@@ -42,6 +57,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let net_cfg = shinu::NetConfig::from_env()?;
     let limits = Limits::from_env();
     let rate = RateLimiter::new();
+    // Registration has its own IP-keyed limiter so API traffic cannot consume
+    // the account-creation allowance (and vice versa).
+    let register_rate = RegistrationLimiter::new();
 
     let listen = std::env::var("SHINU_LISTEN")
         .ok()
@@ -54,6 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let net_cfg = Arc::new(net_cfg);
     let limits = Arc::new(limits);
     let rate = Arc::new(rate);
+    let register_rate = Arc::new(register_rate);
     let registry = Arc::new(Registry::new());
 
     let sweep_root = Arc::clone(&root);
@@ -82,6 +101,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ) {
             eprintln!("usage sweep: {error}");
         }
+        match state::purge_expired_sessions(&lock_db(&sweep_db)) {
+            Ok(removed) if removed > 0 => {
+                eprintln!("session sweep removed {removed} expired sessions");
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("session sweep: {error}"),
+        }
     });
 
     loop {
@@ -93,6 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let connection_net_cfg = Arc::clone(&net_cfg);
                 let connection_limits = Arc::clone(&limits);
                 let connection_rate = Arc::clone(&rate);
+                let connection_register_rate = Arc::clone(&register_rate);
                 let connection_registry = Arc::clone(&registry);
                 thread::spawn(move || {
                     let ctx = Ctx {
@@ -102,6 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         net_cfg: connection_net_cfg.as_ref(),
                         limits: connection_limits.as_ref(),
                         rate: connection_rate.as_ref(),
+                        register_rate: connection_register_rate.as_ref(),
                         registry: connection_registry.as_ref(),
                     };
                     if let Err(error) = serve_connection(stream, &ctx) {
@@ -121,7 +149,50 @@ struct Ctx<'a> {
     net_cfg: &'a shinu::NetConfig,
     limits: &'a Limits,
     rate: &'a RateLimiter,
+    register_rate: &'a RegistrationLimiter,
     registry: &'a Registry,
+}
+
+struct RegistrationLimiter {
+    // quota::RateLimiter is a 60-second per-project limiter; registration is
+    // intentionally a separate one-hour per-IP policy, so the semantics differ.
+    requests: Mutex<HashMap<String, VecDeque<Instant>>>,
+}
+
+impl RegistrationLimiter {
+    fn new() -> Self {
+        Self {
+            requests: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn check(&self, ip: &str) -> shinu::Result<()> {
+        const WINDOW: Duration = Duration::from_secs(60 * 60);
+        let now = Instant::now();
+        let mut requests = self
+            .requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for timestamps in requests.values_mut() {
+            while timestamps.front().is_some_and(|at| {
+                now.checked_duration_since(*at)
+                    .is_some_and(|elapsed| elapsed >= WINDOW)
+            }) {
+                timestamps.pop_front();
+            }
+        }
+        requests.retain(|_, timestamps| !timestamps.is_empty());
+        let mut timestamps = requests.remove(ip).unwrap_or_default();
+        if timestamps.len() >= REGISTER_REQUESTS_PER_HOUR {
+            requests.insert(ip.to_owned(), timestamps);
+            return Err(shinu::Error::Quota(
+                "registration rate limit exceeded: 5 registrations per hour".into(),
+            ));
+        }
+        timestamps.push_back(now);
+        requests.insert(ip.to_owned(), timestamps);
+        Ok(())
+    }
 }
 
 fn lock_db(db: &Mutex<Connection>) -> std::sync::MutexGuard<'_, Connection> {
@@ -893,6 +964,17 @@ fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
 
 #[derive(Debug)]
 enum Endpoint {
+    Root,
+    LoginPage,
+    RegisterPage,
+    AppPage,
+    Asset(&'static str),
+    ConsoleRegister,
+    ConsoleLogin,
+    ConsoleLogout,
+    ConsoleMe,
+    ConsoleTokens,
+    ConsoleToken(String),
     Spaces,
     Usage,
     Limits,
@@ -908,39 +990,22 @@ enum Endpoint {
     RmCkpt(String),
     Gc,
 }
-
-fn hex_digit(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn decode_segment(segment: &str) -> Option<String> {
-    let bytes = segment.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            if index + 2 >= bytes.len() {
-                return None;
-            }
-            let high = hex_digit(bytes[index + 1])?;
-            let low = hex_digit(bytes[index + 2])?;
-            decoded.push((high << 4) | low);
-            index += 3;
-        } else {
-            decoded.push(bytes[index]);
-            index += 1;
-        }
-    }
-    String::from_utf8(decoded).ok()
-}
-
 fn route(path: &str) -> Option<Endpoint> {
     let path = path.split_once('?').map_or(path, |(path, _)| path);
+    match path {
+        "/" => return Some(Endpoint::Root),
+        "/login" => return Some(Endpoint::LoginPage),
+        "/register" => return Some(Endpoint::RegisterPage),
+        "/app" => return Some(Endpoint::AppPage),
+        "/assets/app.css" => return Some(Endpoint::Asset("/assets/app.css")),
+        "/assets/app.js" => return Some(Endpoint::Asset("/assets/app.js")),
+        "/console/register" => return Some(Endpoint::ConsoleRegister),
+        "/console/login" => return Some(Endpoint::ConsoleLogin),
+        "/console/logout" => return Some(Endpoint::ConsoleLogout),
+        "/console/me" => return Some(Endpoint::ConsoleMe),
+        "/console/tokens" => return Some(Endpoint::ConsoleTokens),
+        _ => {}
+    }
     let segments = path
         .split('/')
         .map(decode_segment)
@@ -948,6 +1013,14 @@ fn route(path: &str) -> Option<Endpoint> {
     if segments.first().map(String::as_str) != Some("")
         || segments.get(1).map(String::as_str) != Some("v1")
     {
+        if segments.len() == 4
+            && segments[0].is_empty()
+            && segments[1] == "console"
+            && segments[2] == "tokens"
+            && !segments[3].is_empty()
+        {
+            return Some(Endpoint::ConsoleToken(segments[3].clone()));
+        }
         return None;
     }
     if segments.len() == 3 && segments[2] == "spaces" {
@@ -987,6 +1060,37 @@ fn route(path: &str) -> Option<Endpoint> {
     None
 }
 
+fn hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_segment(segment: &str) -> Option<String> {
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return None;
+            }
+            let high = hex_digit(bytes[index + 1])?;
+            let low = hex_digit(bytes[index + 2])?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+
 fn usage_query(path: &str) -> shinu::Result<(Option<i64>, Option<i64>)> {
     let Some((_, query)) = path.split_once('?') else {
         return Ok((None, None));
@@ -1018,6 +1122,17 @@ fn usage_query(path: &str) -> shinu::Result<(Option<i64>, Option<i64>)> {
 
 fn method_allowed(endpoint: &Endpoint, method: &str) -> bool {
     match endpoint {
+        Endpoint::Root
+        | Endpoint::LoginPage
+        | Endpoint::RegisterPage
+        | Endpoint::AppPage
+        | Endpoint::Asset(_)
+        | Endpoint::ConsoleMe => method == "GET",
+        Endpoint::ConsoleRegister | Endpoint::ConsoleLogin | Endpoint::ConsoleLogout => {
+            method == "POST"
+        }
+        Endpoint::ConsoleTokens => method == "GET" || method == "POST",
+        Endpoint::ConsoleToken(_) => method == "DELETE",
         Endpoint::Spaces => method == "GET" || method == "POST",
         Endpoint::Usage | Endpoint::Limits | Endpoint::Log(_) | Endpoint::Reflog(_) => {
             method == "GET"
@@ -1121,6 +1236,7 @@ fn request_for(
             200,
         )),
         Endpoint::Exec(_) => Err(shinu::Error::Invalid("exec requires a command".into())),
+        _ => Err(shinu::Error::Invalid("endpoint is not an API route".into())),
     }
 }
 
@@ -1144,60 +1260,307 @@ fn exec_command(body: &[u8]) -> shinu::Result<Vec<String>> {
     }
     Ok(command)
 }
+#[derive(Debug)]
+enum Caller {
+    Api { project: String },
+    Console { user_id: String, project: String },
+}
+
+fn caller_project(caller: &Caller) -> &str {
+    match caller {
+        Caller::Api { project } | Caller::Console { project, .. } => project,
+    }
+}
+
+fn is_state_changing(method: &str) -> bool {
+    matches!(method, "POST" | "DELETE" | "PATCH")
+}
+
+fn authenticate(ctx: &Ctx<'_>, request: &http::Request) -> shinu::Result<Caller> {
+    // A bearer token is deliberately authoritative when present. Falling back
+    // to a cookie after an invalid bearer would let a malformed proxy header
+    // silently change which project receives a request.
+    if let Some(plain) = request.token.as_deref() {
+        let tokens = shinu::token::load(ctx.root)?;
+        let project = shinu::token::authenticate(&tokens, plain)?;
+        return Ok(Caller::Api { project });
+    }
+    let token = request
+        .cookies
+        .get(SESSION_COOKIE)
+        .ok_or_else(|| shinu::Error::Auth("missing authentication".into()))?;
+    let token_hash = shinu::sha256_hex(token.as_bytes());
+    let connection = lock_db(ctx.db);
+    let user_id = state::lookup_session(&connection, &token_hash)?
+        .ok_or_else(|| shinu::Error::Auth("invalid or expired session".into()))?;
+    let project = state::user_project(&connection, &user_id)?
+        .ok_or_else(|| shinu::Error::Auth("session user has no project".into()))?;
+    Ok(Caller::Console { user_id, project })
+}
+
+fn authenticate_optional(ctx: &Ctx<'_>, request: &http::Request) -> Option<Caller> {
+    if request.token.is_none() && !request.cookies.contains_key(SESSION_COOKIE) {
+        return None;
+    }
+    authenticate(ctx, request).ok()
+}
+
+fn origin_host(origin: &str) -> Option<&str> {
+    let (_, authority) = origin.split_once("://")?;
+    let end = authority
+        .find(|character| matches!(character, '/' | '?' | '#'))
+        .unwrap_or(authority.len());
+    let authority = &authority[..end];
+    if authority.is_empty()
+        || authority.contains('@')
+        || authority.chars().any(|character| character.is_ascii_whitespace())
+    {
+        return None;
+    }
+    Some(authority)
+}
+
+fn check_console_csrf(request: &http::Request) -> shinu::Result<()> {
+    if !is_state_changing(&request.method) {
+        return Ok(());
+    }
+    let origin = request.origin.as_deref().ok_or_else(|| {
+        shinu::Error::Invalid("origin header is required for this console request".into())
+    })?;
+    let origin_host = origin_host(origin).ok_or_else(|| {
+        shinu::Error::Invalid("origin header is not a valid URL".into())
+    })?;
+    let host = request
+        .host
+        .as_deref()
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| shinu::Error::Invalid("host header is required".into()))?;
+    if !origin_host.eq_ignore_ascii_case(host) {
+        return Err(shinu::Error::Invalid(
+            "origin does not match the host header".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_email(raw: &str) -> shinu::Result<String> {
+    let email = raw.trim();
+    let valid_shape = !email.is_empty()
+        && email.len() <= 254
+        && email.split_once('@').is_some_and(|(local, domain)| {
+            !local.is_empty()
+                && !domain.is_empty()
+                && !domain.contains('@')
+                && !email
+                    .chars()
+                    .any(|character| character.is_ascii_whitespace() || character.is_control())
+        });
+    if !valid_shape {
+        return Err(shinu::Error::Invalid(
+            "please enter a valid email address".into(),
+        ));
+    }
+    Ok(email.to_lowercase())
+}
+fn request_is_secure(request: &http::Request) -> bool {
+    // Caddy terminates TLS and marks the original scheme here. Do not set
+    // Secure for local HTTP, or browsers will silently discard the cookie.
+    request
+        .forwarded_proto
+        .as_deref()
+        .is_some_and(|proto| proto.trim().eq_ignore_ascii_case("https"))
+}
+
+fn parse_credentials(body: &[u8], require_long_password: bool) -> shinu::Result<(String, String)> {
+    let value = parse_body(body)?;
+    let email = value
+        .get("email")
+        .and_then(Value::as_str)
+        .ok_or_else(|| shinu::Error::Invalid("email must be a string".into()))?;
+    let password = value
+        .get("password")
+        .and_then(Value::as_str)
+        .ok_or_else(|| shinu::Error::Invalid("password must be a string".into()))?;
+    let email = normalize_email(email)?;
+    if require_long_password && password.chars().count() < 12 {
+        return Err(shinu::Error::Invalid(
+            "password must be at least 12 characters".into(),
+        ));
+    }
+    Ok((email, password.to_owned()))
+}
+
+fn session_days() -> i64 {
+    std::env::var("SHINU_SESSION_DAYS")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|days| *days > 0)
+        .unwrap_or(SESSION_DEFAULT_DAYS)
+}
+
+fn session_max_age(days: i64) -> u64 {
+    if days == SESSION_DEFAULT_DAYS {
+        SESSION_MAX_AGE_SECONDS
+    } else {
+        u64::try_from(days)
+            .unwrap_or(SESSION_DEFAULT_DAYS as u64)
+            .saturating_mul(24 * 60 * 60)
+    }
+}
+
+fn issue_session(ctx: &Ctx<'_>, user_id: &str, secure: bool) -> shinu::Result<String> {
+    let plain = shinu::auth::new_session_token()?;
+    let token_hash = shinu::sha256_hex(plain.as_bytes());
+    let days = session_days();
+    state::create_session(&lock_db(ctx.db), &token_hash, user_id, days)?;
+    Ok(http::set_cookie(
+        SESSION_COOKIE,
+        &plain,
+        secure,
+        session_max_age(days),
+    ))
+}
+
+fn register_console(
+    ctx: &Ctx<'_>,
+    body: &[u8],
+    ip: &str,
+    secure: bool,
+) -> shinu::Result<(Value, String)> {
+    // Registration uses a dedicated one-hour per-IP limiter; the project API
+    // limiter has different minute-window semantics and must not be reused.
+    ctx.register_rate.check(ip)?;
+    let (email, password) = parse_credentials(body, true)?;
+    {
+        let connection = lock_db(ctx.db);
+        if state::find_user_by_email(&connection, &email)?.is_some() {
+            return Err(shinu::Error::Invalid("email is already registered".into()));
+        }
+    }
+    let password_hash = shinu::auth::hash_password(&password)?;
+    let (user_id, project) = state::create_user(&lock_db(ctx.db), &email, &password_hash)?;
+    let cookie = issue_session(ctx, &user_id, secure)?;
+    Ok((json!({ "user_id": user_id, "project": project }), cookie))
+}
+
+fn login_console(
+    ctx: &Ctx<'_>,
+    body: &[u8],
+    secure: bool,
+) -> shinu::Result<(Value, String)> {
+    let (email, password) = parse_credentials(body, false)?;
+    let user = state::find_user_by_email(&lock_db(ctx.db), &email)?;
+    let (user_id, password_hash) = user
+        .as_ref()
+        .map(|(user_id, password_hash)| (Some(user_id.as_str()), password_hash.as_str()))
+        .unwrap_or((None, DUMMY_PASSWORD_HASH));
+    // The dummy record has the real PBKDF2 shape so an unknown email still
+    // performs the expensive password derivation before returning 401.
+    let valid = shinu::auth::verify_password(&password, password_hash);
+    if !valid {
+        return Err(shinu::Error::Auth(LOGIN_FAILURE_MESSAGE.into()));
+    }
+    let user_id = user_id.ok_or_else(|| shinu::Error::Auth(LOGIN_FAILURE_MESSAGE.into()))?;
+    let project = state::user_project(&lock_db(ctx.db), user_id)?
+        .ok_or_else(|| shinu::Error::Auth(LOGIN_FAILURE_MESSAGE.into()))?;
+    let cookie = issue_session(ctx, user_id, secure)?;
+    Ok((json!({ "user_id": user_id, "project": project }), cookie))
+}
+
+fn logout_console(ctx: &Ctx<'_>, request: &http::Request) -> shinu::Result<String> {
+    let token = request
+        .cookies
+        .get(SESSION_COOKIE)
+        .ok_or_else(|| shinu::Error::Auth("missing session cookie".into()))?;
+    let token_hash = shinu::sha256_hex(token.as_bytes());
+    state::delete_session(&lock_db(ctx.db), &token_hash)?;
+    Ok(http::clear_cookie(SESSION_COOKIE))
+}
+
+fn me_console(ctx: &Ctx<'_>, caller: &Caller) -> shinu::Result<Value> {
+    let Caller::Console { user_id, project } = caller else {
+        return Err(shinu::Error::Auth("console session required".into()));
+    };
+    let email = state::user_email(&lock_db(ctx.db), user_id)?
+        .ok_or_else(|| shinu::Error::Auth("session user no longer exists".into()))?;
+    Ok(json!({ "user_id": user_id, "email": email, "project": project }))
+}
+
+fn token_hash_prefix(hash: &str) -> &str {
+    hash.get(..12).unwrap_or(hash)
+}
+
+fn list_console_tokens(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
+    let _state_guard = lock_state(ctx.registry);
+    let tokens = shinu::token::load(ctx.root)?;
+    let tokens = tokens
+        .iter()
+        .filter(|token| token.project == project)
+        .map(|token| json!({
+            "hash_prefix": token_hash_prefix(&token.hash),
+            "created_at": token.created_at,
+        }))
+        .collect::<Vec<_>>();
+    Ok(json!({ "tokens": tokens }))
+}
+
+fn create_console_token(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
+    let _state_guard = lock_state(ctx.registry);
+    let plain = shinu::token::mint()?;
+    let mut tokens = shinu::token::load(ctx.root)?;
+    tokens.push(shinu::token::Token {
+        hash: shinu::token::hash(&plain),
+        project: project.to_owned(),
+        created_at: Utc::now(),
+    });
+    shinu::token::store(ctx.root, &tokens)?;
+    Ok(json!({ "token": plain }))
+}
+
+fn delete_console_token(ctx: &Ctx<'_>, project: &str, prefix: &str) -> shinu::Result<Value> {
+    if prefix.is_empty() || prefix.len() > 64 || !prefix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(shinu::Error::NotFound("token not found".into()));
+    }
+    let _state_guard = lock_state(ctx.registry);
+    let mut tokens = shinu::token::load(ctx.root)?;
+    let matches = tokens
+        .iter()
+        .filter(|token| token.project == project && token.hash.starts_with(prefix))
+        .count();
+    if matches == 0 {
+        return Err(shinu::Error::NotFound("token not found".into()));
+    }
+    if matches > 1 {
+        return Err(shinu::Error::Invalid("token prefix is ambiguous".into()));
+    }
+    tokens.retain(|token| !(token.project == project && token.hash.starts_with(prefix)));
+    shinu::token::store(ctx.root, &tokens)?;
+    Ok(json!({}))
+}
+
 
 fn respond_error(stream: &mut impl Write, status: u16, error: &shinu::Error) -> shinu::Result<()> {
     http::respond(stream, status, &json!({ "error": error.to_string() }))?;
     Ok(())
 }
 
+fn is_console_path(path: &str) -> bool {
+    path.split_once('?')
+        .map_or(path, |(path, _)| path)
+        .starts_with("/console/")
+}
 fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
+    let client_ip = stream
+        .peer_addr()
+        .map(|address| address.ip().to_string())
+        .unwrap_or_else(|_| "unknown".to_owned());
     let parsed_request = {
         let mut reader = BufReader::new(&mut stream);
         http::parse(&mut reader)
     };
     let request = match parsed_request {
         Ok(request) => request,
-        Err(error) => {
-            respond_error(&mut stream, http::status_for(&error), &error)?;
-            return Ok(());
-        }
-    };
-    let tokens = match shinu::token::load(ctx.root) {
-        Ok(tokens) => tokens,
-        Err(error) => {
-            respond_error(&mut stream, http::status_for(&error), &error)?;
-            return Ok(());
-        }
-    };
-    let project = match request.token.as_deref() {
-        Some(plain) => match shinu::token::authenticate(&tokens, plain) {
-            Ok(project) => project,
-            Err(error) => {
-                respond_error(&mut stream, http::status_for(&error), &error)?;
-                return Ok(());
-            }
-        },
-        None => {
-            let error = shinu::Error::Auth("missing bearer token".into());
-            respond_error(&mut stream, http::status_for(&error), &error)?;
-            return Ok(());
-        }
-    };
-
-    let effective = match effective_limits(ctx, project.as_str()) {
-        Ok(limits) => limits,
-        Err(error) => {
-            respond_error(&mut stream, http::status_for(&error), &error)?;
-            return Ok(());
-        }
-    };
-    if let Err(error) = ctx.rate.check(project.as_str(), effective.api_per_min) {
-        respond_error(&mut stream, http::status_for(&error), &error)?;
-        return Ok(());
-    }
-
-    let (from, to) = match usage_query(&request.path) {
-        Ok(range) => range,
         Err(error) => {
             respond_error(&mut stream, http::status_for(&error), &error)?;
             return Ok(());
@@ -1216,6 +1579,173 @@ fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
         respond_error(&mut stream, 405, &error)?;
         return Ok(());
     }
+    // Register and login have no Caller yet, so the console path itself is the
+    // trust boundary for CSRF. This also covers logout and token mutations.
+    if is_console_path(&request.path)
+        && is_state_changing(&request.method)
+        && let Err(error) = check_console_csrf(&request)
+    {
+        respond_error(&mut stream, 403, &error)?;
+        return Ok(());
+    }
+
+    match &endpoint {
+        Endpoint::Root => {
+            if authenticate_optional(ctx, &request).is_some() {
+                http::respond_redirect(&mut stream, "/app")?;
+            } else {
+                http::respond_redirect(&mut stream, "/login")?;
+            }
+            return Ok(());
+        }
+        Endpoint::LoginPage | Endpoint::RegisterPage => {
+            http::respond_html(&mut stream, 200, AUTH_HTML)?;
+            return Ok(());
+        }
+        Endpoint::AppPage => {
+            if authenticate_optional(ctx, &request).is_some() {
+                http::respond_html(&mut stream, 200, APP_HTML)?;
+            } else {
+                http::respond_redirect(&mut stream, "/login")?;
+            }
+            return Ok(());
+        }
+        Endpoint::Asset(path) => {
+            let body = match *path {
+                "/assets/app.css" => APP_CSS.as_bytes(),
+                "/assets/app.js" => APP_JS.as_bytes(),
+                _ => unreachable!("route only returns known embedded assets"),
+            };
+            http::respond_asset(&mut stream, path, body)?;
+            return Ok(());
+        }
+        Endpoint::ConsoleRegister => {
+            let secure = request_is_secure(&request);
+            match register_console(ctx, &request.body, &client_ip, secure) {
+                Ok((body, cookie)) => {
+                    http::respond_with_cookie(&mut stream, 201, &body, &cookie)?;
+                }
+                Err(error) => respond_error(&mut stream, http::status_for(&error), &error)?,
+            }
+            return Ok(());
+        }
+        Endpoint::ConsoleLogin => {
+            let secure = request_is_secure(&request);
+            match login_console(ctx, &request.body, secure) {
+                Ok((body, cookie)) => {
+                    http::respond_with_cookie(&mut stream, 200, &body, &cookie)?;
+                }
+                Err(shinu::Error::Auth(_)) => {
+                    // Keep every login failure byte-for-byte equivalent so an
+                    // observer cannot distinguish an unknown email.
+                    http::respond(
+                        &mut stream,
+                        401,
+                        &json!({ "error": LOGIN_FAILURE_MESSAGE }),
+                    )?;
+                }
+                Err(error) => respond_error(&mut stream, http::status_for(&error), &error)?,
+            }
+            return Ok(());
+        }
+        Endpoint::ConsoleLogout
+        | Endpoint::ConsoleMe
+        | Endpoint::ConsoleTokens
+        | Endpoint::ConsoleToken(_) => {}
+        _ => {}
+    }
+
+    let caller = match authenticate(ctx, &request) {
+        Ok(caller) => caller,
+        Err(error) => {
+            respond_error(&mut stream, http::status_for(&error), &error)?;
+            return Ok(());
+        }
+    };
+
+    match &endpoint {
+        Endpoint::ConsoleLogout
+        | Endpoint::ConsoleMe
+        | Endpoint::ConsoleTokens
+        | Endpoint::ConsoleToken(_) => {
+            let Caller::Console { .. } = &caller else {
+                let error = shinu::Error::Auth("console session required".into());
+                respond_error(&mut stream, http::status_for(&error), &error)?;
+                return Ok(());
+            };
+            let project = caller_project(&caller);
+            match &endpoint {
+                Endpoint::ConsoleLogout => {
+                    match logout_console(ctx, &request) {
+                        Ok(cookie) => {
+                            http::respond_with_cookie(&mut stream, 200, &json!({}), &cookie)?;
+                        }
+                        Err(error) => {
+                            respond_error(&mut stream, http::status_for(&error), &error)?;
+                        }
+                    }
+                }
+                Endpoint::ConsoleMe => match me_console(ctx, &caller) {
+                    Ok(body) => http::respond(&mut stream, 200, &body)?,
+                    Err(error) => respond_error(&mut stream, http::status_for(&error), &error)?,
+                },
+                Endpoint::ConsoleTokens if request.method == "GET" => {
+                    match list_console_tokens(ctx, project) {
+                        Ok(body) => http::respond(&mut stream, 200, &body)?,
+                        Err(error) => {
+                            respond_error(&mut stream, http::status_for(&error), &error)?;
+                        }
+                    }
+                }
+                Endpoint::ConsoleTokens => match create_console_token(ctx, project) {
+                    Ok(body) => http::respond(&mut stream, 201, &body)?,
+                    Err(error) => respond_error(&mut stream, http::status_for(&error), &error)?,
+                },
+                Endpoint::ConsoleToken(prefix) => {
+                    match delete_console_token(ctx, project, prefix) {
+                        Ok(body) => http::respond(&mut stream, 200, &body)?,
+                        Err(error) => {
+                            respond_error(&mut stream, http::status_for(&error), &error)?;
+                        }
+                    }
+                }
+                _ => unreachable!("console endpoint was checked above"),
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // API routes accept either bearer callers or console sessions. Only the
+    // latter are subject to the browser-origin check; SDKs must remain usable
+    // without manufacturing an Origin header.
+    if let Caller::Console { .. } = &caller
+        && is_state_changing(&request.method)
+        && let Err(error) = check_console_csrf(&request)
+    {
+        respond_error(&mut stream, 403, &error)?;
+        return Ok(());
+    }
+    let project = caller_project(&caller);
+    let effective = match effective_limits(ctx, project) {
+        Ok(limits) => limits,
+        Err(error) => {
+            respond_error(&mut stream, http::status_for(&error), &error)?;
+            return Ok(());
+        }
+    };
+    if let Err(error) = ctx.rate.check(project, effective.api_per_min) {
+        respond_error(&mut stream, http::status_for(&error), &error)?;
+        return Ok(());
+    }
+
+    let (from, to) = match usage_query(&request.path) {
+        Ok(range) => range,
+        Err(error) => {
+            respond_error(&mut stream, http::status_for(&error), &error)?;
+            return Ok(());
+        }
+    };
     if let Endpoint::Exec(space) = &endpoint {
         let command = match exec_command(&request.body) {
             Ok(command) => command,
@@ -1224,9 +1754,9 @@ fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
                 return Ok(());
             }
         };
-        match execute_streaming(&mut stream, ctx, project.as_str(), space.clone(), command) {
+        match execute_streaming(&mut stream, ctx, project, space.clone(), command) {
             Ok(()) => {
-                record_usage(ctx.db, project.as_str(), "api_call", None, 1)?;
+                record_usage(ctx.db, project, "api_call", None, 1)?;
             }
             Err(error) => {
                 respond_error(&mut stream, http::status_for(&error), &error)?;
@@ -1241,9 +1771,9 @@ fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
             return Ok(());
         }
     };
-    match handle(ctx, req, project.as_str()) {
+    match handle(ctx, req, project) {
         Ok(value) => {
-            record_usage(ctx.db, project.as_str(), "api_call", None, 1)?;
+            record_usage(ctx.db, project, "api_call", None, 1)?;
             http::respond(&mut stream, status, &value)?;
         }
         Err(error) => respond_error(&mut stream, http::status_for(&error), &error)?,
@@ -1422,6 +1952,9 @@ mod tests {
         vm,
     };
     use std::os::unix::fs::symlink;
+    use std::collections::HashMap;
+    use std::io::{Read as IoRead, Write as IoWrite};
+    use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
     use std::sync::{LazyLock, Mutex};
@@ -1474,6 +2007,11 @@ mod tests {
         static RATE: LazyLock<RateLimiter> = LazyLock::new(RateLimiter::new);
         &RATE
     }
+    fn test_register_rate() -> &'static super::RegistrationLimiter {
+        static RATE: LazyLock<super::RegistrationLimiter> =
+            LazyLock::new(super::RegistrationLimiter::new);
+        &RATE
+    }
 
     fn store_state(root: &std::path::Path, value: &State) {
         let connection = state::open(root).expect("open test database");
@@ -1494,6 +2032,7 @@ mod tests {
             net_cfg,
             limits: test_limits(),
             rate: test_rate(),
+            register_rate: test_register_rate(),
             registry,
         }
     }
@@ -1604,6 +2143,7 @@ mod tests {
             net_cfg: &net_cfg,
             limits: &global,
             rate: &rate,
+            register_rate: test_register_rate(),
             registry: &registry,
         };
         let override_limits = super::effective_limits(&ctx, "project-a").expect("override");
@@ -2013,5 +2553,251 @@ mod tests {
             "raced commit must stay in the state so its image is never unlinked"
         );
         assert_eq!(state.spaces[0].head, Some(raced_id));
+    }
+    fn console_db() -> Mutex<Connection> {
+        let connection = Connection::open_in_memory().expect("open in-memory console database");
+        connection
+            .execute_batch(
+                "
+                CREATE TABLE users (
+                    id TEXT PRIMARY KEY,
+                    email TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE memberships (
+                    user_id TEXT NOT NULL,
+                    project TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (user_id, project)
+                );
+                CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                );
+                CREATE TABLE projects (
+                    project TEXT PRIMARY KEY,
+                    max_spaces INTEGER,
+                    max_disk_mib INTEGER,
+                    max_running INTEGER,
+                    api_per_min INTEGER
+                );
+                ",
+            )
+            .expect("create console schema");
+        Mutex::new(connection)
+    }
+
+    fn console_ctx<'a>(
+        root: &'a std::path::Path,
+        db: &'a Mutex<Connection>,
+        registry: &'a shinu::registry::Registry,
+    ) -> super::Ctx<'a> {
+        static VM_CONFIG: LazyLock<VmConfig> = LazyLock::new(|| VmConfig {
+            vcpus: 1,
+            mem_mib: 1,
+            idle_secs: 1,
+            jail_uid: 30000,
+            jail_gid: 30000,
+        });
+        static NET_CONFIG: LazyLock<NetConfig> = LazyLock::new(|| NetConfig {
+            enabled: false,
+            base: [172, 31],
+            uplink: String::new(),
+        });
+        super::Ctx {
+            root,
+            db,
+            vm_cfg: &VM_CONFIG,
+            net_cfg: &NET_CONFIG,
+            limits: test_limits(),
+            rate: test_rate(),
+            register_rate: test_register_rate(),
+            registry,
+        }
+    }
+
+    fn console_request(origin: Option<&str>, host: Option<&str>) -> shinu::http::Request {
+        shinu::http::Request {
+            method: "POST".into(),
+            path: "/v1/spaces".into(),
+            token: None,
+            body: br#"{}"#.to_vec(),
+            cookies: HashMap::new(),
+            origin: origin.map(str::to_owned),
+            forwarded_proto: None,
+            host: host.map(str::to_owned),
+        }
+    }
+    fn serve_raw(ctx: &super::Ctx<'_>, raw_request: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind route test listener");
+        let address = listener.local_addr().expect("route test address");
+        std::thread::scope(|scope| {
+            let server = scope.spawn(|| {
+                let (stream, _) = listener.accept().expect("accept route test request");
+                super::serve_connection(stream, ctx).expect("serve route test request");
+            });
+            let mut client = TcpStream::connect(address).expect("connect route test listener");
+            client
+                .write_all(raw_request.as_bytes())
+                .expect("write route test request");
+            let mut response = String::new();
+            client
+                .read_to_string(&mut response)
+                .expect("read route test response");
+            server.join().expect("join route test server");
+            response
+        })
+    }
+
+    #[test]
+    fn console_register_then_login_creates_sessions() {
+        let root = test_root("console-register-login");
+        let db = console_db();
+        let registry = registry();
+        let ctx = console_ctx(&root, &db, &registry);
+        let email = format!("user-{}@example.com", Uuid::new_v4());
+        let body = format!("{{\"email\":\"{email}\",\"password\":\"correct horse\"}}");
+        let (registered, register_cookie) =
+            super::register_console(&ctx, body.as_bytes(), &Uuid::new_v4().to_string(), false)
+                .expect("register user");
+        assert!(registered["project"].as_str().is_some());
+        assert!(register_cookie.contains("shinu_session="));
+
+        let (logged_in, login_cookie) = super::login_console(
+            &ctx,
+            body.as_bytes(),
+            false,
+        )
+        .expect("login user");
+        assert_eq!(logged_in["user_id"], registered["user_id"]);
+        assert!(login_cookie.contains("shinu_session="));
+        assert!(state::find_user_by_email(&super::lock_db(&db), &email)
+            .expect("find registered user")
+            .is_some());
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn console_login_hides_unknown_email_and_wrong_password() {
+        let root = test_root("console-login-errors");
+        let db = console_db();
+        let registry = registry();
+        let ctx = console_ctx(&root, &db, &registry);
+        let email = format!("user-{}@example.com", Uuid::new_v4());
+        let registered = format!(
+            "{{\"email\":\"{email}\",\"password\":\"correct horse\"}}"
+        );
+        super::register_console(&ctx, registered.as_bytes(), &Uuid::new_v4().to_string(), false)
+            .expect("register user");
+        let wrong = format!("{{\"email\":\"{email}\",\"password\":\"wrong secret\"}}");
+        let unknown = format!(
+            "{{\"email\":\"unknown-{}@example.com\",\"password\":\"wrong secret\"}}",
+            Uuid::new_v4()
+        );
+        let wrong_message = match super::login_console(&ctx, wrong.as_bytes(), false) {
+            Err(shinu::Error::Auth(message)) => message,
+            result => panic!("wrong password unexpectedly succeeded: {result:?}"),
+        };
+        let unknown_message = match super::login_console(&ctx, unknown.as_bytes(), false) {
+            Err(shinu::Error::Auth(message)) => message,
+            result => panic!("unknown email unexpectedly succeeded: {result:?}"),
+        };
+        assert_eq!(wrong_message, unknown_message);
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn console_registration_rejects_short_password() {
+        let root = test_root("console-short-password");
+        let db = console_db();
+        let registry = registry();
+        let ctx = console_ctx(&root, &db, &registry);
+        let body = format!(
+            "{{\"email\":\"short-{}@example.com\",\"password\":\"too short\"}}",
+            Uuid::new_v4()
+        );
+        let result = super::register_console(&ctx, body.as_bytes(), &Uuid::new_v4().to_string(), false);
+        assert!(matches!(
+            result,
+            Err(shinu::Error::Invalid(message)) if message.contains("12 characters")
+        ));
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn csrf_rejects_console_origin_mismatch_but_api_has_no_check() {
+        let request = console_request(Some("https://evil.example"), Some("console.example"));
+        assert!(super::check_console_csrf(&request).is_err());
+        let api = super::Caller::Api {
+            project: "project-a".into(),
+        };
+        let api_result = match api {
+            super::Caller::Api { .. } => Ok::<(), shinu::Error>(()),
+            super::Caller::Console { .. } => super::check_console_csrf(&request),
+        };
+        assert!(api_result.is_ok());
+    }
+
+    #[test]
+    fn expired_console_session_is_rejected() {
+        let root = test_root("console-expired-session");
+        let db = console_db();
+        let registry = registry();
+        let ctx = console_ctx(&root, &db, &registry);
+        let email = format!("expired-{}@example.com", Uuid::new_v4());
+        let (user_id, _) = state::create_user(
+            &super::lock_db(&db),
+            &email,
+            super::DUMMY_PASSWORD_HASH,
+        )
+        .expect("create expired-session user");
+        let token = format!("expired-{}", Uuid::new_v4());
+        let token_hash = shinu::sha256_hex(token.as_bytes());
+        state::create_session(&super::lock_db(&db), &token_hash, &user_id, -1)
+            .expect("create expired session");
+        let mut request = console_request(None, Some("console.example"));
+        request.method = "GET".into();
+        request.path = "/console/me".into();
+        request.cookies.insert(super::SESSION_COOKIE.into(), token);
+        assert!(matches!(
+            super::authenticate(&ctx, &request),
+            Err(shinu::Error::Auth(message)) if message.contains("expired")
+        ));
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+    #[test]
+    fn csrf_rejects_missing_origin_for_login() {
+        let mut request = console_request(None, Some("console.example"));
+        request.path = "/console/login".into();
+        assert!(super::check_console_csrf(&request).is_err());
+    }
+
+    #[test]
+    fn registration_limiter_rejects_the_sixth_request_in_an_hour() {
+        let limiter = super::RegistrationLimiter::new();
+        for _ in 0..5 {
+            limiter.check("198.51.100.20").expect("within hourly limit");
+        }
+        assert!(matches!(
+            limiter.check("198.51.100.20"),
+            Err(shinu::Error::Quota(message)) if message.contains("5 registrations per hour")
+        ));
+    }
+    #[test]
+    fn login_route_rejects_missing_origin_before_authentication() {
+        let root = test_root("console-route-csrf");
+        let db = console_db();
+        let registry = registry();
+        let ctx = console_ctx(&root, &db, &registry);
+        let response = serve_raw(
+            &ctx,
+            "POST /console/login HTTP/1.1\r\nHost: console.example\r\nContent-Length: 2\r\n\r\n{}",
+        );
+        assert!(response.starts_with("HTTP/1.1 403"), "response: {response}");
+        std::fs::remove_dir_all(root).expect("remove test root");
     }
 }

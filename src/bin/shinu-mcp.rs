@@ -43,9 +43,17 @@ impl Server {
         let client = self.client()?;
         match name {
             "shinu_list_spaces" => client.request_text("GET", "/v1/spaces", None),
+            "shinu_list_images" => client.request_text("GET", "/v1/images", None),
             "shinu_create_space" => {
                 let name = required_string(arguments, "name")?;
-                client.request_text("POST", "/v1/spaces", Some(json!({ "name": name })))
+                let body = create_space_body(name, arguments)?;
+                client.request_text("POST", "/v1/spaces", Some(body))
+            }
+            "shinu_resize_space" => {
+                let space = required_string(arguments, "space")?;
+                let path = format!("/v1/spaces/{}", encode_path_segment(&space));
+                let body = resize_space_body(arguments)?;
+                client.request_text("PATCH", &path, Some(body))
             }
             "shinu_start" => {
                 let space = required_string(arguments, "space")?;
@@ -384,6 +392,73 @@ fn required_bool(arguments: &Map<String, Value>, field: &str) -> Result<bool, St
         })
 }
 
+fn optional_string(arguments: &Map<String, Value>, field: &str) -> Result<Option<String>, String> {
+    match arguments.get(field) {
+        None => Ok(None),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
+        Some(Value::String(_)) => Err(format!("argument {field} must not be empty")),
+        Some(_) => Err(format!("argument {field} must be a string")),
+    }
+}
+
+fn optional_u64(arguments: &Map<String, Value>, field: &str) -> Result<Option<u64>, String> {
+    match arguments.get(field) {
+        None => Ok(None),
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("argument {field} must be a non-negative integer")),
+        Some(_) => Err(format!("argument {field} must be a non-negative integer")),
+    }
+}
+
+fn create_space_body(
+    name: String,
+    arguments: &Map<String, Value>,
+) -> Result<Value, String> {
+    let mut body = json!({"name": name});
+    let object = body
+        .as_object_mut()
+        .expect("create space body starts as a JSON object");
+    if let Some(image) = optional_string(arguments, "image")? {
+        object.insert("image".to_string(), Value::String(image));
+    }
+    if let Some(vcpus) = optional_u64(arguments, "vcpus")? {
+        object.insert("vcpus".to_string(), Value::from(vcpus));
+    }
+    if let Some(mem_mib) = optional_u64(arguments, "mem_mib")? {
+        object.insert("mem_mib".to_string(), Value::from(mem_mib));
+    }
+    if let Some(disk_mib) = optional_u64(arguments, "disk_mib")? {
+        object.insert("disk_mib".to_string(), Value::from(disk_mib));
+    }
+    Ok(body)
+}
+
+fn resize_space_body(arguments: &Map<String, Value>) -> Result<Value, String> {
+    let vcpus = optional_u64(arguments, "vcpus")?;
+    let mem_mib = optional_u64(arguments, "mem_mib")?;
+    let disk_mib = optional_u64(arguments, "disk_mib")?;
+    if vcpus.is_none() && mem_mib.is_none() && disk_mib.is_none() {
+        return Err("resize requires at least one of vcpus, mem_mib, or disk_mib".to_string());
+    }
+    let mut body = Value::Object(Map::new());
+    let object = body
+        .as_object_mut()
+        .expect("resize space body starts as a JSON object");
+    if let Some(vcpus) = vcpus {
+        object.insert("vcpus".to_string(), Value::from(vcpus));
+    }
+    if let Some(mem_mib) = mem_mib {
+        object.insert("mem_mib".to_string(), Value::from(mem_mib));
+    }
+    if let Some(disk_mib) = disk_mib {
+        object.insert("disk_mib".to_string(), Value::from(disk_mib));
+    }
+    Ok(body)
+}
+
+
 fn required_command(arguments: &Map<String, Value>) -> Result<Vec<String>, String> {
     let value = arguments
         .get("cmd")
@@ -408,9 +483,18 @@ fn required_command(arguments: &Map<String, Value>) -> Result<Vec<String>, Strin
 
 fn validate_arguments(name: &str, arguments: &Map<String, Value>) -> Result<(), String> {
     match name {
-        "shinu_list_spaces" => Ok(()),
+        "shinu_list_spaces" | "shinu_list_images" => Ok(()),
         "shinu_create_space" => {
             required_string(arguments, "name")?;
+            optional_string(arguments, "image")?;
+            optional_u64(arguments, "vcpus")?;
+            optional_u64(arguments, "mem_mib")?;
+            optional_u64(arguments, "disk_mib")?;
+            Ok(())
+        }
+        "shinu_resize_space" => {
+            required_string(arguments, "space")?;
+            resize_space_body(arguments)?;
             Ok(())
         }
         "shinu_start" | "shinu_stop" => {
@@ -772,11 +856,39 @@ fn tool_definitions() -> Vec<Value> {
             "inputSchema": schema(json!({}), &[]),
         }),
         json!({
+            "name": "shinu_list_images",
+            "description": "在创建 space 前查看可用的 guest image 及其构建状态；它只列出固定的 void、ubuntu、arch、rocky image。",
+            "inputSchema": schema(json!({}), &[]),
+        }),
+        json!({
             "name": "shinu_create_space",
-            "description": "在开始一个需要隔离的实验、需要独立分支或需要并行比较方案时使用；它创建一个新的命名 space。",
+            "description": "在开始一个需要隔离的实验、需要独立分支或需要并行比较方案时使用；它创建一个新的命名 space。image 只在创建时设定，之后不可更换。",
             "inputSchema": schema(json!({
-                "name": {"type": "string", "minLength": 1, "description": "新 space 的名称。"}
+                "name": {"type": "string", "minLength": 1, "description": "新 space 的名称。"},
+                "image": {"type": "string", "enum": ["void", "ubuntu", "arch", "rocky"], "description": "guest image；只在创建时设定，之后固定。"},
+                "vcpus": {"type": "integer", "minimum": 1, "description": "该 space 的 vCPU 数量；省略时使用 daemon 默认值。"},
+                "mem_mib": {"type": "integer", "minimum": 1, "description": "该 space 的内存上限，单位 MiB；省略时使用 daemon 默认值。"},
+                "disk_mib": {"type": "integer", "minimum": 1, "description": "该 space 的磁盘容量，单位 MiB；省略时使用 daemon 默认值。"}
             }), &["name"]),
+        }),
+        json!({
+            "name": "shinu_resize_space",
+            "description": "调整 space 的 vCPU、内存或磁盘；space 必须处于 STOPPED 状态，先调用 shinu_stop。至少提供一个尺寸参数；磁盘只能增大、不能缩小，因为缩小会造成数据丢失。image 在创建时固定，不能通过 resize 更换。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "space": {"type": "string", "minLength": 1, "description": "要调整的 space。"},
+                    "vcpus": {"type": "integer", "minimum": 1, "description": "新的 vCPU 数量。"},
+                    "mem_mib": {"type": "integer", "minimum": 1, "description": "新的内存上限，单位 MiB。"},
+                    "disk_mib": {"type": "integer", "minimum": 1, "description": "新的磁盘容量，单位 MiB；只能增大，不能缩小。"}
+                },
+                "required": ["space"],
+                "anyOf": [
+                    {"required": ["vcpus"]},
+                    {"required": ["mem_mib"]},
+                    {"required": ["disk_mib"]}
+                ]
+            },
         }),
         json!({
             "name": "shinu_start",
@@ -870,7 +982,9 @@ fn is_known_tool(name: &str) -> bool {
     matches!(
         name,
         "shinu_list_spaces"
+            | "shinu_list_images"
             | "shinu_create_space"
+            | "shinu_resize_space"
             | "shinu_start"
             | "shinu_stop"
             | "shinu_write_file"
@@ -1066,6 +1180,26 @@ mod tests {
     }
 
     #[test]
+    fn validates_image_and_resize_tools() {
+        assert!(validate_arguments("shinu_list_images", &Map::new()).is_ok());
+        assert!(validate_arguments(
+            "shinu_resize_space",
+            &arguments(json!({"space": "dev", "mem_mib": 2048}))
+        )
+        .is_ok());
+        assert!(validate_arguments(
+            "shinu_resize_space",
+            &arguments(json!({"space": "dev"}))
+        )
+        .is_err());
+        assert!(validate_arguments(
+            "shinu_resize_space",
+            &arguments(json!({"space": "dev", "disk_mib": "2048"}))
+        )
+        .is_err());
+    }
+
+    #[test]
     fn read_file_aggregation_returns_raw_stdout_and_reports_failures() {
         let output = aggregate_stdout(
             br#"{"stream":"stdout","data":"first\n"}
@@ -1089,7 +1223,7 @@ mod tests {
     #[test]
     fn known_tools_match_tool_definitions() {
         let definitions = tool_definitions();
-        assert_eq!(definitions.len(), 13);
+        assert_eq!(definitions.len(), 15);
         for definition in definitions {
             let name = definition
                 .get("name")

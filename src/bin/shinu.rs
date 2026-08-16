@@ -29,7 +29,31 @@ struct Cli {
 enum Command {
     New {
         name: String,
+        #[arg(long)]
+        image: Option<String>,
+        #[arg(long)]
+        vcpus: Option<u32>,
+        #[arg(long, value_name = "MIB")]
+        mem: Option<u32>,
+        #[arg(long, value_name = "MIB")]
+        disk: Option<u64>,
     },
+    #[command(group(
+        clap::ArgGroup::new("resize-options")
+            .required(true)
+            .multiple(true)
+            .args(["vcpus", "mem", "disk"])
+    ))]
+    Resize {
+        space: String,
+        #[arg(long)]
+        vcpus: Option<u32>,
+        #[arg(long, value_name = "MIB")]
+        mem: Option<u32>,
+        #[arg(long, value_name = "MIB")]
+        disk: Option<u64>,
+    },
+    Images,
     Ls {
         #[arg(long)]
         json: bool,
@@ -541,15 +565,89 @@ fn run() -> Result<i32, String> {
     }
 }
 
+fn create_space_body(
+    name: &str,
+    image: Option<String>,
+    vcpus: Option<u32>,
+    mem_mib: Option<u32>,
+    disk_mib: Option<u64>,
+) -> Value {
+    let mut body = json!({"name": name});
+    let object = body
+        .as_object_mut()
+        .expect("create space body starts as a JSON object");
+    if let Some(image) = image {
+        object.insert("image".to_string(), Value::String(image));
+    }
+    if let Some(vcpus) = vcpus {
+        object.insert("vcpus".to_string(), Value::from(vcpus));
+    }
+    if let Some(mem_mib) = mem_mib {
+        object.insert("mem_mib".to_string(), Value::from(mem_mib));
+    }
+    if let Some(disk_mib) = disk_mib {
+        object.insert("disk_mib".to_string(), Value::from(disk_mib));
+    }
+    body
+}
+
+fn resize_space_body(
+    vcpus: Option<u32>,
+    mem_mib: Option<u32>,
+    disk_mib: Option<u64>,
+) -> Result<Value, String> {
+    if vcpus.is_none() && mem_mib.is_none() && disk_mib.is_none() {
+        return Err("resize requires at least one of --vcpus, --mem, or --disk".to_string());
+    }
+    let mut body = Value::Object(serde_json::Map::new());
+    let object = body
+        .as_object_mut()
+        .expect("resize space body starts as a JSON object");
+    if let Some(vcpus) = vcpus {
+        object.insert("vcpus".to_string(), Value::from(vcpus));
+    }
+    if let Some(mem_mib) = mem_mib {
+        object.insert("mem_mib".to_string(), Value::from(mem_mib));
+    }
+    if let Some(disk_mib) = disk_mib {
+        object.insert("disk_mib".to_string(), Value::from(disk_mib));
+    }
+    Ok(body)
+}
+
 fn run_command(client: &HttpClient, command: Command) -> Result<i32, String> {
     match command {
-        Command::New { name } => {
+        Command::New {
+            name,
+            image,
+            vcpus,
+            mem,
+            disk,
+        } => {
             let data = response_value(client.request(
                 "POST",
                 "/v1/spaces",
-                Some(json!({ "name": name })),
+                Some(create_space_body(&name, image, vcpus, mem, disk)),
             )?)?;
             print_space_summary(&data);
+        }
+        Command::Resize {
+            space,
+            vcpus,
+            mem,
+            disk,
+        } => {
+            let data = response_value(client.request(
+                "PATCH",
+                &format!("/v1/spaces/{}", encode_path_segment(&space)),
+                Some(resize_space_body(vcpus, mem, disk)?),
+            )?)?;
+            print_space_summary(&data);
+        }
+        Command::Images => {
+            let response = client.request("GET", "/v1/images", None)?;
+            let body = successful_body(response)?;
+            print_images(&response_value_from_body(&body)?);
         }
         Command::Ls { json } => {
             let response = client.request("GET", "/v1/spaces", None)?;
@@ -793,6 +891,14 @@ fn print_limits(data: &Value) {
         value_u64(data.get("max_spaces")).unwrap_or(0)
     );
     println!(
+        "max_vcpus: {}",
+        value_u64(data.get("max_vcpus")).unwrap_or(0)
+    );
+    println!(
+        "max_mem_mib: {}",
+        human_mib(data.get("max_mem_mib"))
+    );
+    println!(
         "disk_mib: {}/{}",
         value_u64(used.get("disk_mib")).unwrap_or(0),
         value_u64(data.get("max_disk_mib")).unwrap_or(0)
@@ -895,6 +1001,38 @@ fn print_space_summary(data: &Value) {
     println!("{}  {}", field_text(data, "name"), field_text(data, "id"));
 }
 
+fn print_images(data: &Value) {
+    let rows = data
+        .as_array()
+        .map(|images| {
+            images
+                .iter()
+                .map(|image| {
+                    vec![
+                        field_text(image, "image"),
+                        if image
+                            .get("built")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                        {
+                            "yes".to_string()
+                        } else {
+                            "no".to_string()
+                        },
+                    ]
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    table(&["IMAGE", "BUILT"], &rows);
+}
+
+fn human_mib(value: Option<&Value>) -> String {
+    value_u64(value)
+        .map(|mib| human(mib.saturating_mul(1024 * 1024)))
+        .unwrap_or_else(|| "-".to_string())
+}
+
 fn print_spaces(data: &Value) {
     let rows = data
         .get("spaces")
@@ -918,13 +1056,20 @@ fn print_spaces(data: &Value) {
                         short_optional_value(space.get("head")),
                         human(value_u64(space.get("exclusive")).unwrap_or(0)),
                         seconds(&field_text(space, "created_at")),
+                        field_text(space, "image"),
+                        short_optional_value(space.get("vcpus")),
+                        human_mib(space.get("mem_mib")),
+                        human_mib(space.get("disk_mib")),
                     ]
                 })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
     table(
-        &["NAME", "PROJECT", "STATE", "HEAD", "EXCLUSIVE", "CREATED"],
+        &[
+            "NAME", "PROJECT", "STATE", "HEAD", "EXCLUSIVE", "CREATED", "IMAGE", "VCPU",
+            "MEM", "DISK",
+        ],
         &rows,
     );
 
@@ -1477,6 +1622,29 @@ mod tests {
             encode_query_value("/root/a b?x&y=#%é"),
             "%2Froot%2Fa%20b%3Fx%26y%3D%23%25%C3%A9"
         );
+    }
+
+    #[test]
+    fn create_body_omits_unspecified_optional_fields() {
+        let body = create_space_body("dev", None, None, None, None);
+        assert_eq!(body, json!({"name": "dev"}));
+        assert!(body.get("image").is_none());
+        assert!(body.get("vcpus").is_none());
+        assert!(body.get("mem_mib").is_none());
+        assert!(body.get("disk_mib").is_none());
+    }
+
+    #[test]
+    fn resize_body_rejects_no_flags() {
+        let error = resize_space_body(None, None, None).unwrap_err();
+        assert!(error.contains("at least one"));
+    }
+
+    #[test]
+    fn resize_body_includes_only_requested_fields() {
+        let body = resize_space_body(Some(2), None, Some(4096)).unwrap();
+        assert_eq!(body, json!({"vcpus": 2, "disk_mib": 4096}));
+        assert!(body.get("mem_mib").is_none());
     }
 
 

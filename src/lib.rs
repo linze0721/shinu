@@ -199,10 +199,16 @@ pub mod state {
     use std::path::Path;
     use uuid::Uuid;
 
+    use crate::Image;
+
     impl From<rusqlite::Error> for crate::Error {
         fn from(error: rusqlite::Error) -> Self {
             crate::Error::Invalid(format!("sql: {error}"))
         }
+    }
+
+    fn default_image() -> Image {
+        Image::Void
     }
 
     #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -210,9 +216,17 @@ pub mod state {
         pub id: Uuid,
         pub name: String,
         pub project: String,
+        #[serde(default = "default_image")]
+        pub image: Image,
         pub parent: Option<Uuid>,
         #[serde(default)]
         pub head: Option<Uuid>,
+        #[serde(default)]
+        pub vcpus: Option<u32>,
+        #[serde(default)]
+        pub mem_mib: Option<u32>,
+        #[serde(default)]
+        pub disk_mib: Option<u64>,
         pub created_at: DateTime<Utc>,
     }
 
@@ -241,8 +255,12 @@ pub mod state {
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
             project TEXT NOT NULL,
+            image TEXT NOT NULL DEFAULT 'void',
             parent TEXT,
             head TEXT,
+            vcpus INTEGER,
+            mem_mib INTEGER,
+            disk_mib INTEGER,
             created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS ckpts (
@@ -296,8 +314,30 @@ pub mod state {
         CREATE INDEX IF NOT EXISTS memberships_project ON memberships(project);
     "#;
 
+    fn migrate_space_columns(conn: &Connection) -> crate::Result<()> {
+        // ALTER TABLE is conditional because installs before sizing support
+        // already have rows; SQLite has no portable IF NOT EXISTS for columns.
+        for (name, definition) in [
+            ("image", "TEXT NOT NULL DEFAULT 'void'"),
+            ("vcpus", "INTEGER"),
+            ("mem_mib", "INTEGER"),
+            ("disk_mib", "INTEGER"),
+        ] {
+            let present: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('spaces') WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )?;
+            if present == 0 {
+                conn.execute_batch(&format!("ALTER TABLE spaces ADD COLUMN {name} {definition}"))?;
+            }
+        }
+        Ok(())
+    }
+
     fn init_schema(conn: &Connection) -> crate::Result<()> {
         conn.execute_batch(SCHEMA)?;
+        migrate_space_columns(conn)?;
         Ok(())
     }
 
@@ -331,14 +371,28 @@ pub mod state {
             })
     }
 
+    fn parse_image(value: String) -> rusqlite::Result<Image> {
+        value.parse::<Image>().map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                Type::Text,
+                Box::new(std::io::Error::other(format!("invalid image {value}: {error}"))),
+            )
+        })
+    }
+
     fn space_from_row(row: &Row<'_>) -> rusqlite::Result<Space> {
         Ok(Space {
             id: parse_uuid(row.get(0)?, 0)?,
             name: row.get(1)?,
             project: row.get(2)?,
-            parent: parse_optional_uuid(row.get(3)?, 3)?,
-            head: parse_optional_uuid(row.get(4)?, 4)?,
-            created_at: parse_datetime(row.get(5)?, 5)?,
+            image: parse_image(row.get(3)?)?,
+            parent: parse_optional_uuid(row.get(4)?, 4)?,
+            head: parse_optional_uuid(row.get(5)?, 5)?,
+            vcpus: row.get(6)?,
+            mem_mib: row.get(7)?,
+            disk_mib: row.get(8)?,
+            created_at: parse_datetime(row.get(9)?, 9)?,
         })
     }
 
@@ -352,17 +406,6 @@ pub mod state {
             note: row.get(5)?,
             created_at: parse_datetime(row.get(6)?, 6)?,
         })
-    }
-
-    fn space_params(space: &Space) -> [String; 6] {
-        [
-            space.id.to_string(),
-            space.name.clone(),
-            space.project.clone(),
-            space.parent.map(|id| id.to_string()).unwrap_or_default(),
-            space.head.map(|id| id.to_string()).unwrap_or_default(),
-            space.created_at.to_rfc3339(),
-        ]
     }
 
     fn ckpt_params(ckpt: &Ckpt) -> [String; 7] {
@@ -408,10 +451,20 @@ pub mod state {
         let state: State = serde_json::from_str(&contents)?;
         let tx = conn.unchecked_transaction()?;
         for space in &state.spaces {
-            let values = space_params(space);
             tx.execute(
-                "INSERT INTO spaces (id, name, project, parent, head, created_at) VALUES (?1, ?2, ?3, NULLIF(?4, ''), NULLIF(?5, ''), ?6)",
-                params![values[0], values[1], values[2], values[3], values[4], values[5]],
+                "INSERT INTO spaces (id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    space.id.to_string(),
+                    space.name,
+                    space.project,
+                    space.image.to_string(),
+                    space.parent.map(|id| id.to_string()),
+                    space.head.map(|id| id.to_string()),
+                    space.vcpus,
+                    space.mem_mib,
+                    space.disk_mib,
+                    space.created_at.to_rfc3339(),
+                ],
             )?;
         }
         for ckpt in &state.ckpts {
@@ -430,7 +483,7 @@ pub mod state {
     pub fn load(conn: &Connection) -> crate::Result<State> {
         let spaces = {
             let mut statement = conn.prepare(
-                "SELECT id, name, project, parent, head, created_at FROM spaces ORDER BY rowid",
+                "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, created_at FROM spaces ORDER BY rowid",
             )?;
             statement
                 .query_map([], space_from_row)?
@@ -453,10 +506,20 @@ pub mod state {
         tx.execute("DELETE FROM ckpts", [])?;
         tx.execute("DELETE FROM spaces", [])?;
         for space in &state.spaces {
-            let values = space_params(space);
             tx.execute(
-                "INSERT INTO spaces (id, name, project, parent, head, created_at) VALUES (?1, ?2, ?3, NULLIF(?4, ''), NULLIF(?5, ''), ?6)",
-                params![values[0], values[1], values[2], values[3], values[4], values[5]],
+                "INSERT INTO spaces (id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    space.id.to_string(),
+                    space.name,
+                    space.project,
+                    space.image.to_string(),
+                    space.parent.map(|id| id.to_string()),
+                    space.head.map(|id| id.to_string()),
+                    space.vcpus,
+                    space.mem_mib,
+                    space.disk_mib,
+                    space.created_at.to_rfc3339(),
+                ],
             )?;
         }
         for ckpt in &state.ckpts {
@@ -477,7 +540,7 @@ pub mod state {
     ) -> crate::Result<Option<Space>> {
         let by_name = conn
             .query_row(
-                "SELECT id, name, project, parent, head, created_at FROM spaces WHERE project = ?1 AND name = ?2 LIMIT 1",
+                "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, created_at FROM spaces WHERE project = ?1 AND name = ?2 LIMIT 1",
                 params![project, name],
                 space_from_row,
             )
@@ -489,7 +552,7 @@ pub mod state {
             return Ok(None);
         };
         conn.query_row(
-            "SELECT id, name, project, parent, head, created_at FROM spaces WHERE project = ?1 AND id = ?2 LIMIT 1",
+            "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, created_at FROM spaces WHERE project = ?1 AND id = ?2 LIMIT 1",
             params![project, id.to_string()],
             space_from_row,
         )
@@ -775,8 +838,12 @@ pub mod state {
                 id: space_id,
                 name: "demo".into(),
                 project: project.into(),
+                image: Image::Void,
                 parent: None,
                 head: Some(ckpt_id),
+                vcpus: None,
+                mem_mib: None,
+                disk_mib: None,
                 created_at,
             };
             let ckpt = Ckpt {
@@ -809,6 +876,30 @@ pub mod state {
                     .unwrap();
                 assert_eq!(count, 1, "table {table} should exist once");
             }
+        }
+
+        #[test]
+        fn legacy_space_rows_gain_void_image_and_inherited_sizes() {
+            let conn = Connection::open_in_memory().expect("open legacy database");
+            conn.execute_batch(
+                "CREATE TABLE spaces (id TEXT PRIMARY KEY, name TEXT NOT NULL, project TEXT NOT NULL, parent TEXT, head TEXT, created_at TEXT NOT NULL);",
+            )
+            .expect("create legacy spaces table");
+            conn.execute(
+                "INSERT INTO spaces (id, name, project, parent, head, created_at) VALUES (?1, 'legacy', 'project', NULL, NULL, ?2)",
+                params![Uuid::new_v4().to_string(), Utc::now().to_rfc3339()],
+            )
+            .expect("insert legacy space");
+
+            migrate_space_columns(&conn).expect("apply sizing migration");
+            let row: (String, Option<i64>, Option<i64>, Option<i64>) = conn
+                .query_row(
+                    "SELECT image, vcpus, mem_mib, disk_mib FROM spaces",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("read migrated space");
+            assert_eq!(row, ("void".into(), None, None, None));
         }
 
         #[test]
@@ -1867,11 +1958,17 @@ pub mod quota {
     const DEFAULT_MAX_DISK_MIB: u64 = 10_240;
     const DEFAULT_MAX_RUNNING: u32 = 2;
     const DEFAULT_API_PER_MIN: u32 = 120;
+    // These caps leave room for explicitly larger guests than the legacy
+    // defaults while keeping one tenant from exhausting a host by accident.
+    const DEFAULT_MAX_VCPUS: u32 = 16;
+    const DEFAULT_MAX_MEM_MIB: u32 = 32 * 1024;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Limits {
         pub max_spaces: u32,
         pub max_disk_mib: u64,
+        pub max_vcpus: u32,
+        pub max_mem_mib: u32,
         pub max_running: u32,
         pub api_per_min: u32,
     }
@@ -1893,6 +1990,8 @@ pub mod quota {
                     "SHINU_LIMIT_DISK_MIB",
                     DEFAULT_MAX_DISK_MIB,
                 ),
+                max_vcpus: positive_u32(&lookup, "SHINU_LIMIT_VCPUS", DEFAULT_MAX_VCPUS),
+                max_mem_mib: positive_u32(&lookup, "SHINU_LIMIT_MEM_MIB", DEFAULT_MAX_MEM_MIB),
                 max_running: positive_u32(&lookup, "SHINU_LIMIT_RUNNING", DEFAULT_MAX_RUNNING),
                 api_per_min: positive_u32(&lookup, "SHINU_LIMIT_API_PER_MIN", DEFAULT_API_PER_MIN),
             }
@@ -1986,15 +2085,35 @@ pub mod quota {
         Ok(())
     }
 
+    pub fn check_vcpu_limit(requested: u32, limits: &Limits) -> crate::Result<()> {
+        if requested > limits.max_vcpus {
+            return Err(crate::Error::Quota(format!(
+                "vcpus limit exceeded (requested {requested}, cap {})",
+                limits.max_vcpus
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn check_mem_limit(requested: u32, limits: &Limits) -> crate::Result<()> {
+        if requested > limits.max_mem_mib {
+            return Err(crate::Error::Quota(format!(
+                "memory limit exceeded (requested {requested} MiB, cap {} MiB)",
+                limits.max_mem_mib
+            )));
+        }
+        Ok(())
+    }
+
     pub fn check_disk_limit(
         current_mib: u64,
         adding_mib: u64,
         limits: &Limits,
     ) -> crate::Result<()> {
         let projected_mib = current_mib.saturating_add(adding_mib);
-        if projected_mib >= limits.max_disk_mib {
+        if projected_mib > limits.max_disk_mib {
             return Err(crate::Error::Quota(format!(
-                "disk limit reached ({projected_mib}/{} MiB; current {current_mib}, adding {adding_mib}); delete a space or reduce its disk size",
+                "disk limit exceeded (requested total {projected_mib} MiB, cap {} MiB; current {current_mib}, adding {adding_mib})",
                 limits.max_disk_mib
             )));
         }
@@ -2021,6 +2140,8 @@ pub mod quota {
             let limits = Limits::from_lookup(|_| None);
             assert_eq!(limits.max_spaces, 5);
             assert_eq!(limits.max_disk_mib, 10_240);
+            assert_eq!(limits.max_vcpus, 16);
+            assert_eq!(limits.max_mem_mib, 32 * 1024);
             assert_eq!(limits.max_running, 2);
             assert_eq!(limits.api_per_min, 120);
         }
@@ -2031,6 +2152,8 @@ pub mod quota {
                 Some(match key {
                     "SHINU_LIMIT_SPACES" => "9",
                     "SHINU_LIMIT_DISK_MIB" => "20480",
+                    "SHINU_LIMIT_VCPUS" => "8",
+                    "SHINU_LIMIT_MEM_MIB" => "16384",
                     "SHINU_LIMIT_RUNNING" => "4",
                     "SHINU_LIMIT_API_PER_MIN" => "600",
                     _ => return None,
@@ -2039,6 +2162,8 @@ pub mod quota {
             });
             assert_eq!(limits.max_spaces, 9);
             assert_eq!(limits.max_disk_mib, 20_480);
+            assert_eq!(limits.max_vcpus, 8);
+            assert_eq!(limits.max_mem_mib, 16_384);
             assert_eq!(limits.max_running, 4);
             assert_eq!(limits.api_per_min, 600);
         }
@@ -2051,6 +2176,8 @@ pub mod quota {
                     "SHINU_LIMIT_DISK_MIB" => " ",
                     "SHINU_LIMIT_RUNNING" => "0",
                     "SHINU_LIMIT_API_PER_MIN" => "-1",
+                    "SHINU_LIMIT_VCPUS" => "0",
+                    "SHINU_LIMIT_MEM_MIB" => " ",
                     _ => return None,
                 }
                 .to_owned())
@@ -2072,15 +2199,45 @@ pub mod quota {
         }
 
         #[test]
-        fn disk_limit_rejects_boundary_and_allows_below() {
+        fn disk_limit_allows_exact_cap_and_rejects_above() {
             let limits = Limits {
                 max_disk_mib: 100,
                 ..Limits::from_lookup(|_| None)
             };
-            assert!(check_disk_limit(90, 9, &limits).is_ok());
+            // The cap is inclusive: a 100 MiB allowance has to permit exactly
+            // 100 MiB, or the advertised number is never actually reachable.
+            assert!(check_disk_limit(90, 10, &limits).is_ok());
             assert!(matches!(
-                check_disk_limit(90, 10, &limits),
+                check_disk_limit(90, 11, &limits),
                 Err(crate::Error::Quota(message)) if message.contains("100")
+            ));
+        }
+
+        #[test]
+        fn vcpu_limit_allows_exact_cap_and_rejects_above() {
+            let limits = Limits {
+                max_vcpus: 4,
+                ..Limits::from_lookup(|_| None)
+            };
+            assert!(check_vcpu_limit(4, &limits).is_ok());
+            assert!(matches!(
+                check_vcpu_limit(5, &limits),
+                Err(crate::Error::Quota(message))
+                    if message.contains("requested 5") && message.contains("cap 4")
+            ));
+        }
+
+        #[test]
+        fn memory_limit_allows_exact_cap_and_rejects_above() {
+            let limits = Limits {
+                max_mem_mib: 1024,
+                ..Limits::from_lookup(|_| None)
+            };
+            assert!(check_mem_limit(1024, &limits).is_ok());
+            assert!(matches!(
+                check_mem_limit(1025, &limits),
+                Err(crate::Error::Quota(message))
+                    if message.contains("requested 1025") && message.contains("cap 1024")
             ));
         }
 
@@ -2157,10 +2314,82 @@ pub fn cache_dir(root: &Path) -> PathBuf {
     root.join("cache")
 }
 
-/// `<root>/base.ext4` — the golden guest disk image every space is cloned
-/// from. A file, not a subvolume: Firecracker boots a block device.
-pub fn base_path(root: &Path) -> PathBuf {
-    root.join("base.ext4")
+/// The guest distributions supported by the image builder.
+///
+/// The spelling is part of the API: these ids are persisted in space rows and
+/// are used in base-image filenames, so accepting aliases would create two
+/// names for the same disk contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Image {
+    Void,
+    Ubuntu,
+    Arch,
+    Rocky,
+}
+
+impl Image {
+    pub const fn all() -> [Self; 4] {
+        [Self::Void, Self::Ubuntu, Self::Arch, Self::Rocky]
+    }
+
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Void => "void",
+            Self::Ubuntu => "ubuntu",
+            Self::Arch => "arch",
+            Self::Rocky => "rocky",
+        }
+    }
+    pub const fn init_path(self) -> &'static str {
+        match self {
+            Self::Arch => "/usr/lib/systemd/systemd",
+            Self::Void | Self::Ubuntu | Self::Rocky => "/sbin/init",
+        }
+    }
+}
+
+impl std::fmt::Display for Image {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.id())
+    }
+}
+
+impl std::str::FromStr for Image {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "void" => Ok(Self::Void),
+            "ubuntu" => Ok(Self::Ubuntu),
+            "arch" => Ok(Self::Arch),
+            "rocky" => Ok(Self::Rocky),
+            _ => Err(Error::Invalid(format!(
+                "unknown image id {value:?}; valid ids: void, ubuntu, arch, rocky"
+            ))),
+        }
+    }
+}
+
+/// `<root>/base-<image>.ext4` — the golden guest disk for one distribution.
+/// A file, not a subvolume: Firecracker boots a block device.
+pub fn base_path(root: &Path, image: Image) -> PathBuf {
+    root.join(format!("base-{image}.ext4"))
+}
+
+/// Move the pre-multi-image Void base to its explicit image name.
+///
+/// `rename` is atomic on one filesystem, so a daemon restart cannot expose a
+/// partially migrated image. When the destination already exists we leave
+/// both files untouched rather than replacing a valid newer base.
+pub fn migrate_base(root: &Path) -> Result<()> {
+    let legacy = root.join("base.ext4");
+    let migrated = base_path(root, Image::Void);
+    if !legacy.exists() || migrated.exists() {
+        return Ok(());
+    }
+    std::fs::rename(legacy, migrated)?;
+    Ok(())
 }
 
 pub fn space_image(root: &Path, id: Uuid) -> PathBuf {
@@ -2249,10 +2478,17 @@ impl BaseConfig {
         })
     }
 
-    fn index_url(&self) -> String {
+    fn void_index_url(&self) -> String {
         format!("{}/live/current/", self.mirror)
     }
 }
+
+const UBUNTU_RELEASE_URL: &str =
+    "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/";
+const ARCH_BOOTSTRAP_URL: &str =
+    "https://geo.mirror.pkgbuild.com/iso/latest/archlinux-bootstrap-x86_64.tar.zst";
+const ROCKY_CONTAINER_URL: &str =
+    "https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-Container-Base.latest.x86_64.tar.xz";
 
 fn uname_machine() -> Result<String> {
     let output = std::process::Command::new("uname").arg("-m").output()?;
@@ -2296,6 +2532,29 @@ fn pick_tarball_name(index: &str, arch: &str) -> Result<String> {
         .ok_or_else(|| Error::Invalid(format!("no {prefix}*.tar.xz in mirror index for {arch}")))
 }
 
+/// Newest Ubuntu 24.04 point release in the release directory listing.
+fn pick_ubuntu_tarball_name(index: &str) -> Result<String> {
+    let prefix = "ubuntu-base-24.04.";
+    let suffix = "-base-amd64.tar.gz";
+    let mut best: Option<(u32, &str)> = None;
+    for token in index.split(|c: char| !(c.is_ascii_alphanumeric() || "-_.".contains(c))) {
+        let Some(point) = token.strip_prefix(prefix).and_then(|rest| rest.strip_suffix(suffix)) else {
+            continue;
+        };
+        let Ok(point) = point.parse::<u32>() else {
+            continue;
+        };
+        if best.is_none_or(|(current, _)| point > current) {
+            best = Some((point, token));
+        }
+    }
+    best.map(|(_, name)| name.to_owned()).ok_or_else(|| {
+        Error::Invalid(
+            "no ubuntu-base-24.04.N-base-amd64.tar.gz in the Ubuntu release index".to_owned(),
+        )
+    })
+}
+
 /// Void publishes BSD-style digests: `SHA256 (<file>) = <hex>`.
 fn pick_sha256(list: &str, name: &str) -> Result<String> {
     let needle = format!("({name})");
@@ -2309,7 +2568,10 @@ fn pick_sha256(list: &str, name: &str) -> Result<String> {
 
 #[cfg(test)]
 mod base_tests {
-    use super::{pick_sha256, pick_tarball_name};
+    use super::{
+        base_path, migrate_base, oci_layer_member, oci_manifest_member, pick_sha256,
+        pick_tarball_name, pick_ubuntu_tarball_name, Error, Image,
+    };
 
     /// Shape copied from the live mirror index.
     const INDEX: &str = r#"<a href="void-x86_64-ROOTFS-20240314.tar.xz">void-x86_64-ROOTFS-20240314.tar.xz</a>
@@ -2336,7 +2598,7 @@ mod base_tests {
 
     #[test]
     fn reads_bsd_style_digest_for_the_exact_file() {
-        let list = "SHA256 (void-x86_64-musl-ROOTFS-20250202.tar.xz) = 8f66e05401a953d151b3e82d132437840e0b24a51edff27f13202c9010dfa27d\nSHA256 (void-x86_64-ROOTFS-20250202.tar.xz) = 3f48e6673ac5907a897d913c97eb96edbfb230162731b4016562c51b3b8f1876\n";
+        let list = "SHA256 (void-x86_64-musl-ROOTFS-20250202.tar.xz) = 8f66e05401a953d151b3e82d132437840e0b24a51edff27f13202c9010dfa27\nSHA256 (void-x86_64-ROOTFS-20250202.tar.xz) = 3f48e6673ac5907a897d913c97eb96edbfb230162731b4016562c51b3b8f1876\n";
         assert_eq!(
             pick_sha256(list, "void-x86_64-ROOTFS-20250202.tar.xz").expect("digest"),
             "3f48e6673ac5907a897d913c97eb96edbfb230162731b4016562c51b3b8f1876"
@@ -2348,6 +2610,89 @@ mod base_tests {
         let list = "SHA256 (other.tar.xz) = deadbeef\n";
         assert!(pick_sha256(list, "void-x86_64-ROOTFS-20250202.tar.xz").is_err());
         assert!(pick_sha256("SHA256 (x.tar.xz) = nothex\n", "x.tar.xz").is_err());
+    }
+
+    #[test]
+    fn image_ids_round_trip_through_text_and_json() {
+        for image in Image::all() {
+            let id = image.to_string();
+            assert_eq!(id.parse::<Image>().expect("image id"), image);
+            assert_eq!(
+                serde_json::to_string(&image).expect("image JSON"),
+                format!("\"{id}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<Image>(&format!("\"{id}\""))
+                    .expect("image JSON parse"),
+                image
+            );
+        }
+    }
+
+    #[test]
+    fn image_parser_names_the_valid_ids() {
+        let error = "debian".parse::<Image>().expect_err("unknown image");
+        assert!(matches!(error, Error::Invalid(message) if message.contains("void, ubuntu, arch, rocky")));
+    }
+
+    #[test]
+    fn base_paths_are_explicit_per_image() {
+        let root = std::path::Path::new("/var/lib/shinu");
+        assert_eq!(base_path(root, Image::Void), root.join("base-void.ext4"));
+        assert_eq!(base_path(root, Image::Ubuntu), root.join("base-ubuntu.ext4"));
+        assert_eq!(base_path(root, Image::Arch), root.join("base-arch.ext4"));
+        assert_eq!(base_path(root, Image::Rocky), root.join("base-rocky.ext4"));
+    }
+
+    #[test]
+    fn migrates_legacy_void_base_once() {
+        let root = std::env::temp_dir().join(format!("shinu-base-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create test root");
+        let legacy = root.join("base.ext4");
+        std::fs::write(&legacy, b"void image").expect("write legacy base");
+        migrate_base(&root).expect("migrate legacy base");
+        assert!(!legacy.exists());
+        assert_eq!(
+            std::fs::read(base_path(&root, Image::Void)).expect("read migrated base"),
+            b"void image"
+        );
+        migrate_base(&root).expect("idempotent migration");
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn picks_newest_ubuntu_point_release() {
+        let listing = r#"
+            <a href="ubuntu-base-24.04.1-base-amd64.tar.gz">old</a>
+            <a href="ubuntu-base-24.04.10-base-amd64.tar.gz">newest</a>
+            <a href="ubuntu-base-24.04.9-base-amd64.tar.gz">middle</a>
+            <a href="ubuntu-base-24.04.10-base-arm64.tar.gz">wrong arch</a>
+        "#;
+        assert_eq!(
+            pick_ubuntu_tarball_name(listing).expect("Ubuntu archive"),
+            "ubuntu-base-24.04.10-base-amd64.tar.gz"
+        );
+    }
+
+    #[test]
+    fn parses_single_layer_oci_metadata_and_rejects_multi_layer() {
+        let manifest_digest = "a".repeat(64);
+        let layer_digest = "b".repeat(64);
+        let index = format!(r#"{{"manifests":[{{"digest":"sha256:{manifest_digest}"}}]}}"#);
+        let manifest = format!(r#"{{"layers":[{{"digest":"sha256:{layer_digest}"}}]}}"#);
+        assert_eq!(
+            oci_manifest_member(&index).expect("manifest member"),
+            format!("blobs/sha256/{manifest_digest}")
+        );
+        assert_eq!(
+            oci_layer_member(&manifest).expect("layer member"),
+            format!("blobs/sha256/{layer_digest}")
+        );
+        let multi = r#"{"layers":[{"digest":"sha256:a"},{"digest":"sha256:b"}]}"#;
+        let error = oci_layer_member(multi).expect_err("multi-layer OCI");
+        assert!(
+            matches!(error, Error::Invalid(message) if message.contains("2 layers") && message.contains("single-layer"))
+        );
     }
 }
 
@@ -2368,9 +2713,12 @@ fn sha256_file(path: &Path) -> Result<String> {
         .ok_or_else(|| Error::Invalid("empty sha256sum output".to_owned()))
 }
 
-/// Returns a verified tarball path, downloading into `<root>/cache` only when
-/// the cached copy is absent or fails its digest.
-fn fetch_tarball(root: &Path, cfg: &BaseConfig) -> Result<PathBuf> {
+/// Returns the cached rootfs archive for one image, downloading it lazily.
+///
+/// Void retains its signed-by-index digest flow. The other verified sources
+/// publish a stable release URL (Ubuntu's point release is selected from its
+/// directory listing), so their archives are cached by filename.
+fn fetch_tarball(root: &Path, image: Image, cfg: &BaseConfig) -> Result<PathBuf> {
     if let Some(path) = &cfg.tarball {
         if !path.exists() {
             return Err(Error::Invalid(format!(
@@ -2381,42 +2729,134 @@ fn fetch_tarball(root: &Path, cfg: &BaseConfig) -> Result<PathBuf> {
         return Ok(path.clone());
     }
 
-    let index = curl_text(&cfg.index_url())?;
-    let name = pick_tarball_name(&index, &cfg.arch)?;
-    let digest = pick_sha256(
-        &curl_text(&format!("{}sha256sum.txt", cfg.index_url()))?,
-        &name,
-    )?;
-
     let cache = cache_dir(root);
     std::fs::create_dir_all(&cache)?;
-    let target = cache.join(&name);
-    if target.exists() && sha256_file(&target)? == digest {
-        return Ok(target);
-    }
+    match image {
+        Image::Void => {
+            let index_url = cfg.void_index_url();
+            let name = pick_tarball_name(&curl_text(&index_url)?, &cfg.arch)?;
+            let digest = pick_sha256(
+                &curl_text(&format!("{index_url}sha256sum.txt"))?,
+                &name,
+            )?;
+            let target = cache.join(&name);
+            if target.exists() && sha256_file(&target)? == digest {
+                return Ok(target);
+            }
+            let tmp = cache.join(format!("{name}.part"));
+            let _ = std::fs::remove_file(&tmp);
+            let status = std::process::Command::new("curl")
+                .args(["-sSfL", "--max-time", "1800", "-o"])
+                .arg(&tmp)
+                .arg(format!("{index_url}{name}"))
+                .status()?;
+            if !status.success() {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(Error::Invalid(format!("download failed: {name}")));
+            }
+            let actual = sha256_file(&tmp)?;
+            if actual != digest {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(Error::Invalid(format!(
+                    "sha256 mismatch for {name}: expected {digest}, got {actual}"
+                )));
+            }
+            std::fs::rename(tmp, &target)?;
+            Ok(target)
+        }
+        Image::Ubuntu => {
+            let index = curl_text(UBUNTU_RELEASE_URL)?;
+            let name = pick_ubuntu_tarball_name(&index)?;
+            let target = cache.join(&name);
+            if !target.exists() {
+                curl_to_file(&format!("{UBUNTU_RELEASE_URL}{name}"), &target)?;
+            }
+            Ok(target)
+        }
+        Image::Arch => {
+            let target = cache.join("archlinux-bootstrap-x86_64.tar.zst");
+            if !target.exists() {
+                curl_to_file(ARCH_BOOTSTRAP_URL, &target)?;
+            }
+            Ok(target)
+        }
 
-    // Download to a sibling temp name so an interrupted transfer can never be
-    // mistaken for a cached image on the next run.
-    let tmp = cache.join(format!("{name}.part"));
-    let _ = std::fs::remove_file(&tmp);
-    let status = std::process::Command::new("curl")
-        .args(["-sSfL", "--max-time", "1800", "-o"])
-        .arg(&tmp)
-        .arg(format!("{}{name}", cfg.index_url()))
-        .status()?;
-    if !status.success() {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(Error::Invalid(format!("download failed: {name}")));
+        Image::Rocky => {
+            let name = "Rocky-9-Container-Base.latest.x86_64.tar.xz";
+            let target = cache.join(name);
+            if !target.exists() {
+                curl_to_file(ROCKY_CONTAINER_URL, &target)?;
+            }
+            Ok(target)
+        }
     }
-    let actual = sha256_file(&tmp)?;
-    if actual != digest {
-        let _ = std::fs::remove_file(&tmp);
+}
+fn oci_descriptor_member(descriptor: &serde_json::Value, role: &str) -> Result<String> {
+    let digest = descriptor
+        .get("digest")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| Error::Invalid(format!("OCI {role} descriptor has no digest")))?;
+    let Some(hex) = digest.strip_prefix("sha256:") else {
         return Err(Error::Invalid(format!(
-            "sha256 mismatch for {name}: expected {digest}, got {actual}"
+            "OCI {role} digest must use sha256:"
+        )));
+    };
+    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(Error::Invalid(format!("OCI {role} digest is not valid sha256")));
+    }
+    Ok(format!("blobs/sha256/{hex}"))
+}
+
+fn oci_manifest_member(index_json: &str) -> Result<String> {
+    let index: serde_json::Value = serde_json::from_str(index_json)?;
+    let manifests = index
+        .get("manifests")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| Error::Invalid("OCI index has no manifests array".to_owned()))?;
+    if manifests.len() != 1 {
+        return Err(Error::Invalid(format!(
+            "OCI index has {} manifests; expected exactly one",
+            manifests.len()
         )));
     }
-    std::fs::rename(&tmp, &target)?;
-    Ok(target)
+    oci_descriptor_member(&manifests[0], "manifest")
+}
+
+fn oci_layer_member(manifest_json: &str) -> Result<String> {
+    let manifest: serde_json::Value = serde_json::from_str(manifest_json)?;
+    let layers = manifest
+        .get("layers")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| Error::Invalid("OCI manifest has no layers array".to_owned()))?;
+    if layers.len() > 1 {
+        return Err(Error::Invalid(format!(
+            "OCI image has {} layers; only single-layer images are supported",
+            layers.len()
+        )));
+    }
+    if layers.is_empty() {
+        return Err(Error::Invalid(
+            "OCI image has no layers; expected exactly one".to_owned(),
+        ));
+    }
+    oci_descriptor_member(&layers[0], "layer")
+}
+
+fn tar_member(archive: &Path, member: &str) -> Result<Vec<u8>> {
+    let output = std::process::Command::new("tar")
+        .args(["-xJOf"])
+        .arg(archive)
+        .arg(member)
+        .output()?;
+    if !output.status.success() {
+        return Err(Error::Invalid(format!(
+            "extracting {} from {} failed: {}",
+            member,
+            archive.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(output.stdout)
 }
 
 /// Firecracker ships BSD-less `sha256sum` style digests inside the release
@@ -2715,11 +3155,20 @@ pub fn guest_resolv_needs_repair(resolv: &str) -> bool {
 
 fn seed_resolv(mnt: &Path) -> Result<()> {
     let fallback = guest_dns_fallback();
-    if let Ok(resolv) = std::fs::read("/etc/resolv.conf") {
-        let resolv = String::from_utf8_lossy(&resolv);
-        let contents = filter_guest_nameservers(&resolv, &fallback);
-        std::fs::write(mnt.join("etc/resolv.conf"), contents)?;
+    let contents = match std::fs::read("/etc/resolv.conf") {
+        Ok(resolv) => filter_guest_nameservers(&String::from_utf8_lossy(&resolv), &fallback),
+        Err(_) => format!("nameserver {fallback}\n"),
+    };
+    let path = mnt.join("etc/resolv.conf");
+    if std::fs::symlink_metadata(&path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        // Distro archives often ship a dangling systemd-resolved link; writing
+        // through it would fail before the package manager has created /run.
+        std::fs::remove_file(&path)?;
     }
+    std::fs::write(path, contents)?;
     Ok(())
 }
 
@@ -2880,19 +3329,23 @@ pub fn net_spec(id: Uuid, cfg: &NetConfig) -> Option<NetSpec> {
     })
 }
 
-/// Firecracker's `--config-file` body. `root=/dev/vda rw init=/sbin/init`
-/// boots the ext4 image directly with no initrd, which is why the guest
-/// kernel must have virtio-blk and ext4 built in.
+/// Firecracker's `--config-file` body. The init path follows the selected
+/// image because Arch's usr-merged `/sbin/init` symlink is not kernel-safe.
+/// The ext4 image boots directly with no initrd, so the guest kernel must have
+/// virtio-blk and ext4 built in.
 pub fn vm_config_json(
     kernel: &Path,
     rootfs: &Path,
+    image: Image,
     vsock_uds: &Path,
     vcpus: u32,
     mem_mib: u32,
     net: Option<&NetSpec>,
 ) -> String {
-    let mut boot_args =
-        "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/sbin/init".to_owned();
+    let mut boot_args = format!(
+        "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init={}",
+        image.init_path()
+    );
     if let Some(net) = net {
         boot_args.push_str(" shinu.ip=");
         boot_args.push_str(&net.guest_cidr);
@@ -2933,8 +3386,8 @@ pub fn vm_config_json(
 #[cfg(test)]
 mod network_tests {
     use super::{
-        filter_guest_nameservers, guest_resolv_needs_repair, is_rfc1918, parse_net_allow, NetSpec,
-        net_slot, tap_name, vm_config_json,
+        filter_guest_nameservers, guest_resolv_needs_repair, is_rfc1918, parse_net_allow, Image,
+        NetSpec, net_slot, tap_name, vm_config_json,
     };
     use crate::vm::egress_rules;
     use serde_json::Value;
@@ -2973,6 +3426,7 @@ mod network_tests {
         let actual = vm_config_json(
             Path::new("/kernel"),
             Path::new("/rootfs"),
+            Image::Void,
             Path::new("/vsock"),
             2,
             128,
@@ -2996,6 +3450,23 @@ mod network_tests {
         .to_string();
         assert_eq!(actual, legacy);
     }
+    #[test]
+    fn vm_config_uses_arch_systemd_init_path() {
+        let value: Value = serde_json::from_str(&vm_config_json(
+            Path::new("/kernel"),
+            Path::new("/rootfs"),
+            Image::Arch,
+            Path::new("/vsock"),
+            2,
+            128,
+            None,
+        ))
+        .expect("valid Firecracker JSON");
+        assert_eq!(
+            value["boot-source"]["boot_args"],
+            "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda rw init=/usr/lib/systemd/systemd"
+        );
+    }
 
     #[test]
     fn vm_config_network_contains_interface_and_kernel_addresses() {
@@ -3008,6 +3479,7 @@ mod network_tests {
         let value: Value = serde_json::from_str(&vm_config_json(
             Path::new("/kernel"),
             Path::new("/rootfs"),
+            Image::Void,
             Path::new("/vsock"),
             2,
             128,
@@ -3140,6 +3612,71 @@ fn umount(mnt: &Path) -> Result<()> {
     Ok(())
 }
 
+fn extract_rootfs(root: &Path, image: Image, archive: &Path, mnt: &Path) -> Result<()> {
+    match image {
+        Image::Void => extract_archive(archive, mnt, ["-xJpf"], false),
+        Image::Ubuntu => extract_archive(archive, mnt, ["-xzpf"], false),
+        Image::Arch => extract_archive(archive, mnt, ["--zstd", "-xpf"], true),
+        Image::Rocky => extract_oci_rootfs(root, archive, mnt),
+    }
+}
+
+fn extract_archive<const N: usize>(
+    archive: &Path,
+    mnt: &Path,
+    flags: [&str; N],
+    strip_root: bool,
+) -> Result<()> {
+    let mut command = std::process::Command::new("tar");
+    command.args(flags).arg(archive).arg("-C").arg(mnt).arg("--numeric-owner");
+    if strip_root {
+        command.arg("--strip-components=1");
+    }
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err(Error::Invalid(format!(
+            "extracting {} failed: {}",
+            archive.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
+fn extract_oci_rootfs(root: &Path, archive: &Path, mnt: &Path) -> Result<()> {
+    let index = tar_member(archive, "index.json")?;
+    let index = std::str::from_utf8(&index)
+        .map_err(|error| Error::Invalid(format!("OCI index.json is not UTF-8: {error}")))?;
+    let manifest_member = oci_manifest_member(index)?;
+    let manifest = tar_member(archive, &manifest_member)?;
+    let manifest = std::str::from_utf8(&manifest)
+        .map_err(|error| Error::Invalid(format!("OCI manifest is not UTF-8: {error}")))?;
+    let layer_member = oci_layer_member(manifest)?;
+
+    // The OCI outer archive is compressed, while its layer is a plain tar
+    // stream. Stage it in cache so extraction never buffers a rootfs in RAM.
+    let stage = cache_dir(root).join("rocky-layer.tar.part");
+    let _ = std::fs::remove_file(&stage);
+    let file = std::fs::File::create(&stage)?;
+    let output = std::process::Command::new("tar")
+        .args(["-xJOf"])
+        .arg(archive)
+        .arg(&layer_member)
+        .stdout(std::process::Stdio::from(file))
+        .output()?;
+    if !output.status.success() {
+        let _ = std::fs::remove_file(&stage);
+        return Err(Error::Invalid(format!(
+            "extracting OCI layer {} failed: {}",
+            layer_member,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let result = extract_archive(&stage, mnt, ["-xpf"], false);
+    let _ = std::fs::remove_file(&stage);
+    result
+}
+
 /// Runs a shell command inside the mounted image. Only ever called by the
 /// root daemon while building the base: the mounts live in a private
 /// namespace that dies with the child, so nothing leaks into the host.
@@ -3171,7 +3708,12 @@ fn chroot_run(mnt: &Path, command: &str) -> Result<()> {
 /// Turns the extracted rootfs into a bootable cloud image: root login, serial
 /// console, sshd, and the vsock bridge sshd cannot provide itself (OpenSSH
 /// has no AF_VSOCK listener, so socat forwards the guest vsock port to it).
-fn configure_image(mnt: &Path) -> Result<()> {
+fn configure_image(mnt: &Path, image: Image) -> Result<()> {
+    // Package managers resolve mirrors during this build, before a guest has
+    // a runtime network interface; a baked public resolver is the only DNS
+    // path available inside the chroot.
+    seed_resolv(mnt)?;
+
     // Passwordless root for the serial console. Key auth is what `exec` uses;
     // this only matters when a human attaches to ttyS0 to debug a boot.
     let shadow = mnt.join("etc/shadow");
@@ -3190,57 +3732,171 @@ fn configure_image(mnt: &Path) -> Result<()> {
         std::fs::write(&shadow, format!("{patched}\n"))?;
     }
 
-    let default = mnt.join("etc/runit/runsvdir/default");
-    std::fs::create_dir_all(&default)?;
-    // A microVM has one serial port and no virtual terminals; leaving the
-    // tty1-6 gettys enabled just burns boot time on devices that do not exist.
-    for n in 1..=6 {
-        let _ = std::fs::remove_file(default.join(format!("agetty-tty{n}")));
-    }
-
-    let bridge = mnt.join("etc/sv/vsock-sshd");
-    std::fs::create_dir_all(&bridge)?;
-    std::fs::write(
-        bridge.join("run"),
-        format!(
-            "#!/bin/sh\nexec 2>&1\nexec socat VSOCK-LISTEN:{VSOCK_SSH_PORT},fork,reuseaddr TCP:127.0.0.1:22\n"
-        ),
-    )?;
-    std::fs::set_permissions(bridge.join("run"), std::fs::Permissions::from_mode(0o755))?;
-    let network = mnt.join("etc/sv/shinu-net");
-    std::fs::create_dir_all(&network)?;
-    std::fs::write(
-        network.join("run"),
-        "#!/bin/sh\nexec 2>&1\nIP=$(sed -n 's/.*shinu\\.ip=\\([^ ]*\\).*/\\1/p' /proc/cmdline)\nGW=$(sed -n 's/.*shinu\\.gw=\\([^ ]*\\).*/\\1/p' /proc/cmdline)\n[ -n \"$IP\" ] || { echo \"no shinu.ip on cmdline\"; exec sleep infinity; }\nip addr add \"$IP\" dev eth0 2>/dev/null\nip link set eth0 up\n[ -n \"$GW\" ] && ip route add default via \"$GW\" 2>/dev/null\necho \"configured $IP via $GW\"\nexec sleep infinity\n",
-    )?;
-    std::fs::set_permissions(network.join("run"), std::fs::Permissions::from_mode(0o755))?;
-
-    for service in ["agetty-ttyS0", "sshd", "vsock-sshd", "shinu-net"] {
-        let link = default.join(service);
-        let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink(format!("/etc/sv/{service}"), &link)?;
-    }
-
+    let ssh_dir = mnt.join("etc/ssh");
+    std::fs::create_dir_all(&ssh_dir)?;
     // `UseDNS no` keeps login independent of guest network readiness; the
     // bridge peer is always socat on 127.0.0.1 while eth0 is booting.
-    std::fs::write(
-        mnt.join("etc/ssh/sshd_config.d-shinu.conf"),
-        "PermitRootLogin prohibit-password\nPubkeyAuthentication yes\nUseDNS no\nGSSAPIAuthentication no\n",
-    )?;
-    let sshd_config = mnt.join("etc/ssh/sshd_config");
+    let required = [
+        "PermitRootLogin prohibit-password",
+        "PubkeyAuthentication yes",
+        "UseDNS no",
+        "GSSAPIAuthentication no",
+    ];
+    let sshd_config = ssh_dir.join("sshd_config");
     let mut contents = std::fs::read_to_string(&sshd_config).unwrap_or_default();
-    contents.push_str(&std::fs::read_to_string(
-        mnt.join("etc/ssh/sshd_config.d-shinu.conf"),
-    )?);
+    for line in required {
+        if !contents.lines().any(|existing| existing.trim() == line) {
+            if !contents.ends_with('\n') {
+                contents.push('\n');
+            }
+            contents.push_str(line);
+            contents.push('\n');
+        }
+    }
     std::fs::write(&sshd_config, contents)?;
-    std::fs::remove_file(mnt.join("etc/ssh/sshd_config.d-shinu.conf"))?;
+
+    let network_script = "#!/bin/sh\nexec 2>&1\nIP=$(sed -n 's/.*shinu\\.ip=\\([^ ]*\\).*/\\1/p' /proc/cmdline)\nGW=$(sed -n 's/.*shinu\\.gw=\\([^ ]*\\).*/\\1/p' /proc/cmdline)\n[ -n \"$IP\" ] || { echo \"no shinu.ip on cmdline\"; exec sleep infinity; }\nip addr add \"$IP\" dev eth0 2>/dev/null\nip link set eth0 up\n[ -n \"$GW\" ] && ip route add default via \"$GW\" 2>/dev/null\necho \"configured $IP via $GW\"\nexec sleep infinity\n";
+
+    if image == Image::Arch {
+        let pacman = mnt.join("etc/pacman.conf");
+        let contents = std::fs::read_to_string(&pacman).unwrap_or_default();
+        let mut found_check_space = false;
+        let patched = contents
+            .lines()
+            .map(|line| {
+                if line.trim_start().starts_with("CheckSpace") {
+                    found_check_space = true;
+                    format!("#{}", line)
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut patched = patched;
+        if !patched.is_empty() {
+            patched.push('\n');
+        }
+        if !found_check_space {
+            patched.push_str("#CheckSpace\n");
+        }
+        std::fs::write(pacman, patched)?;
+        let mirrorlist = mnt.join("etc/pacman.d/mirrorlist");
+        if let Some(parent) = mirrorlist.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(
+            mirrorlist,
+            "Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch\n",
+        )?;
+    }
+
+    match image {
+        Image::Void => {
+            let default = mnt.join("etc/runit/runsvdir/default");
+            std::fs::create_dir_all(&default)?;
+            // A microVM has one serial port and no virtual terminals; leaving
+            // tty1-6 gettys enabled just burns boot time on devices that do not exist.
+            for n in 1..=6 {
+                let _ = std::fs::remove_file(default.join(format!("agetty-tty{n}")));
+            }
+
+            let bridge = mnt.join("etc/sv/vsock-sshd");
+            std::fs::create_dir_all(&bridge)?;
+            std::fs::write(
+                bridge.join("run"),
+                format!(
+                    "#!/bin/sh\nexec 2>&1\nexec socat VSOCK-LISTEN:{VSOCK_SSH_PORT},fork,reuseaddr TCP:127.0.0.1:22\n"
+                ),
+            )?;
+            std::fs::set_permissions(bridge.join("run"), std::fs::Permissions::from_mode(0o755))?;
+            let network = mnt.join("etc/sv/shinu-net");
+            std::fs::create_dir_all(&network)?;
+            std::fs::write(network.join("run"), network_script)?;
+            std::fs::set_permissions(network.join("run"), std::fs::Permissions::from_mode(0o755))?;
+
+            for service in ["agetty-ttyS0", "sshd", "vsock-sshd", "shinu-net"] {
+                let link = default.join(service);
+                let _ = std::fs::remove_file(&link);
+                std::os::unix::fs::symlink(format!("/etc/sv/{service}"), &link)?;
+            }
+        }
+        Image::Ubuntu | Image::Arch | Image::Rocky => {
+            let sshd = match image {
+                Image::Arch => "/usr/bin/sshd",
+                Image::Ubuntu | Image::Rocky => "/usr/sbin/sshd",
+                Image::Void => unreachable!(),
+            };
+            let systemd = mnt.join("etc/systemd/system");
+            std::fs::create_dir_all(&systemd)?;
+            let machine_id = mnt.join("etc/machine-id");
+            if std::fs::symlink_metadata(&machine_id)
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(false)
+            {
+                std::fs::remove_file(&machine_id)?;
+            }
+            // Keep this file empty instead of baking a UUID into the base:
+            // systemd fills a fresh id during early boot, so cloned spaces do
+            // not share one identity. A future image that loses this file is
+            // also protected from an interactive firstboot prompt below.
+            std::fs::write(&machine_id, b"")?;
+            let firstboot = systemd.join("systemd-firstboot.service");
+            let _ = std::fs::remove_file(&firstboot);
+            std::os::unix::fs::symlink("/dev/null", firstboot)?;
+            std::fs::write(
+                systemd.join("shinu-sshd.service"),
+                format!(
+                    "[Unit]\nAfter=network.target\n\n[Service]\nExecStart={sshd} -D -e\nRestart=on-failure\n\n[Install]\nWantedBy=multi-user.target\n"
+                ),
+            )?;
+            std::fs::write(
+                systemd.join("shinu-vsock.service"),
+                format!(
+                    "[Unit]\nAfter=shinu-sshd.service\n\n[Service]\nExecStart=/usr/bin/socat VSOCK-LISTEN:{VSOCK_SSH_PORT},fork,reuseaddr TCP:127.0.0.1:22\nRestart=always\n\n[Install]\nWantedBy=multi-user.target\n"
+                ),
+            )?;
+            let network_path = mnt.join("usr/local/sbin/shinu-net");
+            if let Some(parent) = network_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&network_path, network_script)?;
+            std::fs::set_permissions(&network_path, std::fs::Permissions::from_mode(0o755))?;
+            std::fs::write(
+                systemd.join("shinu-net.service"),
+                "[Unit]\nAfter=local-fs.target\n\n[Service]\nExecStart=/usr/local/sbin/shinu-net\nRestart=always\n\n[Install]\nWantedBy=multi-user.target\n",
+            )?;
+
+            let multi = systemd.join("multi-user.target.wants");
+            std::fs::create_dir_all(&multi)?;
+            for service in ["ssh.service", "sshd.service"] {
+                let _ = std::fs::remove_file(multi.join(service));
+            }
+            for service in ["shinu-sshd", "shinu-vsock", "shinu-net"] {
+                let link = multi.join(format!("{service}.service"));
+                let _ = std::fs::remove_file(&link);
+                std::os::unix::fs::symlink(format!("/etc/systemd/system/{service}.service"), link)?;
+            }
+
+            let getty = systemd.join("getty.target.wants");
+            std::fs::create_dir_all(&getty)?;
+            for n in 1..=6 {
+                let _ = std::fs::remove_file(getty.join(format!("getty@tty{n}.service")));
+            }
+            let serial = getty.join("serial-getty@ttyS0.service");
+            let _ = std::fs::remove_file(&serial);
+            std::os::unix::fs::symlink(
+                "/usr/lib/systemd/system/serial-getty@.service",
+                serial,
+            )?;
+        }
+    }
 
     let hosts = mnt.join("etc/hosts");
     if !hosts.exists() {
         std::fs::write(&hosts, "127.0.0.1 localhost\n::1 localhost\n")?;
     }
     std::fs::write(mnt.join("etc/hostname"), "shinu\n")?;
-    seed_resolv(mnt)?;
     Ok(())
 }
 
@@ -3261,7 +3917,7 @@ fn configure_image(mnt: &Path) -> Result<()> {
 ///
 /// Nothing here knows what the payload *is* — that keeps this crate a generic
 /// VM engine rather than one workload's launcher.
-fn install_payload(mnt: &Path) -> Result<()> {
+fn install_payload(mnt: &Path, image: Image) -> Result<()> {
     let Some(spec) = std::env::var_os("SHINU_PAYLOAD") else {
         return Ok(());
     };
@@ -3308,14 +3964,36 @@ fn install_payload(mnt: &Path) -> Result<()> {
         )));
     }
     std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o755))?;
-    let link = mnt.join(format!("etc/runit/runsvdir/default/{service}"));
-    let _ = std::fs::remove_file(&link);
-    std::os::unix::fs::symlink(format!("/etc/sv/{service}"), &link)?;
+    match image {
+        Image::Void => {
+            let link = mnt.join(format!("etc/runit/runsvdir/default/{service}"));
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(format!("/etc/sv/{service}"), link)?;
+        }
+        Image::Ubuntu | Image::Arch | Image::Rocky => {
+            let systemd = mnt.join("etc/systemd/system");
+            std::fs::create_dir_all(&systemd)?;
+            std::fs::write(
+                systemd.join(format!("shinu-payload-{service}.service")),
+                format!(
+                    "[Unit]\nAfter=network.target\n\n[Service]\nExecStart=/etc/sv/{service}/run\nRestart=always\n\n[Install]\nWantedBy=multi-user.target\n"
+                ),
+            )?;
+            let wants = systemd.join("multi-user.target.wants");
+            std::fs::create_dir_all(&wants)?;
+            let link = wants.join(format!("shinu-payload-{service}.service"));
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(
+                format!("/etc/systemd/system/shinu-payload-{service}.service"),
+                link,
+            )?;
+        }
+    }
     Ok(())
 }
 
-fn build_base(root: &Path, base: &Path, cfg: &BaseConfig) -> Result<()> {
-    let tarball = fetch_tarball(root, cfg)?;
+fn build_base(root: &Path, base: &Path, image: Image, cfg: &BaseConfig) -> Result<()> {
+    let tarball = fetch_tarball(root, image, cfg)?;
 
     let disk_mib = env_u32("SHINU_DISK_MIB", 2048);
     let status = std::process::Command::new("truncate")
@@ -3337,42 +4015,48 @@ fn build_base(root: &Path, base: &Path, cfg: &BaseConfig) -> Result<()> {
         )));
     }
 
-    let mnt = root.join("build.mnt");
+    let mnt = root.join(format!("build-{image}.mnt"));
     mount_image(base, &mnt)?;
     // Everything past the mount runs in a closure so a failure still unmounts:
     // a leaked loop mount would pin the image and block every later rebuild.
     let result = (|| -> Result<()> {
-        let output = std::process::Command::new("tar")
-            .arg("-xpf")
-            .arg(&tarball)
-            .arg("-C")
-            .arg(&mnt)
-            .arg("--numeric-owner")
-            .output()?;
-        if !output.status.success() {
-            return Err(Error::Invalid(format!(
-                "extracting {} failed: {}",
-                tarball.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
+        extract_rootfs(root, image, &tarball, &mnt)?;
+        // This first pass must seed DNS before any package-manager command.
+        configure_image(&mnt, image)?;
+        match image {
+            Image::Void => {
+                // The shipped xbps refuses to install anything until it updates
+                // itself, so -S is required before both package operations.
+                chroot_run(&mnt, "xbps-install -y -S -u xbps")?;
+                chroot_run(&mnt, "xbps-install -y -S socat openssh iproute2 git")?;
+            }
+            Image::Ubuntu => chroot_run(
+                &mnt,
+                "export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y --no-install-recommends socat openssh-server systemd-sysv",
+            )?,
+            Image::Arch => {
+                chroot_run(&mnt, "pacman-key --init && pacman-key --populate archlinux")?;
+                chroot_run(&mnt, "pacman -Sy --noconfirm socat openssh")?;
+            }
+            Image::Rocky => chroot_run(
+                &mnt,
+                "dnf install -y --setopt=install_weak_deps=False socat openssh-server systemd",
+            )?,
         }
-        configure_image(&mnt)?;
-        // The shipped xbps refuses to install anything until it updates itself
-        // ("The 'xbps' package must be updated"). `-S` is required: without it
-        // xbps compares against empty repodata and reports "up to date" while
-        // changing nothing, and the next install still fails.
-        //
-        // The base build is where guest packages are installed before the
-        // first boot; runtime networking is available after that boot too.
-        chroot_run(&mnt, "xbps-install -y -S -u xbps")?;
-        chroot_run(&mnt, "xbps-install -y -S socat openssh iproute2 git")?;
+        // Package installation can create or replace service/config files, so
+        // reapply the boot wiring after packages and before key generation.
+        configure_image(&mnt, image)?;
         chroot_run(&mnt, "ssh-keygen -A")?;
-        install_payload(&mnt)?;
+        install_payload(&mnt, image)?;
         Ok(())
     })();
-    umount(&mnt)?;
+    let unmount = umount(&mnt);
     let _ = std::fs::remove_dir(&mnt);
-    result?;
+    match (result, unmount) {
+        (Err(error), _) => return Err(error),
+        (Ok(()), Err(error)) => return Err(error),
+        (Ok(()), Ok(())) => {}
+    }
 
     let output = std::process::Command::new("e2fsck")
         .args(["-fp"])
@@ -3389,12 +4073,40 @@ fn build_base(root: &Path, base: &Path, cfg: &BaseConfig) -> Result<()> {
     Ok(())
 }
 
-pub fn ensure_base(root: &Path, cfg: &BaseConfig) -> Result<()> {
-    let base = base_path(root);
+pub fn ensure_base(root: &Path, image: Image, cfg: &BaseConfig) -> Result<()> {
+    // Migration is shared by all image requests. Serialize it separately so
+    // two first-use requests cannot both race on the legacy filename.
+    static MIGRATION_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    let migration_lock = &*MIGRATION_LOCK;
+    let migration_guard = migration_lock
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    migrate_base(root)?;
+    drop(migration_guard);
+
+    // Match Registry::space_lock: each image gets its own lock, while two
+    // requests for one image share the same guard across the full build.
+    static BASE_LOCKS: std::sync::LazyLock<
+        std::sync::Mutex<
+            std::collections::HashMap<Image, std::sync::Arc<std::sync::Mutex<()>>>,
+        >,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let locks = &*BASE_LOCKS;
+    let build_lock = {
+        let mut locks = locks.lock().unwrap_or_else(|error| error.into_inner());
+        locks
+            .entry(image)
+            .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
+            .clone()
+    };
+    let _build_guard = build_lock.lock().unwrap_or_else(|error| error.into_inner());
+
+    let base = base_path(root, image);
     if base.exists() {
         return Ok(());
     }
-    match build_base(root, &base, cfg) {
+    match build_base(root, &base, image, cfg) {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = std::fs::remove_file(&base);
@@ -3403,16 +4115,30 @@ pub fn ensure_base(root: &Path, cfg: &BaseConfig) -> Result<()> {
     }
 }
 
-/// Repairs the resolver baked into an existing base image after the guest
-/// egress policy changes. Returns whether `/etc/resolv.conf` was rewritten;
-/// callers should treat failures as warnings because a busy or damaged base
-/// must not prevent the daemon from starting.
+/// Repairs the resolver baked into existing base images after the guest
+/// egress policy changes. Returns whether any `/etc/resolv.conf` was
+/// rewritten; callers should treat failures as warnings because a busy or
+/// damaged base must not prevent the daemon from starting.
+///
+/// Every built image is repaired, not just the default: a stale private
+/// nameserver breaks package installs in whichever guest inherits it, and
+/// each image carries its own copy.
 pub fn repair_base_resolv(root: &Path) -> Result<bool> {
-    let base = base_path(root);
+    let mut changed = false;
+    for image in Image::all() {
+        changed |= repair_one_base_resolv(root, image)?;
+    }
+    Ok(changed)
+}
+
+fn repair_one_base_resolv(root: &Path, image: Image) -> Result<bool> {
+    let base = base_path(root, image);
     if !base.exists() {
         return Ok(false);
     }
-    let mnt = root.join("base-resolv.mnt");
+    // Per-image mount point: repairing several images must not collide on one
+    // directory, and a leaked mount would pin the wrong base.
+    let mnt = root.join(format!("base-resolv-{image}.mnt"));
     if let Err(error) = mount_image(&base, &mnt) {
         let _ = std::fs::remove_dir(&mnt);
         return Err(error);
@@ -3429,6 +4155,16 @@ pub fn repair_base_resolv(root: &Path) -> Result<bool> {
         }
         let fallback = guest_dns_fallback();
         let filtered = filter_guest_nameservers(&resolv, &fallback);
+        // Ubuntu and Rocky ship /etc/resolv.conf as a symlink into a runtime
+        // directory that does not exist in a cold image. Writing through it
+        // would create the link target and leave the resolver unfixed, so the
+        // link is replaced by a regular file.
+        if std::fs::symlink_metadata(&path)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            std::fs::remove_file(&path)?;
+        }
         std::fs::write(path, filtered)?;
         Ok(true)
     })();
@@ -3445,7 +4181,7 @@ pub fn repair_base_resolv(root: &Path) -> Result<bool> {
 /// Firecracker, owns `/dev/kvm` access, and hands the unprivileged client
 /// nothing but a socket and a key it already owns.
 pub mod vm {
-    use super::{Error, NetConfig, Result, VmConfig};
+    use super::{Error, Image, NetConfig, Result, VmConfig};
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -4154,15 +4890,26 @@ pub mod vm {
         false
     }
 
+    /// Per-space CPU and memory, each falling back to the daemon default when
+    /// the space stores nothing. `None` and a zero are different requests, so
+    /// this replaces the older pair of zero-sentinel integers.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub struct Sizing {
+        pub vcpus: Option<u32>,
+        pub mem_mib: Option<u32>,
+    }
+
     /// Boots the VM unless it is already up. Returns whether a boot happened.
     pub fn start(
         root: &Path,
         id: Uuid,
-        uid: u32,
-        gid: u32,
+        image_kind: Image,
+        sizing: Sizing,
         cfg: &VmConfig,
         net_cfg: &NetConfig,
     ) -> Result<(PathBuf, bool)> {
+        let vcpus = sizing.vcpus.unwrap_or(cfg.vcpus);
+        let mem_mib = sizing.mem_mib.unwrap_or(cfg.mem_mib);
         let dir = crate::vm_dir(root, id);
         let vsock = vsock_path(&dir);
         if is_running(&dir) {
@@ -4213,9 +4960,10 @@ pub mod vm {
                 crate::vm_config_json(
                     Path::new(JAIL_KERNEL),
                     Path::new(JAIL_ROOTFS),
+                    image_kind,
                     Path::new(JAIL_VSOCK),
-                    cfg.vcpus,
-                    cfg.mem_mib,
+                    vcpus,
+                    mem_mib,
                     net.as_ref(),
                 ),
             )?;
@@ -4225,7 +4973,7 @@ pub mod vm {
             // the jailer a detached process while its child becomes the
             // Firecracker process we identify below.
             let log = std::fs::File::create(dir.join("console.log"))?;
-            let memory_limit = format!("memory.max={}M", cfg.mem_mib);
+            let memory_limit = format!("memory.max={mem_mib}M");
             let status = std::process::Command::new("setsid")
                 .arg("--fork")
                 .arg(crate::jailer_bin(root))
@@ -4304,10 +5052,9 @@ pub mod vm {
                         .join(" | ")
                 )));
             }
-            // The jailer runs Firecracker as its configured non-root uid. The
-            // daemon still owns the host-side vsock and hands it to the space
-            // owner only after the guest has proved ready.
-            std::os::unix::fs::chown(&vsock, Some(uid), Some(gid))?;
+            // The jailer runs Firecracker as its configured non-root uid, but
+            // the host-side vsock stays owned by the daemon: 0600 as root is
+            // what keeps a space owner from reaching another guest's socket.
             std::fs::set_permissions(&vsock, std::fs::Permissions::from_mode(0o600))?;
             // The control API remains daemon-only: it can resize the balloon
             // and reconfigure devices, so an owner must never receive it.
@@ -5047,8 +5794,12 @@ mod chain_tests {
             id,
             name: name.to_owned(),
             project: "project".to_owned(),
+            image: super::Image::Void,
             parent,
             head,
+            vcpus: None,
+            mem_mib: None,
+            disk_mib: None,
             created_at: Utc::now(),
         }
     }
@@ -5971,6 +6722,7 @@ pub mod http {
 }
 
 pub mod proto {
+    use crate::Image;
     use serde::{Deserialize, Serialize};
     use uuid::Uuid;
 
@@ -5979,7 +6731,18 @@ pub mod proto {
     pub enum Req {
         New {
             name: String,
+            image: Option<Image>,
+            vcpus: Option<u32>,
+            mem_mib: Option<u32>,
+            disk_mib: Option<u64>,
         },
+        Resize {
+            space: String,
+            vcpus: Option<Option<u32>>,
+            mem_mib: Option<Option<u32>>,
+            disk_mib: Option<Option<u64>>,
+        },
+        Images,
         Fork {
             ckpt: Uuid,
             name: String,

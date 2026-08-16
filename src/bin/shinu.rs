@@ -563,9 +563,13 @@ fn print_usage(data: &Value) {
         "vm_seconds: {}",
         vm_time(value_u64(data.get("vm_seconds")).unwrap_or(0))
     );
+    // A MiB-hour integral is fractional for short-lived spaces, so reading it
+    // as an integer would report zero for anything under two minutes.
     println!(
-        "disk_mib_hour: {}",
-        value_u64(data.get("disk_mib_hour")).unwrap_or(0)
+        "disk_mib_hour: {:.2}",
+        data.get("disk_mib_hour")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0)
     );
     println!("api_calls: {}", value_u64(data.get("api_calls")).unwrap_or(0));
 }

@@ -82,6 +82,17 @@
     return fmtBytes((Number(mib) || 0) * 1024 * 1024);
   }
 
+  // Capacity integrated over time, so it scales past MiB into GiB but never
+  // becomes a plain byte count: 1 GiB held for one hour and 1 MiB held for
+  // 1024 hours are the same figure.
+  function fmtMibHours(mibHours) {
+    var v = Math.max(0, Number(mibHours) || 0);
+    if (v < 1) return v.toFixed(2) + ' MiB\u00b7h';
+    if (v < 1024) return (v < 10 ? v.toFixed(1) : Math.round(v)) + ' MiB\u00b7h';
+    var g = v / 1024;
+    return (g < 10 ? g.toFixed(2) : g.toFixed(1)) + ' GiB\u00b7h';
+  }
+
   function fmtDuration(totalSeconds) {
     var s = Math.max(0, Number(totalSeconds) || 0);
     if (s < 60) return s + ' s';
@@ -513,8 +524,8 @@
           ' spaces created · ' +
           fmtDuration(U.vm_seconds) +
           ' VM time · ' +
-          fmtMib(U.disk_mib_hour) +
-          '·h disk · ' +
+          fmtMibHours(U.disk_mib_hour) +
+          ' disk · ' +
           U.api_calls +
           ' API calls';
       }

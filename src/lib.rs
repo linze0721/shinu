@@ -16,6 +16,14 @@ pub const KERNEL_URL: &str =
 /// Guest vsock port the in-VM socat bridge listens on; forwarded to sshd.
 pub const VSOCK_SSH_PORT: u16 = 2222;
 
+/// Seconds between idle-sweep passes.
+///
+/// The sweep both meters usage and reclaims disk, so the same period defines
+/// how much time one recorded sample represents. Metering and the daemon loop
+/// must not drift apart, which is why the value lives here rather than beside
+/// the `thread::sleep` that consumes it.
+pub const USAGE_SAMPLE_SECS: u64 = 30;
+
 #[derive(Debug)]
 pub enum Error {
     Btrfs(String),
@@ -659,7 +667,7 @@ pub mod state {
         let mut rows = statement.query(params![project, from, to])?;
         let mut spaces_created = 0i64;
         let mut vm_seconds = 0i64;
-        let mut disk_mib_hour = 0i64;
+        let mut disk_mib_samples = 0i64;
         let mut api_calls = 0i64;
         while let Some(row) = rows.next()? {
             let kind: String = row.get(0)?;
@@ -667,16 +675,22 @@ pub mod state {
             match kind.as_str() {
                 "space_created" => spaces_created = amount,
                 "vm_seconds" => vm_seconds = amount,
-                "disk_mib_hour" => disk_mib_hour = amount,
+                "disk_mib_hour" => disk_mib_samples = amount,
                 "api_call" => api_calls = amount,
                 _ => {}
             }
         }
+        // The sweep records one MiB reading per pass rather than a duration,
+        // so the raw sum is a sample count scaled by size. Billing wants an
+        // integral, so convert here: each sample stands for one sweep period.
+        let disk_mib_hour =
+            disk_mib_samples as f64 * (crate::USAGE_SAMPLE_SECS as f64 / 3600.0);
         Ok(serde_json::json!({
             "project": project,
             "spaces_created": spaces_created,
             "vm_seconds": vm_seconds,
             "disk_mib_hour": disk_mib_hour,
+            "disk_mib_samples": disk_mib_samples,
             "api_calls": api_calls,
         }))
     }
@@ -995,7 +1009,11 @@ pub mod state {
             assert_eq!(usage["project"], "alpha");
             assert_eq!(usage["spaces_created"], 2);
             assert_eq!(usage["vm_seconds"], 30);
-            assert_eq!(usage["disk_mib_hour"], 64);
+            // 120 samples of 64 MiB at a 30-second period is exactly 64 MiB-hours.
+            assert_eq!(usage["disk_mib_samples"], 64);
+            let hours = usage["disk_mib_hour"].as_f64().expect("mib-hours");
+            let expected = 64.0 * (super::super::USAGE_SAMPLE_SECS as f64 / 3600.0);
+            assert!((hours - expected).abs() < 1e-9, "got {hours}");
             assert_eq!(usage["api_calls"], 5);
         }
 

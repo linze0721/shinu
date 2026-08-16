@@ -91,7 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sweep_db = Arc::clone(&db);
     let sweep_registry = Arc::clone(&registry);
     thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(30));
+        thread::sleep(Duration::from_secs(shinu::USAGE_SAMPLE_SECS));
         match shinu::vm::sweep_idle(
             sweep_root.as_path(),
             sweep_vm_cfg.idle_secs,
@@ -339,7 +339,7 @@ fn record_sweep_usage(
                 &space.project,
                 "vm_seconds",
                 Some(space.id),
-                30,
+                i64::try_from(shinu::USAGE_SAMPLE_SECS).unwrap_or(30),
             )?;
         }
     }

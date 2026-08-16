@@ -49,7 +49,7 @@ fn build_base(root: &Path, base: &Path, image: Image, cfg: &BaseConfig) -> Resul
             }
             Image::Ubuntu => chroot_run(
                 &mnt,
-                "export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y --no-install-recommends socat openssh-server systemd-sysv",
+                "export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y --no-install-recommends iproute2 socat openssh-server systemd-sysv",
             )?,
             Image::Arch => {
                 chroot_run(&mnt, "pacman-key --init && pacman-key --populate archlinux")?;
@@ -57,7 +57,7 @@ fn build_base(root: &Path, base: &Path, image: Image, cfg: &BaseConfig) -> Resul
             }
             Image::Rocky => chroot_run(
                 &mnt,
-                "dnf install -y --setopt=install_weak_deps=False socat openssh-server systemd",
+                "dnf install -y --setopt=install_weak_deps=False socat openssh-server systemd iproute",
             )?,
         }
         // Package installation can create or replace service/config files, so

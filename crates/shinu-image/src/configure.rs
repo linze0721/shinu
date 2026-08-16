@@ -165,26 +165,59 @@ pub(super) fn configure_image(mnt: &Path, image: Image) -> Result<()> {
     if image == Image::Arch {
         let pacman = mnt.join("etc/pacman.conf");
         let contents = std::fs::read_to_string(&pacman).unwrap_or_default();
+        let mut in_options = false;
+        let mut found_options = false;
         let mut found_check_space = false;
-        let patched = contents
-            .lines()
-            .map(|line| {
-                if line.trim_start().starts_with("CheckSpace") {
-                    found_check_space = true;
-                    format!("#{}", line)
-                } else {
-                    line.to_owned()
+        let mut found_disable_sandbox = false;
+        let mut lines = Vec::new();
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                if in_options && !found_disable_sandbox {
+                    lines.push(
+                        "# The guest kernel lacks Landlock, so pacman's default sandbox cannot initialize."
+                            .to_owned(),
+                    );
+                    lines.push("DisableSandbox".to_owned());
+                    found_disable_sandbox = true;
                 }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut patched = patched;
-        if !patched.is_empty() {
-            patched.push('\n');
+                in_options = trimmed == "[options]";
+                found_options |= in_options;
+            }
+            if in_options
+                && !trimmed.starts_with('#')
+                && trimmed.split_whitespace().next() == Some("DisableSandbox")
+            {
+                found_disable_sandbox = true;
+            }
+            let line = if trimmed.starts_with("CheckSpace") {
+                found_check_space = true;
+                format!("#{line}")
+            } else {
+                line.to_owned()
+            };
+            lines.push(line);
+        }
+        if in_options && !found_disable_sandbox {
+            lines.push(
+                "# The guest kernel lacks Landlock, so pacman's default sandbox cannot initialize."
+                    .to_owned(),
+            );
+            lines.push("DisableSandbox".to_owned());
+        }
+        if !found_options {
+            lines.push("[options]".to_owned());
+            lines.push(
+                "# The guest kernel lacks Landlock, so pacman's default sandbox cannot initialize."
+                    .to_owned(),
+            );
+            lines.push("DisableSandbox".to_owned());
         }
         if !found_check_space {
-            patched.push_str("#CheckSpace\n");
+            lines.push("#CheckSpace".to_owned());
         }
+        let mut patched = lines.join("\n");
+        patched.push('\n');
         std::fs::write(pacman, patched)?;
         let mirrorlist = mnt.join("etc/pacman.d/mirrorlist");
         if let Some(parent) = mirrorlist.parent() {

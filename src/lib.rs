@@ -22,6 +22,7 @@ pub enum Error {
     NotFound(String),
     Invalid(String),
     Auth(String),
+    Quota(String),
     Io(std::io::Error),
     Json(serde_json::Error),
 }
@@ -35,6 +36,7 @@ impl std::fmt::Display for Error {
             Error::NotFound(message) => write!(f, "not found: {message}"),
             Error::Invalid(message) => write!(f, "invalid: {message}"),
             Error::Auth(message) => write!(f, "auth: {message}"),
+            Error::Quota(message) => write!(f, "quota: {message}"),
             Error::Io(error) => write!(f, "{error}"),
             Error::Json(error) => write!(f, "{error}"),
         }
@@ -180,11 +182,20 @@ pub mod btrfs {
 
 pub mod state {
     use chrono::{DateTime, Utc};
+    use rusqlite::types::Type;
+    use rusqlite::{params, Connection, OptionalExtension, Row};
     use serde::{Deserialize, Serialize};
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use uuid::Uuid;
 
-    #[derive(Serialize, Deserialize, Clone, Debug)]
+    impl From<rusqlite::Error> for crate::Error {
+        fn from(error: rusqlite::Error) -> Self {
+            crate::Error::Invalid(format!("sql: {error}"))
+        }
+    }
+
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
     pub struct Space {
         pub id: Uuid,
         pub name: String,
@@ -195,7 +206,7 @@ pub mod state {
         pub created_at: DateTime<Utc>,
     }
 
-    #[derive(Serialize, Deserialize, Clone, Debug)]
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
     pub struct Ckpt {
         pub id: Uuid,
         pub space: Uuid,
@@ -209,28 +220,577 @@ pub mod state {
         pub created_at: DateTime<Utc>,
     }
 
-    #[derive(Serialize, Deserialize, Default, Debug)]
+    #[derive(Serialize, Deserialize, Default, Debug, PartialEq, Eq)]
     pub struct State {
         pub spaces: Vec<Space>,
         pub ckpts: Vec<Ckpt>,
     }
 
+    const SCHEMA: &str = r#"
+        CREATE TABLE IF NOT EXISTS spaces (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            project TEXT NOT NULL,
+            parent TEXT,
+            head TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ckpts (
+            id TEXT PRIMARY KEY,
+            space TEXT NOT NULL,
+            project TEXT NOT NULL,
+            parent TEXT,
+            auto INTEGER NOT NULL,
+            note TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS projects (
+            project TEXT PRIMARY KEY,
+            max_spaces INTEGER,
+            max_disk_mib INTEGER,
+            max_running INTEGER,
+            api_per_min INTEGER
+        );
+        CREATE TABLE IF NOT EXISTS usage_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            space TEXT,
+            amount INTEGER NOT NULL,
+            "at" INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS spaces_project_name ON spaces(project, name);
+        CREATE INDEX IF NOT EXISTS ckpts_project ON ckpts(project);
+        CREATE INDEX IF NOT EXISTS ckpts_space ON ckpts(space);
+        CREATE INDEX IF NOT EXISTS usage_events_project_at ON usage_events(project, "at");
+    "#;
+
+    fn init_schema(conn: &Connection) -> crate::Result<()> {
+        conn.execute_batch(SCHEMA)?;
+        Ok(())
+    }
+
+    /// Opens the per-root database and applies the settings needed by the
+    /// daemon's concurrent readers and serialized state transactions.
+    pub fn open(root: &Path) -> crate::Result<Connection> {
+        std::fs::create_dir_all(root)?;
+        let path = root.join("shinu.db");
+        let conn = Connection::open(&path)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        init_schema(&conn)?;
+        Ok(conn)
+    }
+
+    fn parse_uuid(value: String, column: usize) -> rusqlite::Result<Uuid> {
+        Uuid::parse_str(&value).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
+        })
+    }
+
+    fn parse_optional_uuid(value: Option<String>, column: usize) -> rusqlite::Result<Option<Uuid>> {
+        value.map(|value| parse_uuid(value, column)).transpose()
+    }
+
+    fn parse_datetime(value: String, column: usize) -> rusqlite::Result<DateTime<Utc>> {
+        DateTime::parse_from_rfc3339(&value)
+            .map(|value| value.with_timezone(&Utc))
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
+            })
+    }
+
+    fn space_from_row(row: &Row<'_>) -> rusqlite::Result<Space> {
+        Ok(Space {
+            id: parse_uuid(row.get(0)?, 0)?,
+            name: row.get(1)?,
+            project: row.get(2)?,
+            parent: parse_optional_uuid(row.get(3)?, 3)?,
+            head: parse_optional_uuid(row.get(4)?, 4)?,
+            created_at: parse_datetime(row.get(5)?, 5)?,
+        })
+    }
+
+    fn ckpt_from_row(row: &Row<'_>) -> rusqlite::Result<Ckpt> {
+        Ok(Ckpt {
+            id: parse_uuid(row.get(0)?, 0)?,
+            space: parse_uuid(row.get(1)?, 1)?,
+            project: row.get(2)?,
+            parent: parse_optional_uuid(row.get(3)?, 3)?,
+            auto: row.get::<_, i64>(4)? != 0,
+            note: row.get(5)?,
+            created_at: parse_datetime(row.get(6)?, 6)?,
+        })
+    }
+
+    fn space_params(space: &Space) -> [String; 6] {
+        [
+            space.id.to_string(),
+            space.name.clone(),
+            space.project.clone(),
+            space.parent.map(|id| id.to_string()).unwrap_or_default(),
+            space.head.map(|id| id.to_string()).unwrap_or_default(),
+            space.created_at.to_rfc3339(),
+        ]
+    }
+
+    fn ckpt_params(ckpt: &Ckpt) -> [String; 7] {
+        [
+            ckpt.id.to_string(),
+            ckpt.space.to_string(),
+            ckpt.project.clone(),
+            ckpt.parent.map(|id| id.to_string()).unwrap_or_default(),
+            if ckpt.auto { "1".to_owned() } else { "0".to_owned() },
+            ckpt.note.clone(),
+            ckpt.created_at.to_rfc3339(),
+        ]
+    }
+
     impl State {
         pub fn load(root: &Path) -> crate::Result<State> {
-            let path = root.join("state.json");
-            match std::fs::read_to_string(path) {
-                Ok(contents) => Ok(serde_json::from_str(&contents)?),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(State::default()),
-                Err(error) => Err(error.into()),
-            }
+            let conn = open(root)?;
+            migrate_from_json(root, &conn)?;
+            crate::state::load(&conn)
         }
 
         pub fn store(&self, root: &Path) -> crate::Result<()> {
-            let contents = serde_json::to_string_pretty(self)?;
-            let tmp = root.join("state.json.tmp");
-            std::fs::write(&tmp, contents)?;
-            std::fs::rename(tmp, root.join("state.json"))?;
-            Ok(())
+            let conn = open(root)?;
+            migrate_from_json(root, &conn)?;
+            crate::state::store(&conn, self)
+        }
+    }
+
+    /// Imports the legacy JSON file once, preserving it as an explicit backup.
+    pub fn migrate_from_json(root: &Path, conn: &Connection) -> crate::Result<bool> {
+        let spaces: i64 = conn.query_row("SELECT COUNT(*) FROM spaces", [], |row| row.get(0))?;
+        let ckpts: i64 = conn.query_row("SELECT COUNT(*) FROM ckpts", [], |row| row.get(0))?;
+        if spaces != 0 || ckpts != 0 {
+            return Ok(false);
+        }
+
+        let path = root.join("state.json");
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let state: State = serde_json::from_str(&contents)?;
+        let tx = conn.unchecked_transaction()?;
+        for space in &state.spaces {
+            let values = space_params(space);
+            tx.execute(
+                "INSERT INTO spaces (id, name, project, parent, head, created_at) VALUES (?1, ?2, ?3, NULLIF(?4, ''), NULLIF(?5, ''), ?6)",
+                params![values[0], values[1], values[2], values[3], values[4], values[5]],
+            )?;
+        }
+        for ckpt in &state.ckpts {
+            let values = ckpt_params(ckpt);
+            tx.execute(
+                "INSERT INTO ckpts (id, space, project, parent, auto, note, created_at) VALUES (?1, ?2, ?3, NULLIF(?4, ''), ?5, ?6, ?7)",
+                params![values[0], values[1], values[2], values[3], values[4], values[5], values[6]],
+            )?;
+        }
+        tx.commit()?;
+        std::fs::rename(path, root.join("state.json.migrated"))?;
+        Ok(true)
+    }
+
+    /// Loads the complete in-memory view for listing and history operations.
+    pub fn load(conn: &Connection) -> crate::Result<State> {
+        let spaces = {
+            let mut statement = conn.prepare(
+                "SELECT id, name, project, parent, head, created_at FROM spaces ORDER BY rowid",
+            )?;
+            statement
+                .query_map([], space_from_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let ckpts = {
+            let mut statement = conn.prepare(
+                "SELECT id, space, project, parent, auto, note, created_at FROM ckpts ORDER BY rowid",
+            )?;
+            statement
+                .query_map([], ckpt_from_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(State { spaces, ckpts })
+    }
+
+    /// Replaces the space and checkpoint portions of the in-memory view in one transaction.
+    pub fn store(conn: &Connection, state: &State) -> crate::Result<()> {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM ckpts", [])?;
+        tx.execute("DELETE FROM spaces", [])?;
+        for space in &state.spaces {
+            let values = space_params(space);
+            tx.execute(
+                "INSERT INTO spaces (id, name, project, parent, head, created_at) VALUES (?1, ?2, ?3, NULLIF(?4, ''), NULLIF(?5, ''), ?6)",
+                params![values[0], values[1], values[2], values[3], values[4], values[5]],
+            )?;
+        }
+        for ckpt in &state.ckpts {
+            let values = ckpt_params(ckpt);
+            tx.execute(
+                "INSERT INTO ckpts (id, space, project, parent, auto, note, created_at) VALUES (?1, ?2, ?3, NULLIF(?4, ''), ?5, ?6, ?7)",
+                params![values[0], values[1], values[2], values[3], values[4], values[5], values[6]],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn find_space(
+        conn: &Connection,
+        name: &str,
+        project: &str,
+    ) -> crate::Result<Option<Space>> {
+        let by_name = conn
+            .query_row(
+                "SELECT id, name, project, parent, head, created_at FROM spaces WHERE project = ?1 AND name = ?2 LIMIT 1",
+                params![project, name],
+                space_from_row,
+            )
+            .optional()?;
+        if by_name.is_some() {
+            return Ok(by_name);
+        }
+        let Ok(id) = Uuid::parse_str(name) else {
+            return Ok(None);
+        };
+        conn.query_row(
+            "SELECT id, name, project, parent, head, created_at FROM spaces WHERE project = ?1 AND id = ?2 LIMIT 1",
+            params![project, id.to_string()],
+            space_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn find_ckpt(
+        conn: &Connection,
+        id: Uuid,
+        project: &str,
+    ) -> crate::Result<Option<Ckpt>> {
+        conn.query_row(
+            "SELECT id, space, project, parent, auto, note, created_at FROM ckpts WHERE project = ?1 AND id = ?2 LIMIT 1",
+            params![project, id.to_string()],
+            ckpt_from_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn count_spaces(conn: &Connection, project: &str) -> crate::Result<u32> {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM spaces WHERE project = ?1",
+            params![project],
+            |row| row.get(0),
+        )?;
+        u32::try_from(count)
+            .map_err(|error| crate::Error::Invalid(format!("space count out of range: {error}")))
+    }
+
+
+    pub fn record_usage(
+        conn: &Connection,
+        project: &str,
+        kind: &str,
+        space: Option<Uuid>,
+        amount: i64,
+    ) -> crate::Result<()> {
+        conn.execute(
+            "INSERT INTO usage_events (project, kind, space, amount, \"at\") VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![project, kind, space.map(|id| id.to_string()), amount, Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    pub fn usage_summary(
+        conn: &Connection,
+        project: &str,
+        from: Option<i64>,
+        to: Option<i64>,
+    ) -> crate::Result<serde_json::Value> {
+        let mut statement = conn.prepare(
+            "SELECT kind, COALESCE(SUM(amount), 0) FROM usage_events WHERE project = ?1 AND (?2 IS NULL OR \"at\" >= ?2) AND (?3 IS NULL OR \"at\" <= ?3) GROUP BY kind",
+        )?;
+        let mut rows = statement.query(params![project, from, to])?;
+        let mut spaces_created = 0i64;
+        let mut vm_seconds = 0i64;
+        let mut disk_mib_hour = 0i64;
+        let mut api_calls = 0i64;
+        while let Some(row) = rows.next()? {
+            let kind: String = row.get(0)?;
+            let amount: i64 = row.get(1)?;
+            match kind.as_str() {
+                "space_created" => spaces_created = amount,
+                "vm_seconds" => vm_seconds = amount,
+                "disk_mib_hour" => disk_mib_hour = amount,
+                "api_call" => api_calls = amount,
+                _ => {}
+            }
+        }
+        Ok(serde_json::json!({
+            "project": project,
+            "spaces_created": spaces_created,
+            "vm_seconds": vm_seconds,
+            "disk_mib_hour": disk_mib_hour,
+            "api_calls": api_calls,
+        }))
+    }
+
+    fn project_u32(value: Option<i64>, fallback: u32, field: &str) -> crate::Result<u32> {
+        value
+            .map(|value| {
+                u32::try_from(value).map_err(|error| {
+                    crate::Error::Invalid(format!("{field} limit out of range: {error}"))
+                })
+            })
+            .unwrap_or(Ok(fallback))
+    }
+
+    fn project_u64(value: Option<i64>, fallback: u64, field: &str) -> crate::Result<u64> {
+        value
+            .map(|value| {
+                u64::try_from(value).map_err(|error| {
+                    crate::Error::Invalid(format!("{field} limit out of range: {error}"))
+                })
+            })
+            .unwrap_or(Ok(fallback))
+    }
+
+    pub fn project_limits(
+        conn: &Connection,
+        project: &str,
+    ) -> crate::Result<Option<(u32, u64, u32, u32)>> {
+        let values = conn
+            .query_row(
+                "SELECT max_spaces, max_disk_mib, max_running, api_per_min FROM projects WHERE project = ?1",
+                params![project],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((max_spaces, max_disk_mib, max_running, api_per_min)) = values else {
+            return Ok(None);
+        };
+        let defaults = crate::quota::Limits::from_env();
+        Ok(Some((
+            project_u32(max_spaces, defaults.max_spaces, "max_spaces")?,
+            project_u64(max_disk_mib, defaults.max_disk_mib, "max_disk_mib")?,
+            project_u32(max_running, defaults.max_running, "max_running")?,
+            project_u32(api_per_min, defaults.api_per_min, "api_per_min")?,
+        )))
+    }
+
+    #[cfg(test)]
+    mod db_tests {
+        use super::*;
+        use chrono::TimeZone;
+        use rusqlite::Connection;
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn db() -> Connection {
+            let conn = Connection::open_in_memory().expect("open memory database");
+            init_schema(&conn).expect("create schema");
+            conn
+        }
+
+        fn root() -> std::path::PathBuf {
+            let root = std::env::temp_dir().join(format!("shinu-state-{}", Uuid::new_v4()));
+            fs::create_dir_all(&root).expect("create temporary root");
+            root
+        }
+
+        fn sample_state(project: &str) -> (State, Space, Ckpt) {
+            let space_id = Uuid::new_v4();
+            let ckpt_id = Uuid::new_v4();
+            let created_at = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+            let space = Space {
+                id: space_id,
+                name: "demo".into(),
+                project: project.into(),
+                parent: None,
+                head: Some(ckpt_id),
+                created_at,
+            };
+            let ckpt = Ckpt {
+                id: ckpt_id,
+                space: space_id,
+                project: project.into(),
+                parent: None,
+                auto: false,
+                note: "initial".into(),
+                created_at,
+            };
+            let state = State {
+                spaces: vec![space.clone()],
+                ckpts: vec![ckpt.clone()],
+            };
+            (state, space, ckpt)
+        }
+
+        #[test]
+        fn open_is_idempotent_and_restricts_database_permissions() {
+            let root = root();
+            drop(open(&root).expect("first open"));
+            let conn = open(&root).expect("second open");
+            let tables: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('spaces', 'ckpts', 'projects', 'usage_events')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(tables, 4);
+            let journal_mode: String = conn
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+            let foreign_keys: i64 = conn
+                .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(foreign_keys, 1);
+            let mode = fs::metadata(root.join("shinu.db"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+            drop(conn);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn spaces_and_checkpoints_round_trip() {
+            let conn = db();
+            let (state, space, ckpt) = sample_state("alpha");
+            store(&conn, &state).unwrap();
+            assert_eq!(load(&conn).unwrap(), state);
+            assert_eq!(find_space(&conn, "demo", "alpha").unwrap(), Some(space));
+            assert_eq!(find_ckpt(&conn, ckpt.id, "alpha").unwrap(), Some(ckpt));
+        }
+
+        #[test]
+        fn lookups_hide_rows_from_other_projects() {
+            let conn = db();
+            let (state, _, ckpt) = sample_state("alpha");
+            store(&conn, &state).unwrap();
+            assert!(find_space(&conn, "demo", "other").unwrap().is_none());
+            assert!(find_space(&conn, &state.spaces[0].id.to_string(), "other")
+                .unwrap()
+                .is_none());
+            assert!(find_ckpt(&conn, ckpt.id, "other").unwrap().is_none());
+        }
+
+        #[test]
+        fn counts_spaces_are_project_scoped() {
+            let conn = db();
+            let (mut state, _, _) = sample_state("alpha");
+            let (other, _, _) = sample_state("other");
+            state.spaces.extend(other.spaces);
+            store(&conn, &state).unwrap();
+            assert_eq!(count_spaces(&conn, "alpha").unwrap(), 1);
+            assert_eq!(count_spaces(&conn, "other").unwrap(), 1);
+            assert_eq!(count_spaces(&conn, "missing").unwrap(), 0);
+        }
+
+        #[test]
+        fn usage_summary_aggregates_known_kinds() {
+            let conn = db();
+            record_usage(&conn, "alpha", "space_created", None, 2).unwrap();
+            record_usage(&conn, "alpha", "vm_seconds", None, 30).unwrap();
+            record_usage(&conn, "alpha", "disk_mib_hour", None, 64).unwrap();
+            record_usage(&conn, "alpha", "api_call", None, 5).unwrap();
+            record_usage(&conn, "alpha", "future_kind", None, 1000).unwrap();
+            let usage = usage_summary(&conn, "alpha", None, None).unwrap();
+            assert_eq!(usage["project"], "alpha");
+            assert_eq!(usage["spaces_created"], 2);
+            assert_eq!(usage["vm_seconds"], 30);
+            assert_eq!(usage["disk_mib_hour"], 64);
+            assert_eq!(usage["api_calls"], 5);
+        }
+
+        #[test]
+        fn usage_summary_filters_inclusive_unix_ranges() {
+            let conn = db();
+            conn.execute(
+                "INSERT INTO usage_events (project, kind, space, amount, \"at\") VALUES (?1, ?2, NULL, ?3, ?4)",
+                params!["alpha", "vm_seconds", 10, 10],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO usage_events (project, kind, space, amount, \"at\") VALUES (?1, ?2, NULL, ?3, ?4)",
+                params!["alpha", "vm_seconds", 20, 20],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO usage_events (project, kind, space, amount, \"at\") VALUES (?1, ?2, NULL, ?3, ?4)",
+                params!["alpha", "vm_seconds", 30, 30],
+            )
+            .unwrap();
+            assert_eq!(usage_summary(&conn, "alpha", Some(20), Some(20)).unwrap()["vm_seconds"], 20);
+            assert_eq!(usage_summary(&conn, "alpha", Some(20), Some(30)).unwrap()["vm_seconds"], 50);
+            assert_eq!(usage_summary(&conn, "alpha", Some(31), None).unwrap()["vm_seconds"], 0);
+        }
+
+        #[test]
+        fn migration_imports_rows_and_renames_json() {
+            let root = root();
+            let (state, _, _) = sample_state("alpha");
+            fs::write(root.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+            let conn = db();
+            assert!(migrate_from_json(&root, &conn).unwrap());
+            assert!(!root.join("state.json").exists());
+            assert!(root.join("state.json.migrated").exists());
+            assert_eq!(load(&conn).unwrap(), state);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn migration_skips_database_with_existing_rows() {
+            let root = root();
+            let (existing, _, _) = sample_state("alpha");
+            let (incoming, _, _) = sample_state("other");
+            fs::write(root.join("state.json"), serde_json::to_vec(&incoming).unwrap()).unwrap();
+            let conn = db();
+            store(&conn, &existing).unwrap();
+            assert!(!migrate_from_json(&root, &conn).unwrap());
+            assert!(root.join("state.json").exists());
+            assert_eq!(load(&conn).unwrap(), existing);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn migration_rolls_back_when_a_row_cannot_be_inserted() {
+            let root = root();
+            let (mut state, space, _) = sample_state("alpha");
+            state.spaces.push(space);
+            fs::write(root.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+            let conn = db();
+            assert!(migrate_from_json(&root, &conn).is_err());
+            assert_eq!(count_spaces(&conn, "alpha").unwrap(), 0);
+            assert!(root.join("state.json").exists());
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn project_limits_resolve_overrides_and_defaults() {
+            let conn = db();
+            conn.execute(
+                "INSERT INTO projects (project, max_spaces, max_disk_mib, max_running, api_per_min) VALUES ('alpha', 3, 2048, 1, 60)",
+                [],
+            )
+            .unwrap();
+            assert_eq!(project_limits(&conn, "alpha").unwrap(), Some((3, 2048, 1, 60)));
+            assert!(project_limits(&conn, "missing").unwrap().is_none());
         }
     }
 }
@@ -461,6 +1021,289 @@ pub mod token {
     }
 }
 
+/// Per-project resource ceilings and request throttling for the hosted demo.
+pub mod quota {
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    const DEFAULT_MAX_SPACES: u32 = 5;
+    const DEFAULT_MAX_DISK_MIB: u64 = 10_240;
+    const DEFAULT_MAX_RUNNING: u32 = 2;
+    const DEFAULT_API_PER_MIN: u32 = 120;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Limits {
+        pub max_spaces: u32,
+        pub max_disk_mib: u64,
+        pub max_running: u32,
+        pub api_per_min: u32,
+    }
+
+    impl Limits {
+        pub fn from_env() -> Self {
+            Self::from_lookup(|key| std::env::var(key).ok())
+        }
+
+        // A reader seam keeps parser tests deterministic without mutating the process environment.
+        fn from_lookup<F>(lookup: F) -> Self
+        where
+            F: Fn(&str) -> Option<String>,
+        {
+            Self {
+                max_spaces: positive_u32(&lookup, "SHINU_LIMIT_SPACES", DEFAULT_MAX_SPACES),
+                max_disk_mib: positive_u64(
+                    &lookup,
+                    "SHINU_LIMIT_DISK_MIB",
+                    DEFAULT_MAX_DISK_MIB,
+                ),
+                max_running: positive_u32(&lookup, "SHINU_LIMIT_RUNNING", DEFAULT_MAX_RUNNING),
+                api_per_min: positive_u32(&lookup, "SHINU_LIMIT_API_PER_MIN", DEFAULT_API_PER_MIN),
+            }
+        }
+    }
+
+    fn positive_u32<F>(lookup: &F, key: &str, default: u32) -> u32
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        lookup(key)
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default)
+    }
+
+    fn positive_u64<F>(lookup: &F, key: &str, default: u64) -> u64
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        lookup(key)
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default)
+    }
+
+    pub struct RateLimiter {
+        requests: Mutex<HashMap<String, VecDeque<Instant>>>,
+    }
+
+    impl RateLimiter {
+        pub fn new() -> Self {
+            Self {
+                requests: Mutex::new(HashMap::new()),
+            }
+        }
+
+        pub fn check(&self, project: &str, per_min: u32) -> crate::Result<()> {
+            self.check_at(project, per_min, Instant::now())
+        }
+
+        fn check_at(&self, project: &str, per_min: u32, now: Instant) -> crate::Result<()> {
+            const WINDOW: Duration = Duration::from_secs(60);
+
+            let mut requests = self
+                .requests
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            // Sweep every tenant on each request: otherwise a tenant that stops
+            // sending calls would leave its timestamp and map key forever.
+            for timestamps in requests.values_mut() {
+                while timestamps.front().is_some_and(|at| {
+                    now.checked_duration_since(*at)
+                        .is_some_and(|elapsed| elapsed >= WINDOW)
+                }) {
+                    timestamps.pop_front();
+                }
+            }
+            requests.retain(|_, timestamps| !timestamps.is_empty());
+
+            let mut timestamps = requests.remove(project).unwrap_or_default();
+
+            if timestamps.len() >= per_min as usize {
+                if !timestamps.is_empty() {
+                    requests.insert(project.to_owned(), timestamps);
+                }
+                return Err(crate::Error::Quota(format!(
+                    "rate limit exceeded: {per_min} requests per minute"
+                )));
+            }
+
+            timestamps.push_back(now);
+            requests.insert(project.to_owned(), timestamps);
+            Ok(())
+        }
+    }
+
+    impl Default for RateLimiter {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    pub fn check_space_limit(current_spaces: u32, limits: &Limits) -> crate::Result<()> {
+        if current_spaces >= limits.max_spaces {
+            return Err(crate::Error::Quota(format!(
+                "space limit reached ({current_spaces}/{}); delete a space or upgrade",
+                limits.max_spaces
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn check_disk_limit(
+        current_mib: u64,
+        adding_mib: u64,
+        limits: &Limits,
+    ) -> crate::Result<()> {
+        let projected_mib = current_mib.saturating_add(adding_mib);
+        if projected_mib >= limits.max_disk_mib {
+            return Err(crate::Error::Quota(format!(
+                "disk limit reached ({projected_mib}/{} MiB; current {current_mib}, adding {adding_mib}); delete a space or reduce its disk size",
+                limits.max_disk_mib
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn check_running_limit(current_running: u32, limits: &Limits) -> crate::Result<()> {
+        if current_running >= limits.max_running {
+            return Err(crate::Error::Quota(format!(
+                "running VM limit reached ({current_running}/{}); stop a VM or upgrade",
+                limits.max_running
+            )));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod quota_tests {
+        use super::*;
+        use std::time::Duration;
+
+        #[test]
+        fn limits_default_values_are_conservative() {
+            let limits = Limits::from_lookup(|_| None);
+            assert_eq!(limits.max_spaces, 5);
+            assert_eq!(limits.max_disk_mib, 10_240);
+            assert_eq!(limits.max_running, 2);
+            assert_eq!(limits.api_per_min, 120);
+        }
+
+        #[test]
+        fn limits_environment_values_override_defaults() {
+            let limits = Limits::from_lookup(|key| {
+                Some(match key {
+                    "SHINU_LIMIT_SPACES" => "9",
+                    "SHINU_LIMIT_DISK_MIB" => "20480",
+                    "SHINU_LIMIT_RUNNING" => "4",
+                    "SHINU_LIMIT_API_PER_MIN" => "600",
+                    _ => return None,
+                }
+                .to_owned())
+            });
+            assert_eq!(limits.max_spaces, 9);
+            assert_eq!(limits.max_disk_mib, 20_480);
+            assert_eq!(limits.max_running, 4);
+            assert_eq!(limits.api_per_min, 600);
+        }
+
+        #[test]
+        fn invalid_or_empty_environment_values_use_defaults() {
+            let limits = Limits::from_lookup(|key| {
+                Some(match key {
+                    "SHINU_LIMIT_SPACES" => "not-a-number",
+                    "SHINU_LIMIT_DISK_MIB" => " ",
+                    "SHINU_LIMIT_RUNNING" => "0",
+                    "SHINU_LIMIT_API_PER_MIN" => "-1",
+                    _ => return None,
+                }
+                .to_owned())
+            });
+            assert_eq!(limits, Limits::from_lookup(|_| None));
+        }
+
+        #[test]
+        fn space_limit_rejects_boundary_and_allows_below() {
+            let limits = Limits {
+                max_spaces: 5,
+                ..Limits::from_lookup(|_| None)
+            };
+            assert!(check_space_limit(4, &limits).is_ok());
+            assert!(matches!(
+                check_space_limit(5, &limits),
+                Err(crate::Error::Quota(message)) if message.contains("5/5")
+            ));
+        }
+
+        #[test]
+        fn disk_limit_rejects_boundary_and_allows_below() {
+            let limits = Limits {
+                max_disk_mib: 100,
+                ..Limits::from_lookup(|_| None)
+            };
+            assert!(check_disk_limit(90, 9, &limits).is_ok());
+            assert!(matches!(
+                check_disk_limit(90, 10, &limits),
+                Err(crate::Error::Quota(message)) if message.contains("100")
+            ));
+        }
+
+        #[test]
+        fn running_limit_rejects_boundary_and_allows_below() {
+            let limits = Limits {
+                max_running: 2,
+                ..Limits::from_lookup(|_| None)
+            };
+            assert!(check_running_limit(1, &limits).is_ok());
+            assert!(matches!(
+                check_running_limit(2, &limits),
+                Err(crate::Error::Quota(message)) if message.contains("2/2")
+            ));
+        }
+
+        #[test]
+        fn rate_limiter_rejects_calls_over_the_window_budget() {
+            let limiter = RateLimiter::new();
+            assert!(limiter.check("demo", 2).is_ok());
+            assert!(limiter.check("demo", 2).is_ok());
+            assert!(matches!(
+                limiter.check("demo", 2),
+                Err(crate::Error::Quota(message))
+                    if message == "rate limit exceeded: 2 requests per minute"
+            ));
+        }
+
+        #[test]
+        fn rate_limiter_allows_a_call_after_the_window_slides() {
+            let limiter = RateLimiter::new();
+            let first = Instant::now();
+            assert!(limiter.check_at("demo", 1, first).is_ok());
+            assert!(limiter
+                .check_at("demo", 1, first + Duration::from_secs(59))
+                .is_err());
+            assert!(limiter
+                .check_at("demo", 1, first + Duration::from_secs(60))
+                .is_ok());
+        }
+
+        #[test]
+        fn rate_limiter_removes_expired_entries() {
+            let limiter = RateLimiter::new();
+            let first = Instant::now();
+            assert!(limiter.check_at("stale", 1, first).is_ok());
+            assert!(limiter
+                .check_at("active", 1, first + Duration::from_secs(61))
+                .is_ok());
+            let requests = limiter
+                .requests
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            assert!(!requests.contains_key("stale"));
+            assert_eq!(requests.get("active").map(|times| times.len()), Some(1));
+        }
+    }
+}
+
 /// Resolution order: explicit flag > `$SHINU_ROOT` > [`DEFAULT_ROOT`].
 pub fn resolve_root(explicit: Option<&Path>) -> PathBuf {
     if let Some(path) = explicit {
@@ -500,14 +1343,23 @@ pub fn assets_dir(root: &Path) -> PathBuf {
 pub fn firecracker_bin(root: &Path) -> PathBuf {
     assets_dir(root).join("firecracker")
 }
+pub fn jailer_bin(root: &Path) -> PathBuf {
+    assets_dir(root).join("jailer")
+}
+
 
 pub fn kernel_path(root: &Path) -> PathBuf {
     assets_dir(root).join("vmlinux")
 }
 
-/// `<root>/vm/<space-id>` — one VM's runtime state: `fc.json`, `fc.sock`,
-/// `vsock.sock`, `fc.pid`, `last_used`, and the space's own SSH key pair.
-/// The daemon proxies guest access, so callers never need to traverse this path.
+/// `<root>/vm/<space-id>` — the host-side half of one VM's runtime state:
+/// `last_used` and the space's own SSH key pair.
+///
+/// The rest lives inside the jailer chroot ([`vm::jail_root`]): `fc.json`,
+/// `fc.sock`, `vsock.sock`, and `firecracker.pid` are all written by a
+/// firecracker that has been chrooted and dropped to an unprivileged uid, so
+/// they are reachable only through the jail paths. The daemon proxies guest
+/// access, so callers never need to traverse either location.
 pub fn vm_dir(root: &Path, id: Uuid) -> PathBuf {
     root.join("vm").join(id.to_string())
 }
@@ -782,21 +1634,31 @@ fn curl_to_file(url: &str, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-fn install_firecracker(root: &Path, dst: &Path) -> Result<()> {
+fn release_tarball(root: &Path) -> Result<PathBuf> {
     let cache = cache_dir(root);
     std::fs::create_dir_all(&cache)?;
     let tarball = cache.join(format!("firecracker-{FC_VERSION}-x86_64.tgz"));
     if !tarball.exists() {
         curl_to_file(FC_URL, &tarball)?;
     }
+    Ok(tarball)
+}
 
-    let unpack = assets_dir(root).join(".unpack");
+/// Extracts and verifies one binary from the official release tarball.
+///
+/// Keeping extraction in one path makes the firecracker and jailer artifacts
+/// receive identical digest and permission checks.
+fn install_from_tarball(tarball: &Path, member: &str, dst: &Path) -> Result<()> {
+    let unpack = dst
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".unpack");
     let _ = std::fs::remove_dir_all(&unpack);
     std::fs::create_dir_all(&unpack)?;
     let result = (|| -> Result<()> {
         let output = std::process::Command::new("tar")
             .arg("-xzf")
-            .arg(&tarball)
+            .arg(tarball)
             .arg("-C")
             .arg(&unpack)
             .arg("--strip-components=1")
@@ -808,15 +1670,13 @@ fn install_firecracker(root: &Path, dst: &Path) -> Result<()> {
                 String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
-        // The release carries its own SHA256SUMS, so the binary that is about
-        // to be given KVM is verified against a digest shipped beside it
-        // rather than trusted on transport alone.
-        let member = format!("firecracker-{FC_VERSION}-x86_64");
+        // The release carries its own SHA256SUMS, so both binaries are
+        // verified against a digest shipped beside the release artifacts.
         let digest = pick_sums_digest(
             &std::fs::read_to_string(unpack.join("SHA256SUMS"))?,
-            &member,
+            member,
         )?;
-        let binary = unpack.join(&member);
+        let binary = unpack.join(member);
         let actual = sha256_file(&binary)?;
         if actual != digest {
             return Err(Error::Invalid(format!(
@@ -833,14 +1693,38 @@ fn install_firecracker(root: &Path, dst: &Path) -> Result<()> {
     result
 }
 
-/// Fetches the hypervisor and guest kernel once. Called before `ensure_base`
-/// so a host with no network fails immediately rather than after building an
-/// image it cannot boot.
+fn install_firecracker(root: &Path, dst: &Path) -> Result<()> {
+    let tarball = release_tarball(root)?;
+    let member = format!("firecracker-{FC_VERSION}-x86_64");
+    install_from_tarball(&tarball, &member, dst)
+}
+
+fn install_jailer(root: &Path, dst: &Path) -> Result<()> {
+    let tarball = release_tarball(root)?;
+    let member = format!("jailer-{FC_VERSION}-x86_64");
+    install_from_tarball(&tarball, &member, dst)
+}
+
+fn executable(path: &Path) -> bool {
+    path.metadata()
+        .map(|metadata| {
+            metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+        })
+        .unwrap_or(false)
+}
+
+/// Fetches the hypervisor, jailer, and guest kernel once. Called before
+/// `ensure_base` so a host with no network fails before building an image it
+/// cannot boot.
 pub fn ensure_assets(root: &Path) -> Result<()> {
     std::fs::create_dir_all(assets_dir(root))?;
     let fc = firecracker_bin(root);
     if !fc.exists() {
         install_firecracker(root, &fc)?;
+    }
+    let jailer = jailer_bin(root);
+    if !executable(&jailer) {
+        install_jailer(root, &jailer)?;
     }
     let kernel = kernel_path(root);
     if !kernel.exists() {
@@ -861,7 +1745,7 @@ fn env_u32(key: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
-/// Per-VM sizing and lifetime, read from the environment like [`BaseConfig`].
+/// Per-VM sizing, jail identity, and lifetime, read from the environment.
 #[derive(Debug, Clone, Copy)]
 pub struct VmConfig {
     /// `SHINU_VCPUS`
@@ -870,6 +1754,10 @@ pub struct VmConfig {
     pub mem_mib: u32,
     /// `SHINU_IDLE_SECS` — a VM with no `Touch` for this long is shut down.
     pub idle_secs: u64,
+    /// `SHINU_JAIL_UID` — non-root uid used by Firecracker inside the jail.
+    pub jail_uid: u32,
+    /// `SHINU_JAIL_GID` — non-root gid used by Firecracker inside the jail.
+    pub jail_gid: u32,
 }
 
 impl VmConfig {
@@ -878,6 +1766,8 @@ impl VmConfig {
             vcpus: env_u32("SHINU_VCPUS", 2),
             mem_mib: env_u32("SHINU_MEM_MIB", 1024),
             idle_secs: u64::from(env_u32("SHINU_IDLE_SECS", 600)),
+            jail_uid: env_u32("SHINU_JAIL_UID", 30_000),
+            jail_gid: env_u32("SHINU_JAIL_GID", 30_000),
         }
     }
 }
@@ -1476,27 +2366,61 @@ pub mod vm {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use uuid::Uuid;
 
+    /// `<root>/jail/firecracker/<id>/root` is the host-visible chroot root.
+    /// This is pure path arithmetic so callers can validate it without KVM.
+    pub fn jail_root(root: &Path, id: Uuid) -> PathBuf {
+        root.join("jail")
+            .join("firecracker")
+            .join(id.to_string())
+            .join("root")
+    }
+
+    /// Firecracker's API socket as seen from the host, inside its chroot.
+    pub fn jail_socket(root: &Path, id: Uuid) -> PathBuf {
+        jail_root(root, id).join("fc.sock")
+    }
+
+    fn jail_path(dir: &Path, name: &str) -> PathBuf {
+        let Some(id) = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| Uuid::parse_str(name).ok())
+        else {
+            return dir.join(name);
+        };
+        let Some(vm_root) = dir.parent() else {
+            return dir.join(name);
+        };
+        let Some(root) = vm_root.parent() else {
+            return dir.join(name);
+        };
+        jail_root(root, id).join(name)
+    }
+
     pub fn config_path(dir: &Path) -> PathBuf {
-        dir.join("fc.json")
+        jail_path(dir, "fc.json")
     }
 
     pub fn vsock_path(dir: &Path) -> PathBuf {
-        dir.join("vsock.sock")
+        jail_path(dir, "vsock.sock")
     }
 
-    /// `<vm_dir>/fc.sock` — Firecracker's control API.
-    ///
-    /// Deliberately *not* chowned to the space owner like the vsock socket
-    /// is: this endpoint resizes the balloon and reconfigures devices, so
-    /// handing it to the user would let them lift their own VM's memory
-    /// ceiling. The daemon is the only client.
+    /// `<root>/jail/firecracker/<id>/root/fc.sock` is kept in the chroot so
+    /// Firecracker cannot reach a host socket outside its namespace.
     pub fn api_path(dir: &Path) -> PathBuf {
-        dir.join("fc.sock")
+        jail_path(dir, "fc.sock")
     }
 
+    /// The jailer writes the Firecracker pid inside the chroot. Keeping this
+    /// path next to the process it describes lets lifecycle checks survive a
+    /// daemon restart without exposing a host-side pid file to the guest.
     pub fn pid_path(dir: &Path) -> PathBuf {
-        dir.join("fc.pid")
+        jail_path(dir, "firecracker.pid")
     }
+
+    const JAIL_KERNEL: &str = "vmlinux";
+    const JAIL_ROOTFS: &str = "rootfs.ext4";
+    const JAIL_VSOCK: &str = "vsock.sock";
 
     pub fn key_path(dir: &Path) -> PathBuf {
         dir.join("id_ed25519")
@@ -1801,16 +2725,10 @@ pub mod vm {
 
     /// The pid of the Firecracker instance launched with `config`.
     ///
-    /// `setsid --fork` deliberately loses the grandchild's pid, so it is
-    /// recovered by matching the config path in `/proc/<pid>/cmdline`. That
-    /// path contains the space uuid, so at most one VM can match.
-    ///
-    /// The name check is not redundant: the launching `setsid` carries the
-    /// very same path in its own cmdline, and it exits immediately. Matching
-    /// it recorded an already-dead pid, and the caller then reported a
-    /// perfectly healthy VM as "did not come up" — intermittently, depending
-    /// on whether setsid had been reaped before this scan.
-    fn find_vm_pid(config: &Path) -> Option<u32> {
+    /// `setsid --fork` deliberately loses the grandchild's pid. The jailer
+    /// records Firecracker's pid inside the jail, while the process scan below
+    /// remains a fallback for the short window before that file is written.
+    fn find_vm_pid(config: &Path, id: Uuid) -> Option<u32> {
         for entry in std::fs::read_dir("/proc").ok()?.flatten() {
             let Some(pid) = entry
                 .file_name()
@@ -1819,28 +2737,19 @@ pub mod vm {
             else {
                 continue;
             };
-            if is_vm_process(pid, config) {
+            if is_vm_process(pid, config, id) {
                 return Some(pid);
             }
         }
         None
     }
 
-    /// Whether `pid` is a live Firecracker running exactly `config`.
+    /// Whether `pid` is a live Firecracker running exactly this VM.
     ///
-    /// The single definition of "this VM", shared by the scan that discovers
-    /// a pid and by every later check that trusts one. Two copies of this
-    /// predicate would be free to drift apart, and the lax one would decide
-    /// who gets signalled.
-    ///
-    /// All three conditions earn their place:
-    /// - the name, because a pid file outlives its process;
-    /// - not a zombie, whose `/proc` entry (including `comm`) lingers until
-    ///   reaped, which would report every exited VM as still alive;
-    /// - the config path, because pids are recycled and every VM here is a
-    ///   process called `firecracker`. The path carries the space uuid, so
-    ///   no other VM can match it.
-    fn is_vm_process(pid: u32, config: &Path) -> bool {
+    /// The single definition is shared by discovery and every later lifecycle
+    /// check. The jailer forwards Firecracker's UUID argument after chrooting,
+    /// so matching that identity avoids confusing relative `fc.json` paths.
+    fn is_vm_process(pid: u32, config: &Path, id: Uuid) -> bool {
         let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
             return false;
         };
@@ -1855,19 +2764,32 @@ pub mod vm {
         let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
             return false;
         };
-        // cmdline is NUL-separated; the config path is one whole argument.
-        let needle = config.as_os_str().as_encoded_bytes();
-        cmdline.split(|b| *b == 0).any(|arg| arg == needle)
+        let config_needle = config.as_os_str().as_encoded_bytes();
+        let id_text = id.to_string();
+        let id_with_equals = format!("--id={id_text}");
+        let mut id_matches = false;
+        let mut config_matches = false;
+        let mut previous_was_id_flag = false;
+        for arg in cmdline.split(|byte| *byte == 0) {
+            if arg == id_with_equals.as_bytes()
+                || (previous_was_id_flag && arg == id_text.as_bytes())
+            {
+                id_matches = true;
+            }
+            if arg == config_needle {
+                config_matches = true;
+            }
+            previous_was_id_flag = arg == b"--id";
+        }
+        id_matches || config_matches
     }
 
     /// The pid of this space's VM, or `None` if it is not running.
-    ///
-    /// Every lifecycle decision — reuse, signal, reclaim, sweep — routes
-    /// through here, so the identity check is deliberately strict; see
-    /// [`is_vm_process`] for why each condition is load-bearing.
     pub fn running_pid(dir: &Path) -> Option<u32> {
         let pid = read_pid(dir)?;
-        is_vm_process(pid, &config_path(dir)).then_some(pid)
+        let id = dir_id(dir).ok()?;
+        let config = config_path(dir);
+        is_vm_process(pid, &config, id).then_some(pid)
     }
 
     pub fn is_running(dir: &Path) -> bool {
@@ -2017,6 +2939,57 @@ pub mod vm {
         }
         line(&mut stream).is_some_and(|banner| banner.starts_with(b"SSH-"))
     }
+    fn link_resource(src: &Path, dst: &Path) -> Result<()> {
+        if dst.exists() {
+            std::fs::remove_file(dst)?;
+        }
+        // A 2 GiB image must stay on the same filesystem as its source: a
+        // hardlink is O(1) and preserves CoW accounting, while copying would
+        // consume the whole image and silently destroy that invariant.
+        std::fs::hard_link(src, dst).map_err(|error| {
+            Error::Invalid(format!(
+                "hard-link {} -> {} failed (cross-device links are not supported): {error}",
+                src.display(),
+                dst.display()
+            ))
+        })?;
+        Ok(())
+    }
+
+    fn clean_jail(dir: &Path) -> Result<()> {
+        let Some(id) = dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| Uuid::parse_str(name).ok())
+        else {
+            return Ok(());
+        };
+        let Some(vm_root) = dir.parent() else {
+            return Ok(());
+        };
+        let Some(root) = vm_root.parent() else {
+            return Ok(());
+        };
+        let jail = jail_root(root, id);
+        match std::fs::remove_dir_all(jail) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn wait_ready(dir: &Path, vsock: &Path) -> bool {
+        for _ in 0..600 {
+            if vsock.exists() && probe(vsock, crate::VSOCK_SSH_PORT) {
+                return true;
+            }
+            if !is_running(dir) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
 
     /// Boots the VM unless it is already up. Returns whether a boot happened.
     pub fn start(
@@ -2037,69 +3010,103 @@ pub mod vm {
             return Ok((vsock, false));
         }
 
-        // Sockets left behind by a dead VM make Firecracker fail to bind —
-        // measured on the API socket, which refuses to start with
-        // "Check that it is not already used" — and the readiness wait would
-        // then hang on a stale file.
-        let _ = std::fs::remove_file(&vsock);
-        let _ = std::fs::remove_file(api_path(&dir));
-        std::fs::create_dir_all(&dir)?;
-
         let image = crate::space_image(root, id);
         if !image.exists() {
             return Err(Error::NotFound(format!("space image: {}", image.display())));
         }
+        let kernel = crate::kernel_path(root);
+        if !kernel.exists() {
+            return Err(Error::NotFound(format!("kernel image: {}", kernel.display())));
+        }
+
+        // A stale socket or jail from a dead VM must not make the next jailer
+        // invocation reuse an old chroot or fail to bind its UDS.
+        let _ = std::fs::remove_file(&vsock);
+        let _ = std::fs::remove_file(api_path(&dir));
+        std::fs::create_dir_all(&dir)?;
+        clean_jail(&dir)?;
+        let jail = jail_root(root, id);
+        std::fs::create_dir_all(&jail)?;
+
         let net = crate::net_spec(id, net_cfg);
         if let Err(error) = tap_up(id, net_cfg) {
             tap_down(id, net_cfg);
+            let _ = clean_jail(&dir);
             return Err(error);
         }
         let result = (|| -> Result<(PathBuf, bool)> {
+            let jail_kernel = jail.join(JAIL_KERNEL);
+            let jail_rootfs = jail.join(JAIL_ROOTFS);
+            link_resource(&kernel, &jail_kernel)?;
+            link_resource(&image, &jail_rootfs)?;
+            // Hardlinks share inode ownership and mode with the source image.
+            // Give only the dedicated jail group write access; the host's
+            // 0700 spaces directory still keeps the image off user paths.
+            std::os::unix::fs::chown(&jail_rootfs, None, Some(cfg.jail_gid))?;
+            std::fs::set_permissions(&jail_rootfs, std::fs::Permissions::from_mode(0o660))?;
+            std::fs::set_permissions(&jail_kernel, std::fs::Permissions::from_mode(0o444))?;
             std::fs::write(
                 config_path(&dir),
                 crate::vm_config_json(
-                    &crate::kernel_path(root),
-                    &image,
-                    &vsock,
+                    Path::new(JAIL_KERNEL),
+                    Path::new(JAIL_ROOTFS),
+                    Path::new(JAIL_VSOCK),
                     cfg.vcpus,
                     cfg.mem_mib,
                     net.as_ref(),
                 ),
             )?;
 
-            // Launched through `setsid` so the VM is not the daemon's own child.
-            //
-            // The daemon is a single-threaded accept loop with nowhere to reap
-            // from: a directly spawned Firecracker becomes a zombie the moment it
-            // exits and stays one for the daemon's whole life (measured: three
-            // stopped VMs, three zombies). Re-parenting to init makes exit
-            // accounting somebody else's job, and `setsid` also detaches the VM
-            // from the daemon's session so a signal to the group cannot take
-            // every running VM down with it.
-            //
-            // `--fork` makes setsid exit immediately, so its own pid is useless
-            // here; the VM's real pid is recovered from `/proc` below.
+            // Keep the VM outside the daemon's session so daemon restart does
+            // not signal or reap a running guest. `setsid --fork` still gives
+            // the jailer a detached process while its child becomes the
+            // Firecracker process we identify below.
             let log = std::fs::File::create(dir.join("console.log"))?;
+            let memory_limit = format!("memory.max={}M", cfg.mem_mib);
             let status = std::process::Command::new("setsid")
                 .arg("--fork")
+                .arg(crate::jailer_bin(root))
+                .arg("--id")
+                .arg(id.to_string())
+                .arg("--exec-file")
                 .arg(crate::firecracker_bin(root))
+                .arg("--uid")
+                .arg(cfg.jail_uid.to_string())
+                .arg("--gid")
+                .arg(cfg.jail_gid.to_string())
+                .arg("--chroot-base-dir")
+                .arg(root.join("jail"))
+                .arg("--cgroup-version")
+                .arg("2")
+                .arg("--cgroup")
+                .arg(memory_limit)
+                .arg("--cgroup")
+                .arg("pids.max=512")
+                .arg("--")
                 .arg("--api-sock")
-                .arg(api_path(&dir))
+                .arg("fc.sock")
                 .arg("--config-file")
-                .arg(config_path(&dir))
+                .arg("fc.json")
                 .stdin(std::process::Stdio::null())
                 .stderr(log.try_clone()?)
                 .stdout(log)
                 .status()?;
             if !status.success() {
-                return Err(Error::Invalid("could not launch firecracker".to_owned()));
+                return Err(Error::Invalid("could not launch jailer".to_owned()));
             }
-            // The pid file is what every later lifecycle check reads, so it must
-            // name the VM itself. Find the process holding this VM's config file:
-            // the path is unique per space, so the match is unambiguous.
+
+            // The jailer writes this pid inside the chroot. Scan as a fallback
+            // during the short interval before that file becomes visible.
+            let config = config_path(&dir);
             let mut pid = None;
             for _ in 0..100 {
-                if let Some(found) = find_vm_pid(&config_path(&dir)) {
+                if let Some(found) = read_pid(&dir)
+                    && is_vm_process(found, &config, id)
+                {
+                    pid = Some(found);
+                    break;
+                }
+                if let Some(found) = find_vm_pid(&config, id) {
                     pid = Some(found);
                     break;
                 }
@@ -2117,26 +3124,11 @@ pub mod vm {
                         .join(" | ")
                 )));
             };
+            // Keep a deterministic pid file even if this is the scan fallback;
+            // normal jailer launches have already created the same path.
             std::fs::write(pid_path(&dir), pid.to_string())?;
 
-            // Readiness is a guest-side property, and the socket file is not it:
-            // Firecracker binds the UDS at startup, long before the guest kernel
-            // has run init, so waiting for the file returns while nothing inside
-            // is listening yet and the first exec fails the handshake. The only
-            // honest signal is completing that handshake against the guest's own
-            // vsock listener.
-            let mut booted = false;
-            for _ in 0..600 {
-                if vsock.exists() && probe(&vsock, crate::VSOCK_SSH_PORT) {
-                    booted = true;
-                    break;
-                }
-                if !is_running(&dir) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            if !booted {
+            if !wait_ready(&dir, &vsock) {
                 let console = std::fs::read_to_string(dir.join("console.log")).unwrap_or_default();
                 let _ = stop(&dir, net_cfg);
                 return Err(Error::Invalid(format!(
@@ -2149,14 +3141,13 @@ pub mod vm {
                         .join(" | ")
                 )));
             }
-            // Firecracker creates both sockets as root. Only the vsock one is
-            // handed to the owner — that is all `exec` needs, and it carries no
-            // authority beyond talking to the guest.
+            // The jailer runs Firecracker as its configured non-root uid. The
+            // daemon still owns the host-side vsock and hands it to the space
+            // owner only after the guest has proved ready.
             std::os::unix::fs::chown(&vsock, Some(uid), Some(gid))?;
             std::fs::set_permissions(&vsock, std::fs::Permissions::from_mode(0o600))?;
-            // The control API stays root-only and is pinned explicitly rather
-            // than left to umask: it can resize the balloon and reconfigure
-            // devices, so an owner holding it could lift their own memory cap.
+            // The control API remains daemon-only: it can resize the balloon
+            // and reconfigure devices, so an owner must never receive it.
             std::fs::set_permissions(api_path(&dir), std::fs::Permissions::from_mode(0o600))?;
             touch(&dir)?;
             Ok((vsock, true))
@@ -2193,6 +3184,7 @@ pub mod vm {
             let _ = std::fs::remove_file(api_path(dir));
             let _ = std::fs::remove_file(pid_path(dir));
             tap_down(id, cfg);
+            clean_jail(dir)?;
             return Ok(false);
         };
 
@@ -2200,15 +3192,7 @@ pub mod vm {
         if vsock.exists() {
             // Durability needs exactly one thing: the guest's dirty pages on
             // the image before the VMM dies. `sync` plus a read-only remount
-            // does that and *returns normally*, leaving the connection intact.
-            //
-            // Asking the guest to power itself off instead is worse on both
-            // ends: an orderly `poweroff` spends ~13s tearing down services
-            // for a machine about to cease existing, and `poweroff -f` halts
-            // the vCPU without the VMM ever exiting, so the command never
-            // returns and the SSH client hangs (both measured on this host).
-            // Once the data is on disk, killing the VMM is the fast, correct
-            // way to end it.
+            // does that and returns normally, leaving the connection intact.
             let _ = crate::exec_in_vm(
                 &vsock,
                 &key_path(dir),
@@ -2234,15 +3218,23 @@ pub mod vm {
             signal(pid, "KILL");
             for _ in 0..20 {
                 if running_pid(dir).is_none() {
+                    gone = true;
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
+        if !gone {
+            tap_down(id, cfg);
+            return Err(Error::Invalid(format!(
+                "firecracker pid {pid} did not stop"
+            )));
+        }
         let _ = std::fs::remove_file(vsock_path(dir));
         let _ = std::fs::remove_file(api_path(dir));
         let _ = std::fs::remove_file(pid_path(dir));
         tap_down(id, cfg);
+        clean_jail(dir)?;
         Ok(true)
     }
 
@@ -2290,6 +3282,100 @@ pub mod vm {
             }
         }
         Ok(stopped)
+    }
+    #[cfg(test)]
+    mod jail_tests {
+        use super::{jail_root, jail_socket, VmConfig};
+        use std::ffi::OsString;
+        use std::path::{Path, PathBuf};
+        use std::sync::Mutex;
+        use uuid::Uuid;
+
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+        struct JailEnv {
+            uid: Option<OsString>,
+            gid: Option<OsString>,
+        }
+
+        impl JailEnv {
+            fn capture() -> Self {
+                Self {
+                    uid: std::env::var_os("SHINU_JAIL_UID"),
+                    gid: std::env::var_os("SHINU_JAIL_GID"),
+                }
+            }
+        }
+
+        impl Drop for JailEnv {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.uid {
+                        Some(value) => std::env::set_var("SHINU_JAIL_UID", value),
+                        None => std::env::remove_var("SHINU_JAIL_UID"),
+                    }
+                    match &self.gid {
+                        Some(value) => std::env::set_var("SHINU_JAIL_GID", value),
+                        None => std::env::remove_var("SHINU_JAIL_GID"),
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn jail_root_has_the_expected_chroot_layout() {
+            let id = Uuid::from_u128(1);
+            assert_eq!(
+                jail_root(Path::new("/var/lib/shinu"), id),
+                PathBuf::from(format!(
+                    "/var/lib/shinu/jail/firecracker/{id}/root"
+                ))
+            );
+        }
+
+        #[test]
+        fn jail_socket_is_inside_the_jail_root() {
+            let id = Uuid::from_u128(2);
+            let root = jail_root(Path::new("/srv/shinu"), id);
+            let socket = jail_socket(Path::new("/srv/shinu"), id);
+            assert!(socket.starts_with(&root));
+            assert_eq!(socket.strip_prefix(root).expect("socket relative"), Path::new("fc.sock"));
+        }
+
+        #[test]
+        fn different_uuids_get_disjoint_jails() {
+            let first = jail_root(Path::new("/srv/shinu"), Uuid::from_u128(3));
+            let second = jail_root(Path::new("/srv/shinu"), Uuid::from_u128(4));
+            assert_ne!(first, second);
+            assert!(!first.starts_with(&second));
+            assert!(!second.starts_with(&first));
+        }
+
+        #[test]
+        fn jail_ids_default_to_the_dedicated_non_root_user() {
+            let _lock = ENV_LOCK.lock().expect("jail env lock");
+            let _env = JailEnv::capture();
+            unsafe {
+                std::env::remove_var("SHINU_JAIL_UID");
+                std::env::remove_var("SHINU_JAIL_GID");
+            }
+            let config = VmConfig::from_env();
+            assert_eq!(config.jail_uid, 30_000);
+            assert_eq!(config.jail_gid, 30_000);
+        }
+
+        #[test]
+        fn jail_ids_can_be_overridden_per_deployment() {
+            let _lock = ENV_LOCK.lock().expect("jail env lock");
+            let _env = JailEnv::capture();
+            unsafe {
+                std::env::set_var("SHINU_JAIL_UID", "40123");
+                std::env::set_var("SHINU_JAIL_GID", "40124");
+            }
+            let config = VmConfig::from_env();
+            assert_eq!(config.jail_uid, 40_123);
+            assert_eq!(config.jail_gid, 40_124);
+        }
     }
 }
 
@@ -3046,6 +4132,7 @@ pub mod http {
             crate::Error::Auth(_) => 401,
             crate::Error::NotFound(_) => 404,
             crate::Error::Invalid(_) => 400,
+            crate::Error::Quota(_) => 429,
             crate::Error::Btrfs(_) | crate::Error::Io(_) | crate::Error::Json(_) => 500,
         }
     }
@@ -3153,6 +4240,7 @@ pub mod http {
             assert_eq!(status_for(&crate::Error::Auth("bad".into())), 401);
             assert_eq!(status_for(&crate::Error::NotFound("gone".into())), 404);
             assert_eq!(status_for(&crate::Error::Invalid("bad".into())), 400);
+            assert_eq!(status_for(&crate::Error::Quota("limit".into())), 429);
             assert_eq!(status_for(&crate::Error::Btrfs("bad".into())), 500);
             assert_eq!(
                 status_for(&crate::Error::Io(std::io::Error::other("bad"))),
@@ -3220,6 +4308,11 @@ pub mod proto {
         Touch {
             space: String,
         },
+        Usage {
+            from: Option<i64>,
+            to: Option<i64>,
+        },
+        Limits,
         Gc {
             free_below: u64,
             dry_run: bool,

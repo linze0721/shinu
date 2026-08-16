@@ -1,0 +1,27 @@
+# Caddyfile for shinud TLS termination and reverse proxy.
+#
+# shinud listens strictly on 127.0.0.1:7878 (cleartext HTTP).
+# Caddy terminates TLS (automatic HTTPS via Let's Encrypt / ZeroSSL)
+# and proxies external traffic to shinud.
+#
+# CRITICAL: NDJSON output streaming from `shinu exec` (POST /v1/spaces/{name}/exec)
+# uses chunked HTTP responses. Response buffering MUST be disabled (`flush_interval -1`)
+# so agents receive command terminal output in real-time instead of waiting for buffer
+# fills or process exit.
+
+api.example.com {
+    reverse_proxy 127.0.0.1:7878 {
+        # Stream chunks straight through instead of buffering them.
+        flush_interval -1
+
+        # `transport` configures the upstream connection and must sit inside
+        # the reverse_proxy block, not beside it.
+        transport http {
+            # exec holds the response open for as long as the guest command
+            # runs, so the read timeout has to outlive the longest command
+            # rather than the longest silence between chunks.
+            read_timeout 0
+            dial_timeout 5s
+        }
+    }
+}

@@ -80,6 +80,18 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    Usage {
+        #[arg(long)]
+        from: Option<i64>,
+        #[arg(long)]
+        to: Option<i64>,
+        #[arg(long)]
+        json: bool,
+    },
+    Limits {
+        #[arg(long)]
+        json: bool,
+    },
     Token {
         #[command(subcommand)]
         command: TokenCommand,
@@ -487,11 +499,95 @@ fn run_command(client: &HttpClient, command: Command) -> Result<i32, String> {
                 value_u64(data.get("reclaimed")).unwrap_or(0)
             );
         }
+        Command::Usage { from, to, json } => {
+            let path = usage_path(from, to);
+            let response = client.request("GET", &path, None)?;
+            let body = successful_body(response)?;
+            if json {
+                print_raw_json(&body)?;
+            } else {
+                print_usage(&response_value_from_body(&body)?);
+            }
+        }
+        Command::Limits { json } => {
+            let response = client.request("GET", "/v1/limits", None)?;
+            let body = successful_body(response)?;
+            if json {
+                print_raw_json(&body)?;
+            } else {
+                print_limits(&response_value_from_body(&body)?);
+            }
+        }
         Command::Token { .. } => {
             return Err("token commands must be handled without an HTTP endpoint".to_string());
         }
     }
     Ok(0)
+}
+
+fn usage_path(from: Option<i64>, to: Option<i64>) -> String {
+    let mut query = Vec::new();
+    if let Some(from) = from {
+        query.push(format!("from={from}"));
+    }
+    if let Some(to) = to {
+        query.push(format!("to={to}"));
+    }
+    if query.is_empty() {
+        "/v1/usage".to_string()
+    } else {
+        format!("/v1/usage?{}", query.join("&"))
+    }
+}
+
+fn vm_time(seconds: u64) -> String {
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn print_usage(data: &Value) {
+    println!("project: {}", field_text(data, "project"));
+    println!(
+        "spaces_created: {}",
+        value_u64(data.get("spaces_created")).unwrap_or(0)
+    );
+    println!(
+        "vm_seconds: {}",
+        vm_time(value_u64(data.get("vm_seconds")).unwrap_or(0))
+    );
+    println!(
+        "disk_mib_hour: {}",
+        value_u64(data.get("disk_mib_hour")).unwrap_or(0)
+    );
+    println!("api_calls: {}", value_u64(data.get("api_calls")).unwrap_or(0));
+}
+
+fn print_limits(data: &Value) {
+    let used = data.get("used").unwrap_or(&Value::Null);
+    println!(
+        "spaces: {}/{}",
+        value_u64(used.get("spaces")).unwrap_or(0),
+        value_u64(data.get("max_spaces")).unwrap_or(0)
+    );
+    println!(
+        "disk_mib: {}/{}",
+        value_u64(used.get("disk_mib")).unwrap_or(0),
+        value_u64(data.get("max_disk_mib")).unwrap_or(0)
+    );
+    println!(
+        "running: {}/{}",
+        value_u64(used.get("running")).unwrap_or(0),
+        value_u64(data.get("max_running")).unwrap_or(0)
+    );
+    println!("api_per_min: {}", value_u64(data.get("api_per_min")).unwrap_or(0));
 }
 
 fn run_token(root: Option<PathBuf>, command: TokenCommand) -> Result<i32, String> {

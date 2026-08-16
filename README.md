@@ -100,6 +100,87 @@ shinu gc
 
 ---
 
+## Production Deployment & Multi-Tenancy
+
+For multi-tenant SaaS hosting, running microVM sandboxes securely requires strict isolation, quota limits, and TLS termination.
+
+### 1. Jailer Sandboxing (Mandatory Security)
+`shinud` executes Firecracker instances inside the Firecracker **jailer** sub-process (`<root>/assets/jailer`), providing:
+ **Chroot jail**: MicroVM filesystem root isolated under `<root>/jail/firecracker/<uuid>/root`. Kernel and ext4 space images are hardlinked into the jail.
+ **Privilege dropping**: MicroVM process runs under non-root UID/GID (default `30000`).
+ **cgroup v2 isolation**: Enforces strict memory ceilings (`cgroup memory.max`) and process caps (`cgroup pids.max=512`).
+ **Seccomp & Namespaces**: MicroVM runs in unshared PID, net, mount, and IPC namespaces.
+
+**Host Prerequisite**:
+Create the non-privileged jailer user and group (handled automatically by `./packaging/install.sh`):
+```sh
+groupadd -g 30000 -r shinu-jail
+useradd -u 30000 -g 30000 -r -s /usr/sbin/nologin -d /nonexistent shinu-jail
+```
+Host kernel must have cgroup v2 unified hierarchy mounted at `/sys/fs/cgroup`.
+
+### 2. Quota & Rate Limits
+Resource consumption is bounded per project via environment variables or DB overrides:
+
+| Variable | Default | Description |
+|---|---|---|
+| `SHINU_LIMIT_SPACES` | `5` | Maximum active or stopped spaces per project. |
+| `SHINU_LIMIT_DISK_MIB` | `10240` | Maximum total exclusive disk allocation (MiB) per project across all spaces. |
+| `SHINU_LIMIT_RUNNING` | `2` | Maximum concurrently running Firecracker VMs per project. |
+| `SHINU_LIMIT_API_PER_MIN` | `120` | Maximum API requests per minute per project (sliding window). |
+
+When a project exceeds a quota, API calls return `429 Too Many Requests` with `{"error":"quota: ..."}`.
+Per-project quota overrides can be stored directly in `<root>/shinu.db`.
+
+### 3. TLS Termination & Network Binding
+`shinud` listens strictly on cleartext HTTP on `127.0.0.1:7878` (loopback only) to keep the core daemon dependency tree minimal and simple.
+
+**Never expose `shinud` directly to the internet.**
+Deploy Caddy (or Nginx) in front of `shinud` to terminate TLS. A ready-to-use Caddyfile is provided at `packaging/caddy/Caddyfile`:
+
+```caddy
+api.example.com {
+    reverse_proxy 127.0.0.1:7878 {
+        flush_interval -1
+    }
+    transport http {
+        response_header_timeout 10m
+    }
+}
+```
+> **CRITICAL**: `flush_interval -1` disables response buffering. `shinu exec` uses chunked NDJSON streaming; proxy response buffering delays terminal output streams until execution completes.
+
+
+## Usage Metering & State Storage
+
+### Usage Accounting
+`shinud` records granular usage metrics into the database during background sweeps (every 30s):
+ `vm_seconds`: Active microVM uptime in wall-clock seconds.
+ `disk_mib_hour`: Exclusive host disk allocation measured via btrfs reflink accounting (`btrfs::exclusive`).
+ `spaces_created`: Total count of created spaces.
+ `api_calls`: Total API invocations.
+
+Query aggregated usage via CLI or HTTP API:
+```sh
+shinu usage [--json] [--from <timestamp>] [--to <timestamp>]
+```
+or `GET /v1/usage?from=<ts>&to=<ts>`:
+```json
+{
+  "project": "demo",
+  "spaces_created": 3,
+  "vm_seconds": 1800,
+  "disk_mib_hour": 10240,
+  "api_calls": 42
+}
+```
+
+### State Storage (`shinu.db`)
+State is stored in SQLite at `<root>/shinu.db` (`0600` permissions, WAL mode enabled for concurrent reads without blocking writes).
+
+**Automatic Migration**: On startup, if `<root>/state.json` exists and `<root>/shinu.db` is empty, `shinud` automatically migrates spaces, checkpoints, and tokens into SQLite and renames `<root>/state.json` to `<root>/state.json.migrated` (preserving old state files without deletion).
+
+
 ## HTTP REST API
 
 All API routes require authentication header: `Authorization: Bearer <token>`.
@@ -119,8 +200,9 @@ All API routes require authentication header: `Authorization: Bearer <token>`.
 | `POST` | `/v1/spaces/{name}/checkout` | `{"commit":"<id>"}` | `200 OK` `{"head":"...","auto_commit":"..."}` | Rewind space to commit (auto-commits state first) |
 | `POST` | `/v1/commits/{id}/fork` | `{"name":"web2"}` | `201 Created` | Fork space from existing commit |
 | `DELETE` | `/v1/commits/{id}` | — | `200 OK` | Delete unreferenced commit |
+| `GET` | `/v1/usage[?from=&to=]` | — | `200 OK` | Query usage summary metrics for project |
+| `GET` | `/v1/limits` | — | `200 OK` | Query project quota limits and current resource usage |
 | `POST` | `/v1/gc` | `{"free_below":...,"dry_run":false}` | `200 OK` | Run garbage collection on unreferenced commits |
-
 ### Streaming `exec` Format (NDJSON)
 
 The `POST /v1/spaces/{name}/exec` endpoint uses `Transfer-Encoding: chunked` returning newline-delimited JSON (NDJSON) messages:
@@ -144,11 +226,12 @@ Errors return JSON responses with standard HTTP status codes:
 ```
 
 Status Code Mapping (`http::status_for`):
-- `401 Unauthorized`: Missing, malformed, or invalid `Authorization: Bearer <token>`.
-- `400 Bad Request`: Invalid JSON body, malformed command, or invalid request payload.
-- `404 Not Found`: Target space or commit does not exist within caller's project scope.
-- `405 Method Not Allowed`: Unrecognized HTTP verb for path.
-- `500 Internal Server Error`: Host I/O errors, btrfs reflink failure, or process execution failures.
+ `401 Unauthorized`: Missing, malformed, or invalid `Authorization: Bearer <token>`.
+ `400 Bad Request`: Invalid JSON body, malformed command, or invalid request payload.
+ `404 Not Found`: Target space or commit does not exist within caller's project scope.
+ `405 Method Not Allowed`: Unrecognized HTTP verb for path.
+ `429 Too Many Requests`: Project resource quota or API rate limit exceeded (`{"error":"quota: ..."}`).
+ `500 Internal Server Error`: Host I/O errors, btrfs reflink failure, or process execution failures.
 
 ### cURL Example
 
@@ -224,13 +307,18 @@ Daemon configuration via environment variables:
 | `SHINU_MEM_MIB` | `1024` | Maximum RAM limit (MiB) per VM. Memory is allocated on demand. |
 | `SHINU_IDLE_SECS` | `600` | Inactivity timeout (seconds). Reclaims memory at 1/10th timeout; shuts down VM at full value. |
 | `SHINU_DISK_MIB` | `2048` | Guest disk capacity (MiB). **Only read when `base.ext4` is first built.** |
+| `SHINU_JAIL_UID` | `30000` | Unprivileged UID under which Firecracker microVM runs inside jailer. |
+| `SHINU_JAIL_GID` | `30000` | Unprivileged GID under which Firecracker microVM runs inside jailer. |
+| `SHINU_LIMIT_SPACES` | `5` | Default maximum spaces limit per project. |
+| `SHINU_LIMIT_DISK_MIB` | `10240` | Default maximum exclusive disk quota limit (MiB) per project. |
+| `SHINU_LIMIT_RUNNING` | `2` | Default maximum concurrent active microVM limit per project. |
+| `SHINU_LIMIT_API_PER_MIN` | `120` | Default API rate limit per minute per project. |
 | `SHINU_MIRROR` | — | Ubuntu mirror URL for guest rootfs generation. |
 | `SHINU_ARCH` | `uname -m` | Target architecture (`x86_64`). |
 | `SHINU_ROOTFS_TARBALL` | — | Local path to pre-built rootfs tarball for offline installations. |
 | `SHINU_NET_ENABLE` | `true` | Enable guest network interfaces. Set to `0` or `false` to disable networking. |
 | `SHINU_NET_BASE` | `172.31` | First two octets for per-VM `/30` NAT IP allocations. |
 | `SHINU_NET_UPLINK` | Default route | Host egress network interface for NAT forwarding. |
-
 Client environment variables:
 
 | Variable | Description |
@@ -272,27 +360,34 @@ e2fsck -E discard -fp <root>/spaces/<uuid>.ext4
 ## Storage & Path Layout
 
 ```text
+<root>/shinu.db           SQLite database (spaces, ckpts, tokens, quotas, usage events, mode 0600)
 <root>/base.ext4          golden rootfs image (mode 0600)
 <root>/spaces/<uuid>.ext4 ext4 space disk image (mode 0700 dir)
 <root>/ckpts/<uuid>.ext4  immutable commit snapshot images (mode 0700 dir)
-<root>/tokens.json        hashed bearer tokens (mode 0600)
+<root>/jail/firecracker/<uuid>/root/
+                          chroot base for jailer sandbox (mode 0700)
 <root>/vm/<uuid>/         per-VM directory (mode 0700):
-                          fc.json, fc.sock (root only), vsock.sock,
-                          fc.pid, id_ed25519, last_used, console.log
-<root>/assets/            firecracker binary + guest kernel (mode 0755)
+                          fc.json, fc.sock, vsock.sock, fc.pid,
+                          id_ed25519, last_used, console.log
+<root>/assets/            firecracker & jailer binaries + guest kernel (mode 0755)
 <root>/cache/             downloaded assets and rootfs cache (mode 0755)
 ```
 
-Direct host path permissions on `<root>/spaces/`, `<root>/ckpts/`, and `<root>/vm/` are strictly restricted to `0700` owned by `root`. Clients interact exclusively over HTTP API endpoints.
+Direct host path permissions on `<root>/spaces/`, `<root>/ckpts/`, `<root>/jail/`, and `<root>/vm/` are strictly restricted to `0700` owned by `root`. Clients interact exclusively over HTTP API endpoints.
 
 ---
 
-## Security Model
-
-- **Bearer Token Authentication**: Authentication uses `Authorization: Bearer <token>`. `shinud` stores only SHA-256 hashes of tokens in `<root>/tokens.json` (mode `0600`). Hashes are validated in constant time to prevent timing attacks. Token creation and management (`shinu token new/ls/rm`) must run host-locally as `root` and cannot be invoked over HTTP.
+- **Bearer Token Authentication**: Authentication uses `Authorization: Bearer <token>`. `shinud` stores SHA-256 hashes of tokens in `<root>/shinu.db` (mode `0600`). Hashes are validated in constant time to prevent timing attacks. Token creation and management (`shinu token new/ls/rm`) must run host-locally as `root` and cannot be invoked over HTTP.
 - **Project Scope Isolation**: Every token maps to a single `project`. All space and commit lookup operations are strictly project-scoped. Accessing a space or commit belonging to another project returns `404 Not Found`, preventing project resource enumeration or existence leakage.
-- **Host Path Isolation**: VM control sockets (`fc.sock`), state directories (`<root>/vm/`), and ext4 image files (`<root>/spaces/`) are secured at mode `0700` owned by `root`. Non-root clients communicate solely over the `shinud` HTTP daemon proxy and cannot directly access or tamper with host disk files.
+- **Jailer & Cgroup Sandboxing**: MicroVMs execute under `jailer` with chroot jails, dropped privileges (UID/GID `30000`), and cgroup v2 resource bounds (`memory.max`, `pids.max`).
+- **Host Path Isolation**: Control sockets, state directories, and ext4 image files are secured at mode `0700` owned by `root`. Non-root clients communicate solely over the `shinud` HTTP daemon proxy and cannot directly access or tamper with host disk files.
 - **Network Isolation**: Every VM receives an isolated host-guest `/30` subnet derived from its UUID (host `.1`, guest `.2`). Guest traffic is NAT'd through host egress interfaces (`iptables`). Networking can be disabled by setting `SHINU_NET_ENABLE=0`.
-- **Cleartext HTTP Warning**: `shinud` listens by default on `127.0.0.1:7878`. Tokens travel in cleartext HTTP headers. **If exposing `shinud` across a external network, you must deploy a reverse proxy providing TLS termination (e.g. nginx or Caddy) in front of `shinud`.**
+- **Cleartext HTTP Warning**: `shinud` listens by default on `127.0.0.1:7878`. Tokens travel in cleartext HTTP headers. **When exposing `shinud` across an external network, deploy a reverse proxy providing TLS termination (such as Caddy) in front of `shinud`.**
 
-**Non-goals**: `shinu` does not enforce per-project disk or memory quotas. Any project with a valid token can allocate spaces and boot VMs up to total host capacity. Multi-tenant host environments must enforce resource bounds at the host container or cgroup level outside `shinu`.
+### SaaS Demo Boundaries & Non-Goals
+
+This release provides a **managed SaaS Demo** for early customer testing and monetization signal validation. The following architectural trade-offs apply:
+
+1. **Single-Host Daemon**: `shinud` manages microVMs on a single physical host. Multi-host scheduling or cross-node VM migration is not implemented.
+2. **No Integrated Billing/Payment Processing**: `shinud` provides granular usage accounting (`vm_seconds`, `disk_mib_hour`, `api_calls`), but payment gateway integration (e.g. Stripe) must be handled by an upstream control plane.
+3. **Monotonic Disk Growth & Commercial Implication**: Firecracker v1.13.1 block devices do not support TRIM/discard operations. Once a space guest writes data, host ext4 block allocations grow permanently until manual offline compaction (`e2fsck -E discard`). Under pay-per-use usage accounting, guests deleting internal files still consume host physical disk capacity, making disk allocation a fixed-capacity cost parameter for hosting providers.

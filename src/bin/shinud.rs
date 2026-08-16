@@ -5,16 +5,18 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, MutexGuard, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
 
+use rusqlite::Connection;
 use shinu::{
     http,
     proto::Req,
+    quota::{self, Limits, RateLimiter},
     registry::Registry,
-    state::{Ckpt, Space, State},
+    state::{self, Ckpt, Space, State},
 };
 
 #[derive(Parser)]
@@ -28,12 +30,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let root = shinu::resolve_root(cli.root.as_deref());
     shinu::init_layout(&root)?;
+    let connection = state::open(&root)?;
+    if state::migrate_from_json(&root, &connection)? {
+        eprintln!("imported state.json into shinu.db (renamed to state.json.migrated)");
+    }
     // Fetch VM assets first: a host without network must fail before spending
     // minutes building an image it could never boot.
     shinu::ensure_assets(&root)?;
     shinu::ensure_base(&root, &shinu::BaseConfig::from_env()?)?;
     let vm_cfg = shinu::VmConfig::from_env();
     let net_cfg = shinu::NetConfig::from_env()?;
+    let limits = Limits::from_env();
+    let rate = RateLimiter::new();
 
     let listen = std::env::var("SHINU_LISTEN")
         .ok()
@@ -41,13 +49,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "127.0.0.1:7878".to_owned());
     let listener = TcpListener::bind(&listen)?;
     let root = Arc::new(root);
+    let db = Arc::new(Mutex::new(connection));
     let vm_cfg = Arc::new(vm_cfg);
     let net_cfg = Arc::new(net_cfg);
+    let limits = Arc::new(limits);
+    let rate = Arc::new(rate);
     let registry = Arc::new(Registry::new());
 
     let sweep_root = Arc::clone(&root);
     let sweep_vm_cfg = Arc::clone(&vm_cfg);
     let sweep_net_cfg = Arc::clone(&net_cfg);
+    let sweep_db = Arc::clone(&db);
+    let sweep_registry = Arc::clone(&registry);
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(30));
         match shinu::vm::sweep_idle(
@@ -62,23 +75,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Err(error) => eprintln!("idle sweep: {error}"),
         }
+        if let Err(error) = record_sweep_usage(
+            sweep_root.as_path(),
+            &sweep_db,
+            &sweep_registry,
+        ) {
+            eprintln!("usage sweep: {error}");
+        }
     });
 
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
                 let connection_root = Arc::clone(&root);
+                let connection_db = Arc::clone(&db);
                 let connection_vm_cfg = Arc::clone(&vm_cfg);
                 let connection_net_cfg = Arc::clone(&net_cfg);
+                let connection_limits = Arc::clone(&limits);
+                let connection_rate = Arc::clone(&rate);
                 let connection_registry = Arc::clone(&registry);
                 thread::spawn(move || {
-                    if let Err(error) = serve_connection(
-                        stream,
-                        connection_root.as_path(),
-                        connection_vm_cfg.as_ref(),
-                        connection_net_cfg.as_ref(),
-                        connection_registry.as_ref(),
-                    ) {
+                    let ctx = Ctx {
+                        root: connection_root.as_path(),
+                        db: connection_db.as_ref(),
+                        vm_cfg: connection_vm_cfg.as_ref(),
+                        net_cfg: connection_net_cfg.as_ref(),
+                        limits: connection_limits.as_ref(),
+                        rate: connection_rate.as_ref(),
+                        registry: connection_registry.as_ref(),
+                    };
+                    if let Err(error) = serve_connection(stream, &ctx) {
                         eprintln!("connection: {error}");
                     }
                 });
@@ -90,9 +116,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 struct Ctx<'a> {
     root: &'a Path,
+    db: &'a Mutex<Connection>,
     vm_cfg: &'a shinu::VmConfig,
     net_cfg: &'a shinu::NetConfig,
+    limits: &'a Limits,
+    rate: &'a RateLimiter,
     registry: &'a Registry,
+}
+
+fn lock_db(db: &Mutex<Connection>) -> std::sync::MutexGuard<'_, Connection> {
+    db.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn lock_state(registry: &Registry) -> MutexGuard<'_, ()> {
@@ -102,21 +135,134 @@ fn lock_state(registry: &Registry) -> MutexGuard<'_, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn snapshot(root: &Path, registry: &Registry) -> shinu::Result<State> {
+fn snapshot(db: &Mutex<Connection>, registry: &Registry) -> shinu::Result<State> {
     let _state_guard = lock_state(registry);
-    State::load(root)
+    state::load(&lock_db(db))
 }
 
 fn update_state<T>(
-    root: &Path,
+    db: &Mutex<Connection>,
     registry: &Registry,
     update: impl FnOnce(&mut State) -> shinu::Result<T>,
 ) -> shinu::Result<T> {
     let _state_guard = lock_state(registry);
-    let mut state = State::load(root)?;
+    let connection = lock_db(db);
+    let mut state = state::load(&connection)?;
     let value = update(&mut state)?;
-    state.store(root)?;
+    state::store(&connection, &state)?;
     Ok(value)
+}
+
+fn update_state_with_quota<T>(
+    root: &Path,
+    db: &Mutex<Connection>,
+    registry: &Registry,
+    project: &str,
+    limits: &Limits,
+    adding_mib: u64,
+    update: impl FnOnce(&mut State) -> shinu::Result<T>,
+) -> shinu::Result<T> {
+    let _state_guard = lock_state(registry);
+    let connection = lock_db(db);
+    check_space_quota(root, &connection, project, limits, adding_mib)?;
+    let mut state = state::load(&connection)?;
+    let value = update(&mut state)?;
+    state::store(&connection, &state)?;
+    Ok(value)
+}
+
+fn current_disk_mib(root: &Path, state: &State, project: &str) -> u64 {
+    state
+        .spaces
+        .iter()
+        .filter(|space| space.project == project)
+        .map(|space| {
+            shinu::btrfs::exclusive(&shinu::space_image(root, space.id))
+                .unwrap_or(0)
+                .saturating_add(1024 * 1024 - 1)
+                / (1024 * 1024)
+        })
+        .sum()
+}
+
+fn check_space_quota(
+    root: &Path,
+    connection: &Connection,
+    project: &str,
+    limits: &Limits,
+    adding_mib: u64,
+) -> shinu::Result<()> {
+    let spaces = state::count_spaces(connection, project)?;
+    quota::check_space_limit(spaces, limits)?;
+    let state = state::load(connection)?;
+    let disk_mib = current_disk_mib(root, &state, project);
+    // Capacity quota is an instantaneous btrfs measurement. It is deliberately
+    // separate from usage_events.disk_mib_hour, which is a billing time series.
+    quota::check_disk_limit(disk_mib, adding_mib, limits)
+}
+
+fn effective_limits(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Limits> {
+    let connection = lock_db(ctx.db);
+    match state::project_limits(&connection, project)? {
+        Some((max_spaces, max_disk_mib, max_running, api_per_min)) => Ok(Limits {
+            max_spaces,
+            max_disk_mib,
+            max_running,
+            api_per_min,
+        }),
+        None => Ok(Limits {
+            max_spaces: ctx.limits.max_spaces,
+            max_disk_mib: ctx.limits.max_disk_mib,
+            max_running: ctx.limits.max_running,
+            api_per_min: ctx.limits.api_per_min,
+        }),
+    }
+}
+
+fn count_running(root: &Path, state: &State, project: &str) -> u32 {
+    state
+        .spaces
+        .iter()
+        .filter(|space| {
+            space.project == project && shinu::vm::is_running(&shinu::vm_dir(root, space.id))
+        })
+        .count() as u32
+}
+
+fn record_sweep_usage(
+    root: &Path,
+    db: &Mutex<Connection>,
+    registry: &Registry,
+) -> shinu::Result<()> {
+    let _state_guard = lock_state(registry);
+    let connection = lock_db(db);
+    let state = state::load(&connection)?;
+    for space in &state.spaces {
+        let image = shinu::space_image(root, space.id);
+        let disk_mib = shinu::btrfs::exclusive(&image)
+            .unwrap_or(0)
+            .saturating_add(1024 * 1024 - 1)
+            / (1024 * 1024);
+        // `disk_mib_hour` stores one MiB snapshot per sweep, not a duration;
+        // later pricing can multiply the sum by the 30-second sample period.
+        state::record_usage(
+            &connection,
+            &space.project,
+            "disk_mib_hour",
+            Some(space.id),
+            i64::try_from(disk_mib).unwrap_or(i64::MAX),
+        )?;
+        if shinu::vm::is_running(&shinu::vm_dir(root, space.id)) {
+            state::record_usage(
+                &connection,
+                &space.project,
+                "vm_seconds",
+                Some(space.id),
+                30,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn check_name(state: &State, name: &str, project: &str) -> shinu::Result<()> {
@@ -183,100 +329,144 @@ fn set_head(state: &mut State, space_id: Uuid, project: &str, head: Uuid) -> shi
     Ok(())
 }
 
-fn create_space(
-    root: &Path,
+fn bytes_to_mib(bytes: u64) -> u64 {
+    bytes.saturating_add(1024 * 1024 - 1) / (1024 * 1024)
+}
+
+fn record_usage(
+    db: &Mutex<Connection>,
     project: &str,
-    name: String,
-    registry: &Registry,
-) -> shinu::Result<Value> {
+    kind: &str,
+    space: Option<Uuid>,
+    amount: i64,
+) -> shinu::Result<()> {
+    state::record_usage(&lock_db(db), project, kind, space, amount)
+}
+fn find_space(db: &Mutex<Connection>, name: &str, project: &str) -> shinu::Result<Space> {
+    state::find_space(&lock_db(db), name, project)?
+        .ok_or_else(|| shinu::Error::NotFound(name.to_owned()))
+}
+
+fn find_checkpoint(db: &Mutex<Connection>, id: Uuid, project: &str) -> shinu::Result<Ckpt> {
+    state::find_ckpt(&lock_db(db), id, project)?
+        .ok_or_else(|| shinu::Error::NotFound(id.to_string()))
+}
+
+fn create_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value> {
+    let limits = effective_limits(ctx, project)?;
     {
-        let state = snapshot(root, registry)?;
-        check_name(&state, &name, project)?;
+        let _state_guard = lock_state(ctx.registry);
+        let connection = lock_db(ctx.db);
+        check_space_quota(ctx.root, &connection, project, &limits, 0)?;
     }
     let id = Uuid::new_v4();
-    let space_guard = registry.space_lock(id);
+    let space_guard = ctx.registry.space_lock(id);
     let _space_guard = space_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let image = shinu::space_image(root, id);
-    shinu::btrfs::clone_for(&shinu::base_path(root), &image, 0, 0)?;
-    let mount = root.join(format!("authorize.{id}.mnt"));
+    let image = shinu::space_image(ctx.root, id);
+    shinu::btrfs::clone_for(&shinu::base_path(ctx.root), &image, 0, 0)?;
+    let mount = ctx.root.join(format!("authorize.{id}.mnt"));
     let result = (|| -> shinu::Result<Value> {
-        let public_key = shinu::vm::prepare(&shinu::vm_dir(root, id), 0, 0)?;
+        let public_key = shinu::vm::prepare(&shinu::vm_dir(ctx.root, id), 0, 0)?;
         // Each image gets its own key: the base is the common ancestor of every
         // space, so a key baked into it would be shared by all spaces.
         shinu::vm::authorize(&image, &public_key, &mount)?;
-        let space = update_state(root, registry, |state| {
-            check_name(state, &name, project)?;
-            let space = Space {
-                id,
-                name: name.clone(),
-                project: project.to_owned(),
-                parent: None,
-                head: None,
-                created_at: Utc::now(),
-            };
-            state.spaces.push(space.clone());
-            Ok(space)
-        })?;
+        let adding_mib = bytes_to_mib(shinu::btrfs::exclusive(&image).unwrap_or(0));
+        let space = update_state_with_quota(
+            ctx.root,
+            ctx.db,
+            ctx.registry,
+            project,
+            &limits,
+            adding_mib,
+            |state| {
+                check_name(state, &name, project)?;
+                let space = Space {
+                    id,
+                    name: name.clone(),
+                    project: project.to_owned(),
+                    parent: None,
+                    head: None,
+                    created_at: Utc::now(),
+                };
+                state.spaces.push(space.clone());
+                Ok(space)
+            },
+        )?;
+        record_usage(ctx.db, project, "space_created", Some(id), 1)?;
         Ok(serde_json::to_value(space)?)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&image);
-        let _ = std::fs::remove_dir_all(shinu::vm_dir(root, id));
+        let _ = std::fs::remove_dir_all(shinu::vm_dir(ctx.root, id));
         let _ = std::fs::remove_dir_all(&mount);
     }
     result
 }
 
 fn fork_space(
-    root: &Path,
+    ctx: &Ctx<'_>,
     project: &str,
     ckpt: Uuid,
     name: String,
-    registry: &Registry,
 ) -> shinu::Result<Value> {
+    let limits = effective_limits(ctx, project)?;
     let source = {
-        let state = snapshot(root, registry)?;
-        check_name(&state, &name, project)?;
-        shinu::find_ckpt(&state, ckpt, project)?.id
+        let _state_guard = lock_state(ctx.registry);
+        let connection = lock_db(ctx.db);
+        check_space_quota(ctx.root, &connection, project, &limits, 0)?;
+        state::find_ckpt(&connection, ckpt, project)?
+            .ok_or_else(|| shinu::Error::NotFound(ckpt.to_string()))?
+            .id
     };
     let id = Uuid::new_v4();
-    let space_guard = registry.space_lock(id);
+    let space_guard = ctx.registry.space_lock(id);
     let _space_guard = space_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let image = shinu::space_image(root, id);
-    shinu::btrfs::clone_for(&shinu::ckpt_image(root, source), &image, 0, 0)?;
-    let mount = root.join(format!("authorize.{id}.mnt"));
+    let image = shinu::space_image(ctx.root, id);
+    shinu::btrfs::clone_for(&shinu::ckpt_image(ctx.root, source), &image, 0, 0)?;
+    let mount = ctx.root.join(format!("authorize.{id}.mnt"));
     let result = (|| -> shinu::Result<Value> {
-        let public_key = shinu::vm::prepare(&shinu::vm_dir(root, id), 0, 0)?;
+        let public_key = shinu::vm::prepare(&shinu::vm_dir(ctx.root, id), 0, 0)?;
         // A fork gets a distinct VM key because it is an independent space even
         // though its first filesystem state is shared by reflink.
         shinu::vm::authorize(&image, &public_key, &mount)?;
-        let space = update_state(root, registry, |state| {
-            check_name(state, &name, project)?;
-            shinu::find_ckpt(state, source, project)?;
-            let space = Space {
-                id,
-                name: name.clone(),
-                project: project.to_owned(),
-                parent: Some(source),
-                head: Some(source),
-                created_at: Utc::now(),
-            };
-            state.spaces.push(space.clone());
-            Ok(space)
-        })?;
+        let adding_mib = bytes_to_mib(shinu::btrfs::exclusive(&image).unwrap_or(0));
+        let space = update_state_with_quota(
+            ctx.root,
+            ctx.db,
+            ctx.registry,
+            project,
+            &limits,
+            adding_mib,
+            |state| {
+                check_name(state, &name, project)?;
+                shinu::find_ckpt(state, source, project)?;
+                let space = Space {
+                    id,
+                    name: name.clone(),
+                    project: project.to_owned(),
+                    parent: Some(source),
+                    head: Some(source),
+                    created_at: Utc::now(),
+                };
+                state.spaces.push(space.clone());
+                Ok(space)
+            },
+        )?;
+        record_usage(ctx.db, project, "space_created", Some(id), 1)?;
         Ok(serde_json::to_value(space)?)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&image);
-        let _ = std::fs::remove_dir_all(shinu::vm_dir(root, id));
+        let _ = std::fs::remove_dir_all(shinu::vm_dir(ctx.root, id));
         let _ = std::fs::remove_dir_all(&mount);
     }
     result
 }
+
 
 fn commit_space(
     ctx: &Ctx<'_>,
@@ -287,9 +477,8 @@ fn commit_space(
 ) -> shinu::Result<Value> {
     require_checkpoint_note(&note)?;
     let (space_id, space_name) = {
-        let state = snapshot(ctx.root, ctx.registry)?;
-        let entry = shinu::find(&state, &space, project)?;
-        (entry.id, entry.name.clone())
+        let entry = find_space(ctx.db, &space, project)?;
+        (entry.id, entry.name)
     };
     let space_guard = ctx.registry.space_lock(space_id);
     let _space_guard = space_guard
@@ -320,7 +509,7 @@ fn commit_space(
     let id = Uuid::new_v4();
     let image = shinu::ckpt_image(ctx.root, id);
     shinu::btrfs::clone_for(&shinu::space_image(ctx.root, space_id), &image, 0, 0)?;
-    let result = update_state(ctx.root, ctx.registry, |state| {
+    let result = update_state(ctx.db, ctx.registry, |state| {
         let checkpoint = append_checkpoint(state, space_id, project, id, note, false, true)?;
         Ok(serde_json::to_value(checkpoint)?)
     });
@@ -331,46 +520,43 @@ fn commit_space(
 }
 
 fn checkout_space(
-    root: &Path,
+    ctx: &Ctx<'_>,
     project: &str,
     space: String,
     commit: Uuid,
-    net_cfg: &shinu::NetConfig,
-    registry: &Registry,
 ) -> shinu::Result<Value> {
     let (space_id, space_name) = {
-        let state = snapshot(root, registry)?;
-        let entry = shinu::find(&state, &space, project)?;
-        (entry.id, entry.name.clone())
+        let entry = find_space(ctx.db, &space, project)?;
+        (entry.id, entry.name)
     };
-    let space_guard = registry.space_lock(space_id);
+    let space_guard = ctx.registry.space_lock(space_id);
     let _space_guard = space_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (target, current_head) = {
-        let state = snapshot(root, registry)?;
-        let entry = shinu::find(&state, &space_name, project)?;
-        let vm_dir = shinu::vm_dir(root, entry.id);
+        let _state_guard = lock_state(ctx.registry);
+        let entry = find_space(ctx.db, &space_name, project)?;
+        let vm_dir = shinu::vm_dir(ctx.root, entry.id);
         if shinu::vm::is_running(&vm_dir) {
             return Err(shinu::Error::Invalid(format!(
                 "stop the space before checking it out: {space_name}"
             )));
         }
-        let target = shinu::find_ckpt(&state, commit, project)?.clone();
+        let target = find_checkpoint(ctx.db, commit, project)?;
         (target, entry.head)
     };
 
     let auto_id = Uuid::new_v4();
-    let auto_image = shinu::ckpt_image(root, auto_id);
+    let auto_image = shinu::ckpt_image(ctx.root, auto_id);
     shinu::btrfs::clone_for(
-        &shinu::space_image(root, space_id),
+        &shinu::space_image(ctx.root, space_id),
         &auto_image,
         0,
         0,
     )?;
     let short_id = commit.to_string().chars().take(8).collect::<String>();
     let auto_note = format!("auto before checkout {short_id}");
-    let auto_checkpoint = update_state(root, registry, |state| {
+    let auto_checkpoint = update_state(ctx.db, ctx.registry, |state| {
         let entry = shinu::find(state, &space_name, project)?;
         if entry.id != space_id {
             return Err(shinu::Error::NotFound(space_name.clone()));
@@ -390,64 +576,50 @@ fn checkout_space(
 
     // Keep the VM directory and keypair: changing that identity would invalidate
     // credentials already used by the daemon to reach this space.
-    let vm_dir = shinu::vm_dir(root, space_id);
+    let vm_dir = shinu::vm_dir(ctx.root, space_id);
     let public_key = std::fs::read_to_string(shinu::vm::key_path(&vm_dir).with_extension("pub"))?;
-    let image = shinu::space_image(root, space_id);
-    shinu::btrfs::clone_for(&shinu::ckpt_image(root, target.id), &image, 0, 0)?;
-    let mount = root.join(format!("authorize.checkout.{space_id}.mnt"));
+    let image = shinu::space_image(ctx.root, space_id);
+    shinu::btrfs::clone_for(&shinu::ckpt_image(ctx.root, target.id), &image, 0, 0)?;
+    let mount = ctx.root.join(format!("authorize.checkout.{space_id}.mnt"));
     shinu::vm::authorize(&image, &public_key, &mount)?;
-    update_state(root, registry, |state| {
+    update_state(ctx.db, ctx.registry, |state| {
         shinu::find_ckpt(state, target.id, project)?;
         set_head(state, space_id, project, target.id)?;
         Ok(())
     })?;
-    let _ = net_cfg;
     Ok(json!({ "head": target.id, "auto_commit": auto_checkpoint.id }))
 }
 
-fn remove_space(
-    root: &Path,
-    project: &str,
-    name: String,
-    net_cfg: &shinu::NetConfig,
-    registry: &Registry,
-) -> shinu::Result<Value> {
+fn remove_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value> {
     let (id, resolved_name) = {
-        let state = snapshot(root, registry)?;
-        let entry = shinu::find(&state, &name, project)?;
-        (entry.id, entry.name.clone())
+        let entry = find_space(ctx.db, &name, project)?;
+        (entry.id, entry.name)
     };
-    let space_guard = registry.space_lock(id);
+    let space_guard = ctx.registry.space_lock(id);
     let _space_guard = space_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    shinu::vm::stop(&shinu::vm_dir(root, id), net_cfg)?;
-    let image = shinu::space_image(root, id);
+    shinu::vm::stop(&shinu::vm_dir(ctx.root, id), ctx.net_cfg)?;
+    let image = shinu::space_image(ctx.root, id);
     match std::fs::remove_file(&image) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    match std::fs::remove_dir_all(shinu::vm_dir(root, id)) {
+    match std::fs::remove_dir_all(shinu::vm_dir(ctx.root, id)) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    update_state(root, registry, |state| {
+    update_state(ctx.db, ctx.registry, |state| {
         state.spaces.retain(|space| space.id != id);
         Ok(())
     })?;
     Ok(json!({ "removed": resolved_name, "id": id }))
 }
-
-fn remove_checkpoint(
-    root: &Path,
-    project: &str,
-    id: Uuid,
-    registry: &Registry,
-) -> shinu::Result<Value> {
-    let state = snapshot(root, registry)?;
-    let checkpoint = shinu::find_ckpt(&state, id, project)?;
+fn remove_checkpoint(ctx: &Ctx<'_>, project: &str, id: Uuid) -> shinu::Result<Value> {
+    let checkpoint = find_checkpoint(ctx.db, id, project)?;
+    let state = snapshot(ctx.db, ctx.registry)?;
     let referenced = shinu::is_referenced(&state, checkpoint.id);
     if !referenced.is_empty() {
         return Err(shinu::Error::Invalid(format!(
@@ -455,13 +627,13 @@ fn remove_checkpoint(
             referenced.join(", ")
         )));
     }
-    let image = shinu::ckpt_image(root, id);
+    let image = shinu::ckpt_image(ctx.root, id);
     match std::fs::remove_file(&image) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    update_state(root, registry, |state| {
+    update_state(ctx.db, ctx.registry, |state| {
         let checkpoint = shinu::find_ckpt(state, id, project)?;
         if !shinu::is_referenced(state, checkpoint.id).is_empty() {
             return Err(shinu::Error::Invalid(format!(
@@ -474,17 +646,18 @@ fn remove_checkpoint(
     Ok(json!({ "removed": id }))
 }
 
-fn list_spaces(root: &Path, project: &str, registry: &Registry) -> shinu::Result<Value> {
-    let state = snapshot(root, registry)?;
+
+fn list_spaces(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
+    let state = snapshot(ctx.db, ctx.registry)?;
     let mut spaces = Vec::new();
     for space in state.spaces.iter().filter(|space| space.project == project) {
         let mut value = serde_json::to_value(space)?;
         if let Some(object) = value.as_object_mut() {
-            let size = shinu::btrfs::exclusive(&shinu::space_image(root, space.id)).unwrap_or(0);
+            let size = shinu::btrfs::exclusive(&shinu::space_image(ctx.root, space.id)).unwrap_or(0);
             object.insert("exclusive".into(), Value::from(size));
             object.insert(
                 "running".into(),
-                Value::from(shinu::vm::is_running(&shinu::vm_dir(root, space.id))),
+                Value::from(shinu::vm::is_running(&shinu::vm_dir(ctx.root, space.id))),
             );
         }
         spaces.push(value);
@@ -493,7 +666,7 @@ fn list_spaces(root: &Path, project: &str, registry: &Registry) -> shinu::Result
     for checkpoint in state.ckpts.iter().filter(|checkpoint| checkpoint.project == project) {
         let mut value = serde_json::to_value(checkpoint)?;
         if let Some(object) = value.as_object_mut() {
-            let size = shinu::btrfs::exclusive(&shinu::ckpt_image(root, checkpoint.id)).unwrap_or(0);
+            let size = shinu::btrfs::exclusive(&shinu::ckpt_image(ctx.root, checkpoint.id)).unwrap_or(0);
             object.insert("exclusive".into(), Value::from(size));
         }
         checkpoints.push(value);
@@ -501,75 +674,76 @@ fn list_spaces(root: &Path, project: &str, registry: &Registry) -> shinu::Result
     Ok(json!({ "spaces": spaces, "ckpts": checkpoints }))
 }
 
-fn start_space(
-    root: &Path,
-    project: &str,
-    name: String,
-    vm_cfg: &shinu::VmConfig,
-    net_cfg: &shinu::NetConfig,
-    registry: &Registry,
-) -> shinu::Result<Value> {
+fn start_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value> {
     let id = {
-        let state = snapshot(root, registry)?;
-        shinu::find(&state, &name, project)?.id
+        let connection = lock_db(ctx.db);
+        state::find_space(&connection, &name, project)?
+            .ok_or_else(|| shinu::Error::NotFound(name.clone()))?
+            .id
     };
-    let space_guard = registry.space_lock(id);
+    let space_guard = ctx.registry.space_lock(id);
     let _space_guard = space_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (_, booted) = shinu::vm::start(root, id, 0, 0, vm_cfg, net_cfg)?;
+    let limits = effective_limits(ctx, project)?;
+    // The registry state lock is held across the check and spawn. This closes
+    // the race where two starts both observe the same running count.
+    let _state_guard = lock_state(ctx.registry);
+    let connection = lock_db(ctx.db);
+    let state = state::load(&connection)?;
+    let already_running = shinu::vm::is_running(&shinu::vm_dir(ctx.root, id));
+    if !already_running {
+        quota::check_running_limit(count_running(ctx.root, &state, project), &limits)?;
+    }
+    drop(connection);
+    let (_, booted) = shinu::vm::start(
+        ctx.root,
+        id,
+        0,
+        0,
+        ctx.vm_cfg,
+        ctx.net_cfg,
+    )?;
     Ok(json!({ "booted": booted }))
 }
 
-fn stop_space(
-    root: &Path,
-    project: &str,
-    name: String,
-    net_cfg: &shinu::NetConfig,
-    registry: &Registry,
-) -> shinu::Result<Value> {
+fn stop_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value> {
     let id = {
-        let state = snapshot(root, registry)?;
-        shinu::find(&state, &name, project)?.id
+        let connection = lock_db(ctx.db);
+        state::find_space(&connection, &name, project)?
+            .ok_or_else(|| shinu::Error::NotFound(name.clone()))?
+            .id
     };
-    let space_guard = registry.space_lock(id);
+    let space_guard = ctx.registry.space_lock(id);
     let _space_guard = space_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let was_running = shinu::vm::stop(&shinu::vm_dir(root, id), net_cfg)?;
+    let was_running = shinu::vm::stop(&shinu::vm_dir(ctx.root, id), ctx.net_cfg)?;
     Ok(json!({ "was_running": was_running }))
 }
 
-fn touch_space(
-    root: &Path,
-    project: &str,
-    name: String,
-    registry: &Registry,
-) -> shinu::Result<Value> {
+fn touch_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value> {
     let id = {
-        let state = snapshot(root, registry)?;
-        shinu::find(&state, &name, project)?.id
+        let connection = lock_db(ctx.db);
+        state::find_space(&connection, &name, project)?
+            .ok_or_else(|| shinu::Error::NotFound(name.clone()))?
+            .id
     };
-    let space_guard = registry.space_lock(id);
+    let space_guard = ctx.registry.space_lock(id);
     let _space_guard = space_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    shinu::vm::touch(&shinu::vm_dir(root, id))?;
+    shinu::vm::touch(&shinu::vm_dir(ctx.root, id))?;
     Ok(json!({ "ok": true }))
 }
 
-fn gc(
-    root: &Path,
-    project: &str,
-    free_below: u64,
-    dry_run: bool,
-    registry: &Registry,
-) -> shinu::Result<Value> {
-    let available = shinu::avail_bytes(root)?;
+
+fn gc(ctx: &Ctx<'_>, project: &str, free_below: u64, dry_run: bool) -> shinu::Result<Value> {
+    let available = shinu::avail_bytes(ctx.root)?;
     if available >= free_below {
         return Ok(json!({ "dry_run": dry_run, "reclaimed": 0, "deleted": [] }));
     }
-    let state = snapshot(root, registry)?;
+    let state = snapshot(ctx.db, ctx.registry)?;
     let retention_days = std::env::var("SHINU_REFLOG_DAYS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
@@ -590,7 +764,7 @@ fn gc(
         {
             continue;
         }
-        let exclusive = shinu::btrfs::exclusive(&shinu::ckpt_image(root, checkpoint.id))?;
+        let exclusive = shinu::btrfs::exclusive(&shinu::ckpt_image(ctx.root, checkpoint.id))?;
         candidates.push((checkpoint.id, checkpoint.note.clone(), exclusive));
     }
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.2));
@@ -614,7 +788,7 @@ fn gc(
     // it leaves a window where a space's `parent`/`head` points at a commit whose
     // image is already gone. Crashing between the claim and the unlink instead
     // leaks an unreferenced image file, which is recoverable garbage.
-    let claimed = update_state(root, registry, |state| {
+    let claimed = update_state(ctx.db, ctx.registry, |state| {
         let mut claimed = Vec::new();
         let mut budget = 0u64;
         for (id, note, exclusive) in &candidates {
@@ -638,7 +812,7 @@ fn gc(
     let mut reclaimed = 0;
     let mut deleted = Vec::new();
     for (id, note, exclusive) in claimed {
-        let image = shinu::ckpt_image(root, id);
+        let image = shinu::ckpt_image(ctx.root, id);
         match std::fs::remove_file(&image) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -654,16 +828,35 @@ fn checkpoint_json(checkpoint: &Ckpt) -> shinu::Result<Value> {
     Ok(serde_json::to_value(checkpoint)?)
 }
 
+fn limits_value(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
+    let limits = effective_limits(ctx, project)?;
+    let _state_guard = lock_state(ctx.registry);
+    let connection = lock_db(ctx.db);
+    let state = state::load(&connection)?;
+    let used_spaces = state::count_spaces(&connection, project)?;
+    let used_disk = current_disk_mib(ctx.root, &state, project);
+    let used_running = count_running(ctx.root, &state, project);
+    Ok(json!({
+        "max_spaces": limits.max_spaces,
+        "max_disk_mib": limits.max_disk_mib,
+        "max_running": limits.max_running,
+        "api_per_min": limits.api_per_min,
+        "used": {
+            "spaces": used_spaces,
+            "disk_mib": used_disk,
+            "running": used_running,
+        },
+    }))
+}
+
 fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
     match req {
-        Req::New { name } => create_space(ctx.root, project, name, ctx.registry),
-        Req::Fork { ckpt, name } => fork_space(ctx.root, project, ckpt, name, ctx.registry),
+        Req::New { name } => create_space(ctx, project, name),
+        Req::Fork { ckpt, name } => fork_space(ctx, project, ckpt, name),
         Req::Commit { space, note, hot } => commit_space(ctx, project, space, note, hot),
-        Req::Checkout { space, commit } => {
-            checkout_space(ctx.root, project, space, commit, ctx.net_cfg, ctx.registry)
-        }
+        Req::Checkout { space, commit } => checkout_space(ctx, project, space, commit),
         Req::Log { space } => {
-            let state = snapshot(ctx.root, ctx.registry)?;
+            let state = snapshot(ctx.db, ctx.registry)?;
             let entry = shinu::find(&state, &space, project)?;
             let commits = shinu::log_chain(&state, entry)
                 .into_iter()
@@ -672,7 +865,7 @@ fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
             Ok(json!({ "commits": commits }))
         }
         Req::Reflog { space } => {
-            let state = snapshot(ctx.root, ctx.registry)?;
+            let state = snapshot(ctx.db, ctx.registry)?;
             let entry = shinu::find(&state, &space, project)?;
             let entries = shinu::reflog_entries(&state, entry)
                 .into_iter()
@@ -680,29 +873,29 @@ fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
                 .collect::<shinu::Result<Vec<_>>>()?;
             Ok(json!({ "entries": entries }))
         }
-        Req::Rm { space } => remove_space(ctx.root, project, space, ctx.net_cfg, ctx.registry),
-        Req::RmCkpt { ckpt } => remove_checkpoint(ctx.root, project, ckpt, ctx.registry),
-        Req::Ls => list_spaces(ctx.root, project, ctx.registry),
-        Req::Start { space } => start_space(
-            ctx.root,
-            project,
-            space,
-            ctx.vm_cfg,
-            ctx.net_cfg,
-            ctx.registry,
-        ),
-        Req::Stop { space } => stop_space(ctx.root, project, space, ctx.net_cfg, ctx.registry),
-        Req::Touch { space } => touch_space(ctx.root, project, space, ctx.registry),
+        Req::Rm { space } => remove_space(ctx, project, space),
+        Req::RmCkpt { ckpt } => remove_checkpoint(ctx, project, ckpt),
+        Req::Ls => list_spaces(ctx, project),
+        Req::Start { space } => start_space(ctx, project, space),
+        Req::Stop { space } => stop_space(ctx, project, space),
+        Req::Touch { space } => touch_space(ctx, project, space),
         Req::Gc {
             free_below,
             dry_run,
-        } => gc(ctx.root, project, free_below, dry_run, ctx.registry),
+        } => gc(ctx, project, free_below, dry_run),
+        Req::Usage { from, to } => {
+            let connection = lock_db(ctx.db);
+            state::usage_summary(&connection, project, from, to)
+        }
+        Req::Limits => limits_value(ctx, project),
     }
 }
 
 #[derive(Debug)]
 enum Endpoint {
     Spaces,
+    Usage,
+    Limits,
     Rm(String),
     Start(String),
     Stop(String),
@@ -747,6 +940,7 @@ fn decode_segment(segment: &str) -> Option<String> {
 }
 
 fn route(path: &str) -> Option<Endpoint> {
+    let path = path.split_once('?').map_or(path, |(path, _)| path);
     let segments = path
         .split('/')
         .map(decode_segment)
@@ -758,6 +952,12 @@ fn route(path: &str) -> Option<Endpoint> {
     }
     if segments.len() == 3 && segments[2] == "spaces" {
         return Some(Endpoint::Spaces);
+    }
+    if segments.len() == 3 && segments[2] == "usage" {
+        return Some(Endpoint::Usage);
+    }
+    if segments.len() == 3 && segments[2] == "limits" {
+        return Some(Endpoint::Limits);
     }
     if segments.len() == 3 && segments[2] == "gc" {
         return Some(Endpoint::Gc);
@@ -787,10 +987,41 @@ fn route(path: &str) -> Option<Endpoint> {
     None
 }
 
+fn usage_query(path: &str) -> shinu::Result<(Option<i64>, Option<i64>)> {
+    let Some((_, query)) = path.split_once('?') else {
+        return Ok((None, None));
+    };
+    let mut from = None;
+    let mut to = None;
+    if query.is_empty() {
+        return Ok((None, None));
+    }
+    for pair in query.split('&') {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| shinu::Error::Invalid("usage query must use key=value".into()))?;
+        let parsed = value.parse::<i64>().map_err(|error| {
+            shinu::Error::Invalid(format!("usage query {key} must be a unix timestamp: {error}"))
+        })?;
+        match key {
+            "from" if from.is_none() => from = Some(parsed),
+            "to" if to.is_none() => to = Some(parsed),
+            "from" | "to" => {
+                return Err(shinu::Error::Invalid(format!("duplicate usage query key: {key}")))
+            }
+            _ => return Err(shinu::Error::Invalid(format!("unknown usage query key: {key}"))),
+        }
+    }
+    Ok((from, to))
+}
+
+
 fn method_allowed(endpoint: &Endpoint, method: &str) -> bool {
     match endpoint {
         Endpoint::Spaces => method == "GET" || method == "POST",
-        Endpoint::Log(_) | Endpoint::Reflog(_) => method == "GET",
+        Endpoint::Usage | Endpoint::Limits | Endpoint::Log(_) | Endpoint::Reflog(_) => {
+            method == "GET"
+        }
         Endpoint::Rm(_) | Endpoint::RmCkpt(_) => method == "DELETE",
         Endpoint::Start(_)
         | Endpoint::Stop(_)
@@ -801,7 +1032,6 @@ fn method_allowed(endpoint: &Endpoint, method: &str) -> bool {
         | Endpoint::Gc => method == "POST",
     }
 }
-
 fn parse_body(body: &[u8]) -> shinu::Result<Value> {
     if body.is_empty() {
         return Err(shinu::Error::Invalid("request body is required".into()));
@@ -835,10 +1065,18 @@ fn body_u64(body: &[u8], field: &str) -> shinu::Result<u64> {
         .ok_or_else(|| shinu::Error::Invalid(format!("body field {field} must be an unsigned integer")))
 }
 
-fn request_for(endpoint: Endpoint, method: &str, body: &[u8]) -> shinu::Result<(Req, u16)> {
+fn request_for(
+    endpoint: Endpoint,
+    method: &str,
+    body: &[u8],
+    from: Option<i64>,
+    to: Option<i64>,
+) -> shinu::Result<(Req, u16)> {
     match endpoint {
         Endpoint::Spaces if method == "GET" => Ok((Req::Ls, 200)),
         Endpoint::Spaces => Ok((Req::New { name: body_string(body, "name")? }, 201)),
+        Endpoint::Usage => Ok((Req::Usage { from, to }, 200)),
+        Endpoint::Limits => Ok((Req::Limits, 200)),
         Endpoint::Rm(space) => Ok((Req::Rm { space }, 200)),
         Endpoint::Start(space) => Ok((Req::Start { space }, 200)),
         Endpoint::Stop(space) => Ok((Req::Stop { space }, 200)),
@@ -912,19 +1150,7 @@ fn respond_error(stream: &mut impl Write, status: u16, error: &shinu::Error) -> 
     Ok(())
 }
 
-fn serve_connection(
-    mut stream: TcpStream,
-    root: &Path,
-    vm_cfg: &shinu::VmConfig,
-    net_cfg: &shinu::NetConfig,
-    registry: &Registry,
-) -> shinu::Result<()> {
-    let ctx = Ctx {
-        root,
-        vm_cfg,
-        net_cfg,
-        registry,
-    };
+fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
     let parsed_request = {
         let mut reader = BufReader::new(&mut stream);
         http::parse(&mut reader)
@@ -958,6 +1184,25 @@ fn serve_connection(
         }
     };
 
+    let effective = match effective_limits(ctx, project.as_str()) {
+        Ok(limits) => limits,
+        Err(error) => {
+            respond_error(&mut stream, http::status_for(&error), &error)?;
+            return Ok(());
+        }
+    };
+    if let Err(error) = ctx.rate.check(project.as_str(), effective.api_per_min) {
+        respond_error(&mut stream, http::status_for(&error), &error)?;
+        return Ok(());
+    }
+
+    let (from, to) = match usage_query(&request.path) {
+        Ok(range) => range,
+        Err(error) => {
+            respond_error(&mut stream, http::status_for(&error), &error)?;
+            return Ok(());
+        }
+    };
     let endpoint = match route(&request.path) {
         Some(endpoint) => endpoint,
         None => {
@@ -979,20 +1224,28 @@ fn serve_connection(
                 return Ok(());
             }
         };
-        if let Err(error) = execute_streaming(&mut stream, &ctx, project.as_str(), space.clone(), command) {
-            respond_error(&mut stream, http::status_for(&error), &error)?;
+        match execute_streaming(&mut stream, ctx, project.as_str(), space.clone(), command) {
+            Ok(()) => {
+                record_usage(ctx.db, project.as_str(), "api_call", None, 1)?;
+            }
+            Err(error) => {
+                respond_error(&mut stream, http::status_for(&error), &error)?;
+            }
         }
         return Ok(());
     }
-    let (req, status) = match request_for(endpoint, &request.method, &request.body) {
+    let (req, status) = match request_for(endpoint, &request.method, &request.body, from, to) {
         Ok(request) => request,
         Err(error) => {
             respond_error(&mut stream, http::status_for(&error), &error)?;
             return Ok(());
         }
     };
-    match handle(&ctx, req, project.as_str()) {
-        Ok(value) => http::respond(&mut stream, status, &value)?,
+    match handle(ctx, req, project.as_str()) {
+        Ok(value) => {
+            record_usage(ctx.db, project.as_str(), "api_call", None, 1)?;
+            http::respond(&mut stream, status, &value)?;
+        }
         Err(error) => respond_error(&mut stream, http::status_for(&error), &error)?,
     }
     Ok(())
@@ -1042,17 +1295,26 @@ fn execute_streaming(
     command: Vec<String>,
 ) -> shinu::Result<()> {
     let space_id = {
-        let state = snapshot(ctx.root, ctx.registry)?;
-        shinu::find(&state, &space, project)?.id
+        let connection = lock_db(ctx.db);
+        state::find_space(&connection, &space, project)?
+            .ok_or_else(|| shinu::Error::NotFound(space.clone()))?
+            .id
     };
+    let limits = effective_limits(ctx, project)?;
     let space_guard = ctx.registry.space_lock(space_id);
     {
         let _space_guard = space_guard
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Start is serialized only with lifecycle/image operations. The SSH
-        // session itself runs after this guard is dropped so concurrent execs
-        // in one guest are not needlessly serialized.
+        // Hold the state lock through the check and spawn so concurrent execs
+        // cannot all observe a free running-VM slot.
+        let _state_guard = lock_state(ctx.registry);
+        let connection = lock_db(ctx.db);
+        let state = state::load(&connection)?;
+        if !shinu::vm::is_running(&shinu::vm_dir(ctx.root, space_id)) {
+            quota::check_running_limit(count_running(ctx.root, &state, project), &limits)?;
+        }
+        drop(connection);
         shinu::vm::start(ctx.root, space_id, 0, 0, ctx.vm_cfg, ctx.net_cfg)?;
     }
     let vm_dir = shinu::vm_dir(ctx.root, space_id);
@@ -1151,15 +1413,18 @@ fn execute_streaming(
 mod tests {
     use super::{append_checkpoint, handle, set_head};
     use chrono::Utc;
+    use rusqlite::Connection;
     use shinu::{
         NetConfig, VmConfig,
         proto::Req,
-        state::{Ckpt, Space, State},
+        quota::{Limits, RateLimiter},
+        state::{self, Ckpt, Space, State},
         vm,
     };
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
+    use std::sync::{LazyLock, Mutex};
     use std::thread;
     use std::time::Duration;
     use uuid::Uuid;
@@ -1176,6 +1441,8 @@ mod tests {
                 vcpus: 1,
                 mem_mib: 1,
                 idle_secs: 1,
+                jail_uid: 30000,
+                jail_gid: 30000,
             },
             NetConfig {
                 enabled: false,
@@ -1188,26 +1455,55 @@ mod tests {
     fn registry() -> shinu::registry::Registry {
         shinu::registry::Registry::new()
     }
+
+    fn test_db(root: &std::path::Path) -> Mutex<Connection> {
+        Mutex::new(state::open(root).expect("open test database"))
+    }
+
+    fn test_limits() -> &'static Limits {
+        static LIMITS: LazyLock<Limits> = LazyLock::new(|| Limits {
+            max_spaces: 5,
+            max_disk_mib: 10240,
+            max_running: 2,
+            api_per_min: 120,
+        });
+        &LIMITS
+    }
+
+    fn test_rate() -> &'static RateLimiter {
+        static RATE: LazyLock<RateLimiter> = LazyLock::new(RateLimiter::new);
+        &RATE
+    }
+
+    fn store_state(root: &std::path::Path, value: &State) {
+        let connection = state::open(root).expect("open test database");
+        state::store(&connection, value).expect("write test state");
+    }
+
     fn daemon_ctx<'a>(
         root: &'a std::path::Path,
+        db: &'a Mutex<Connection>,
         vm_cfg: &'a VmConfig,
         net_cfg: &'a NetConfig,
         registry: &'a shinu::registry::Registry,
     ) -> super::Ctx<'a> {
         super::Ctx {
             root,
+            db,
             vm_cfg,
             net_cfg,
+            limits: test_limits(),
+            rate: test_rate(),
             registry,
         }
     }
-
     #[test]
     fn rejects_empty_snapshot_note() {
         let root = test_root("empty-note");
         let (vm_cfg, net_cfg) = test_configs();
+        let db = test_db(&root);
         let registry = registry();
-        let ctx = daemon_ctx(&root, &vm_cfg, &net_cfg, &registry);
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
         let result = handle(
             &ctx,
             Req::Commit {
@@ -1223,6 +1519,101 @@ mod tests {
         ));
         std::fs::remove_dir_all(root).expect("remove test root");
     }
+    #[test]
+    fn space_quota_boundary_is_rejected_before_state_write() {
+        let root = test_root("quota-boundary");
+        let id = Uuid::new_v4();
+        store_state(
+            &root,
+            &State {
+                spaces: vec![Space {
+                    id,
+                    name: "one".into(),
+                    project: "project-a".into(),
+                    parent: None,
+                    head: None,
+                    created_at: Utc::now(),
+                }],
+                ckpts: Vec::new(),
+            },
+        );
+        let db = test_db(&root);
+        let registry = registry();
+        let limits = Limits {
+            max_spaces: 1,
+            max_disk_mib: 10240,
+            max_running: 2,
+            api_per_min: 120,
+        };
+        let result = super::update_state_with_quota(
+            &root,
+            &db,
+            &registry,
+            "project-a",
+            &limits,
+            0,
+            |_| Ok(()),
+        );
+        assert!(matches!(result, Err(shinu::Error::Quota(message)) if message.contains("space limit")));
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn rate_limit_rejects_the_request_after_the_boundary() {
+        let rate = RateLimiter::new();
+        assert!(rate.check("project-a", 1).is_ok());
+        let result = rate.check("project-a", 1);
+        assert!(matches!(result, Err(shinu::Error::Quota(message)) if message.contains("rate limit")));
+    }
+
+    #[test]
+    fn usage_query_accepts_unix_ranges_and_rejects_bad_values() {
+        assert_eq!(
+            super::usage_query("/v1/usage?from=10&to=20").expect("valid range"),
+            (Some(10), Some(20))
+        );
+        assert!(super::usage_query("/v1/usage?from=nope").is_err());
+    }
+
+    #[test]
+    fn effective_limits_prefers_project_override() {
+        let root = test_root("project-limits");
+        let db = test_db(&root);
+        {
+            let connection = db.lock().expect("lock test database");
+            connection
+                .execute(
+                    "INSERT INTO projects(project,max_spaces,max_disk_mib,max_running,api_per_min) VALUES ('project-a',7,99,4,321)",
+                    [],
+                )
+                .expect("insert project limits");
+        }
+        let (vm_cfg, net_cfg) = test_configs();
+        let registry = registry();
+        let global = Limits {
+            max_spaces: 5,
+            max_disk_mib: 10,
+            max_running: 2,
+            api_per_min: 120,
+        };
+        let rate = RateLimiter::new();
+        let ctx = super::Ctx {
+            root: &root,
+            db: &db,
+            vm_cfg: &vm_cfg,
+            net_cfg: &net_cfg,
+            limits: &global,
+            rate: &rate,
+            registry: &registry,
+        };
+        let override_limits = super::effective_limits(&ctx, "project-a").expect("override");
+        assert_eq!(override_limits.max_spaces, 7);
+        assert_eq!(override_limits.max_disk_mib, 99);
+        let default_limits = super::effective_limits(&ctx, "project-b").expect("default");
+        assert_eq!(default_limits.max_spaces, 5);
+        assert_eq!(default_limits.max_disk_mib, 10);
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
 
     fn running_state(root: &std::path::Path, project: &str) -> (Uuid, Uuid, std::process::Child) {
         let space_id = Uuid::new_v4();
@@ -1230,9 +1621,11 @@ mod tests {
         let name = "running";
         let vm_dir = shinu::vm_dir(root, space_id);
         std::fs::create_dir_all(&vm_dir).expect("create VM directory");
-        let config = vm_dir.join("fc.json");
+        let config = vm::config_path(&vm_dir);
+        std::fs::create_dir_all(config.parent().expect("config parent"))
+            .expect("create config directory");
         std::fs::write(&config, "{}").expect("write fake config");
-        State {
+        let state = State {
             spaces: vec![Space {
                 id: space_id,
                 name: name.into(),
@@ -1250,9 +1643,8 @@ mod tests {
                 note: "before".into(),
                 created_at: Utc::now(),
             }],
-        }
-        .store(root)
-        .expect("write test state");
+        };
+        store_state(root, &state);
         let fake_firecracker = root.join("firecracker");
         symlink("/usr/bin/yes", &fake_firecracker).expect("link fake firecracker");
         let child = Command::new(&fake_firecracker)
@@ -1262,7 +1654,10 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("start fake firecracker");
-        std::fs::write(vm::pid_path(&vm_dir), child.id().to_string()).expect("write fake pid");
+        let pid_path = vm::pid_path(&vm_dir);
+        std::fs::create_dir_all(pid_path.parent().expect("pid parent"))
+            .expect("create pid directory");
+        std::fs::write(pid_path, child.id().to_string()).expect("write fake pid");
         let running = (0..20).any(|_| {
             if vm::is_running(&vm_dir) {
                 true
@@ -1282,7 +1677,8 @@ mod tests {
         let (_space_id, ckpt_id, mut child) = running_state(&root, project);
         let (vm_cfg, net_cfg) = test_configs();
         let registry = registry();
-        let ctx = daemon_ctx(&root, &vm_cfg, &net_cfg, &registry);
+        let db = test_db(&root);
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
         let result = handle(
             &ctx,
             Req::Checkout {
@@ -1306,7 +1702,7 @@ mod tests {
         let project = "project-a";
         let checkpoint_id = Uuid::new_v4();
         let child_id = Uuid::new_v4();
-        State {
+        let state = State {
             spaces: vec![Space {
                 id: child_id,
                 name: "child-space".into(),
@@ -1324,15 +1720,15 @@ mod tests {
                 note: "base".into(),
                 created_at: Utc::now(),
             }],
-        }
-        .store(&root)
-        .expect("write test state");
+        };
+        store_state(&root, &state);
         std::fs::create_dir_all(root.join("ckpts")).expect("create checkpoint directory");
         std::fs::write(shinu::ckpt_image(&root, checkpoint_id), b"checkpoint")
             .expect("write checkpoint image");
         let (vm_cfg, net_cfg) = test_configs();
         let registry = registry();
-        let ctx = daemon_ctx(&root, &vm_cfg, &net_cfg, &registry);
+        let db = test_db(&root);
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
         let result = handle(&ctx, Req::RmCkpt { ckpt: checkpoint_id }, project);
         assert!(matches!(
             result,
@@ -1346,7 +1742,7 @@ mod tests {
     fn checkpoint_deletion_hides_foreign_project() {
         let root = test_root("rmckpt-project");
         let checkpoint_id = Uuid::new_v4();
-        State {
+        let state = State {
             spaces: Vec::new(),
             ckpts: vec![Ckpt {
                 id: checkpoint_id,
@@ -1357,12 +1753,12 @@ mod tests {
                 note: "private".into(),
                 created_at: Utc::now(),
             }],
-        }
-        .store(&root)
-        .expect("write test state");
+        };
+        store_state(&root, &state);
         let (vm_cfg, net_cfg) = test_configs();
         let registry = registry();
-        let ctx = daemon_ctx(&root, &vm_cfg, &net_cfg, &registry);
+        let db = test_db(&root);
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
         let result = handle(
             &ctx,
             Req::RmCkpt { ckpt: checkpoint_id },
@@ -1382,7 +1778,8 @@ mod tests {
         let (_space_id, _ckpt_id, mut child) = running_state(&root, project);
         let (vm_cfg, net_cfg) = test_configs();
         let registry = registry();
-        let ctx = daemon_ctx(&root, &vm_cfg, &net_cfg, &registry);
+        let db = test_db(&root);
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
         let result = handle(
             &ctx,
             Req::Commit {
@@ -1491,7 +1888,7 @@ mod tests {
         let space_id = Uuid::new_v4();
         let old_id = Uuid::new_v4();
         let auto_id = Uuid::new_v4();
-        State {
+        let state = State {
             spaces: vec![Space {
                 id: space_id,
                 name: "web".into(),
@@ -1520,12 +1917,12 @@ mod tests {
                     created_at: Utc::now(),
                 },
             ],
-        }
-        .store(&root)
-        .expect("write reflog state");
+        };
+        store_state(&root, &state);
         let (vm_cfg, net_cfg) = test_configs();
         let registry = registry();
-        let ctx = daemon_ctx(&root, &vm_cfg, &net_cfg, &registry);
+        let db = test_db(&root);
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
 
         let reflog = handle(
             &ctx,

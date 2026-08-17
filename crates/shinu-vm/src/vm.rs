@@ -141,12 +141,23 @@ fn ensure_address_free(id: Uuid, tap: &str, address: &str) -> Result<()> {
     Ok(())
 }
 
+/// Runs an iptables check, then the add if the rule is absent.
+///
+/// Every invocation waits for /run/xtables.lock rather than failing fast:
+/// iptables serialises all callers on that file, and concurrent VM boots
+/// would otherwise lose the race and report "Resource temporarily
+/// unavailable" instead of configuring their network.
 fn ensure_iptables_rule(check: &[&str], add: &[&str]) -> Result<()> {
-    let checked = run_command("iptables", check)?;
+    fn with_wait<'a>(args: &[&'a str]) -> Vec<&'a str> {
+        let mut full = vec!["-w", "5"];
+        full.extend_from_slice(args);
+        full
+    }
+    let checked = run_command("iptables", &with_wait(check))?;
     if checked.status.success() {
         return Ok(());
     }
-    require_success("iptables", add)
+    require_success("iptables", &with_wait(add))
 }
 
 fn ensure_forward_rule(rule: &[String], position: usize) -> Result<()> {

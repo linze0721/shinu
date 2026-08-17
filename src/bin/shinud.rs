@@ -1665,19 +1665,26 @@ fn prepare_ssh(ctx: &Ctx<'_>, project: &str, space: &str) -> shinu::Result<SshTa
     let limits = effective_limits(ctx, project)?;
     check_vm_sizing(ctx, &limits, entry.vcpus, entry.mem_mib)?;
     let space_guard = ctx.registry.space_lock(space_id);
-    {
-        let _space_guard = space_guard
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Hold the state lock through the quota check and spawn so concurrent
-        // transfers cannot all observe the same free running-VM slot.
+    let _space_guard = space_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // The quota check must be serialised so concurrent callers cannot all
+    // observe the same free slot, but booting must not be: vm::start blocks
+    // until the guest's sshd answers, so holding the state lock across it
+    // serialised every concurrent boot behind one VM's readiness wait.
+    // vm::start writes the pid file before waiting, so a VM counts as running
+    // as soon as it is spawned and the next caller sees an accurate count.
+    let already_running = {
         let _state_guard = lock_state(ctx.registry);
         let connection = lock_db(ctx.db);
         let state = state::load(&connection)?;
-        if !shinu::vm::is_running(&shinu::vm_dir(ctx.root, space_id)) {
+        let running = shinu::vm::is_running(&shinu::vm_dir(ctx.root, space_id));
+        if !running {
             quota::check_running_limit(count_running(ctx.root, &state, project), &limits)?;
         }
-        drop(connection);
+        running
+    };
+    if !already_running {
         shinu::vm::start(
             ctx.root,
             space_id,

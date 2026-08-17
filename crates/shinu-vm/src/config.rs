@@ -11,6 +11,8 @@ pub struct VmConfig {
     /// `SHINU_MEM_MIB`
     pub mem_mib: u32,
     /// `SHINU_IDLE_SECS` — a VM with no `Touch` for this long is shut down.
+    /// One hour: an agent often pauses mid-task while a caller thinks, and a
+    /// shorter window kills detached work such as a tmux session or a build.
     pub idle_secs: u64,
     /// `SHINU_JAIL_UID` — non-root uid used by Firecracker inside the jail.
     pub jail_uid: u32,
@@ -23,7 +25,7 @@ impl VmConfig {
         Self {
             vcpus: env_u32("SHINU_VCPUS", 2),
             mem_mib: env_u32("SHINU_MEM_MIB", 1024),
-            idle_secs: u64::from(env_u32("SHINU_IDLE_SECS", 600)),
+            idle_secs: u64::from(env_u32("SHINU_IDLE_SECS", 3600)),
             jail_uid: env_u32("SHINU_JAIL_UID", 30_000),
             jail_gid: env_u32("SHINU_JAIL_GID", 30_000),
         }

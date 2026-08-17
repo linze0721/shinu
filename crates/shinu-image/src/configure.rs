@@ -83,13 +83,16 @@ pub fn seed_resolv(mnt: &Path) -> Result<()> {
     Ok(())
 }
 /// Runs a shell command inside the mounted image. Only ever called by the
-/// root daemon while building the base: the mounts live in a private
-/// namespace that dies with the child, so nothing leaks into the host.
+/// root daemon while building the base. The PID namespace is intentional:
+/// package hooks can daemonize helpers, and killing the namespace at shell exit
+/// lets the parent unmount the image without leaving a hidden loop mount.
 pub(super) fn chroot_run(mnt: &Path, command: &str) -> Result<()> {
     let script = r#"mount -t proc proc "$1/proc" && (mount --rbind /dev "$1/dev" || :) && (mount --rbind /sys "$1/sys" || :) && exec chroot "$1" /bin/sh -c "$2""#;
     let status = std::process::Command::new("unshare")
         .args([
             "--mount",
+            "--pid",
+            "--fork",
             "--propagation",
             "private",
             "--",

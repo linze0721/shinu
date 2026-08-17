@@ -153,10 +153,46 @@ pub fn net_spec(id: Uuid, cfg: &NetConfig) -> Option<NetSpec> {
 
 /// Returns match/action arguments in firewall order. `tap_up` inserts each
 /// rule at its final position so retries preserve this ordering.
-/// The gateway exception must stay ahead of the 172.16/12 drop: the host
-/// side of each guest /30 lives inside that private range.
+/// The gateway and named-network peer exceptions must stay ahead of the
+/// 172.16/12 drop: the host side of each guest /30 and every peer guest
+/// address live inside that private range.
 pub fn egress_rules(tap: &str, gateway: &str, allow: &[String]) -> Vec<Vec<String>> {
-    let mut rules = Vec::with_capacity(1 + allow.len() + GUEST_BLOCKED_CIDRS.len());
+    egress_rules_with_peers(tap, gateway, allow, &[])
+}
+
+/// Returns one ACCEPT rule for each named-network peer guest address.
+///
+/// UUID-derived guest addresses are scattered through the pool, so the mesh
+/// cannot be represented by one aggregate CIDR. The caller supplies bare
+/// guest addresses and this function makes the host firewall's /32 boundary
+/// explicit for each one.
+pub fn peer_rules(tap: &str, peers: &[String]) -> Vec<Vec<String>> {
+    peers
+        .iter()
+        .map(|peer| {
+            vec![
+                "-i".to_owned(),
+                tap.to_owned(),
+                "-d".to_owned(),
+                format!("{peer}/32"),
+                "-j".to_owned(),
+                "ACCEPT".to_owned(),
+            ]
+        })
+        .collect()
+}
+
+/// Builds the complete ordered rule list, placing peer exceptions directly
+/// before the blanket private-destination drops.
+pub(crate) fn egress_rules_with_peers(
+    tap: &str,
+    gateway: &str,
+    allow: &[String],
+    peers: &[String],
+) -> Vec<Vec<String>> {
+    let mut rules = Vec::with_capacity(
+        1 + allow.len() + peers.len() + GUEST_BLOCKED_CIDRS.len(),
+    );
     rules.push(vec![
         "-i".to_owned(),
         tap.to_owned(),
@@ -175,6 +211,7 @@ pub fn egress_rules(tap: &str, gateway: &str, allow: &[String]) -> Vec<Vec<Strin
             "ACCEPT".to_owned(),
         ]);
     }
+    rules.extend(peer_rules(tap, peers));
     for destination in GUEST_BLOCKED_CIDRS {
         rules.push(vec![
             "-i".to_owned(),
@@ -192,7 +229,7 @@ pub fn egress_rules(tap: &str, gateway: &str, allow: &[String]) -> Vec<Vec<Strin
 #[cfg(test)]
 mod network_tests {
     use super::{
-        parse_net_allow, NetSpec, net_slot, tap_name,
+        egress_rules_with_peers, net_slot, parse_net_allow, peer_rules, tap_name, NetSpec,
     };
     use crate::config::vm_config_json;
     use crate::vm::egress_rules;
@@ -352,5 +389,40 @@ mod network_tests {
             assert_eq!(rule[3], destination);
             assert_eq!(rule[5], "DROP");
         }
+    }
+    #[test]
+    fn ordered_rules_place_peers_between_allowlist_and_private_drops() {
+        let allow = vec!["10.42.0.0/16".to_owned()];
+        let peers = vec!["172.31.1.2".to_owned(), "172.31.200.6".to_owned()];
+        let rules = egress_rules_with_peers("tap0", "172.31.1.1", &allow, &peers);
+        assert_eq!(rules[2][3], "172.31.1.2/32");
+        assert_eq!(rules[3][3], "172.31.200.6/32");
+        assert_eq!(rules[4][3], "10.0.0.0/8");
+        assert_eq!(rules[4][5], "DROP");
+    }
+    #[test]
+    fn peer_rules_keep_peer_order_and_use_host_firewall_slash_thirty_twos() {
+        let peers = vec!["172.31.1.2".to_owned(), "172.31.200.6".to_owned()];
+        assert_eq!(
+            peer_rules("tap0", &peers),
+            vec![
+                vec![
+                    "-i".to_owned(),
+                    "tap0".to_owned(),
+                    "-d".to_owned(),
+                    "172.31.1.2/32".to_owned(),
+                    "-j".to_owned(),
+                    "ACCEPT".to_owned(),
+                ],
+                vec![
+                    "-i".to_owned(),
+                    "tap0".to_owned(),
+                    "-d".to_owned(),
+                    "172.31.200.6/32".to_owned(),
+                    "-j".to_owned(),
+                    "ACCEPT".to_owned(),
+                ],
+            ]
+        );
     }
 }

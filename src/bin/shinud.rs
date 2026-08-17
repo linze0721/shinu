@@ -92,8 +92,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             sweep_net_cfg.as_ref(),
         ) {
             Ok(stopped) => {
-                for dir in stopped {
+                for dir in &stopped {
                     eprintln!("idle sweep stopped {}", dir.display());
+                }
+                if let Err(error) = refresh_idle_networks(
+                    sweep_root.as_path(),
+                    &sweep_db,
+                    &sweep_registry,
+                    sweep_net_cfg.as_ref(),
+                    &stopped,
+                ) {
+                    eprintln!("idle network refresh: {error}");
                 }
             }
             Err(error) => eprintln!("idle sweep: {error}"),
@@ -280,6 +289,227 @@ fn remove_file_if_missing(path: &Path) -> shinu::Result<()> {
 fn remove_space_snapshot_files(root: &Path, id: Uuid) -> shinu::Result<()> {
     remove_file_if_missing(&space_snapshot_mem(root, id))?;
     remove_file_if_missing(&space_snapshot_state(root, id))
+}
+const NETWORK_HOSTS_BEGIN: &str = "# BEGIN SHINU NETWORK PEERS";
+const NETWORK_HOSTS_END: &str = "# END SHINU NETWORK PEERS";
+
+fn network_members(state: &State, project: &str, network: Option<&str>) -> Vec<Space> {
+    let Some(network) = network else {
+        return Vec::new();
+    };
+    state
+        .spaces
+        .iter()
+        .filter(|space| {
+            space.project == project && space.network.as_deref() == Some(network)
+        })
+        .cloned()
+        .collect()
+}
+
+fn guest_ip(id: Uuid, cfg: &shinu::NetConfig) -> Option<String> {
+    shinu::net_spec(id, cfg).and_then(|spec| {
+        spec.guest_cidr
+            .split_once('/')
+            .map(|(address, _)| address.to_owned())
+    })
+}
+
+fn peer_ips(space: &Space, members: &[Space], cfg: &shinu::NetConfig) -> Vec<String> {
+    members
+        .iter()
+        .filter(|peer| peer.id != space.id)
+        .filter_map(|peer| guest_ip(peer.id, cfg))
+        .collect()
+}
+
+fn running_network_members(
+    root: &Path,
+    state: &State,
+    project: &str,
+    network: Option<&str>,
+) -> Vec<Space> {
+    network_members(state, project, network)
+        .into_iter()
+        .filter(|space| shinu::vm::is_running(&shinu::vm_dir(root, space.id)))
+        .collect()
+}
+
+fn refresh_network_rules_with(
+    root: &Path,
+    cfg: &shinu::NetConfig,
+    state: &State,
+    project: &str,
+    network: Option<&str>,
+    previous_running: &[Space],
+) -> shinu::Result<Vec<Space>> {
+    let current_running = running_network_members(root, state, project, network);
+    for member in &current_running {
+        let old_peers = peer_ips(member, previous_running, cfg);
+        let new_peers = peer_ips(member, &current_running, cfg);
+        let departed = old_peers
+            .iter()
+            .filter(|peer| !new_peers.contains(peer))
+            .cloned()
+            .collect::<Vec<_>>();
+        shinu::vm::remove_peer_rules(member.id, cfg, &departed);
+        shinu::vm::refresh_peer_rules(member.id, cfg, &new_peers)?;
+    }
+    Ok(current_running)
+}
+
+fn refresh_network_rules(
+    ctx: &Ctx<'_>,
+    state: &State,
+    project: &str,
+    network: Option<&str>,
+    previous_running: &[Space],
+) -> shinu::Result<Vec<Space>> {
+    refresh_network_rules_with(
+        ctx.root,
+        ctx.net_cfg,
+        state,
+        project,
+        network,
+        previous_running,
+    )
+}
+
+fn network_hosts_command(
+    member: &Space,
+    members: &[Space],
+    cfg: &shinu::NetConfig,
+) -> Option<Vec<String>> {
+    let mut script = format!(
+        r#"set -e
+tmp=/tmp/shinu-hosts.$$
+awk '
+$0 == {:?} {{ inside=1; next }}
+$0 == {:?} {{ inside=0; next }}
+!inside {{ print }}
+' /etc/hosts > "$tmp"
+{{
+printf '%s\n' {}
+"#,
+        NETWORK_HOSTS_BEGIN,
+        NETWORK_HOSTS_END,
+        shinu::shell_quote_word(NETWORK_HOSTS_BEGIN),
+    );
+    for peer in members.iter().filter(|peer| peer.id != member.id) {
+        let ip = guest_ip(peer.id, cfg)?;
+        script.push_str(&format!(
+            "printf '%s %s\\n' {} {}\n",
+            shinu::shell_quote_word(&ip),
+            shinu::shell_quote_word(&peer.name),
+        ));
+    }
+    script.push_str(&format!(
+        "printf '%s\\n' {}\n}} >> \"$tmp\"\ncat \"$tmp\" > /etc/hosts\nrm -f \"$tmp\"",
+        shinu::shell_quote_word(NETWORK_HOSTS_END),
+    ));
+    Some(vec!["sh".to_owned(), "-c".to_owned(), script])
+}
+
+fn sync_network_hosts_with(
+    root: &Path,
+    cfg: &shinu::NetConfig,
+    running_members: &[Space],
+    all_members: &[Space],
+) {
+    for member in running_members {
+        let Some(network) = member.network.as_deref() else {
+            continue;
+        };
+        let network_members = all_members
+            .iter()
+            .filter(|peer| peer.network.as_deref() == Some(network))
+            .cloned()
+            .collect::<Vec<_>>();
+        let Some(command) = network_hosts_command(member, &network_members, cfg) else {
+            continue;
+        };
+        match shinu::exec_in_vm(
+            &shinu::vm::vsock_path(&shinu::vm_dir(root, member.id)),
+            &shinu::vm::key_path(&shinu::vm_dir(root, member.id)),
+            shinu::VSOCK_SSH_PORT,
+            &command,
+        ) {
+            Ok(0) => {}
+            Ok(status) => eprintln!(
+                "failed to update /etc/hosts for network member {}: exit status {status}",
+                member.name
+            ),
+            Err(error) => eprintln!(
+                "failed to update /etc/hosts for network member {}: {error}",
+                member.name
+            ),
+        }
+    }
+}
+
+fn sync_network_hosts(ctx: &Ctx<'_>, running_members: &[Space], all_members: &[Space]) {
+    sync_network_hosts_with(ctx.root, ctx.net_cfg, running_members, all_members);
+}
+fn refresh_idle_networks(
+    root: &Path,
+    db: &Mutex<Connection>,
+    registry: &Registry,
+    cfg: &shinu::NetConfig,
+    stopped: &[PathBuf],
+) -> shinu::Result<()> {
+    if stopped.is_empty() {
+        return Ok(());
+    }
+    let state = snapshot(db, registry)?;
+    let stopped_ids = stopped
+        .iter()
+        .filter_map(|dir| {
+            dir.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| Uuid::parse_str(name).ok())
+        })
+        .collect::<Vec<_>>();
+    let mut groups = Vec::<(String, String)>::new();
+    for space in &state.spaces {
+        let Some(network) = space.network.as_deref() else {
+            continue;
+        };
+        if stopped_ids.contains(&space.id)
+            && !groups
+                .iter()
+                .any(|(project, name)| project == &space.project && name == network)
+        {
+            groups.push((space.project.clone(), network.to_owned()));
+        }
+    }
+    for (project, network) in groups {
+        let all_members = network_members(&state, &project, Some(&network));
+        let mut previous_running = running_network_members(
+            root,
+            &state,
+            &project,
+            Some(&network),
+        );
+        for member in &all_members {
+            if stopped_ids.contains(&member.id)
+                && !previous_running
+                    .iter()
+                    .any(|running| running.id == member.id)
+            {
+                previous_running.push(member.clone());
+            }
+        }
+        let current_running = refresh_network_rules_with(
+            root,
+            cfg,
+            &state,
+            &project,
+            Some(&network),
+            &previous_running,
+        )?;
+        sync_network_hosts_with(root, cfg, &current_running, &all_members);
+    }
+    Ok(())
 }
 
 fn checkpoint_exclusive(root: &Path, id: Uuid) -> shinu::Result<u64> {
@@ -553,15 +783,28 @@ fn resize_disk_image(image: &Path, disk_mib: u64) -> shinu::Result<()> {
     Ok(())
 }
 
-fn create_space(
-    ctx: &Ctx<'_>,
-    project: &str,
+/// What a caller asks for when creating a space, as opposed to how the
+/// daemon satisfies it. Grouping these keeps `create_space` under the
+/// argument count where a positional call stops being readable.
+struct SpaceSpec {
     name: String,
     image: Option<Image>,
     vcpus: Option<u32>,
     mem_mib: Option<u32>,
     disk_mib: Option<u64>,
-) -> shinu::Result<Value> {
+    network: Option<String>,
+}
+
+fn create_space(ctx: &Ctx<'_>, project: &str, spec: SpaceSpec) -> shinu::Result<Value> {
+    let SpaceSpec {
+        name,
+        image,
+        vcpus,
+        mem_mib,
+        disk_mib,
+        network,
+    } = spec;
+    state::validate_network_name(network.as_deref())?;
     ensure_positive_size("vcpus", vcpus.map(u64::from))?;
     ensure_positive_size("mem_mib", mem_mib.map(u64::from))?;
     ensure_positive_size("disk_mib", disk_mib)?;
@@ -620,6 +863,7 @@ fn create_space(
                     vcpus,
                     mem_mib,
                     disk_mib,
+                    network: network.clone(),
                     created_at: Utc::now(),
                 };
                 state.spaces.push(space.clone());
@@ -732,6 +976,7 @@ fn fork_space(
                     vcpus: source_space.vcpus,
                     mem_mib: source_space.mem_mib,
                     disk_mib: source_space.disk_mib,
+                    network: source_space.network.clone(),
                     created_at: Utc::now(),
                 };
                 state.spaces.push(space.clone());
@@ -939,6 +1184,21 @@ fn checkout_space(
         Ok(())
     })?;
     if target.full {
+        let (network, previous_running) = {
+            let state = snapshot(ctx.db, ctx.registry)?;
+            let network = state
+                .spaces
+                .iter()
+                .find(|space| space.id == space_id && space.project == project)
+                .and_then(|space| space.network.clone());
+            let previous_running = running_network_members(
+                ctx.root,
+                &state,
+                project,
+                network.as_deref(),
+            );
+            (network, previous_running)
+        };
         let _ = start_vm_with_pending_restore(
             ctx,
             space_id,
@@ -946,6 +1206,16 @@ fn checkout_space(
             vcpus,
             mem_mib,
         )?;
+        let state = snapshot(ctx.db, ctx.registry)?;
+        let current_running = refresh_network_rules(
+            ctx,
+            &state,
+            project,
+            network.as_deref(),
+            &previous_running,
+        )?;
+        let all_members = network_members(&state, project, network.as_deref());
+        sync_network_hosts(ctx, &current_running, &all_members);
     }
     Ok(json!({ "head": target.id, "auto_commit": auto_checkpoint.id }))
 }
@@ -954,15 +1224,46 @@ fn checkout_space(
 
 
 fn remove_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value> {
-    let (id, resolved_name) = {
+    let (id, resolved_name, network) = {
         let entry = find_space(ctx.db, &name, project)?;
-        (entry.id, entry.name)
+        (entry.id, entry.name, entry.network)
     };
     let space_guard = ctx.registry.space_lock(id);
     let _space_guard = space_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    shinu::vm::stop(&shinu::vm_dir(ctx.root, id), ctx.net_cfg)?;
+    let (current_running, all_members) = {
+        let _state_guard = lock_state(ctx.registry);
+        let connection = lock_db(ctx.db);
+        let state = state::load(&connection)?;
+        let space = state
+            .spaces
+            .iter()
+            .find(|space| space.id == id && space.project == project)
+            .cloned()
+            .ok_or_else(|| shinu::Error::NotFound(id.to_string()))?;
+        let previous_running = running_network_members(
+            ctx.root,
+            &state,
+            project,
+            network.as_deref(),
+        );
+        let peers = peer_ips(&space, &previous_running, ctx.net_cfg);
+        shinu::vm::stop_with_peers(&shinu::vm_dir(ctx.root, id), ctx.net_cfg, &peers)?;
+        let current_running = refresh_network_rules(
+            ctx,
+            &state,
+            project,
+            network.as_deref(),
+            &previous_running,
+        )?;
+        let all_members = network_members(&state, project, network.as_deref())
+            .into_iter()
+            .filter(|member| member.id != id)
+            .collect::<Vec<_>>();
+        (current_running, all_members)
+    };
+    sync_network_hosts(ctx, &current_running, &all_members);
     let image = shinu::space_image(ctx.root, id);
     match std::fs::remove_file(&image) {
         Ok(()) => {}
@@ -1105,6 +1406,12 @@ fn start_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Valu
     let _state_guard = lock_state(ctx.registry);
     let connection = lock_db(ctx.db);
     let state = state::load(&connection)?;
+    let previous_running = running_network_members(
+        ctx.root,
+        &state,
+        project,
+        space.network.as_deref(),
+    );
     let already_running = shinu::vm::is_running(&shinu::vm_dir(ctx.root, space.id));
     if !already_running {
         quota::check_running_limit(count_running(ctx.root, &state, project), &limits)?;
@@ -1117,21 +1424,55 @@ fn start_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Valu
         space.vcpus,
         space.mem_mib,
     )?;
+    let current_running = refresh_network_rules(
+        ctx,
+        &state,
+        project,
+        space.network.as_deref(),
+        &previous_running,
+    )?;
+    let all_members = network_members(&state, project, space.network.as_deref());
+    sync_network_hosts(ctx, &current_running, &all_members);
     Ok(json!({ "booted": booted }))
 }
 
 fn stop_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value> {
-    let id = {
+    let space = {
         let connection = lock_db(ctx.db);
         state::find_space(&connection, &name, project)?
             .ok_or_else(|| shinu::Error::NotFound(name.clone()))?
-            .id
     };
-    let space_guard = ctx.registry.space_lock(id);
+    let space_guard = ctx.registry.space_lock(space.id);
     let _space_guard = space_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let was_running = shinu::vm::stop(&shinu::vm_dir(ctx.root, id), ctx.net_cfg)?;
+    let (was_running, current_running, all_members) = {
+        let _state_guard = lock_state(ctx.registry);
+        let connection = lock_db(ctx.db);
+        let state = state::load(&connection)?;
+        let previous_running = running_network_members(
+            ctx.root,
+            &state,
+            project,
+            space.network.as_deref(),
+        );
+        let peers = peer_ips(&space, &previous_running, ctx.net_cfg);
+        let was_running = shinu::vm::stop_with_peers(
+            &shinu::vm_dir(ctx.root, space.id),
+            ctx.net_cfg,
+            &peers,
+        )?;
+        let current_running = refresh_network_rules(
+            ctx,
+            &state,
+            project,
+            space.network.as_deref(),
+            &previous_running,
+        )?;
+        let all_members = network_members(&state, project, space.network.as_deref());
+        (was_running, current_running, all_members)
+    };
+    sync_network_hosts(ctx, &current_running, &all_members);
     Ok(json!({ "was_running": was_running }))
 }
 
@@ -1358,7 +1699,19 @@ fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
             vcpus,
             mem_mib,
             disk_mib,
-        } => create_space(ctx, project, name, image, vcpus, mem_mib, disk_mib),
+            network,
+        } => create_space(
+            ctx,
+            project,
+            SpaceSpec {
+                name,
+                image,
+                vcpus,
+                mem_mib,
+                disk_mib,
+                network,
+            },
+        ),
         Req::Resize {
             space,
             vcpus,
@@ -1718,12 +2071,22 @@ fn new_request(body: &[u8]) -> shinu::Result<Req> {
             })?)
         }
     };
+    let network = match value.get("network") {
+        None | Some(Value::Null) => None,
+        Some(raw) => Some(
+            raw.as_str()
+                .ok_or_else(|| shinu::Error::Invalid("body field network must be a string".into()))?
+                .to_owned(),
+        ),
+    };
+    state::validate_network_name(network.as_deref())?;
     Ok(Req::New {
         name,
         image,
         vcpus: value_optional_u32(&value, "vcpus")?,
         mem_mib: value_optional_u32(&value, "mem_mib")?,
         disk_mib: value_optional_u64(&value, "disk_mib")?,
+        network,
     })
 }
 
@@ -1895,15 +2258,21 @@ fn prepare_ssh(ctx: &Ctx<'_>, project: &str, space: &str) -> shinu::Result<SshTa
     // serialised every concurrent boot behind one VM's readiness wait.
     // vm::start writes the pid file before waiting, so a VM counts as running
     // as soon as it is spawned and the next caller sees an accurate count.
-    let already_running = {
+    let (already_running, state, previous_running) = {
         let _state_guard = lock_state(ctx.registry);
         let connection = lock_db(ctx.db);
         let state = state::load(&connection)?;
+        let previous_running = running_network_members(
+            ctx.root,
+            &state,
+            project,
+            entry.network.as_deref(),
+        );
         let running = shinu::vm::is_running(&shinu::vm_dir(ctx.root, space_id));
         if !running {
             quota::check_running_limit(count_running(ctx.root, &state, project), &limits)?;
         }
-        running
+        (running, state, previous_running)
     };
     if !already_running {
         start_vm_with_pending_restore(
@@ -1914,6 +2283,15 @@ fn prepare_ssh(ctx: &Ctx<'_>, project: &str, space: &str) -> shinu::Result<SshTa
             entry.mem_mib,
         )?;
     }
+    let current_running = refresh_network_rules(
+        ctx,
+        &state,
+        project,
+        entry.network.as_deref(),
+        &previous_running,
+    )?;
+    let all_members = network_members(&state, project, entry.network.as_deref());
+    sync_network_hosts(ctx, &current_running, &all_members);
     let vm_dir = shinu::vm_dir(ctx.root, space_id);
     let helper = shinu::vsock_helper()?;
     let proxy = format!(
@@ -3068,6 +3446,43 @@ mod tests {
     fn test_db(root: &std::path::Path) -> Mutex<Connection> {
         Mutex::new(state::open(root).expect("open test database"))
     }
+    #[test]
+    fn network_members_are_scoped_by_project_and_name() {
+        fn space(id: Uuid, name: &str, project: &str, network: Option<&str>) -> Space {
+            Space {
+                id,
+                name: name.to_owned(),
+                project: project.to_owned(),
+                image: Image::Void,
+                parent: None,
+                head: None,
+                vcpus: None,
+                mem_mib: None,
+                disk_mib: None,
+                network: network.map(str::to_owned),
+                created_at: Utc::now(),
+            }
+        }
+        let state = State {
+            spaces: vec![
+                space(Uuid::new_v4(), "web", "project-a", Some("blue")),
+                space(Uuid::new_v4(), "db", "project-a", Some("blue")),
+                space(Uuid::new_v4(), "other-network", "project-a", Some("green")),
+                space(Uuid::new_v4(), "other-project", "project-b", Some("blue")),
+                space(Uuid::new_v4(), "isolated", "project-a", None),
+            ],
+            ckpts: Vec::new(),
+        };
+        let members = super::network_members(&state, "project-a", Some("blue"));
+        assert_eq!(
+            members.iter().map(|space| space.name.as_str()).collect::<Vec<_>>(),
+            vec!["web", "db"]
+        );
+        assert!(super::network_members(&state, "project-b", Some("blue"))
+            .iter()
+            .all(|space| space.name == "other-project"));
+        assert!(super::network_members(&state, "project-a", None).is_empty());
+    }
 
     fn test_limits() -> &'static Limits {
         static LIMITS: LazyLock<Limits> = LazyLock::new(|| Limits {
@@ -3134,6 +3549,23 @@ mod tests {
         assert!(matches!(
             super::exec_command(br#"{"cmd":["cat"],"stdin":7}"#),
             Err(shinu::Error::Invalid(message)) if message == "stdin must be a string"
+        ));
+    }
+    #[test]
+    fn new_request_round_trips_and_validates_network() {
+        let request = super::new_request(br#"{"name":"web","network":"lan-1"}"#)
+            .expect("parse network create request");
+        assert!(matches!(
+            request,
+            Req::New {
+                network: Some(network),
+                ..
+            } if network == "lan-1"
+        ));
+        assert!(matches!(
+            super::new_request(br#"{"name":"web","network":"LAN"}"#),
+            Err(shinu::Error::Invalid(message))
+                if message.contains("network name must be non-empty")
         ));
     }
 
@@ -3260,6 +3692,7 @@ mod tests {
                     vcpus: None,
                     mem_mib: None,
                     disk_mib: None,
+                    network: None,
                     parent: None,
                     head: None,
                     created_at: Utc::now(),
@@ -3367,6 +3800,7 @@ mod tests {
                     vcpus: None,
                     mem_mib: None,
                     disk_mib: Some(100),
+                    network: None,
                     created_at: Utc::now(),
                 }],
                 ckpts: Vec::new(),
@@ -3412,6 +3846,7 @@ mod tests {
                 vcpus: None,
                 mem_mib: None,
                 disk_mib: None,
+                network: None,
                 parent: None,
                 head: None,
                 created_at: Utc::now(),
@@ -3521,6 +3956,7 @@ mod tests {
                 vcpus: None,
                 mem_mib: None,
                 disk_mib: None,
+                network: None,
                 parent: Some(checkpoint_id),
                 head: None,
                 created_at: Utc::now(),
@@ -3628,6 +4064,7 @@ mod tests {
                 vcpus: None,
                 mem_mib: None,
                 disk_mib: None,
+                network: None,
                 parent: None,
                 head: None,
                 created_at: Utc::now(),
@@ -3681,6 +4118,7 @@ mod tests {
                 vcpus: None,
                 mem_mib: None,
                 disk_mib: None,
+                network: None,
                 parent: None,
                 head: Some(target_id),
                 created_at: Utc::now(),
@@ -3732,6 +4170,7 @@ mod tests {
                 vcpus: None,
                 mem_mib: None,
                 disk_mib: None,
+                network: None,
                 parent: None,
                 head: Some(old_id),
                 created_at: Utc::now(),
@@ -3812,6 +4251,7 @@ mod tests {
                 vcpus: None,
                 mem_mib: None,
                 disk_mib: None,
+                network: None,
                 parent: None,
                 // The racing fork landed between the snapshot and the claim.
                 head: Some(raced_id),

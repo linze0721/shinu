@@ -39,6 +39,8 @@ enum Command {
         mem: Option<u32>,
         #[arg(long, value_name = "MIB")]
         disk: Option<u64>,
+        #[arg(long)]
+        network: Option<String>,
     },
     #[command(group(
         clap::ArgGroup::new("resize-options")
@@ -59,6 +61,9 @@ enum Command {
     Ls {
         #[arg(long)]
         json: bool,
+    },
+    Network {
+        name: String,
     },
     Rm {
         space: String,
@@ -690,6 +695,7 @@ fn create_space_body(
     vcpus: Option<u32>,
     mem_mib: Option<u32>,
     disk_mib: Option<u64>,
+    network: Option<String>,
 ) -> Value {
     let mut body = json!({"name": name});
     let object = body
@@ -706,6 +712,9 @@ fn create_space_body(
     }
     if let Some(disk_mib) = disk_mib {
         object.insert("disk_mib".to_string(), Value::from(disk_mib));
+    }
+    if let Some(network) = network {
+        object.insert("network".to_string(), Value::String(network));
     }
     body
 }
@@ -742,11 +751,12 @@ fn run_command(client: &HttpClient, command: Command) -> Result<i32, String> {
             vcpus,
             mem,
             disk,
+            network,
         } => {
             let data = response_value(client.request(
                 "POST",
                 "/v1/spaces",
-                Some(create_space_body(&name, image, vcpus, mem, disk)),
+                Some(create_space_body(&name, image, vcpus, mem, disk, network)),
             )?)?;
             print_space_summary(&data);
         }
@@ -776,6 +786,11 @@ fn run_command(client: &HttpClient, command: Command) -> Result<i32, String> {
             } else {
                 print_spaces(&response_value_from_body(&body)?);
             }
+        }
+        Command::Network { name } => {
+            let response = client.request("GET", "/v1/spaces", None)?;
+            let body = successful_body(response)?;
+            print_network(&response_value_from_body(&body)?, &name)?;
         }
         Command::Rm { space } => {
             let data = response_value(client.request(
@@ -1186,6 +1201,33 @@ fn human_mib(value: Option<&Value>) -> String {
         .map(|mib| human(mib.saturating_mul(1024 * 1024)))
         .unwrap_or_else(|| "-".to_string())
 }
+fn print_network(data: &Value, name: &str) -> Result<(), String> {
+    shinu::state::validate_network_name(Some(name)).map_err(|error| error.to_string())?;
+    let config = shinu::NetConfig::from_env().map_err(|error| error.to_string())?;
+    let rows = data
+        .get("spaces")
+        .and_then(Value::as_array)
+        .map(|spaces| {
+            spaces
+                .iter()
+                .filter(|space| space.get("network").and_then(Value::as_str) == Some(name))
+                .map(|space| {
+                    let guest_ip = space
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .and_then(|id| Uuid::parse_str(id).ok())
+                        .and_then(|id| shinu::net_spec(id, &config))
+                        .and_then(|spec| spec.guest_cidr.strip_suffix("/30").map(str::to_owned))
+                        .unwrap_or_else(|| "-".to_string());
+                    vec![field_text(space, "name"), guest_ip]
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    println!("network: {name}");
+    table(&["NAME", "GUEST IP"], &rows);
+    Ok(())
+}
 
 fn print_spaces(data: &Value) {
     let rows = data
@@ -1197,6 +1239,11 @@ fn print_spaces(data: &Value) {
                 .map(|space| {
                     vec![
                         field_text(space, "name"),
+                        space
+                            .get("network")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| "-".to_string()),
                         field_text(space, "project"),
                         if space
                             .get("running")
@@ -1221,12 +1268,11 @@ fn print_spaces(data: &Value) {
         .unwrap_or_default();
     table(
         &[
-            "NAME", "PROJECT", "STATE", "HEAD", "EXCLUSIVE", "CREATED", "IMAGE", "VCPU",
+            "NAME", "NETWORK", "PROJECT", "STATE", "HEAD", "EXCLUSIVE", "CREATED", "IMAGE", "VCPU",
             "MEM", "DISK",
         ],
         &rows,
     );
-
     if let Some(ckpts) = data.get("ckpts").and_then(Value::as_array) {
         println!();
         let rows = ckpts
@@ -1780,12 +1826,17 @@ mod tests {
 
     #[test]
     fn create_body_omits_unspecified_optional_fields() {
-        let body = create_space_body("dev", None, None, None, None);
+        let body = create_space_body("dev", None, None, None, None, None);
         assert_eq!(body, json!({"name": "dev"}));
         assert!(body.get("image").is_none());
         assert!(body.get("vcpus").is_none());
         assert!(body.get("mem_mib").is_none());
         assert!(body.get("disk_mib").is_none());
+    }
+    #[test]
+    fn create_body_includes_network_when_requested() {
+        let body = create_space_body("dev", None, None, None, None, Some("lan".into()));
+        assert_eq!(body, json!({"name": "dev", "network": "lan"}));
     }
 
     #[test]

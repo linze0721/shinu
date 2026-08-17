@@ -11,6 +11,8 @@ pub enum Req {
         vcpus: Option<u32>,
         mem_mib: Option<u32>,
         disk_mib: Option<u64>,
+        #[serde(default)]
+        network: Option<String>,
     },
     Resize {
         space: String,

@@ -28,6 +28,8 @@ pub struct Space {
     pub mem_mib: Option<u32>,
     #[serde(default)]
     pub disk_mib: Option<u64>,
+    #[serde(default)]
+    pub network: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -64,6 +66,7 @@ const SCHEMA: &str = r#"
         vcpus INTEGER,
         mem_mib INTEGER,
         disk_mib INTEGER,
+        network TEXT,
         created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS ckpts (
@@ -119,13 +122,14 @@ const SCHEMA: &str = r#"
 "#;
 
 fn migrate_space_columns(conn: &Connection) -> Result<()> {
-    // ALTER TABLE is conditional because installs before sizing support
-    // already have rows; SQLite has no portable IF NOT EXISTS for columns.
+    // ALTER TABLE is conditional because older installs may already have
+    // rows; SQLite has no portable IF NOT EXISTS for columns.
     for (name, definition) in [
         ("image", "TEXT NOT NULL DEFAULT 'void'"),
         ("vcpus", "INTEGER"),
         ("mem_mib", "INTEGER"),
         ("disk_mib", "INTEGER"),
+        ("network", "TEXT"),
     ] {
         let present: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('spaces') WHERE name = ?1",
@@ -135,6 +139,28 @@ fn migrate_space_columns(conn: &Connection) -> Result<()> {
         if present == 0 {
             conn.execute_batch(&format!("ALTER TABLE spaces ADD COLUMN {name} {definition}"))?;
         }
+    }
+    Ok(())
+}
+
+/// Validates the optional project-scoped segment name assigned to a space.
+///
+/// The value is copied into guest name-resolution files, so keeping the
+/// alphabet narrow also keeps it safe at that trust boundary.
+pub fn validate_network_name(network: Option<&str>) -> Result<()> {
+    let Some(network) = network else {
+        return Ok(());
+    };
+    if network.is_empty()
+        || network.len() > 32
+        || !network
+            .bytes()
+            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+    {
+        return Err(Error::Invalid(
+            "network name must be non-empty, at most 32 bytes, and contain only [a-z0-9-]"
+                .into(),
+        ));
     }
     Ok(())
 }
@@ -209,10 +235,10 @@ fn space_from_row(row: &Row<'_>) -> rusqlite::Result<Space> {
         vcpus: row.get(6)?,
         mem_mib: row.get(7)?,
         disk_mib: row.get(8)?,
-        created_at: parse_datetime(row.get(9)?, 9)?,
+        network: row.get(9)?,
+        created_at: parse_datetime(row.get(10)?, 10)?,
     })
 }
-
 fn ckpt_from_row(row: &Row<'_>) -> rusqlite::Result<Ckpt> {
     Ok(Ckpt {
         id: parse_uuid(row.get(0)?, 0)?,
@@ -268,10 +294,13 @@ pub fn migrate_from_json(root: &Path, conn: &Connection) -> Result<bool> {
         Err(error) => return Err(error.into()),
     };
     let state: State = serde_json::from_str(&contents)?;
+    for space in &state.spaces {
+        validate_network_name(space.network.as_deref())?;
+    }
     let tx = conn.unchecked_transaction()?;
     for space in &state.spaces {
         tx.execute(
-            "INSERT INTO spaces (id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO spaces (id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 space.id.to_string(),
                 space.name,
@@ -282,6 +311,7 @@ pub fn migrate_from_json(root: &Path, conn: &Connection) -> Result<bool> {
                 space.vcpus,
                 space.mem_mib,
                 space.disk_mib,
+                space.network,
                 space.created_at.to_rfc3339(),
             ],
         )?;
@@ -302,7 +332,7 @@ pub fn migrate_from_json(root: &Path, conn: &Connection) -> Result<bool> {
 pub fn load(conn: &Connection) -> Result<State> {
     let spaces = {
         let mut statement = conn.prepare(
-            "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, created_at FROM spaces ORDER BY rowid",
+            "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, created_at FROM spaces ORDER BY rowid",
         )?;
         statement
             .query_map([], space_from_row)?
@@ -321,12 +351,15 @@ pub fn load(conn: &Connection) -> Result<State> {
 
 /// Replaces the space and checkpoint portions of the in-memory view in one transaction.
 pub fn store(conn: &Connection, state: &State) -> Result<()> {
+    for space in &state.spaces {
+        validate_network_name(space.network.as_deref())?;
+    }
     let tx = conn.unchecked_transaction()?;
     tx.execute("DELETE FROM ckpts", [])?;
     tx.execute("DELETE FROM spaces", [])?;
     for space in &state.spaces {
         tx.execute(
-            "INSERT INTO spaces (id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO spaces (id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 space.id.to_string(),
                 space.name,
@@ -337,6 +370,7 @@ pub fn store(conn: &Connection, state: &State) -> Result<()> {
                 space.vcpus,
                 space.mem_mib,
                 space.disk_mib,
+                space.network,
                 space.created_at.to_rfc3339(),
             ],
         )?;
@@ -359,7 +393,7 @@ pub fn find_space(
 ) -> Result<Option<Space>> {
     let by_name = conn
         .query_row(
-            "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, created_at FROM spaces WHERE project = ?1 AND name = ?2 LIMIT 1",
+            "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, created_at FROM spaces WHERE project = ?1 AND name = ?2 LIMIT 1",
             params![project, name],
             space_from_row,
         )
@@ -371,7 +405,7 @@ pub fn find_space(
         return Ok(None);
     };
     conn.query_row(
-        "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, created_at FROM spaces WHERE project = ?1 AND id = ?2 LIMIT 1",
+        "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, created_at FROM spaces WHERE project = ?1 AND id = ?2 LIMIT 1",
         params![project, id.to_string()],
         space_from_row,
     )
@@ -663,6 +697,7 @@ mod db_tests {
             vcpus: None,
             mem_mib: None,
             disk_mib: None,
+            network: Some("lan".into()),
             created_at,
         };
         let ckpt = Ckpt {
@@ -699,6 +734,21 @@ mod db_tests {
     }
 
     #[test]
+    fn network_name_validation_enforces_guest_identifier_rule() {
+        for accepted in ["web", "web-01", "a", "a".repeat(32).as_str()] {
+            validate_network_name(Some(accepted)).expect("accepted network name");
+        }
+        for rejected in ["", "A", "web_name", "web name", "a".repeat(33).as_str(), "é"] {
+            assert!(matches!(
+                validate_network_name(Some(rejected)),
+                Err(Error::Invalid(message))
+                    if message == "network name must be non-empty, at most 32 bytes, and contain only [a-z0-9-]"
+            ));
+        }
+        validate_network_name(None).expect("networkless spaces are valid");
+    }
+
+    #[test]
     fn legacy_space_rows_gain_void_image_and_inherited_sizes() {
         let conn = Connection::open_in_memory().expect("open legacy database");
         conn.execute_batch(
@@ -712,16 +762,15 @@ mod db_tests {
         .expect("insert legacy space");
 
         migrate_space_columns(&conn).expect("apply sizing migration");
-        let row: (String, Option<i64>, Option<i64>, Option<i64>) = conn
+        let row: (String, Option<i64>, Option<i64>, Option<i64>, Option<String>) = conn
             .query_row(
-                "SELECT image, vcpus, mem_mib, disk_mib FROM spaces",
+                "SELECT image, vcpus, mem_mib, disk_mib, network FROM spaces",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .expect("read migrated space");
-        assert_eq!(row, ("void".into(), None, None, None));
+        assert_eq!(row, ("void".into(), None, None, None, None));
     }
-
     #[test]
     fn legacy_checkpoint_rows_gain_full_column() {
         let conn = Connection::open_in_memory().expect("open legacy database");

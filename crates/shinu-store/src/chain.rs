@@ -132,6 +132,7 @@ mod chain_tests {
             vcpus: None,
             mem_mib: None,
             disk_mib: None,
+            network: None,
             created_at: Utc::now(),
         }
     }

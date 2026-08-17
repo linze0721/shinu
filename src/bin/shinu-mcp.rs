@@ -437,6 +437,9 @@ fn create_space_body(
     if let Some(disk_mib) = optional_u64(arguments, "disk_mib")? {
         object.insert("disk_mib".to_string(), Value::from(disk_mib));
     }
+    if let Some(network) = optional_string(arguments, "network")? {
+        object.insert("network".to_string(), Value::String(network));
+    }
     Ok(body)
 }
 
@@ -495,6 +498,7 @@ fn validate_arguments(name: &str, arguments: &Map<String, Value>) -> Result<(), 
             optional_u64(arguments, "vcpus")?;
             optional_u64(arguments, "mem_mib")?;
             optional_u64(arguments, "disk_mib")?;
+            optional_string(arguments, "network")?;
             Ok(())
         }
         "shinu_resize_space" => {
@@ -874,7 +878,8 @@ fn tool_definitions() -> Vec<Value> {
                 "image": {"type": "string", "enum": ["void", "ubuntu", "arch", "rocky"], "description": "guest image；只在创建时设定，之后固定。"},
                 "vcpus": {"type": "integer", "minimum": 1, "description": "该 space 的 vCPU 数量；省略时使用 daemon 默认值。"},
                 "mem_mib": {"type": "integer", "minimum": 1, "description": "该 space 的内存上限，单位 MiB；省略时使用 daemon 默认值。"},
-                "disk_mib": {"type": "integer", "minimum": 1, "description": "该 space 的磁盘容量，单位 MiB；省略时使用 daemon 默认值。"}
+                "disk_mib": {"type": "integer", "minimum": 1, "description": "该 space 的磁盘容量，单位 MiB；省略时使用 daemon 默认值。"},
+                "network": {"type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[a-z0-9-]+$", "description": "可选的项目内网络名称；同名 space 才能互相访问。"}
             }), &["name"]),
         }),
         json!({

@@ -1,4 +1,4 @@
-pub use crate::net::egress_rules;
+pub use crate::net::{egress_rules, peer_rules};
 
 use crate::config::VmConfig;
 use crate::net::NetConfig;
@@ -180,6 +180,10 @@ fn ensure_forward_rule(rule: &[String], position: usize) -> Result<()> {
 /// Every add is preceded by an existence check so retries do not grow the
 /// host firewall, while the address check preserves /30 isolation.
 pub fn tap_up(id: Uuid, cfg: &NetConfig) -> Result<()> {
+    tap_up_with_peers(id, cfg, &[])
+}
+
+pub fn tap_up_with_peers(id: Uuid, cfg: &NetConfig, peers: &[String]) -> Result<()> {
     if !cfg.enabled {
         return Ok(());
     }
@@ -284,7 +288,10 @@ pub fn tap_up(id: Uuid, cfg: &NetConfig) -> Result<()> {
     ensure_iptables_rule(&forward_in_check, &forward_in_add)?;
     // Insert after the broad forwarding rules so these entries end up
     // ahead of the unconditional tap-to-uplink ACCEPT.
-    for (position, rule) in egress_rules(&tap, &host, &cfg.allow).iter().enumerate() {
+    for (position, rule) in crate::net::egress_rules_with_peers(&tap, &host, &cfg.allow, peers)
+        .iter()
+        .enumerate()
+    {
         ensure_forward_rule(rule, position + 1)?;
     }
     // The guest uses a static /30 address and a public resolver baked into
@@ -295,10 +302,53 @@ pub fn tap_up(id: Uuid, cfg: &NetConfig) -> Result<()> {
     let input_add = ["-I", "INPUT", "1", "-i", &tap, "-j", "DROP"];
     ensure_iptables_rule(&input_check, &input_add)
 }
+/// Adds the current named-network peer exceptions to an existing tap.
+///
+/// This uses the same fixed positions as `tap_up`: gateway and explicit LAN
+/// allowances occupy the prefix, peer /32s follow, and the private-address
+/// drops remain after them. `ensure_forward_rule` makes repeated refreshes
+/// idempotent instead of growing FORWARD on every start.
+pub fn refresh_peer_rules(id: Uuid, cfg: &NetConfig, peers: &[String]) -> Result<()> {
+    if !cfg.enabled || peers.is_empty() {
+        return Ok(());
+    }
+    let tap = crate::net::tap_name(id);
+    let prefix = 1 + cfg.allow.len();
+    for (position, rule) in crate::net::peer_rules(&tap, peers).iter().enumerate() {
+        ensure_forward_rule(rule, prefix + position + 1)?;
+    }
+    Ok(())
+}
+
+/// Removes only named-network peer exceptions from an existing tap.
+///
+/// Stopping one member must not tear down the gateway, egress, or blanket
+/// isolation rules that still protect the remaining VM.
+pub fn remove_peer_rules(id: Uuid, cfg: &NetConfig, peers: &[String]) {
+    if !cfg.enabled || peers.is_empty() {
+        return;
+    }
+    let tap = crate::net::tap_name(id);
+    for rule in crate::net::peer_rules(&tap, peers) {
+        let mut args = vec![
+            "-w".to_owned(),
+            "5".to_owned(),
+            "-D".to_owned(),
+            "FORWARD".to_owned(),
+        ];
+        args.extend(rule);
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        let _ = std::process::Command::new("iptables").args(args).output();
+    }
+}
 
 /// Removes this VM's rules and tap. Cleanup is deliberately best effort:
 /// a stopped VM with a missing tap is already in the desired state.
 pub fn tap_down(id: Uuid, cfg: &NetConfig) {
+    tap_down_with_peers(id, cfg, &[])
+}
+
+pub fn tap_down_with_peers(id: Uuid, cfg: &NetConfig, peers: &[String]) {
     if !cfg.enabled {
         return;
     }
@@ -355,7 +405,7 @@ pub fn tap_down(id: Uuid, cfg: &NetConfig) {
             "ACCEPT",
         ])
         .output();
-    for rule in egress_rules(&tap, &gateway, &cfg.allow) {
+    for rule in crate::net::egress_rules_with_peers(&tap, &gateway, &cfg.allow, peers) {
         let mut args = vec!["-D".to_owned(), "FORWARD".to_owned()];
         args.extend(rule);
         let args = args.iter().map(String::as_str).collect::<Vec<_>>();
@@ -1191,12 +1241,16 @@ fn reclaim_stopped_image(root: &Path, dir: &Path, id: Uuid) {
 /// fine within one session came back empty after a stop). So flush the
 /// guest first, and keep SIGTERM/SIGKILL for one that is wedged or gone.
 pub fn stop(dir: &Path, cfg: &NetConfig) -> Result<bool> {
+    stop_with_peers(dir, cfg, &[])
+}
+
+pub fn stop_with_peers(dir: &Path, cfg: &NetConfig, peers: &[String]) -> Result<bool> {
     let id = dir_id(dir)?;
     let Some(pid) = running_pid(dir) else {
         let _ = std::fs::remove_file(vsock_path(dir));
         let _ = std::fs::remove_file(api_path(dir));
         let _ = std::fs::remove_file(pid_path(dir));
-        tap_down(id, cfg);
+        tap_down_with_peers(id, cfg, peers);
         clean_jail(dir)?;
         mark_stopped(dir);
         return Ok(false);
@@ -1239,7 +1293,7 @@ pub fn stop(dir: &Path, cfg: &NetConfig) -> Result<bool> {
         }
     }
     if !gone {
-        tap_down(id, cfg);
+        tap_down_with_peers(id, cfg, peers);
         return Err(Error::Invalid(format!(
             "firecracker pid {pid} did not stop"
         )));
@@ -1247,7 +1301,7 @@ pub fn stop(dir: &Path, cfg: &NetConfig) -> Result<bool> {
     let _ = std::fs::remove_file(vsock_path(dir));
     let _ = std::fs::remove_file(api_path(dir));
     let _ = std::fs::remove_file(pid_path(dir));
-    tap_down(id, cfg);
+    tap_down_with_peers(id, cfg, peers);
     clean_jail(dir)?;
     mark_stopped(dir);
     Ok(true)

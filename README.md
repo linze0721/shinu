@@ -92,10 +92,15 @@ shinu gc
 
 ## Requirements
 
-- `/dev/kvm` and the `SHINU_ROOT` directory **must be on a btrfs filesystem**. Spaces are instantiated via `cp --reflink=always`. Any non-btrfs filesystem fails loudly during space creation (`Operation not supported`).
+Run `packaging/preflight.sh [root-path]` on a candidate host before installing; it checks everything below and exits non-zero naming the specific reason.
+
+- **Hardware virtualisation.** `/dev/kvm` must exist and the CPU must expose `vmx` or `svm`. On bare metal this means VT-x/AMD-V enabled in firmware; on a VPS it means the provider offers nested virtualisation. Most shared VPS plans do not.
+- **Reflink-capable filesystem.** The `--root` directory must be on btrfs (or reflink-capable xfs). Spaces are cloned with `cp --reflink=always`, which is what keeps a clone 0 bytes exclusive; a plain copy is never substituted, so any other filesystem fails loudly at space creation.
+- **`/dev/vhost-vsock`.** `exec` tunnels over AF_VSOCK, so without the `vhost_vsock` module no command can reach a guest.
 - `x86_64` CPU architecture. The guest kernel and Firecracker v1.13.1 binaries are fetched automatically on first boot.
-- External binaries required on host: `curl tar mkfs.ext4 e2fsck mount umount truncate ssh ssh-keygen setsid cp chown btrfs df kill ip iptables`.
+- External binaries required on host: `curl tar mkfs.ext4 e2fsck mount umount truncate ssh ssh-keygen setsid cp chown btrfs df kill ip iptables unshare debugfs losetup`.
 - `shinud` daemon **must run as root** to create loop devices, configure NAT network interfaces (`iptables`), and set up tap devices.
+- `net.ipv4.ip_forward` must be enabled for guest egress, and cgroup v2 must be mounted for the jailer's resource limits.
 - HTTP clients run non-root and require no host group memberships (specifically no `/dev/kvm` or root access required).
 
 ---

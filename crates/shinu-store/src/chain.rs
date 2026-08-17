@@ -98,7 +98,7 @@ pub fn is_referenced(st: &state::State, ckpt: Uuid) -> Vec<String> {
         }
     }
     for other in &st.ckpts {
-        if other.id != ckpt && other.parent == Some(ckpt) {
+        if other.id != ckpt && (other.parent == Some(ckpt) || other.base == Some(ckpt)) {
             references.push(short_id(other.id));
         }
     }
@@ -145,6 +145,7 @@ mod chain_tests {
             parent,
             auto: false,
             full: false,
+            base: None,
             note: "note".to_owned(),
             created_at: Utc::now(),
         }
@@ -298,7 +299,11 @@ mod chain_tests {
             ],
             ckpts: vec![
                 ckpt(target, id(33), None),
-                ckpt(child, id(33), Some(target)),
+                {
+                    let mut diff = ckpt(child, id(33), None);
+                    diff.base = Some(target);
+                    diff
+                },
             ],
         };
 

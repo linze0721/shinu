@@ -631,11 +631,27 @@ pub fn release(dir: &Path) {
     let _ = api(dir, "PATCH", "/balloon", Some("{\"amount_mib\": 0}"));
 }
 
+/// The memory representation requested from Firecracker when creating a snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotKind {
+    Full,
+    Diff,
+}
+
+impl SnapshotKind {
+    fn firecracker_name(self) -> &'static str {
+        match self {
+            Self::Full => "Full",
+            Self::Diff => "Diff",
+        }
+    }
+}
+
 /// Captures guest RAM and vCPU state beside the disk image.
 ///
 /// Firecracker resolves these paths inside the jailer's chroot, so the files
 /// land in the jail and must be moved out by the caller.
-pub fn snapshot(dir: &Path) -> Result<(PathBuf, PathBuf)> {
+pub fn snapshot(dir: &Path, kind: SnapshotKind) -> Result<(PathBuf, PathBuf)> {
     release(dir);
     if api(
         dir,
@@ -649,16 +665,11 @@ pub fn snapshot(dir: &Path) -> Result<(PathBuf, PathBuf)> {
             "failed to pause VM for snapshot".to_owned(),
         ));
     }
-    if api(
-        dir,
-        "PUT",
-        "/snapshot/create",
-        Some(
-            "{\"snapshot_type\":\"Full\",\"snapshot_path\":\"snap.state\",\"mem_file_path\":\"snap.mem\"}",
-        ),
-    )
-    .is_none()
-    {
+    let body = format!(
+        "{{\"snapshot_type\":\"{}\",\"snapshot_path\":\"snap.state\",\"mem_file_path\":\"snap.mem\"}}",
+        kind.firecracker_name()
+    );
+    if api(dir, "PUT", "/snapshot/create", Some(&body)).is_none() {
         // A failed create leaves Firecracker paused, so always make the best
         // effort to restore normal VM operation before reporting the error.
         let _ = api(
@@ -687,6 +698,87 @@ pub fn snapshot(dir: &Path) -> Result<(PathBuf, PathBuf)> {
         jail_path(dir, JAIL_SNAP_MEM),
         jail_path(dir, JAIL_SNAP_STATE),
     ))
+}
+
+/// Byte ranges the diff actually wrote, found with `SEEK_DATA`/`SEEK_HOLE`.
+///
+/// Firecracker writes a diff as a sparse file: holes are pages the guest never
+/// touched, and allocated ranges are the dirty pages. That distinction cannot
+/// be recovered from the bytes themselves, because a dirty page whose new
+/// contents are all zero looks exactly like a hole to any content-based scan.
+/// The kernel knows which is which, so ask it.
+fn written_extents(file: &std::fs::File, size: u64) -> Result<Vec<(u64, u64)>> {
+    // Declared rather than taken from a crate: this is the only syscall in the
+    // codebase std does not expose, and one extern beats a dependency.
+    unsafe extern "C" {
+        fn lseek(fd: i32, offset: i64, whence: i32) -> i64;
+    }
+    const SEEK_DATA: i32 = 3;
+    const SEEK_HOLE: i32 = 4;
+    let fd = std::os::fd::AsRawFd::as_raw_fd(file);
+    let mut extents = Vec::new();
+    let mut offset = 0i64;
+    while (offset as u64) < size {
+        let start = unsafe { lseek(fd, offset, SEEK_DATA) };
+        if start < 0 {
+            let error = std::io::Error::last_os_error();
+            // ENXIO means no data remains past this offset: the normal exit.
+            // Anything else (a filesystem without extent seeks, most of all)
+            // must fail loudly, because silently treating the diff as empty
+            // would restore the base alone and call it the caller's snapshot.
+            if error.raw_os_error() == Some(6) {
+                break;
+            }
+            return Err(Error::Invalid(format!(
+                "cannot map written extents of a diff snapshot: {error}"
+            )));
+        }
+        let end = unsafe { lseek(fd, start, SEEK_HOLE) };
+        if end < 0 {
+            return Err(Error::Invalid(format!(
+                "cannot map the end of a diff snapshot extent: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        extents.push((start as u64, (end - start) as u64));
+        offset = end;
+    }
+    Ok(extents)
+}
+
+/// Builds a loadable memory image from a full base and a Firecracker diff.
+///
+/// The reflink keeps every untouched page shared with the base, then only the
+/// diff's written extents are copied over it. Both halves matter:
+///
+/// Copying the whole diff instead (`dd conv=notrunc`) would write its holes as
+/// zeros, which both destroys the base's untouched pages and allocates the
+/// full 1 GiB, defeating the reflink. Skipping zeros instead (`conv=sparse`)
+/// would drop pages the guest deliberately zeroed and leave the base's stale
+/// bytes there. Measured, both produced a wrong image; extents are what
+/// distinguish "never written" from "written as zero".
+pub fn merge_snapshot_memory(base: &Path, diff: &Path, merged: &Path) -> Result<()> {
+    if merged.exists() {
+        std::fs::remove_file(merged)?;
+    }
+    shinu_core::btrfs::reflink(base, merged)?;
+    let source = std::fs::File::open(diff)?;
+    let size = source.metadata()?.len();
+    let extents = written_extents(&source, size)?;
+    let target = std::fs::OpenOptions::new().write(true).open(merged)?;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    for (offset, length) in extents {
+        let mut copied = 0u64;
+        while copied < length {
+            let chunk = std::cmp::min(buffer.len() as u64, length - copied) as usize;
+            let at = offset + copied;
+            std::os::unix::fs::FileExt::read_exact_at(&source, &mut buffer[..chunk], at)?;
+            std::os::unix::fs::FileExt::write_all_at(&target, &buffer[..chunk], at)?;
+            copied += chunk as u64;
+        }
+    }
+    target.sync_all()?;
+    Ok(())
 }
 
 fn signal(pid: u32, sig: &str) -> bool {

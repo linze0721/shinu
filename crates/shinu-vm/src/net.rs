@@ -266,7 +266,7 @@ mod network_tests {
     }
 
     #[test]
-    fn vm_config_without_network_is_the_legacy_bytes() {
+    fn vm_config_without_network_enables_dirty_tracking() {
         let actual = vm_config_json(
             Path::new("/kernel"),
             Path::new("/rootfs"),
@@ -289,7 +289,7 @@ mod network_tests {
             }],
             "vsock": { "vsock_id": "vsock0", "guest_cid": 3, "uds_path": "/vsock" },
             "balloon": { "amount_mib": 0, "deflate_on_oom": true, "stats_polling_interval_s": 1 },
-            "machine-config": { "vcpu_count": 2, "mem_size_mib": 128 }
+            "machine-config": { "vcpu_count": 2, "mem_size_mib": 128, "track_dirty_pages": true }
         })
         .to_string();
         assert_eq!(actual, legacy);

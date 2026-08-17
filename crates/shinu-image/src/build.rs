@@ -48,6 +48,11 @@ fn build_base(root: &Path, base: &Path, image: Image, cfg: &BaseConfig) -> Resul
                     // The shipped xbps refuses to install anything until it updates
                     // itself, so -S is required before both package operations.
                     chroot_run(&mnt, "xbps-install -y -S -u xbps")?;
+                    // The shipped libstdc++ can lag the repository's current packages,
+                    // causing CXXABI errors in programs that link modern C++ libraries.
+                    chroot_run(&mnt, "xbps-install -Syu")?;
+                    // xbps may replace itself during the first pass before all upgrades apply.
+                    chroot_run(&mnt, "xbps-install -yu")?;
                     chroot_run(&mnt, "xbps-install -y -S socat openssh iproute2 git tmux xorg-server-xvfb x11vnc openbox xdotool scrot")?;
                 }
                 // ca-certificates is not pulled in by --no-install-recommends, and

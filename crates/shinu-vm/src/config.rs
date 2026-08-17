@@ -74,7 +74,8 @@ pub fn vm_config_json(
         // memory back before the daemon deflates, the balloon yields instead
         // of letting the OOM killer run.
         "balloon": { "amount_mib": 0, "deflate_on_oom": true, "stats_polling_interval_s": 1 },
-        "machine-config": { "vcpu_count": vcpus, "mem_size_mib": mem_mib }
+        // Diff snapshots depend on Firecracker's dirty-page bitmap, which cannot be enabled after boot.
+        "machine-config": { "vcpu_count": vcpus, "mem_size_mib": mem_mib, "track_dirty_pages": true }
     });
     if let Some(net) = net {
         config["network-interfaces"] = serde_json::json!([{

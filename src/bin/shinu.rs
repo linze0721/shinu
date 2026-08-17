@@ -1,6 +1,7 @@
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
+use shinu::proto::SnapshotMode;
 use shinu::token::{self, Token};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
@@ -11,6 +12,7 @@ use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+use shinu_image::DEFAULT_DIFF_LIMIT;
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:7878";
 
@@ -82,6 +84,12 @@ enum Command {
         #[arg(long, default_value_t = 5901)]
         port: u16,
     },
+    Proxy {
+        space: String,
+        port: u16,
+        #[arg(long, default_value = "/")]
+        path: String,
+    },
     Exec {
         space: String,
         #[arg(long, value_name = "FILE")]
@@ -105,8 +113,10 @@ enum Command {
         note: String,
         #[arg(long)]
         hot: bool,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "diff")]
         full: bool,
+        #[arg(long, conflicts_with = "full")]
+        diff: bool,
     },
     Log {
         space: String,
@@ -117,6 +127,16 @@ enum Command {
         space: String,
         #[arg(long)]
         json: bool,
+    },
+    /// Compare filesystems: SOURCE alone is a space versus HEAD; SOURCE plus
+    /// a commit compares that space to the commit, or compares two commits.
+    Diff {
+        source: String,
+        target: Option<String>,
+        #[arg(long, help = "include all paths; by default exclude /dev, /proc, /run, /sys, /tmp, /var/log, /etc/machine-id, and /etc/ssh/ssh_host_*")]
+        all: bool,
+        #[arg(long, default_value_t = DEFAULT_DIFF_LIMIT, help = "maximum reported entries (default 10000; larger values are capped by the daemon)")]
+        limit: usize,
     },
     Checkout {
         space: String,
@@ -463,6 +483,35 @@ impl HttpClient {
             stream_body(&mut reader, &head.headers, &mut output)
         }
     }
+    fn proxy_once(&self, space: &str, port: u16, path: &str) -> Result<i32, String> {
+        if port == 0 {
+            return Err("proxy port must be between 1 and 65535".to_string());
+        }
+        if !path.starts_with('/')
+            || path
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte == b' ')
+        {
+            return Err("proxy path must start with / and contain no control characters".to_string());
+        }
+        let target = format!(
+            "/v1/spaces/{}/proxy/{port}{path}",
+            encode_path_segment(space)
+        );
+        let (mut reader, head) = self.open_request("GET", &target, None)?;
+        let body = read_body(&mut reader, &head.headers)?;
+        let stdout = io::stdout();
+        let mut output = stdout.lock();
+        writeln!(output, "HTTP/1.1 {}", head.status).map_err(|error| error.to_string())?;
+        for (name, value) in &head.headers {
+            writeln!(output, "{name}: {value}").map_err(|error| error.to_string())?;
+        }
+        output.write_all(b"\r\n").map_err(|error| error.to_string())?;
+        output.write_all(&body).map_err(|error| error.to_string())?;
+        output.flush().map_err(|error| error.to_string())?;
+        Ok(if (200..300).contains(&head.status) { 0 } else { 1 })
+    }
+
     fn proxy_vnc(&self, space: &str, port: u16) -> Result<i32, String> {
         let listener = TcpListener::bind(("127.0.0.1", port))
             .map_err(|error| format!("could not listen on localhost:{port}: {error}"))?;
@@ -859,6 +908,7 @@ fi"#
             }
             return Ok(status);
         }
+        Command::Proxy { space, port, path } => return client.proxy_once(&space, port, &path),
         Command::Vnc { space, port } => return client.proxy_vnc(&space, port),
         Command::Exec { space, stdin, cmd } => {
             return client.stream_exec(&space, &cmd, stdin.as_deref());
@@ -888,11 +938,18 @@ fi"#
             note,
             hot,
             full,
+            diff,
         } => {
+            let snapshot = match (full, diff) {
+                (true, false) => SnapshotMode::Full,
+                (false, true) => SnapshotMode::Diff,
+                (false, false) => SnapshotMode::None,
+                (true, true) => unreachable!("clap rejects --full with --diff"),
+            };
             let data = response_value(client.request(
                 "POST",
                 &format!("/v1/spaces/{}/commits", encode_path_segment(&space)),
-                Some(json!({ "note": note, "hot": hot, "full": full })),
+                Some(json!({ "note": note, "hot": hot, "snapshot": snapshot })),
             )?)?;
             println!("{}  {}", short_id_value(data.get("id")), field_text(&data, "note"));
         }
@@ -921,6 +978,34 @@ fi"#
             } else {
                 print_reflog(&response_value_from_body(&body)?);
             }
+        }
+        Command::Diff {
+            source,
+            target,
+            all,
+            limit,
+        } => {
+            let mut path = format!(
+                "/v1/spaces/{}/diff",
+                encode_path_segment(&source)
+            );
+            let mut query = Vec::new();
+            if let Some(target) = target {
+                if source.parse::<Uuid>().is_ok() && target.parse::<Uuid>().is_ok() {
+                    query.push(format!("from={}", encode_query_value(&source)));
+                    query.push(format!("to={}", encode_query_value(&target)));
+                } else {
+                    query.push(format!("from={}", encode_query_value(&target)));
+                }
+            }
+            if all {
+                query.push("all=1".to_owned());
+            }
+            query.push(format!("limit={limit}"));
+            path.push('?');
+            path.push_str(&query.join("&"));
+            let data = response_value(client.request("GET", &path, None)?)?;
+            print_diff(&data);
         }
         Command::Checkout { space, commit } => {
             let data = response_value(client.request(
@@ -1307,6 +1392,28 @@ fn print_log(data: &Value) {
 fn print_reflog(data: &Value) {
     print_checkpoint_list(data, "entries");
 }
+fn print_diff(data: &Value) {
+    if let Some(entries) = data.get("entries").and_then(Value::as_array) {
+        for entry in entries {
+            println!("{} {}", field_text(entry, "status"), field_text(entry, "path"));
+        }
+    }
+    let summary = data.get("summary");
+    let added = value_u64(summary.and_then(|value| value.get("added"))).unwrap_or(0);
+    let removed = value_u64(summary.and_then(|value| value.get("removed"))).unwrap_or(0);
+    let modified = value_u64(summary.and_then(|value| value.get("modified"))).unwrap_or(0);
+    let total = value_u64(summary.and_then(|value| value.get("total"))).unwrap_or(0);
+    println!("summary: +{added} -{removed} M{modified} ({total} total)");
+    if data
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let limit = value_u64(data.get("limit")).unwrap_or(0);
+        println!("output truncated at {limit} entries");
+    }
+}
+
 
 fn print_checkpoint_list(data: &Value, key: &str) {
     if let Some(commits) = data.get(key).and_then(Value::as_array) {

@@ -13,9 +13,13 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use rusqlite::Connection;
+use shinu_image::{
+    diff_images, DiffEntry, DiffOptions, DiffResult, DiffStatus, DEFAULT_DIFF_LIMIT,
+    DEFAULT_EXCLUSIONS, MAX_DIFF_LIMIT,
+};
 use shinu::{
     http,
-    proto::Req,
+    proto::{Req, SnapshotMode},
     quota::{self, Limits, RateLimiter},
     registry::Registry,
     state::{self, Ckpt, Space, State},
@@ -165,6 +169,58 @@ struct Ctx<'a> {
     register_rate: &'a RegistrationLimiter,
     registry: &'a Registry,
 }
+
+/// Keeps the parsed header bytes available for proxy forwarding while leaving
+/// normal routes on the shared HTTP parser and body reader.
+struct RequestReader<'a> {
+    inner: BufReader<&'a mut TcpStream>,
+    captured: Vec<u8>,
+    capture: bool,
+}
+
+impl<'a> RequestReader<'a> {
+    fn new(stream: &'a mut TcpStream) -> Self {
+        Self {
+            inner: BufReader::new(stream),
+            captured: Vec::new(),
+            capture: true,
+        }
+    }
+
+    fn stop_capture(&mut self) {
+        self.capture = false;
+        self.captured.clear();
+    }
+
+    fn take_headers(&mut self) -> Vec<u8> {
+        self.capture = false;
+        std::mem::take(&mut self.captured)
+    }
+}
+
+impl Read for RequestReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.inner.read(buffer)?;
+        if self.capture {
+            self.captured.extend_from_slice(&buffer[..count]);
+        }
+        Ok(count)
+    }
+}
+
+impl BufRead for RequestReader<'_> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amount: usize) {
+        if self.capture && let Ok(buffer) = self.inner.fill_buf() {
+            self.captured.extend_from_slice(&buffer[..amount]);
+        }
+        self.inner.consume(amount);
+    }
+}
+
 
 struct RegistrationLimiter {
     // quota::RateLimiter is a 60-second per-project limiter; registration is
@@ -678,14 +734,14 @@ fn require_checkpoint_note(note: &str) -> shinu::Result<()> {
     Ok(())
 }
 
-/// The three independent booleans a new checkpoint carries. Grouping them
-/// keeps callsites readable: a bare `false, false, true` argument tail says
-/// nothing about which flag is which.
+/// The checkpoint metadata needed when appending a state transition.
 struct CkptFlags {
     /// Written by the daemon itself rather than requested by a caller.
     auto: bool,
     /// Has memory and vCPU state beside the disk image.
     full: bool,
+    /// Full checkpoint whose memory this diff overlays, if any.
+    base: Option<Uuid>,
     /// Moves the space's head to this checkpoint.
     update_head: bool,
 }
@@ -711,6 +767,7 @@ fn append_checkpoint(
         parent,
         auto: flags.auto,
         full: flags.full,
+        base: flags.base,
         note,
         created_at: Utc::now(),
     };
@@ -719,6 +776,39 @@ fn append_checkpoint(
         state.spaces[space_index].head = Some(id);
     }
     Ok(checkpoint)
+}
+
+fn latest_full_checkpoint(state: &State, space: &Space) -> Option<Ckpt> {
+    shinu::log_chain(state, space)
+        .into_iter()
+        .find(|checkpoint| checkpoint.full && checkpoint.base.is_none())
+        .cloned()
+}
+
+fn materialize_checkpoint_memory(
+    root: &Path,
+    checkpoint: &Ckpt,
+    destination: &Path,
+) -> shinu::Result<()> {
+    if !checkpoint.full {
+        return Err(shinu::Error::Invalid(format!(
+            "checkpoint {} has no memory snapshot",
+            checkpoint.id
+        )));
+    }
+    let memory = shinu::ckpt_mem(root, checkpoint.id);
+    if let Some(base) = checkpoint.base {
+        let base_memory = shinu::ckpt_mem(root, base);
+        if !base_memory.exists() {
+            return Err(shinu::Error::Invalid(format!(
+                "diff checkpoint {} requires missing base checkpoint {}",
+                checkpoint.id, base
+            )));
+        }
+        shinu::vm::merge_snapshot_memory(&base_memory, &memory, destination)
+    } else {
+        shinu::btrfs::clone_for(&memory, destination, 0, 0)
+    }
 }
 
 fn set_head(state: &mut State, space_id: Uuid, project: &str, head: Uuid) -> shinu::Result<()> {
@@ -888,7 +978,7 @@ fn fork_space(
     name: String,
 ) -> shinu::Result<Value> {
     let limits = effective_limits(ctx, project)?;
-    let (source, source_full, source_space) = {
+    let (source_checkpoint, source_space) = {
         let _state_guard = lock_state(ctx.registry);
         let connection = lock_db(ctx.db);
         let state = state::load(&connection)?;
@@ -905,8 +995,10 @@ fn fork_space(
             .unwrap_or_else(|| image_size_mib(&shinu::ckpt_image(ctx.root, checkpoint.id)));
         check_space_quota(ctx.root, &connection, project, &limits, source_disk)?;
         check_vm_sizing(ctx, &limits, source_space.vcpus, source_space.mem_mib)?;
-        (checkpoint.id, checkpoint.full, source_space)
+        (checkpoint, source_space)
     };
+    let source = source_checkpoint.id;
+    let source_full = source_checkpoint.full;
     let id = Uuid::new_v4();
     let space_guard = ctx.registry.space_lock(id);
     let _space_guard = space_guard
@@ -940,12 +1032,7 @@ fn fork_space(
             shinu::vm::authorize(&image_path, &public_key, &mount)?;
         }
         if source_full {
-            shinu::btrfs::clone_for(
-                &shinu::ckpt_mem(ctx.root, source),
-                &snapshot_mem,
-                0,
-                0,
-            )?;
+            materialize_checkpoint_memory(ctx.root, &source_checkpoint, &snapshot_mem)?;
             shinu::btrfs::clone_for(
                 &shinu::ckpt_state(ctx.root, source),
                 &snapshot_state,
@@ -1001,7 +1088,7 @@ fn commit_space(
     space: String,
     note: String,
     hot: bool,
-    full: bool,
+    mode: SnapshotMode,
 ) -> shinu::Result<Value> {
     require_checkpoint_note(&note)?;
     let (space_id, space_name) = {
@@ -1014,16 +1101,47 @@ fn commit_space(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let vm_dir = shinu::vm_dir(ctx.root, space_id);
     let running = shinu::vm::is_running(&vm_dir);
-    if full && !running {
-        return Err(shinu::Error::Invalid(
-            "a full checkpoint needs a running space; start it or drop --full".into(),
-        ));
+    let has_snapshot = !matches!(mode, SnapshotMode::None);
+    if has_snapshot && !running {
+        let kind = match mode {
+            SnapshotMode::Full => "full",
+            SnapshotMode::Diff => "diff",
+            SnapshotMode::None => unreachable!(),
+        };
+        return Err(shinu::Error::Invalid(format!(
+            "a {kind} checkpoint needs a running space; start it or drop --{kind}"
+        )));
     }
-    if running && !hot && !full {
+    if running && !hot && !has_snapshot {
         return Err(shinu::Error::Invalid(format!(
             "stop the space before checkpointing it: {space_name}"
         )));
     }
+    let diff_base = if mode == SnapshotMode::Diff {
+        let state = snapshot(ctx.db, ctx.registry)?;
+        let current_space = state
+            .spaces
+            .iter()
+            .find(|entry| entry.id == space_id && entry.project == project)
+            .ok_or_else(|| shinu::Error::NotFound(space_name.clone()))?;
+        let base = latest_full_checkpoint(&state, current_space).ok_or_else(|| {
+            shinu::Error::Invalid(
+                "a diff checkpoint needs an existing full checkpoint in this space's history"
+                    .into(),
+            )
+        })?;
+        let base_mem = shinu::ckpt_mem(ctx.root, base.id);
+        let base_state = shinu::ckpt_state(ctx.root, base.id);
+        if !base_mem.exists() || !base_state.exists() {
+            return Err(shinu::Error::Invalid(format!(
+                "full checkpoint {} is missing memory or state files",
+                base.id
+            )));
+        }
+        Some(base)
+    } else {
+        None
+    };
     if running {
         // A hot commit flushes once, but writes after sync and before reflink
         // completion remain outside the image by design.
@@ -1040,23 +1158,24 @@ fn commit_space(
         }
     }
     let id = Uuid::new_v4();
-    let full_limits = if full {
-        Some(effective_limits(ctx, project)?)
-    } else {
-        None
-    };
+    let snapshot_limits = has_snapshot.then(|| effective_limits(ctx, project)).transpose()?;
     let image = shinu::ckpt_image(ctx.root, id);
     let jail_snapshot_mem = shinu::vm::jail_root(ctx.root, space_id).join("snap.mem");
     let jail_snapshot_state = shinu::vm::jail_root(ctx.root, space_id).join("snap.state");
     let result = (|| -> shinu::Result<Value> {
         shinu::btrfs::clone_for(&shinu::space_image(ctx.root, space_id), &image, 0, 0)?;
-        if full {
-            let (snapshot_mem, snapshot_state) = shinu::vm::snapshot(&vm_dir)?;
+        if has_snapshot {
+            let kind = match mode {
+                SnapshotMode::Full => shinu::vm::SnapshotKind::Full,
+                SnapshotMode::Diff => shinu::vm::SnapshotKind::Diff,
+                SnapshotMode::None => unreachable!(),
+            };
+            let (snapshot_mem, snapshot_state) = shinu::vm::snapshot(&vm_dir, kind)?;
             std::fs::rename(snapshot_mem, shinu::ckpt_mem(ctx.root, id))?;
             std::fs::rename(snapshot_state, shinu::ckpt_state(ctx.root, id))?;
         }
         let checkpoint = update_state(ctx.db, ctx.registry, |state| {
-            if let Some(limits) = full_limits.as_ref() {
+            if let Some(limits) = snapshot_limits.as_ref() {
                 let new_checkpoint_mib = checkpoint_exclusive(ctx.root, id)?
                     .saturating_add(1024 * 1024 - 1)
                     / (1024 * 1024);
@@ -1067,6 +1186,18 @@ fn commit_space(
                     limits,
                 )?;
             }
+            if let Some(base) = diff_base.as_ref() {
+                let still_present = state
+                    .ckpts
+                    .iter()
+                    .any(|checkpoint| checkpoint.id == base.id && checkpoint.project == project);
+                if !still_present {
+                    return Err(shinu::Error::Invalid(format!(
+                        "diff checkpoint base {} was deleted before commit completed",
+                        base.id
+                    )));
+                }
+            }
             append_checkpoint(
                 state,
                 space_id,
@@ -1075,7 +1206,8 @@ fn commit_space(
                 note,
                 CkptFlags {
                     auto: false,
-                    full,
+                    full: has_snapshot,
+                    base: diff_base.as_ref().map(|checkpoint| checkpoint.id),
                     update_head: true,
                 },
             )
@@ -1141,6 +1273,7 @@ fn checkout_space(
             parent: current_head,
             auto: true,
             full: false,
+            base: None,
             note: auto_note.clone(),
             created_at: Utc::now(),
         };
@@ -1160,12 +1293,19 @@ fn checkout_space(
     let snapshot_state = space_snapshot_state(ctx.root, space_id);
     if target.full {
         remove_space_snapshot_files(ctx.root, space_id)?;
-        shinu::btrfs::clone_for(
-            &shinu::ckpt_mem(ctx.root, target.id),
-            &snapshot_mem,
-            0,
-            0,
-        )?;
+        if let Some(base_id) = target.base {
+            let base = find_checkpoint(ctx.db, base_id, project)?;
+            if !base.full || base.base.is_some() {
+                return Err(shinu::Error::Invalid(format!(
+                    "diff checkpoint {} does not have a standalone full base {}",
+                    target.id, base_id
+                )));
+            }
+        }
+        if let Err(error) = materialize_checkpoint_memory(ctx.root, &target, &snapshot_mem) {
+            let _ = remove_space_snapshot_files(ctx.root, space_id);
+            return Err(error);
+        }
         if let Err(error) = shinu::btrfs::clone_for(
             &shinu::ckpt_state(ctx.root, target.id),
             &snapshot_state,
@@ -1283,29 +1423,22 @@ fn remove_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Val
     Ok(json!({ "removed": resolved_name, "id": id }))
 }
 fn remove_checkpoint(ctx: &Ctx<'_>, project: &str, id: Uuid) -> shinu::Result<Value> {
-    let checkpoint = find_checkpoint(ctx.db, id, project)?;
-    let state = snapshot(ctx.db, ctx.registry)?;
-    let referenced = shinu::is_referenced(&state, checkpoint.id);
-    if !referenced.is_empty() {
-        return Err(shinu::Error::Invalid(format!(
-            "checkpoint {id} is still referenced by: {}",
-            referenced.join(", ")
-        )));
-    }
-    let image = shinu::ckpt_image(ctx.root, id);
-    remove_file_if_missing(&image)?;
-    remove_file_if_missing(&shinu::ckpt_mem(ctx.root, id))?;
-    remove_file_if_missing(&shinu::ckpt_state(ctx.root, id))?;
+    find_checkpoint(ctx.db, id, project)?;
     update_state(ctx.db, ctx.registry, |state| {
         let checkpoint = shinu::find_ckpt(state, id, project)?;
-        if !shinu::is_referenced(state, checkpoint.id).is_empty() {
+        let referenced = shinu::is_referenced(state, checkpoint.id);
+        if !referenced.is_empty() {
             return Err(shinu::Error::Invalid(format!(
-                "checkpoint {id} is still referenced"
+                "checkpoint {id} is still referenced by: {}",
+                referenced.join(", ")
             )));
         }
         state.ckpts.retain(|entry| entry.id != id);
         Ok(())
     })?;
+    remove_file_if_missing(&shinu::ckpt_image(ctx.root, id))?;
+    remove_file_if_missing(&shinu::ckpt_mem(ctx.root, id))?;
+    remove_file_if_missing(&shinu::ckpt_state(ctx.root, id))?;
     Ok(json!({ "removed": id }))
 }
 
@@ -1690,6 +1823,106 @@ fn limits_value(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
         },
     }))
 }
+struct DiffSpec {
+    space: String,
+    from: Option<Uuid>,
+    to: Option<Uuid>,
+    all: bool,
+    limit: usize,
+}
+
+fn diff_space(ctx: &Ctx<'_>, project: &str, spec: DiffSpec) -> shinu::Result<Value> {
+    let state = snapshot(ctx.db, ctx.registry)?;
+    let (old_image, new_image) = match (spec.from, spec.to) {
+        (Some(from), Some(to)) => {
+            shinu::find_ckpt(&state, from, project)?;
+            shinu::find_ckpt(&state, to, project)?;
+            (shinu::ckpt_image(ctx.root, from), shinu::ckpt_image(ctx.root, to))
+        }
+        (Some(from), None) => {
+            let space = shinu::find(&state, &spec.space, project)?;
+            shinu::find_ckpt(&state, from, project)?;
+            (shinu::ckpt_image(ctx.root, from), shinu::space_image(ctx.root, space.id))
+        }
+        (None, Some(to)) => {
+            if let Ok(from) = spec.space.parse::<Uuid>() {
+                shinu::find_ckpt(&state, from, project)?;
+                shinu::find_ckpt(&state, to, project)?;
+                (shinu::ckpt_image(ctx.root, from), shinu::ckpt_image(ctx.root, to))
+            } else {
+                let space = shinu::find(&state, &spec.space, project)?;
+                shinu::find_ckpt(&state, to, project)?;
+                (shinu::space_image(ctx.root, space.id), shinu::ckpt_image(ctx.root, to))
+            }
+        }
+        (None, None) => {
+            let space = shinu::find(&state, &spec.space, project)?;
+            let head = space.head.ok_or_else(|| {
+                shinu::Error::Invalid(format!("space {} has no HEAD checkpoint", space.name))
+            })?;
+            shinu::find_ckpt(&state, head, project)?;
+            (shinu::ckpt_image(ctx.root, head), shinu::space_image(ctx.root, space.id))
+        }
+    };
+    let limit = spec.limit.min(MAX_DIFF_LIMIT);
+    let result = diff_images(
+        &old_image,
+        &new_image,
+        ctx.root,
+        DiffOptions {
+            all: spec.all,
+            limit,
+        },
+    )?;
+    Ok(diff_json(&result, spec.all, limit))
+}
+
+fn diff_json(result: &DiffResult, all: bool, limit: usize) -> Value {
+    let entries = result
+        .entries
+        .iter()
+        .map(|entry| {
+            json!({
+                "status": diff_status_marker(entry),
+                "path": entry.path,
+            })
+        })
+        .collect::<Vec<_>>();
+    let exclusions = if all {
+        Vec::new()
+    } else {
+        DEFAULT_EXCLUSIONS.to_vec()
+    };
+    let total = result.added + result.removed + result.modified;
+    json!({
+        "comparison": "size_or_mtime",
+        "entries": entries,
+        "added": result.added,
+        "removed": result.removed,
+        "modified": result.modified,
+        "total": total,
+        "reported": result.entries.len(),
+        "summary": {
+            "added": result.added,
+            "removed": result.removed,
+            "modified": result.modified,
+            "total": total,
+            "reported": result.entries.len(),
+        },
+        "limit": limit,
+        "truncated": result.truncated,
+        "excluded": exclusions,
+    })
+}
+
+fn diff_status_marker(entry: &DiffEntry) -> &'static str {
+    match entry.status {
+        DiffStatus::Added => "+",
+        DiffStatus::Removed => "-",
+        DiffStatus::Modified => "M",
+    }
+}
+
 
 fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
     match req {
@@ -1724,8 +1957,8 @@ fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
             space,
             note,
             hot,
-            full,
-        } => commit_space(ctx, project, space, note, hot, full),
+            snapshot,
+        } => commit_space(ctx, project, space, note, hot, snapshot),
         Req::Checkout { space, commit } => checkout_space(ctx, project, space, commit),
         Req::Log { space } => {
             let state = snapshot(ctx.db, ctx.registry)?;
@@ -1745,6 +1978,23 @@ fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
                 .collect::<shinu::Result<Vec<_>>>()?;
             Ok(json!({ "entries": entries }))
         }
+        Req::Diff {
+            space,
+            from,
+            to,
+            all,
+            limit,
+        } => diff_space(
+            ctx,
+            project,
+            DiffSpec {
+                space,
+                from,
+                to,
+                all,
+                limit,
+            },
+        ),
         Req::Rm { space } => remove_space(ctx, project, space),
         Req::RmCkpt { ckpt } => remove_checkpoint(ctx, project, ckpt),
         Req::Ls => list_spaces(ctx, project),
@@ -1784,12 +2034,18 @@ enum Endpoint {
     Start(String),
     Stop(String),
     Exec(String),
+    Proxy {
+        space: String,
+        port: u16,
+        path: String,
+    },
     Push(String),
     Pull(String),
     Vnc(String),
     Commit(String),
     Log(String),
     Reflog(String),
+    Diff(String),
     Checkout(String),
     Fork(String),
     RmCkpt(String),
@@ -1797,8 +2053,8 @@ enum Endpoint {
 }
 
 fn route(path: &str) -> Option<Endpoint> {
-    let path = path.split_once('?').map_or(path, |(path, _)| path);
-    match path {
+    let (path_without_query, query) = path.split_once('?').map_or((path, ""), |parts| parts);
+    match path_without_query {
         "/" => return Some(Endpoint::Root),
         "/login" => return Some(Endpoint::LoginPage),
         "/register" => return Some(Endpoint::RegisterPage),
@@ -1812,7 +2068,10 @@ fn route(path: &str) -> Option<Endpoint> {
         "/console/tokens" => return Some(Endpoint::ConsoleTokens),
         _ => {}
     }
-    let segments = path
+    if let Some(endpoint) = proxy_route(path_without_query, query) {
+        return Some(endpoint);
+    }
+    let segments = path_without_query
         .split('/')
         .map(decode_segment)
         .collect::<Option<Vec<_>>>()?;
@@ -1859,6 +2118,7 @@ fn route(path: &str) -> Option<Endpoint> {
             "commits" => Some(Endpoint::Commit(name)),
             "log" => Some(Endpoint::Log(name)),
             "reflog" => Some(Endpoint::Reflog(name)),
+            "diff" => Some(Endpoint::Diff(name)),
             "checkout" => Some(Endpoint::Checkout(name)),
             _ => None,
         };
@@ -1870,6 +2130,37 @@ fn route(path: &str) -> Option<Endpoint> {
         return Some(Endpoint::Fork(segments[3].clone()));
     }
     None
+}
+
+fn proxy_route(path: &str, query: &str) -> Option<Endpoint> {
+    let raw = path.split('/').collect::<Vec<_>>();
+    if raw.len() < 6
+        || !raw[0].is_empty()
+        || raw[1] != "v1"
+        || raw[2] != "spaces"
+        || raw[4] != "proxy"
+    {
+        return None;
+    }
+    let space = decode_segment(raw[3])?;
+    if space.is_empty() {
+        return None;
+    }
+    let port = decode_segment(raw[5])?.parse::<u16>().ok()?;
+    if port == 0 {
+        return None;
+    }
+    let guest_path = if raw.len() == 6 {
+        "/".to_owned()
+    } else {
+        format!("/{}", raw[6..].join("/"))
+    };
+    let path = if query.is_empty() {
+        guest_path
+    } else {
+        format!("{guest_path}?{query}")
+    };
+    Some(Endpoint::Proxy { space, port, path })
 }
 
 fn hex_digit(value: u8) -> Option<u8> {
@@ -1930,6 +2221,68 @@ fn usage_query(path: &str) -> shinu::Result<(Option<i64>, Option<i64>)> {
     }
     Ok((from, to))
 }
+fn diff_request(path: &str, space: String) -> shinu::Result<Req> {
+    let mut from = None;
+    let mut to = None;
+    let mut all = false;
+    let mut limit = DEFAULT_DIFF_LIMIT;
+    if let Some((_, query)) = path.split_once('?') {
+        for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+            let (raw_key, raw_value) = pair
+                .split_once('=')
+                .ok_or_else(|| shinu::Error::Invalid("diff query must use key=value".into()))?;
+            let key = decode_segment(raw_key)
+                .ok_or_else(|| shinu::Error::Invalid("diff query key is not valid UTF-8".into()))?;
+            let value = decode_segment(raw_value)
+                .ok_or_else(|| shinu::Error::Invalid(format!("diff query value for {key} is invalid")))?;
+            match key.as_str() {
+                "from" | "commit" => {
+                    if from.is_some() {
+                        return Err(shinu::Error::Invalid("duplicate diff query key: from".into()));
+                    }
+                    from = Some(parse_diff_commit(&key, &value)?);
+                }
+                "to" => {
+                    if to.is_some() {
+                        return Err(shinu::Error::Invalid("duplicate diff query key: to".into()));
+                    }
+                    to = Some(parse_diff_commit(&key, &value)?);
+                }
+                "all" => {
+                    all = match value.as_str() {
+                        "1" | "true" => true,
+                        "0" | "false" => false,
+                        _ => {
+                            return Err(shinu::Error::Invalid(
+                                "diff query all must be true or false".into(),
+                            ));
+                        }
+                    };
+                }
+                "limit" => {
+                    let parsed = value.parse::<usize>().map_err(|error| {
+                        shinu::Error::Invalid(format!("diff query limit is invalid: {error}"))
+                    })?;
+                    limit = parsed.min(MAX_DIFF_LIMIT);
+                }
+                _ => return Err(shinu::Error::Invalid(format!("unknown diff query key: {key}"))),
+            }
+        }
+    }
+    Ok(Req::Diff {
+        space,
+        from,
+        to,
+        all,
+        limit,
+    })
+}
+
+fn parse_diff_commit(key: &str, value: &str) -> shinu::Result<Uuid> {
+    Uuid::parse_str(value)
+        .map_err(|error| shinu::Error::Invalid(format!("diff query {key} is not a commit id: {error}")))
+}
+
 
 
 fn method_allowed(endpoint: &Endpoint, method: &str) -> bool {
@@ -1947,9 +2300,11 @@ fn method_allowed(endpoint: &Endpoint, method: &str) -> bool {
         Endpoint::ConsoleTokens => method == "GET" || method == "POST",
         Endpoint::ConsoleToken(_) => method == "DELETE",
         Endpoint::Spaces => method == "GET" || method == "POST",
-        Endpoint::Usage | Endpoint::Limits | Endpoint::Log(_) | Endpoint::Reflog(_) => {
-            method == "GET"
-        }
+        Endpoint::Usage
+        | Endpoint::Limits
+        | Endpoint::Log(_)
+        | Endpoint::Reflog(_)
+        | Endpoint::Diff(_) => method == "GET",
         Endpoint::Rm(_) => method == "DELETE" || method == "PATCH",
         Endpoint::RmCkpt(_) => method == "DELETE",
         Endpoint::Start(_)
@@ -1961,6 +2316,7 @@ fn method_allowed(endpoint: &Endpoint, method: &str) -> bool {
         | Endpoint::Fork(_)
         | Endpoint::Gc => method == "POST",
         Endpoint::Pull(_) | Endpoint::Vnc(_) => method == "GET",
+        Endpoint::Proxy { .. } => matches!(method, "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD"),
     }
 }
 
@@ -1988,13 +2344,22 @@ fn body_bool(body: &[u8], field: &str) -> shinu::Result<bool> {
         .and_then(Value::as_bool)
         .ok_or_else(|| shinu::Error::Invalid(format!("body field {field} must be a boolean")))
 }
-fn body_bool_default(body: &[u8], field: &str, default: bool) -> shinu::Result<bool> {
+
+fn body_snapshot_mode(body: &[u8]) -> shinu::Result<SnapshotMode> {
     let value = parse_body(body)?;
-    match value.get(field) {
-        None => Ok(default),
-        Some(value) => value.as_bool().ok_or_else(|| {
-            shinu::Error::Invalid(format!("body field {field} must be a boolean"))
-        }),
+    match value.get("snapshot") {
+        None => Ok(SnapshotMode::None),
+        Some(Value::String(mode)) => match mode.as_str() {
+            "none" => Ok(SnapshotMode::None),
+            "full" => Ok(SnapshotMode::Full),
+            "diff" => Ok(SnapshotMode::Diff),
+            _ => Err(shinu::Error::Invalid(
+                "body field snapshot must be one of: none, full, diff".into(),
+            )),
+        },
+        Some(_) => Err(shinu::Error::Invalid(
+            "body field snapshot must be a string".into(),
+        )),
     }
 }
 
@@ -2127,12 +2492,13 @@ fn request_for(
                 space,
                 note: body_string(body, "note")?,
                 hot: body_bool(body, "hot")?,
-                full: body_bool_default(body, "full", false)?,
+                snapshot: body_snapshot_mode(body)?,
             },
             201,
         )),
         Endpoint::Log(space) => Ok((Req::Log { space }, 200)),
         Endpoint::Reflog(space) => Ok((Req::Reflog { space }, 200)),
+        Endpoint::Diff(space) => Ok((diff_request("", space)?, 200)),
         Endpoint::Checkout(space) => Ok((
             Req::Checkout {
                 space,
@@ -2610,6 +2976,658 @@ fn vnc_bridge_error(space: &str, error: &shinu::Error) -> shinu::Error {
     ))
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProxyHeader {
+    name: String,
+    value: String,
+}
+
+#[derive(Debug)]
+struct ProxyRequestHead {
+    method: String,
+    path: String,
+    headers: Vec<ProxyHeader>,
+    content_length: Option<usize>,
+    chunked: bool,
+}
+
+#[derive(Debug)]
+struct ProxyResponseHead {
+    status_line: String,
+    status: u16,
+    headers: Vec<ProxyHeader>,
+}
+
+#[derive(Debug)]
+enum ProxyBody {
+    None,
+    Length(usize),
+    Chunked,
+    Close,
+}
+
+#[derive(Debug)]
+enum ProxyRelayFailure {
+    BeforeResponse(String),
+    GuestClosed(String),
+    Transport(String),
+}
+
+fn proxy_header(name: &str, value: &str) -> ProxyHeader {
+    ProxyHeader {
+        name: name.to_owned(),
+        value: value.to_owned(),
+    }
+}
+
+fn is_proxy_hop_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "transfer-encoding"
+            | "upgrade"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "expect"
+    )
+}
+
+fn proxy_connection_tokens(headers: &[ProxyHeader]) -> Vec<String> {
+    headers
+        .iter()
+        .filter(|header| header.name.eq_ignore_ascii_case("Connection"))
+        .flat_map(|header| header.value.split(','))
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn proxy_is_filtered(header: &ProxyHeader, connection_tokens: &[String]) -> bool {
+    is_proxy_hop_header(&header.name)
+        || connection_tokens
+            .iter()
+            .any(|token| header.name.eq_ignore_ascii_case(token))
+}
+
+fn parse_proxy_request_head(
+    raw: &[u8],
+    method: &str,
+    path: &str,
+) -> shinu::Result<ProxyRequestHead> {
+    let mut lines = raw.split(|byte| *byte == b'\n');
+    lines
+        .next()
+        .ok_or_else(|| shinu::Error::Invalid("proxy request headers are empty".into()))?;
+    let mut headers = Vec::new();
+    for line in lines {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            break;
+        }
+        let colon = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .ok_or_else(|| shinu::Error::Invalid("proxy request header has no colon".into()))?;
+        let name = String::from_utf8(line[..colon].to_vec())
+            .map_err(|_| shinu::Error::Invalid("proxy request header name is not UTF-8".into()))?;
+        let value = String::from_utf8(line[colon + 1..].to_vec())
+            .map_err(|_| shinu::Error::Invalid("proxy request header value is not UTF-8".into()))?
+            .trim()
+            .to_owned();
+        headers.push(ProxyHeader { name, value });
+    }
+
+    let mut content_length = None;
+    let mut transfer_encoding = None;
+    for header in &headers {
+        if header.name.eq_ignore_ascii_case("Content-Length") {
+            if content_length.is_some() {
+                return Err(shinu::Error::Invalid(
+                    "proxy request has duplicate Content-Length".into(),
+                ));
+            }
+            content_length = Some(header.value.parse::<usize>().map_err(|error| {
+                shinu::Error::Invalid(format!("proxy request has invalid Content-Length: {error}"))
+            })?);
+        } else if header.name.eq_ignore_ascii_case("Transfer-Encoding")
+            && transfer_encoding.is_some()
+        {
+            return Err(shinu::Error::Invalid(
+                "proxy request has duplicate Transfer-Encoding".into(),
+            ));
+        } else if header.name.eq_ignore_ascii_case("Transfer-Encoding") {
+            transfer_encoding = Some(header.value.clone());
+        }
+    }
+    let chunked = transfer_encoding.as_ref().is_some_and(|value| {
+        value
+            .split(',')
+            .all(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"))
+    });
+    if transfer_encoding.is_some() && !chunked {
+        return Err(shinu::Error::Invalid(
+            "proxy request uses an unsupported transfer encoding".into(),
+        ));
+    }
+    if chunked && content_length.is_some() {
+        return Err(shinu::Error::Invalid(
+            "proxy request cannot combine Transfer-Encoding and Content-Length".into(),
+        ));
+    }
+    Ok(ProxyRequestHead {
+        method: method.to_owned(),
+        path: path.to_owned(),
+        headers,
+        content_length,
+        chunked,
+    })
+}
+
+fn proxy_request_headers(request: &ProxyRequestHead, port: u16) -> Vec<ProxyHeader> {
+    let connection_tokens = proxy_connection_tokens(&request.headers);
+    let mut headers = request
+        .headers
+        .iter()
+        .filter(|header| {
+            !proxy_is_filtered(header, &connection_tokens)
+                && !header.name.eq_ignore_ascii_case("Host")
+                && !header.name.eq_ignore_ascii_case("Content-Length")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    headers.push(proxy_header("Host", &format!("127.0.0.1:{port}")));
+    if request.chunked {
+        headers.push(proxy_header("Transfer-Encoding", "chunked"));
+    } else if let Some(length) = request.content_length {
+        headers.push(proxy_header("Content-Length", &length.to_string()));
+    }
+    headers.push(proxy_header("Connection", "close"));
+    headers
+}
+
+fn send_proxy_request_head(
+    writer: &mut impl Write,
+    request: &ProxyRequestHead,
+    port: u16,
+) -> std::io::Result<()> {
+    write!(writer, "{} {} HTTP/1.1\r\n", request.method, request.path)?;
+    for header in proxy_request_headers(request, port) {
+        write!(writer, "{}: {}\r\n", header.name, header.value)?;
+    }
+    writer.write_all(b"\r\n")
+}
+
+fn copy_proxy_content_length(
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    mut remaining: usize,
+) -> Result<(), String> {
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let amount = remaining.min(buffer.len());
+        let count = reader
+            .read(&mut buffer[..amount])
+            .map_err(|error| format!("could not read proxy request body: {error}"))?;
+        if count == 0 {
+            return Err("proxy request body ended before Content-Length".into());
+        }
+        writer
+            .write_all(&buffer[..count])
+            .map_err(|error| format!("could not send proxy request body: {error}"))?;
+        remaining -= count;
+    }
+    Ok(())
+}
+
+fn read_proxy_line(reader: &mut impl BufRead) -> Result<Vec<u8>, String> {
+    let mut line = Vec::new();
+    reader
+        .read_until(b'\n', &mut line)
+        .map_err(|error| format!("could not read proxy body framing: {error}"))?;
+    if line.is_empty() {
+        return Err("proxy chunked body ended before a chunk size".into());
+    }
+    if line.len() > 64 * 1024 {
+        return Err("proxy chunked body line exceeds 64 KiB".into());
+    }
+    Ok(line)
+}
+
+fn parse_proxy_chunk_size(line: &[u8]) -> Result<usize, String> {
+    let line = line.strip_suffix(b"\n").unwrap_or(line);
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let size = line
+        .split(|byte| *byte == b';')
+        .next()
+        .unwrap_or_default();
+    let size = std::str::from_utf8(size)
+        .map_err(|_| "proxy chunk size is not ASCII".to_string())?
+        .trim();
+    usize::from_str_radix(size, 16)
+        .map_err(|error| format!("invalid proxy chunk size {size:?}: {error}"))
+}
+
+fn copy_proxy_chunked(reader: &mut impl BufRead, writer: &mut impl Write) -> Result<(), String> {
+    loop {
+        let size_line = read_proxy_line(reader)?;
+        let size = parse_proxy_chunk_size(&size_line)?;
+        writer
+            .write_all(&size_line)
+            .map_err(|error| format!("could not send proxy chunk size: {error}"))?;
+        if size == 0 {
+            loop {
+                let trailer = read_proxy_line(reader)?;
+                writer
+                    .write_all(&trailer)
+                    .map_err(|error| format!("could not send proxy trailer: {error}"))?;
+                if trailer == b"\r\n" || trailer == b"\n" {
+                    return Ok(());
+                }
+            }
+        }
+        let mut remaining = size;
+        let mut buffer = [0u8; 64 * 1024];
+        while remaining > 0 {
+            let amount = remaining.min(buffer.len());
+            reader
+                .read_exact(&mut buffer[..amount])
+                .map_err(|error| format!("proxy chunk ended before its declared size: {error}"))?;
+            writer
+                .write_all(&buffer[..amount])
+                .map_err(|error| format!("could not send proxy chunk: {error}"))?;
+            remaining -= amount;
+        }
+        let mut crlf = [0u8; 2];
+        reader
+            .read_exact(&mut crlf)
+            .map_err(|error| format!("proxy chunk is missing its CRLF: {error}"))?;
+        if crlf != *b"\r\n" {
+            return Err("proxy chunk is missing its CRLF".into());
+        }
+        writer
+            .write_all(&crlf)
+            .map_err(|error| format!("could not send proxy chunk CRLF: {error}"))?;
+    }
+}
+
+fn send_proxy_request(
+    reader: &mut RequestReader<'_>,
+    child: &mut Child,
+    request: &ProxyRequestHead,
+    port: u16,
+) -> Result<(), String> {
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "ssh proxy stdin pipe unavailable".to_string())?;
+    send_proxy_request_head(&mut stdin, request, port)
+        .map_err(|error| format!("could not send proxy request headers: {error}"))?;
+    if request.chunked {
+        copy_proxy_chunked(reader, &mut stdin)?;
+    } else if let Some(length) = request.content_length {
+        copy_proxy_content_length(reader, &mut stdin, length)?;
+    }
+    stdin
+        .flush()
+        .map_err(|error| format!("could not flush proxy request: {error}"))?;
+    drop(stdin);
+    Ok(())
+}
+
+/// SSH direct stream forwarding keeps the guest's network private while
+/// reusing the already authenticated vsock channel for every arbitrary port.
+fn spawn_proxy_forward(target: &SshTarget, port: u16) -> shinu::Result<Child> {
+    let key = shinu::vm::key_path(&target.vm_dir);
+    let mut command = Command::new("ssh");
+    command
+        .args([
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "LogLevel=ERROR",
+            "-o",
+            "IdentitiesOnly=yes",
+        ])
+        .arg("-o")
+        .arg(&target.proxy)
+        .arg("-i")
+        .arg(key)
+        .arg("-W")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("root@shinu")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    Ok(command.spawn()?)
+}
+
+fn read_proxy_response_line(reader: &mut impl BufRead) -> Result<Vec<u8>, String> {
+    let line = read_proxy_line(reader)?;
+    if line.len() > 64 * 1024 {
+        return Err("proxy response header line exceeds 64 KiB".into());
+    }
+    Ok(line)
+}
+
+fn parse_proxy_response_head(reader: &mut impl BufRead) -> Result<ProxyResponseHead, String> {
+    let status_line = read_proxy_response_line(reader)?;
+    let status_text = std::str::from_utf8(&status_line)
+        .map_err(|_| "guest response status line is not UTF-8".to_string())?
+        .trim_end_matches(&['\r', '\n'][..]);
+    if status_text.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
+        return Err("guest returned a status line with embedded line breaks".into());
+    }
+    let mut fields = status_text.splitn(3, ' ');
+    let version = fields.next().unwrap_or_default();
+    let code = fields.next().unwrap_or_default();
+    if !version.starts_with("HTTP/1.") || code.len() != 3 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("guest returned an invalid HTTP status line: {status_text:?}"));
+    }
+    let status = code
+        .parse::<u16>()
+        .map_err(|error| format!("guest returned an invalid HTTP status code: {error}"))?;
+    if !(100..=599).contains(&status) {
+        return Err(format!("guest returned an invalid HTTP status code: {status}"));
+    }
+    let mut headers = Vec::new();
+    loop {
+        let line = read_proxy_response_line(reader)?;
+        let line = line.strip_suffix(b"\n").unwrap_or(&line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.iter().any(|byte| *byte == b'\r' || *byte == b'\n') {
+            return Err("guest returned a response header with embedded line breaks".into());
+        }
+        if line.is_empty() {
+            break;
+        }
+        let colon = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .ok_or_else(|| "guest returned a malformed HTTP response header".to_string())?;
+        let name = String::from_utf8(line[..colon].to_vec())
+            .map_err(|_| "guest response header name is not UTF-8".to_string())?;
+        let value = String::from_utf8(line[colon + 1..].to_vec())
+            .map_err(|_| "guest response header value is not UTF-8".to_string())?
+            .trim()
+            .to_owned();
+        if headers.len() >= 100 {
+            return Err("guest returned more than 100 response headers".into());
+        }
+        headers.push(ProxyHeader { name, value });
+    }
+    Ok(ProxyResponseHead {
+        status_line: status_text.to_owned(),
+        status,
+        headers,
+    })
+}
+
+fn proxy_response_body(
+    response: &ProxyResponseHead,
+    method: &str,
+) -> Result<ProxyBody, String> {
+    if method.eq_ignore_ascii_case("HEAD") || (100..200).contains(&response.status) || matches!(response.status, 204 | 304) {
+        return Ok(ProxyBody::None);
+    }
+    let mut content_length = None;
+    let mut transfer_encoding = None;
+    for header in &response.headers {
+        if header.name.eq_ignore_ascii_case("Content-Length") {
+            if content_length.is_some() {
+                return Err("guest response has duplicate Content-Length".into());
+            }
+            content_length = Some(header.value.parse::<usize>().map_err(|error| {
+                format!("guest response has invalid Content-Length: {error}")
+            })?);
+        } else if header.name.eq_ignore_ascii_case("Transfer-Encoding")
+            && transfer_encoding.is_some()
+        {
+            return Err("guest response has duplicate Transfer-Encoding".into());
+        } else if header.name.eq_ignore_ascii_case("Transfer-Encoding") {
+            transfer_encoding = Some(header.value.clone());
+        }
+    }
+    if transfer_encoding.is_some() && content_length.is_some() {
+        return Err("guest response combines Transfer-Encoding and Content-Length".into());
+    }
+    if let Some(encoding) = transfer_encoding {
+        if encoding
+            .split(',')
+            .all(|value| value.trim().eq_ignore_ascii_case("chunked"))
+        {
+            return Ok(ProxyBody::Chunked);
+        }
+        return Err("guest response uses an unsupported transfer encoding".into());
+    }
+    Ok(content_length.map_or(ProxyBody::Close, ProxyBody::Length))
+}
+
+fn write_proxy_response_head(
+    stream: &mut TcpStream,
+    response: &ProxyResponseHead,
+    body: &ProxyBody,
+) -> std::io::Result<()> {
+    write!(stream, "{}\r\n", response.status_line)?;
+    let connection_tokens = proxy_connection_tokens(&response.headers);
+    for header in &response.headers {
+        if proxy_is_filtered(header, &connection_tokens)
+            || header.name.eq_ignore_ascii_case("Content-Length") && matches!(body, ProxyBody::Close)
+        {
+            continue;
+        }
+        write!(stream, "{}: {}\r\n", header.name, header.value)?;
+    }
+
+    if matches!(body, ProxyBody::Chunked) {
+        stream.write_all(b"Transfer-Encoding: chunked\r\n")?;
+    }
+    stream.write_all(b"Connection: close\r\n\r\n")?;
+    stream.flush()
+}
+
+fn relay_proxy_length(
+    reader: &mut impl Read,
+    stream: &mut TcpStream,
+    mut remaining: usize,
+) -> Result<(), ProxyRelayFailure> {
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let amount = remaining.min(buffer.len());
+        let count = reader
+            .read(&mut buffer[..amount])
+            .map_err(|error| ProxyRelayFailure::GuestClosed(error.to_string()))?;
+        if count == 0 {
+            return Err(ProxyRelayFailure::GuestClosed(
+                "response ended before Content-Length".into(),
+            ));
+        }
+        stream
+            .write_all(&buffer[..count])
+            .map_err(|error| ProxyRelayFailure::Transport(error.to_string()))?;
+        remaining -= count;
+    }
+    Ok(())
+}
+
+fn relay_proxy_chunked(
+    reader: &mut impl BufRead,
+    stream: &mut TcpStream,
+) -> Result<(), ProxyRelayFailure> {
+    loop {
+        let size_line = read_proxy_response_line(reader).map_err(ProxyRelayFailure::GuestClosed)?;
+        let size = parse_proxy_chunk_size(&size_line).map_err(ProxyRelayFailure::GuestClosed)?;
+        stream
+            .write_all(&size_line)
+            .map_err(|error| ProxyRelayFailure::Transport(error.to_string()))?;
+        if size == 0 {
+            loop {
+                let trailer = read_proxy_response_line(reader).map_err(ProxyRelayFailure::GuestClosed)?;
+                stream
+                    .write_all(&trailer)
+                    .map_err(|error| ProxyRelayFailure::Transport(error.to_string()))?;
+                if trailer == b"\r\n" || trailer == b"\n" {
+                    return Ok(());
+                }
+            }
+        }
+        let mut remaining = size;
+        let mut buffer = [0u8; 64 * 1024];
+        while remaining > 0 {
+            let amount = remaining.min(buffer.len());
+            reader
+                .read_exact(&mut buffer[..amount])
+                .map_err(|error| ProxyRelayFailure::GuestClosed(error.to_string()))?;
+            stream
+                .write_all(&buffer[..amount])
+                .map_err(|error| ProxyRelayFailure::Transport(error.to_string()))?;
+            remaining -= amount;
+        }
+        let mut crlf = [0u8; 2];
+        reader
+            .read_exact(&mut crlf)
+            .map_err(|error| ProxyRelayFailure::GuestClosed(error.to_string()))?;
+        if crlf != *b"\r\n" {
+            return Err(ProxyRelayFailure::GuestClosed(
+                "chunked response is missing its CRLF".into(),
+            ));
+        }
+        stream
+            .write_all(&crlf)
+            .map_err(|error| ProxyRelayFailure::Transport(error.to_string()))?;
+    }
+}
+
+fn relay_proxy_close(reader: &mut impl Read, stream: &mut TcpStream) -> Result<(), ProxyRelayFailure> {
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|error| ProxyRelayFailure::GuestClosed(error.to_string()))?;
+        if count == 0 {
+            return Ok(());
+        }
+        stream
+            .write_all(&buffer[..count])
+            .map_err(|error| ProxyRelayFailure::Transport(error.to_string()))?;
+    }
+}
+
+fn finish_proxy_child(
+    child: &mut Child,
+    stderr_reader: Option<std::thread::JoinHandle<Vec<u8>>>,
+) -> String {
+    let _ = child.kill();
+    let _ = child.wait();
+    stderr_reader
+        .and_then(|reader| reader.join().ok())
+        .map(|stderr| String::from_utf8_lossy(&stderr).trim().to_owned())
+        .unwrap_or_default()
+}
+
+fn abort_proxy_child(child: &mut Child) {
+    let stderr_reader = child.stderr.take().map(|stderr| {
+        thread::spawn(move || {
+            let mut output = Vec::new();
+            let _ = BufReader::new(stderr).read_to_end(&mut output);
+            output
+        })
+    });
+    let _ = finish_proxy_child(child, stderr_reader);
+}
+
+fn relay_proxy_response(
+    stream: &mut TcpStream,
+    child: &mut Child,
+    method: &str,
+) -> Result<(), ProxyRelayFailure> {
+    let stdout = child.stdout.take().ok_or_else(|| {
+        ProxyRelayFailure::BeforeResponse("ssh proxy stdout pipe unavailable".into())
+    })?;
+    let stderr_reader = child.stderr.take().map(|stderr| {
+        thread::spawn(move || {
+            let mut output = Vec::new();
+            let _ = BufReader::new(stderr).read_to_end(&mut output);
+            output
+        })
+    });
+    let mut reader = BufReader::new(stdout);
+    let response = match parse_proxy_response_head(&mut reader) {
+        Ok(response) => response,
+        Err(error) => {
+            let stderr = finish_proxy_child(child, stderr_reader);
+            let detail = if stderr.is_empty() {
+                error
+            } else {
+                format!("{error}: {stderr}")
+            };
+            return Err(ProxyRelayFailure::BeforeResponse(detail));
+        }
+    };
+    let body = match proxy_response_body(&response, method) {
+        Ok(body) => body,
+        Err(error) => {
+            let detail = finish_proxy_child(child, stderr_reader);
+            return Err(ProxyRelayFailure::BeforeResponse(if detail.is_empty() {
+                error
+            } else {
+                format!("{error}: {detail}")
+            }));
+        }
+    };
+    if let Err(error) = write_proxy_response_head(stream, &response, &body) {
+        let _ = finish_proxy_child(child, stderr_reader);
+        return Err(ProxyRelayFailure::Transport(error.to_string()));
+    }
+    let result = match body {
+        ProxyBody::None => Ok(()),
+        ProxyBody::Length(length) => relay_proxy_length(&mut reader, stream, length),
+        ProxyBody::Chunked => relay_proxy_chunked(&mut reader, stream),
+        ProxyBody::Close => relay_proxy_close(&mut reader, stream),
+    };
+    if let Err(error) = result {
+        let _ = finish_proxy_child(child, stderr_reader);
+        return Err(error);
+    }
+    if !matches!(body, ProxyBody::Close) {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    if let Some(stderr_reader) = stderr_reader {
+        let _ = stderr_reader.join();
+    }
+    Ok(())
+}
+
+fn proxy_bridge_error(
+    space: &str,
+    port: u16,
+    failure: ProxyRelayFailure,
+) -> shinu::Error {
+    let (kind, detail) = match failure {
+        ProxyRelayFailure::BeforeResponse(detail) => ("before response", detail),
+        ProxyRelayFailure::GuestClosed(detail) => ("after the response started", detail),
+        ProxyRelayFailure::Transport(detail) => ("while writing the response", detail),
+    };
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("connection refused") || lower.contains("connect_to") {
+        return shinu::Error::Invalid(format!(
+            "guest port {port} in space {space} has nothing listening; start a service on port {port}: {detail}"
+        ));
+    }
+    if kind == "after the response started" {
+        return shinu::Error::Invalid(format!(
+            "guest in space {space} closed port {port} before completing its response: {detail}"
+        ));
+    }
+    shinu::Error::Invalid(format!(
+        "proxy to guest port {port} in space {space} failed {kind}: {detail}"
+    ))
+}
+
 #[derive(Debug)]
 enum Caller {
     Api { project: String },
@@ -2623,7 +3641,7 @@ fn caller_project(caller: &Caller) -> &str {
 }
 
 fn is_state_changing(method: &str) -> bool {
-    matches!(method, "POST" | "DELETE" | "PATCH")
+    matches!(method, "POST" | "PUT" | "DELETE" | "PATCH")
 }
 
 fn authenticate(ctx: &Ctx<'_>, request: &http::Request) -> shinu::Result<Caller> {
@@ -2905,7 +3923,7 @@ fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
         .peer_addr()
         .map(|address| address.ip().to_string())
         .unwrap_or_else(|_| "unknown".to_owned());
-    let mut reader = Some(BufReader::new(&mut stream));
+    let mut reader = Some(RequestReader::new(&mut stream));
     let head = match http::parse_head(reader.as_mut().expect("request reader present")) {
         Ok(head) => head,
         Err(error) => {
@@ -2944,11 +3962,15 @@ fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
 
     let is_transfer = matches!(
         &endpoint,
-        Endpoint::Push(_) | Endpoint::Pull(_) | Endpoint::Vnc(_)
+        Endpoint::Push(_) | Endpoint::Pull(_) | Endpoint::Vnc(_) | Endpoint::Proxy { .. }
     );
     let request = if is_transfer {
         metadata
     } else {
+        reader
+            .as_mut()
+            .expect("request reader present")
+            .stop_capture();
         let body = match http::read_body(
             reader.as_mut().expect("request reader present"),
             content_length,
@@ -3125,6 +4147,23 @@ fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
     } else {
         (None, None)
     };
+    if let Endpoint::Diff(space) = &endpoint {
+        let req = match diff_request(&request.path, space.clone()) {
+            Ok(req) => req,
+            Err(error) => {
+                respond_error(&mut stream, http::status_for(&error), &error)?;
+                return Ok(());
+            }
+        };
+        match handle(ctx, req, project) {
+            Ok(value) => {
+                record_usage(ctx.db, project, "api_call", None, 1)?;
+                http::respond(&mut stream, 200, &value)?;
+            }
+            Err(error) => respond_error(&mut stream, http::status_for(&error), &error)?,
+        }
+        return Ok(());
+    }
     if let Endpoint::Exec(space) = &endpoint {
         let (command, stdin) = match exec_command(&request.body) {
             Ok(command) => command,
@@ -3221,7 +4260,10 @@ fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
                 return Ok(());
             }
         };
-        let vsock = match shinu::vsock_connect(&shinu::vm::vsock_path(&target.vm_dir), shinu::VSOCK_VNC_PORT) {
+        let vsock = match shinu::vsock_connect(
+            &shinu::vm::vsock_path(&target.vm_dir),
+            shinu::VSOCK_VNC_PORT,
+        ) {
             Ok(vsock) => vsock,
             Err(error) => {
                 let _ = reader.take();
@@ -3234,6 +4276,76 @@ fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
         respond_vnc_start(&mut stream)?;
         stream_vnc(&mut stream, vsock)?;
         record_usage(ctx.db, project, "api_call", None, 1)?;
+        return Ok(());
+    }
+    if let Endpoint::Proxy { space, port, path } = &endpoint {
+        let raw_headers = reader
+            .as_mut()
+            .expect("request reader present")
+            .take_headers();
+        let proxy_head = match parse_proxy_request_head(&raw_headers, &request.method, path) {
+            Ok(head) => head,
+            Err(error) => {
+                let _ = reader.take();
+                respond_error(&mut stream, http::status_for(&error), &error)?;
+                return Ok(());
+            }
+        };
+        let target = match prepare_ssh(ctx, project, space) {
+            Ok(target) => target,
+            Err(error) => {
+                let _ = reader.take();
+                let error = if matches!(error, shinu::Error::NotFound(_)) {
+                    error
+                } else {
+                    shinu::Error::Invalid(format!(
+                        "could not start VM for proxy space {space}: {error}"
+                    ))
+                };
+                respond_error(&mut stream, http::status_for(&error), &error)?;
+                return Ok(());
+            }
+        };
+        let mut child = match spawn_proxy_forward(&target, *port) {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = reader.take();
+                let error = shinu::Error::Invalid(format!(
+                    "could not open SSH proxy to guest port {port} in space {space}: {error}"
+                ));
+                respond_error(&mut stream, http::status_for(&error), &error)?;
+                return Ok(());
+            }
+        };
+        let request_result = send_proxy_request(
+            reader.as_mut().expect("request reader present"),
+            &mut child,
+            &proxy_head,
+            *port,
+        );
+        let _ = reader.take();
+        if let Err(error) = request_result {
+            abort_proxy_child(&mut child);
+            let error = shinu::Error::Invalid(format!(
+                "proxy request to guest port {port} in space {space} failed: {error}"
+            ));
+            respond_error(&mut stream, http::status_for(&error), &error)?;
+            return Ok(());
+        }
+        match relay_proxy_response(&mut stream, &mut child, &request.method) {
+            Ok(()) => record_usage(ctx.db, project, "api_call", None, 1)?,
+            Err(failure) => {
+                let before_response = matches!(&failure, ProxyRelayFailure::BeforeResponse(_));
+                let error = proxy_bridge_error(space, *port, failure);
+                if before_response {
+                    respond_error(&mut stream, http::status_for(&error), &error)?;
+                } else {
+                    // Once guest headers are emitted, appending a JSON error would
+                    // turn a diagnosable truncated response into invalid bytes.
+                    eprintln!("{error}");
+                }
+            }
+        }
         return Ok(());
     }
 
@@ -3399,7 +4511,7 @@ mod tests {
     use rusqlite::Connection;
     use shinu::{
         Image, NetConfig, VmConfig,
-        proto::Req,
+        proto::{Req, SnapshotMode},
         quota::{Limits, RateLimiter},
         state::{self, Ckpt, Space, State},
         vm,
@@ -3576,15 +4688,121 @@ mod tests {
         let pull = super::route("/v1/spaces/demo/pull?path=%2Ftmp%2Ffile")
             .expect("pull route");
         let vnc = super::route("/v1/spaces/demo/vnc").expect("vnc route");
+        let diff = super::route("/v1/spaces/demo/diff").expect("diff route");
         assert!(matches!(&vnc, super::Endpoint::Vnc(name) if name == "demo"));
         assert!(super::method_allowed(&vnc, "GET"));
         assert!(!super::method_allowed(&vnc, "POST"));
+        assert!(matches!(&diff, super::Endpoint::Diff(name) if name == "demo"));
+        assert!(super::method_allowed(&diff, "GET"));
+        assert!(!super::method_allowed(&diff, "POST"));
         assert!(matches!(&push, super::Endpoint::Push(name) if name == "demo"));
         assert!(matches!(&pull, super::Endpoint::Pull(name) if name == "demo"));
         assert!(super::method_allowed(&push, "POST"));
         assert!(!super::method_allowed(&push, "GET"));
         assert!(super::method_allowed(&pull, "GET"));
         assert!(!super::method_allowed(&pull, "POST"));
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let request = super::diff_request(
+            &format!("/v1/spaces/demo/diff?from={first}&to={second}&all=1&limit=12"),
+            "demo".to_owned(),
+        )
+        .expect("diff query");
+        assert!(matches!(
+            request,
+            Req::Diff {
+                space,
+                from: Some(actual_first),
+                to: Some(actual_second),
+                all: true,
+                limit: 12,
+            } if space == "demo" && actual_first == first && actual_second == second
+        ));
+    }
+
+    #[test]
+    fn proxy_routes_preserve_guest_path_and_allow_http_methods() {
+        let endpoint = super::route("/v1/spaces/demo/proxy/8080/api%2Fv1/items?q=one%20two")
+            .expect("proxy route");
+        assert!(matches!(
+            &endpoint,
+            super::Endpoint::Proxy { space, port, path }
+                if space == "demo" && *port == 8080 && path == "/api%2Fv1/items?q=one%20two"
+        ));
+        for method in ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"] {
+            assert!(super::method_allowed(&endpoint, method), "{method}");
+        }
+        assert!(!super::method_allowed(&endpoint, "OPTIONS"));
+    }
+
+    #[test]
+    fn proxy_header_filter_rewrites_host_and_framing() {
+        let raw = b"POST /v1/spaces/demo/proxy/8080/ HTTP/1.1\r\nHost: control\r\nConnection: X-Trace\r\nX-Trace: hidden\r\nX-Request: kept\r\nContent-Length: 4\r\n\r\n";
+        let request = super::parse_proxy_request_head(raw, "POST", "/")
+            .expect("parse proxy request");
+        let headers = super::proxy_request_headers(&request, 8080);
+        assert!(headers.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("Host") && header.value == "127.0.0.1:8080"
+        }));
+        assert!(headers.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("X-Request") && header.value == "kept"
+        }));
+        assert!(!headers.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("X-Trace")
+                || header.name.eq_ignore_ascii_case("Transfer-Encoding")
+        }));
+        assert!(headers.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("Content-Length") && header.value == "4"
+        }));
+        assert!(headers.iter().any(|header| {
+            header.name.eq_ignore_ascii_case("Connection") && header.value == "close"
+        }));
+    }
+
+    #[test]
+    fn proxy_chunked_body_preserves_chunks_and_trailers() {
+        let mut reader = std::io::Cursor::new(b"4\r\ntest\r\n0\r\nX-Trailer: yes\r\n\r\n");
+        let mut output = Vec::new();
+        super::copy_proxy_chunked(&mut reader, &mut output).expect("copy chunked body");
+        assert_eq!(output, b"4\r\ntest\r\n0\r\nX-Trailer: yes\r\n\r\n");
+    }
+
+    #[test]
+    fn proxy_failures_name_guest_port_and_phase() {
+        let refused = super::proxy_bridge_error(
+            "demo",
+            8080,
+            super::ProxyRelayFailure::BeforeResponse("Connection refused".into()),
+        );
+        assert!(refused
+            .to_string()
+            .contains("guest port 8080 in space demo has nothing listening"));
+        let closed = super::proxy_bridge_error(
+            "demo",
+            8080,
+            super::ProxyRelayFailure::GuestClosed("response ended before Content-Length".into()),
+        );
+        assert!(closed
+            .to_string()
+            .contains("guest in space demo closed port 8080 before completing its response"));
+    }
+
+    #[test]
+    fn proxy_response_framing_accepts_length_and_chunked() {
+        let mut length = std::io::Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n");
+        let response = super::parse_proxy_response_head(&mut length).expect("length response");
+        assert!(matches!(
+            super::proxy_response_body(&response, "GET"),
+            Ok(super::ProxyBody::Length(4))
+        ));
+        let mut chunked = std::io::Cursor::new(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+        );
+        let response = super::parse_proxy_response_head(&mut chunked).expect("chunked response");
+        assert!(matches!(
+            super::proxy_response_body(&response, "GET"),
+            Ok(super::ProxyBody::Chunked)
+        ));
     }
 
     #[test]
@@ -3615,7 +4833,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_request_defaults_full_to_false() {
+    fn commit_request_defaults_snapshot_to_none() {
         let (request, status) = super::request_for(
             super::Endpoint::Commit("demo".into()),
             "POST",
@@ -3623,20 +4841,48 @@ mod tests {
             None,
             None,
         )
-        .expect("parse legacy commit request");
+        .expect("parse commit request");
         assert_eq!(status, 201);
-        assert!(matches!(request, Req::Commit { full: false, .. }));
+        assert!(matches!(
+            request,
+            Req::Commit {
+                snapshot: SnapshotMode::None,
+                ..
+            }
+        ));
 
         let (request, status) = super::request_for(
             super::Endpoint::Commit("demo".into()),
             "POST",
-            br#"{"note":"memory","hot":false,"full":true}"#,
+            br#"{"note":"memory","hot":false,"snapshot":"full"}"#,
             None,
             None,
         )
         .expect("parse full commit request");
         assert_eq!(status, 201);
-        assert!(matches!(request, Req::Commit { full: true, .. }));
+        assert!(matches!(
+            request,
+            Req::Commit {
+                snapshot: SnapshotMode::Full,
+                ..
+            }
+        ));
+        let (request, status) = super::request_for(
+            super::Endpoint::Commit("demo".into()),
+            "POST",
+            br#"{"note":"delta","hot":false,"snapshot":"diff"}"#,
+            None,
+            None,
+        )
+        .expect("parse diff commit request");
+        assert_eq!(status, 201);
+        assert!(matches!(
+            request,
+            Req::Commit {
+                snapshot: SnapshotMode::Diff,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -3667,7 +4913,7 @@ mod tests {
                 space: "missing".into(),
                 note: "  ".into(),
                 hot: false,
-                full: false,
+                snapshot: SnapshotMode::None,
             },
             "project-a",
         );
@@ -3858,6 +5104,7 @@ mod tests {
                 parent: None,
                 auto: false,
                 full: false,
+                base: None,
                 note: "before".into(),
                 created_at: Utc::now(),
             }],
@@ -3968,6 +5215,7 @@ mod tests {
                 parent: None,
                 auto: false,
                 full: false,
+                base: None,
                 note: "base".into(),
                 created_at: Utc::now(),
             }],
@@ -4002,6 +5250,7 @@ mod tests {
                 parent: None,
                 auto: false,
                 full: false,
+                base: None,
                 note: "private".into(),
                 created_at: Utc::now(),
             }],
@@ -4038,7 +5287,7 @@ mod tests {
                 space: "running".into(),
                 note: "cold".into(),
                 hot: false,
-                full: false,
+                snapshot: SnapshotMode::None,
             },
             project,
         );
@@ -4080,6 +5329,7 @@ mod tests {
             CkptFlags {
                 auto: false,
                 full: false,
+                base: None,
                 update_head: true,
             },
         )
@@ -4093,6 +5343,7 @@ mod tests {
             CkptFlags {
                 auto: false,
                 full: false,
+                base: None,
                 update_head: true,
             },
         )
@@ -4130,6 +5381,7 @@ mod tests {
                 parent: None,
                 auto: false,
                 full: false,
+                base: None,
                 note: "target".into(),
                 created_at: Utc::now(),
             }],
@@ -4143,6 +5395,7 @@ mod tests {
             CkptFlags {
                 auto: true,
                 full: false,
+                base: None,
                 update_head: false,
             },
         )
@@ -4183,6 +5436,7 @@ mod tests {
                     parent: None,
                     auto: false,
                     full: false,
+                    base: None,
                     note: "before checkout".into(),
                     created_at: Utc::now(),
                 },
@@ -4193,6 +5447,7 @@ mod tests {
                     parent: Some(old_id),
                     auto: true,
                     full: false,
+                    base: None,
                     note: "auto before checkout".into(),
                     created_at: Utc::now(),
                 },
@@ -4265,6 +5520,7 @@ mod tests {
                     parent: None,
                     auto: true,
                     full: false,
+                    base: None,
                     note: "auto stale".into(),
                     created_at: Utc::now(),
                 },
@@ -4275,6 +5531,7 @@ mod tests {
                     parent: None,
                     auto: true,
                     full: false,
+                    base: None,
                     note: "auto raced".into(),
                     created_at: Utc::now(),
                 },

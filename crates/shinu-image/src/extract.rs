@@ -4,11 +4,23 @@ use shinu_core::{cache_dir, Error, Image, Result};
 
 use super::fetch::{oci_layer_member, oci_manifest_member, tar_member};
 
+/// Mounts an image read-write for image construction and guest authorization.
+/// Callers comparing an existing image must use [`mount_image_read_only`].
 pub fn mount_image(image: &Path, mnt: &Path) -> Result<()> {
+    mount_image_with_options(image, mnt, false)
+}
+
+/// Mounts an existing image read-only so inspection cannot dirty a reflink
+/// ancestor or change the source that later spaces inherit.
+pub fn mount_image_read_only(image: &Path, mnt: &Path) -> Result<()> {
+    mount_image_with_options(image, mnt, true)
+}
+
+fn mount_image_with_options(image: &Path, mnt: &Path, read_only: bool) -> Result<()> {
     std::fs::create_dir_all(mnt)?;
     let output = std::process::Command::new("mount")
         .arg("-o")
-        .arg("loop")
+        .arg(mount_options(read_only))
         .arg(image)
         .arg(mnt)
         .output()?;
@@ -20,6 +32,16 @@ pub fn mount_image(image: &Path, mnt: &Path) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// `noload` accompanies `ro` because a checkpoint is a reflink of a disk that
+/// may have been captured while the guest was running, so its ext4 journal can
+/// hold unreplayed records. The kernel refuses such a filesystem read-only
+/// ("recovery required on readonly filesystem") and replaying the journal would
+/// mean writing to it, dirtying an image every later space inherits. Skipping
+/// the journal is correct here: inspection only ever reads.
+pub(crate) fn mount_options(read_only: bool) -> &'static str {
+    if read_only { "loop,ro,noload" } else { "loop" }
 }
 
 pub fn umount(mnt: &Path) -> Result<()> {

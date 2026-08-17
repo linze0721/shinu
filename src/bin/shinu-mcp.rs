@@ -123,7 +123,7 @@ impl Server {
                 let space = required_string(arguments, "space")?;
                 let note = required_string(arguments, "note")?;
                 let hot = required_bool(arguments, "hot")?;
-                let full = required_bool(arguments, "full")?;
+                let snapshot = required_snapshot_mode(arguments, "snapshot")?;
                 let path = format!(
                     "/v1/spaces/{}/commits",
                     encode_path_segment(&space)
@@ -131,7 +131,7 @@ impl Server {
                 client.request_text(
                     "POST",
                     &path,
-                    Some(json!({ "note": note, "hot": hot, "full": full })),
+                    Some(json!({ "note": note, "hot": hot, "snapshot": snapshot })),
                 )
             }
             "shinu_log" => {
@@ -397,6 +397,18 @@ fn required_bool(arguments: &Map<String, Value>, field: &str) -> Result<bool, St
         })
 }
 
+fn required_snapshot_mode(
+    arguments: &Map<String, Value>,
+    field: &str,
+) -> Result<String, String> {
+    let value = required_string(arguments, field)?;
+    if matches!(value.as_str(), "none" | "full" | "diff") {
+        Ok(value)
+    } else {
+        Err(format!("argument {field} must be one of: none, full, diff"))
+    }
+}
+
 fn optional_string(arguments: &Map<String, Value>, field: &str) -> Result<Option<String>, String> {
     match arguments.get(field) {
         None => Ok(None),
@@ -530,7 +542,7 @@ fn validate_arguments(name: &str, arguments: &Map<String, Value>) -> Result<(), 
             required_string(arguments, "space")?;
             required_string(arguments, "note")?;
             required_bool(arguments, "hot")?;
-            required_bool(arguments, "full")?;
+            required_snapshot_mode(arguments, "snapshot")?;
             Ok(())
         }
         "shinu_log" | "shinu_reflog" => {
@@ -942,13 +954,13 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "shinu_commit",
-            "description": "在需要把当前实验状态存成可回滚的检查点、或在下一轮试错前保留安全副本时使用；hot 与 full 都必须显式选择，full 检查点需要 space 正在运行并会保存 guest 内存与进程状态。",
+            "description": "在需要把当前实验状态存成可回滚的检查点、或在下一轮试错前保留安全副本时使用；hot 与 snapshot 都必须显式选择，snapshot 可为 none、full 或 diff。full 检查点保存 guest 内存与进程状态，diff 检查点保存相对既有 full 基线的脏页。",
             "inputSchema": schema(json!({
                 "space": {"type": "string", "minLength": 1, "description": "要存档的 space。"},
                 "note": {"type": "string", "minLength": 1, "description": "描述这个存档用途的非空备注。"},
                 "hot": {"type": "boolean", "description": "是否创建 hot commit。"},
-                "full": {"type": "boolean", "description": "是否同时保存 guest 内存与 CPU 状态；需要 space 正在运行。"}
-            }), &["space", "note", "hot", "full"]),
+                "snapshot": {"type": "string", "enum": ["none", "full", "diff"], "description": "内存快照模式；必须显式选择。"}
+            }), &["space", "note", "hot", "snapshot"]),
         }),
         json!({
             "name": "shinu_log",

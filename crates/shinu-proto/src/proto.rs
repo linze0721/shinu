@@ -2,6 +2,15 @@ use shinu_core::Image;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SnapshotMode {
+    #[default]
+    None,
+    Full,
+    Diff,
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Req {
@@ -27,14 +36,14 @@ pub enum Req {
     },
     /// `hot: true` syncs a running guest without remounting read-only and
     /// is not crash-consistent; `hot: false` requires the space to be stopped.
-    /// `full: true` additionally captures guest memory and CPU state, so the
-    /// space must be running even when `hot` is false.
+    /// A full snapshot captures guest memory and CPU state; a diff snapshot
+    /// captures only dirty memory relative to its selected full base.
     Commit {
         space: String,
         note: String,
         hot: bool,
         #[serde(default)]
-        full: bool,
+        snapshot: SnapshotMode,
     },
     Checkout {
         space: String,
@@ -48,6 +57,15 @@ pub enum Req {
     /// checkpoints that checkout created and then left unreachable.
     Reflog {
         space: String,
+    },
+    /// Compares filesystem trees; `from` and `to` are checkpoint IDs when
+    /// supplied, otherwise the space's current image is compared with HEAD.
+    Diff {
+        space: String,
+        from: Option<Uuid>,
+        to: Option<Uuid>,
+        all: bool,
+        limit: usize,
     },
     Rm {
         space: String,

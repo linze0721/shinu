@@ -41,6 +41,8 @@ pub struct Ckpt {
     pub parent: Option<Uuid>,
     #[serde(default)]
     pub auto: bool,
+    #[serde(default)]
+    pub full: bool,
     pub note: String,
     pub created_at: DateTime<Utc>,
 }
@@ -71,7 +73,8 @@ const SCHEMA: &str = r#"
         parent TEXT,
         auto INTEGER NOT NULL,
         note TEXT NOT NULL,
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        full INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS projects (
         project TEXT PRIMARY KEY,
@@ -136,9 +139,22 @@ fn migrate_space_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_ckpt_columns(conn: &Connection) -> Result<()> {
+    let present: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('ckpts') WHERE name = ?1",
+        params!["full"],
+        |row| row.get(0),
+    )?;
+    if present == 0 {
+        conn.execute_batch("ALTER TABLE ckpts ADD COLUMN full INTEGER NOT NULL DEFAULT 0")?;
+    }
+    Ok(())
+}
+
 fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
     migrate_space_columns(conn)?;
+    migrate_ckpt_columns(conn)?;
     Ok(())
 }
 
@@ -204,18 +220,20 @@ fn ckpt_from_row(row: &Row<'_>) -> rusqlite::Result<Ckpt> {
         project: row.get(2)?,
         parent: parse_optional_uuid(row.get(3)?, 3)?,
         auto: row.get::<_, i64>(4)? != 0,
-        note: row.get(5)?,
-        created_at: parse_datetime(row.get(6)?, 6)?,
+        full: row.get::<_, i64>(5)? != 0,
+        note: row.get(6)?,
+        created_at: parse_datetime(row.get(7)?, 7)?,
     })
 }
 
-fn ckpt_params(ckpt: &Ckpt) -> [String; 7] {
+fn ckpt_params(ckpt: &Ckpt) -> [String; 8] {
     [
         ckpt.id.to_string(),
         ckpt.space.to_string(),
         ckpt.project.clone(),
         ckpt.parent.map(|id| id.to_string()).unwrap_or_default(),
         if ckpt.auto { "1".to_owned() } else { "0".to_owned() },
+        if ckpt.full { "1".to_owned() } else { "0".to_owned() },
         ckpt.note.clone(),
         ckpt.created_at.to_rfc3339(),
     ]
@@ -271,8 +289,8 @@ pub fn migrate_from_json(root: &Path, conn: &Connection) -> Result<bool> {
     for ckpt in &state.ckpts {
         let values = ckpt_params(ckpt);
         tx.execute(
-            "INSERT INTO ckpts (id, space, project, parent, auto, note, created_at) VALUES (?1, ?2, ?3, NULLIF(?4, ''), ?5, ?6, ?7)",
-            params![values[0], values[1], values[2], values[3], values[4], values[5], values[6]],
+            "INSERT INTO ckpts (id, space, project, parent, auto, full, note, created_at) VALUES (?1, ?2, ?3, NULLIF(?4, ''), ?5, ?6, ?7, ?8)",
+            params![values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7]],
         )?;
     }
     tx.commit()?;
@@ -292,7 +310,7 @@ pub fn load(conn: &Connection) -> Result<State> {
     };
     let ckpts = {
         let mut statement = conn.prepare(
-            "SELECT id, space, project, parent, auto, note, created_at FROM ckpts ORDER BY rowid",
+            "SELECT id, space, project, parent, auto, full, note, created_at FROM ckpts ORDER BY rowid",
         )?;
         statement
             .query_map([], ckpt_from_row)?
@@ -326,8 +344,8 @@ pub fn store(conn: &Connection, state: &State) -> Result<()> {
     for ckpt in &state.ckpts {
         let values = ckpt_params(ckpt);
         tx.execute(
-            "INSERT INTO ckpts (id, space, project, parent, auto, note, created_at) VALUES (?1, ?2, ?3, NULLIF(?4, ''), ?5, ?6, ?7)",
-            params![values[0], values[1], values[2], values[3], values[4], values[5], values[6]],
+            "INSERT INTO ckpts (id, space, project, parent, auto, full, note, created_at) VALUES (?1, ?2, ?3, NULLIF(?4, ''), ?5, ?6, ?7, ?8)",
+            params![values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7]],
         )?;
     }
     tx.commit()?;
@@ -367,7 +385,7 @@ pub fn find_ckpt(
     project: &str,
 ) -> Result<Option<Ckpt>> {
     conn.query_row(
-        "SELECT id, space, project, parent, auto, note, created_at FROM ckpts WHERE project = ?1 AND id = ?2 LIMIT 1",
+        "SELECT id, space, project, parent, auto, full, note, created_at FROM ckpts WHERE project = ?1 AND id = ?2 LIMIT 1",
         params![project, id.to_string()],
         ckpt_from_row,
     )
@@ -653,6 +671,7 @@ mod db_tests {
             project: project.into(),
             parent: None,
             auto: false,
+            full: false,
             note: "initial".into(),
             created_at,
         };
@@ -701,6 +720,34 @@ mod db_tests {
             )
             .expect("read migrated space");
         assert_eq!(row, ("void".into(), None, None, None));
+    }
+
+    #[test]
+    fn legacy_checkpoint_rows_gain_full_column() {
+        let conn = Connection::open_in_memory().expect("open legacy database");
+        conn.execute_batch(
+            "CREATE TABLE ckpts (id TEXT PRIMARY KEY, space TEXT NOT NULL, project TEXT NOT NULL, parent TEXT, auto INTEGER NOT NULL, note TEXT NOT NULL, created_at TEXT NOT NULL);",
+        )
+        .expect("create legacy ckpts table");
+        let id = Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO ckpts (id, space, project, parent, auto, note, created_at) VALUES (?1, ?2, 'legacy', NULL, 0, 'initial', ?3)",
+            params![id.to_string(), Uuid::new_v4().to_string(), Utc::now().to_rfc3339()],
+        )
+        .expect("insert legacy checkpoint");
+
+        init_schema(&conn).expect("apply complete schema");
+        let columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('ckpts') WHERE name = 'full'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect migrated schema");
+        assert_eq!(columns, 1);
+        let state = load(&conn).expect("load migrated checkpoint");
+        assert_eq!(state.ckpts.len(), 1);
+        assert!(!state.ckpts[0].full);
     }
 
     #[test]

@@ -63,6 +63,8 @@ pub fn pid_path(dir: &Path) -> PathBuf {
 const JAIL_KERNEL: &str = "vmlinux";
 const JAIL_ROOTFS: &str = "rootfs.ext4";
 const JAIL_VSOCK: &str = "vsock.sock";
+const JAIL_SNAP_MEM: &str = "snap.mem";
+const JAIL_SNAP_STATE: &str = "snap.state";
 
 pub fn key_path(dir: &Path) -> PathBuf {
     dir.join("id_ed25519")
@@ -417,11 +419,13 @@ fn read_pid(dir: &Path) -> Option<u32> {
         .ok()
 }
 
-/// The pid of the Firecracker instance launched with `config`.
+/// The pid of the Firecracker instance launched for `id`.
 ///
 /// `setsid --fork` deliberately loses the grandchild's pid. The jailer
 /// records Firecracker's pid inside the jail, while the process scan below
-/// remains a fallback for the short window before that file is written.
+/// remains a fallback for the short window before that file is written. Cold
+/// boots can be identified by their config path; restores rely on the UUID
+/// that the jailer forwards to Firecracker because they have no config file.
 fn find_vm_pid(config: &Path, id: Uuid) -> Option<u32> {
     for entry in std::fs::read_dir("/proc").ok()?.flatten() {
         let Some(pid) = entry
@@ -441,8 +445,9 @@ fn find_vm_pid(config: &Path, id: Uuid) -> Option<u32> {
 /// Whether `pid` is a live Firecracker running exactly this VM.
 ///
 /// The single definition is shared by discovery and every later lifecycle
-/// check. The jailer forwards Firecracker's UUID argument after chrooting,
-/// so matching that identity avoids confusing relative `fc.json` paths.
+/// check. The jailer forwards Firecracker's UUID argument after chrooting, so
+/// matching that identity keeps discovery valid for restores without a
+/// config path, while the config match preserves cold-boot discovery.
 fn is_vm_process(pid: u32, config: &Path, id: Uuid) -> bool {
     let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
         return false;
@@ -576,6 +581,64 @@ pub fn release(dir: &Path) {
     let _ = api(dir, "PATCH", "/balloon", Some("{\"amount_mib\": 0}"));
 }
 
+/// Captures guest RAM and vCPU state beside the disk image.
+///
+/// Firecracker resolves these paths inside the jailer's chroot, so the files
+/// land in the jail and must be moved out by the caller.
+pub fn snapshot(dir: &Path) -> Result<(PathBuf, PathBuf)> {
+    release(dir);
+    if api(
+        dir,
+        "PATCH",
+        "/vm",
+        Some("{\"state\": \"Paused\"}"),
+    )
+    .is_none()
+    {
+        return Err(Error::Invalid(
+            "failed to pause VM for snapshot".to_owned(),
+        ));
+    }
+    if api(
+        dir,
+        "PUT",
+        "/snapshot/create",
+        Some(
+            "{\"snapshot_type\":\"Full\",\"snapshot_path\":\"snap.state\",\"mem_file_path\":\"snap.mem\"}",
+        ),
+    )
+    .is_none()
+    {
+        // A failed create leaves Firecracker paused, so always make the best
+        // effort to restore normal VM operation before reporting the error.
+        let _ = api(
+            dir,
+            "PATCH",
+            "/vm",
+            Some("{\"state\": \"Resumed\"}"),
+        );
+        return Err(Error::Invalid(
+            "failed to create VM snapshot".to_owned(),
+        ));
+    }
+    if api(
+        dir,
+        "PATCH",
+        "/vm",
+        Some("{\"state\": \"Resumed\"}"),
+    )
+    .is_none()
+    {
+        return Err(Error::Invalid(
+            "failed to resume VM after snapshot".to_owned(),
+        ));
+    }
+    Ok((
+        jail_path(dir, JAIL_SNAP_MEM),
+        jail_path(dir, JAIL_SNAP_STATE),
+    ))
+}
+
 fn signal(pid: u32, sig: &str) -> bool {
     std::process::Command::new("kill")
         .arg(format!("-{sig}"))
@@ -694,6 +757,12 @@ pub struct Sizing {
     pub mem_mib: Option<u32>,
 }
 
+/// Host-side snapshot files to load instead of a cold boot.
+pub struct RestoreFiles<'a> {
+    pub mem: &'a Path,
+    pub state: &'a Path,
+}
+
 /// Boots the VM unless it is already up. Returns whether a boot happened.
 pub fn start(
     root: &Path,
@@ -702,6 +771,7 @@ pub fn start(
     sizing: Sizing,
     cfg: &VmConfig,
     net_cfg: &NetConfig,
+    restore: Option<&RestoreFiles>,
 ) -> Result<(PathBuf, bool)> {
     let vcpus = sizing.vcpus.unwrap_or(cfg.vcpus);
     let mem_mib = sizing.mem_mib.unwrap_or(cfg.mem_mib);
@@ -750,18 +820,33 @@ pub fn start(
         std::os::unix::fs::chown(&jail_rootfs, None, Some(cfg.jail_gid))?;
         std::fs::set_permissions(&jail_rootfs, std::fs::Permissions::from_mode(0o660))?;
         std::fs::set_permissions(&jail_kernel, std::fs::Permissions::from_mode(0o444))?;
-        std::fs::write(
-            config_path(&dir),
-            crate::config::vm_config_json(
-                Path::new(JAIL_KERNEL),
-                Path::new(JAIL_ROOTFS),
-                image_kind,
-                Path::new(JAIL_VSOCK),
-                vcpus,
-                mem_mib,
-                net.as_ref(),
-            ),
-        )?;
+        if let Some(files) = restore {
+            let jail_mem = jail.join(JAIL_SNAP_MEM);
+            let jail_state = jail.join(JAIL_SNAP_STATE);
+            link_resource(files.mem, &jail_mem)?;
+            link_resource(files.state, &jail_state)?;
+            // Snapshot files must remain readable by the jailed Firecracker
+            // uid while staying inaccessible to the space owner on the host.
+            std::os::unix::fs::chown(&jail_mem, None, Some(cfg.jail_gid))?;
+            std::os::unix::fs::chown(&jail_state, None, Some(cfg.jail_gid))?;
+            std::fs::set_permissions(&jail_mem, std::fs::Permissions::from_mode(0o660))?;
+            std::fs::set_permissions(&jail_state, std::fs::Permissions::from_mode(0o660))?;
+        }
+
+        if restore.is_none() {
+            std::fs::write(
+                config_path(&dir),
+                crate::config::vm_config_json(
+                    Path::new(JAIL_KERNEL),
+                    Path::new(JAIL_ROOTFS),
+                    image_kind,
+                    Path::new(JAIL_VSOCK),
+                    vcpus,
+                    mem_mib,
+                    net.as_ref(),
+                ),
+            )?;
+        }
 
         // Keep the VM outside the daemon's session so daemon restart does
         // not signal or reap a running guest. `setsid --fork` still gives
@@ -769,7 +854,8 @@ pub fn start(
         // Firecracker process we identify below.
         let log = std::fs::File::create(dir.join("console.log"))?;
         let memory_limit = format!("memory.max={mem_mib}M");
-        let status = std::process::Command::new("setsid")
+        let mut command = std::process::Command::new("setsid");
+        command
             .arg("--fork")
             .arg(shinu_core::jailer_bin(root))
             .arg("--id")
@@ -785,14 +871,16 @@ pub fn start(
             .arg("--cgroup-version")
             .arg("2")
             .arg("--cgroup")
-            .arg(memory_limit)
+            .arg(&memory_limit)
             .arg("--cgroup")
             .arg("pids.max=512")
             .arg("--")
             .arg("--api-sock")
-            .arg("fc.sock")
-            .arg("--config-file")
-            .arg("fc.json")
+            .arg("fc.sock");
+        if restore.is_none() {
+            command.arg("--config-file").arg("fc.json");
+        }
+        let status = command
             .stdin(std::process::Stdio::null())
             .stderr(log.try_clone()?)
             .stdout(log)
@@ -834,6 +922,47 @@ pub fn start(
         // normal jailer launches have already created the same path.
         std::fs::write(pid_path(&dir), pid.to_string())?;
 
+        if restore.is_some() {
+            let mut api_ready = false;
+            for _ in 0..100 {
+                if api_path(&dir).exists() {
+                    api_ready = true;
+                    break;
+                }
+                if !is_running(&dir) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if !api_ready {
+                let _ = stop(&dir, net_cfg);
+                let _ = std::fs::remove_file(jail.join(JAIL_SNAP_MEM));
+                let _ = std::fs::remove_file(jail.join(JAIL_SNAP_STATE));
+                return Err(Error::Invalid(
+                    "snapshot restore API socket did not appear".to_owned(),
+                ));
+            }
+            // A snapshot records the tap it was captured on. Restoring into a
+            // different space (fork, or any re-derived tap) must repoint the
+            // interface or Firecracker reopens the source's tap and fails with
+            // EBUSY while that VM still owns it.
+            let body = match net.as_ref() {
+                Some(spec) => format!(
+                    "{{\"snapshot_path\":\"snap.state\",\"mem_backend\":{{\"backend_path\":\"snap.mem\",\"backend_type\":\"File\"}},\"resume_vm\":true,\"network_overrides\":[{{\"iface_id\":\"eth0\",\"host_dev_name\":\"{}\"}}]}}",
+                    spec.tap
+                ),
+                None => "{\"snapshot_path\":\"snap.state\",\"mem_backend\":{\"backend_path\":\"snap.mem\",\"backend_type\":\"File\"},\"resume_vm\":true}".to_owned(),
+            };
+            if api(&dir, "PUT", "/snapshot/load", Some(&body)).is_none() {
+                let _ = stop(&dir, net_cfg);
+                let _ = std::fs::remove_file(jail.join(JAIL_SNAP_MEM));
+                let _ = std::fs::remove_file(jail.join(JAIL_SNAP_STATE));
+                return Err(Error::Invalid(
+                    "failed to load VM snapshot".to_owned(),
+                ));
+            }
+        }
+
         if !wait_ready(&dir, &vsock) {
             let console = std::fs::read_to_string(dir.join("console.log")).unwrap_or_default();
             let _ = stop(&dir, net_cfg);
@@ -847,6 +976,56 @@ pub fn start(
                     .join(" | ")
             )));
         }
+        if restore.is_some() {
+            // Firecracker restores the guest wall clock from snapshot time;
+            // correcting it here keeps timers and certificate checks sane.
+            let clock_command = [
+                "date".to_owned(),
+                "-u".to_owned(),
+                "-s".to_owned(),
+                format!("@{}", now_secs()),
+            ];
+            match exec_in_vm(
+                &vsock,
+                &key_path(&dir),
+                shinu_core::VSOCK_SSH_PORT,
+                &clock_command,
+            ) {
+                Ok(0) => {}
+                Ok(status) => eprintln!(
+                    "failed to correct restored guest clock for {id}: exit status {status}"
+                ),
+                Err(error) => {
+                    eprintln!("failed to correct restored guest clock for {id}: {error}")
+                }
+            }
+            // The snapshot also carries the source space's address. Each space
+            // owns a distinct /30, so a fork resumes holding an IP that does
+            // not belong to its tap; exec still works because it rides vsock,
+            // which is how this stayed invisible until egress was tried.
+            if let Some(spec) = net.as_ref() {
+                let reconfigure = format!(
+                    "ip addr flush dev eth0; ip addr add {} dev eth0; ip link set eth0 up; ip route add default via {} 2>/dev/null; true",
+                    spec.guest_cidr, spec.gateway
+                );
+                let net_command = ["sh".to_owned(), "-c".to_owned(), reconfigure];
+                match exec_in_vm(
+                    &vsock,
+                    &key_path(&dir),
+                    shinu_core::VSOCK_SSH_PORT,
+                    &net_command,
+                ) {
+                    Ok(0) => {}
+                    Ok(status) => eprintln!(
+                        "failed to reconfigure restored guest network for {id}: exit status {status}"
+                    ),
+                    Err(error) => {
+                        eprintln!("failed to reconfigure restored guest network for {id}: {error}")
+                    }
+                }
+            }
+        }
+
         // The jailer runs Firecracker as its configured non-root uid, but
         // the host-side vsock stays owned by the daemon: 0600 as root is
         // what keeps a space owner from reaching another guest's socket.

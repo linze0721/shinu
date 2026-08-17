@@ -48,22 +48,22 @@ fn build_base(root: &Path, base: &Path, image: Image, cfg: &BaseConfig) -> Resul
                     // The shipped xbps refuses to install anything until it updates
                     // itself, so -S is required before both package operations.
                     chroot_run(&mnt, "xbps-install -y -S -u xbps")?;
-                    chroot_run(&mnt, "xbps-install -y -S socat openssh iproute2 git tmux")?;
+                    chroot_run(&mnt, "xbps-install -y -S socat openssh iproute2 git tmux xorg-server-xvfb x11vnc openbox xdotool scrot")?;
                 }
                 // ca-certificates is not pulled in by --no-install-recommends, and
                 // without it every HTTPS clone or download in the guest fails with
                 // "server certificate verification failed".
                 Image::Ubuntu => chroot_run(
                     &mnt,
-                    "export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y --no-install-recommends ca-certificates iproute2 socat openssh-server systemd-sysv tmux",
+                    "export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y --no-install-recommends ca-certificates iproute2 socat openssh-server systemd-sysv tmux xvfb x11vnc openbox xdotool scrot",
                 )?,
                 Image::Arch => {
                     chroot_run(&mnt, "pacman-key --init && pacman-key --populate archlinux")?;
-                    chroot_run(&mnt, "pacman -Sy --noconfirm socat openssh tmux")?;
+                    chroot_run(&mnt, "pacman -Sy --noconfirm socat openssh tmux xorg-server-xvfb x11vnc openbox xdotool scrot")?;
                 }
                 Image::Rocky => chroot_run(
                     &mnt,
-                    "dnf install -y --setopt=install_weak_deps=False socat openssh-server systemd iproute tmux",
+                    "dnf install -y epel-release && dnf install -y --setopt=install_weak_deps=False socat openssh-server systemd iproute tmux xorg-x11-server-Xvfb x11vnc openbox xdotool ImageMagick",
                 )?,
             }
             // Package installation can create or replace service/config files, so

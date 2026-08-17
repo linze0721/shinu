@@ -25,10 +25,14 @@ pub enum Req {
     },
     /// `hot: true` syncs a running guest without remounting read-only and
     /// is not crash-consistent; `hot: false` requires the space to be stopped.
+    /// `full: true` additionally captures guest memory and CPU state, so the
+    /// space must be running even when `hot` is false.
     Commit {
         space: String,
         note: String,
         hot: bool,
+        #[serde(default)]
+        full: bool,
     },
     Checkout {
         space: String,

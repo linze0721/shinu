@@ -3,11 +3,13 @@ use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 use shinu::token::{self, Token};
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::net::TcpStream;
+use std::io::{self, BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:7878";
@@ -67,6 +69,14 @@ enum Command {
     Stop {
         space: String,
     },
+    Desktop {
+        space: String,
+    },
+    Vnc {
+        space: String,
+        #[arg(long, default_value_t = 5901)]
+        port: u16,
+    },
     Exec {
         space: String,
         #[arg(long, value_name = "FILE")]
@@ -90,6 +100,8 @@ enum Command {
         note: String,
         #[arg(long)]
         hot: bool,
+        #[arg(long)]
+        full: bool,
     },
     Log {
         space: String,
@@ -258,6 +270,7 @@ fn parse_port(value: &str) -> Result<u16, String> {
     Ok(port)
 }
 
+#[derive(Clone)]
 struct HttpClient {
     endpoint: Endpoint,
     token: String,
@@ -349,6 +362,28 @@ impl HttpClient {
         let head = read_response_head(&mut reader)?;
         Ok((reader, head))
     }
+    fn open_raw_request(
+        &self,
+        method: &str,
+        path: &str,
+    ) -> Result<(TcpStream, ResponseHead), String> {
+        let mut stream = self.start_request(method, path, 0, None)?;
+        let mut head_bytes = Vec::new();
+        let mut byte = [0u8; 1];
+        while head_bytes.len() < 64 * 1024 {
+            let count = stream.read(&mut byte).map_err(|error| error.to_string())?;
+            if count == 0 {
+                return Err("HTTP response ended before the VNC headers".to_string());
+            }
+            head_bytes.push(byte[0]);
+            if head_bytes.ends_with(b"\r\n\r\n") {
+                let mut cursor = Cursor::new(head_bytes);
+                let head = read_response_head(&mut cursor)?;
+                return Ok((stream, head));
+            }
+        }
+        Err("HTTP response headers exceed 64 KiB".to_string())
+    }
 
     fn stream_exec(
         &self,
@@ -422,6 +457,90 @@ impl HttpClient {
                 .map_err(|error| format!("could not create {local_path:?}: {error}"))?;
             stream_body(&mut reader, &head.headers, &mut output)
         }
+    }
+    fn proxy_vnc(&self, space: &str, port: u16) -> Result<i32, String> {
+        let listener = TcpListener::bind(("127.0.0.1", port))
+            .map_err(|error| format!("could not listen on localhost:{port}: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("could not inspect VNC listener address: {error}"))?;
+        println!("VNC proxy listening on {address}");
+        for incoming in listener.incoming() {
+            let local = incoming.map_err(|error| format!("could not accept VNC client: {error}"))?;
+            let client = self.clone();
+            let space = space.to_owned();
+            thread::spawn(move || {
+                if let Err(error) = client.proxy_vnc_connection(&space, local) {
+                    eprintln!("VNC connection: {error}");
+                }
+            });
+        }
+        Ok(0)
+    }
+
+    fn proxy_vnc_connection(&self, space: &str, mut local: TcpStream) -> Result<(), String> {
+        let path = format!("/v1/spaces/{}/vnc", encode_path_segment(space));
+        let (mut remote, head) = self.open_raw_request("GET", &path)?;
+        if !(200..300).contains(&head.status) {
+            let mut reader = BufReader::new(remote);
+            let body = read_body(&mut reader, &head.headers)?;
+            return Err(http_error(head.status, &body));
+        }
+
+        let mut client_reader = local
+            .try_clone()
+            .map_err(|error| format!("could not clone VNC client stream: {error}"))?;
+        let mut remote_writer = remote
+            .try_clone()
+            .map_err(|error| format!("could not clone VNC endpoint stream: {error}"))?;
+        let stop_client_reader = Arc::new(AtomicBool::new(false));
+        let stop_client_reader_thread = Arc::clone(&stop_client_reader);
+        let client_thread = thread::spawn(move || {
+            // Do not half-close either socket: Firecracker's vsock
+            // multiplexer treats that as closing both directions.
+            if client_reader
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .is_err()
+            {
+                return;
+            }
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                match client_reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => {
+                        if remote_writer.write_all(&buffer[..count]).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                        ) => {
+                            if stop_client_reader_thread.load(Ordering::Acquire) {
+                                break;
+                            }
+                        }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            match remote.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(count) => {
+                    if local.write_all(&buffer[..count]).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        stop_client_reader.store(true, Ordering::Release);
+        let _ = client_thread.join();
+        Ok(())
     }
 }
 
@@ -696,6 +815,36 @@ fn run_command(client: &HttpClient, command: Command) -> Result<i32, String> {
                 println!("not running {stopped}");
             }
         }
+        Command::Desktop { space } => {
+            let command = vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                r#"if [ -d /etc/runit ]; then
+    ln -sf /etc/sv/shinu-desktop /etc/runit/runsvdir/default/
+    ln -sf /etc/sv/shinu-vsock-vnc /etc/runit/runsvdir/default/
+    # runsvdir rescans on its own schedule, so the supervise directories a
+    # `sv` command talks to do not exist the instant the symlink appears.
+    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        [ -e /etc/sv/shinu-desktop/supervise/ok ] \
+            && [ -e /etc/sv/shinu-vsock-vnc/supervise/ok ] && break
+        sleep 1
+    done
+    sv up shinu-desktop shinu-vsock-vnc
+elif command -v systemctl >/dev/null 2>&1; then
+    systemctl enable --now shinu-desktop shinu-vsock-vnc
+else
+    echo "unsupported guest init; expected runit or systemd" >&2
+    exit 1
+fi"#
+                    .to_owned(),
+            ];
+            let status = client.stream_exec(&space, &command, None)?;
+            if status == 0 {
+                println!("desktop services enabled and running for {space}");
+            }
+            return Ok(status);
+        }
+        Command::Vnc { space, port } => return client.proxy_vnc(&space, port),
         Command::Exec { space, stdin, cmd } => {
             return client.stream_exec(&space, &cmd, stdin.as_deref());
         }
@@ -719,11 +868,16 @@ fn run_command(client: &HttpClient, command: Command) -> Result<i32, String> {
                 println!("pulled {bytes} bytes to {local_file}");
             }
          }
-        Command::Commit { space, note, hot } => {
+        Command::Commit {
+            space,
+            note,
+            hot,
+            full,
+        } => {
             let data = response_value(client.request(
                 "POST",
                 &format!("/v1/spaces/{}/commits", encode_path_segment(&space)),
-                Some(json!({ "note": note, "hot": hot })),
+                Some(json!({ "note": note, "hot": hot, "full": full })),
             )?)?;
             println!("{}  {}", short_id_value(data.get("id")), field_text(&data, "note"));
         }

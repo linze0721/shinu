@@ -15,6 +15,9 @@ pub const KERNEL_URL: &str =
     "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.13/x86_64/vmlinux-6.1.141";
 /// Guest vsock port the in-VM socat bridge listens on; forwarded to sshd.
 pub const VSOCK_SSH_PORT: u16 = 2222;
+/// GUI VNC uses a separate vsock connection because each Firecracker vsock
+/// connection carries one `CONNECT <port>` request.
+pub const VSOCK_VNC_PORT: u16 = 2223;
 /// Raw uploads use a separate cap because they stream bytes instead of the 1 MiB JSON body.
 pub const MAX_UPLOAD_BYTES: usize = 256 * 1024 * 1024;
 
@@ -299,6 +302,14 @@ pub fn space_image(root: &Path, id: Uuid) -> PathBuf {
 
 pub fn ckpt_image(root: &Path, id: Uuid) -> PathBuf {
     root.join("ckpts").join(format!("{id}.ext4"))
+}
+
+pub fn ckpt_mem(root: &Path, id: Uuid) -> PathBuf {
+    root.join("ckpts").join(format!("{id}.mem"))
+}
+
+pub fn ckpt_state(root: &Path, id: Uuid) -> PathBuf {
+    root.join("ckpts").join(format!("{id}.state"))
 }
 
 /// `<root>/assets` — the firecracker binary and the guest kernel.

@@ -1,6 +1,5 @@
 use std::fmt::Display;
 use std::io::{self, Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process;
 use std::thread;
@@ -26,42 +25,7 @@ fn main() {
         usage();
     }
 
-    let mut stream = UnixStream::connect(&uds).unwrap_or_else(|error| fail(error));
-    let request = format!("CONNECT {port}\n");
-    stream
-        .write_all(request.as_bytes())
-        .unwrap_or_else(|error| fail(error));
-    stream.flush().unwrap_or_else(|error| fail(error));
-
-    // Read one byte at a time: BufReader would read ahead past the newline and swallow
-    // the first payload bytes of the SSH banner.
-    let mut reply = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        if reply.len() >= 64 {
-            fail(format!(
-                "vsock connect refused for {} port {port}: handshake too long",
-                uds.display()
-            ));
-        }
-        match stream.read(&mut byte) {
-            Ok(0) => fail(format!(
-                "vsock connect refused for {} port {port}: EOF during handshake",
-                uds.display()
-            )),
-            Ok(_) if byte[0] == b'\n' => break,
-            Ok(_) => reply.push(byte[0]),
-            Err(error) => fail(error),
-        }
-    }
-    let reply = String::from_utf8_lossy(&reply);
-    if !reply.starts_with("OK ") {
-        fail(format!(
-            "vsock connect refused for {} port {port}: {}",
-            uds.display(),
-            reply.trim()
-        ));
-    }
+    let mut stream = shinu::vsock_connect(&uds, port).unwrap_or_else(|error| fail(error));
 
     let mut to_socket = stream.try_clone().unwrap_or_else(|error| fail(error));
     // No `shutdown(Write)` on stdin EOF, and no exit from this thread.

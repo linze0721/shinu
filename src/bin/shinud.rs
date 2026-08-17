@@ -4,9 +4,10 @@ use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, MutexGuard, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -260,6 +261,39 @@ fn image_size_mib(path: &Path) -> u64 {
                 / (1024 * 1024)
         })
 }
+fn space_snapshot_mem(root: &Path, id: Uuid) -> PathBuf {
+    shinu::space_image(root, id).with_extension("mem")
+}
+
+fn space_snapshot_state(root: &Path, id: Uuid) -> PathBuf {
+    shinu::space_image(root, id).with_extension("state")
+}
+
+fn remove_file_if_missing(path: &Path) -> shinu::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn remove_space_snapshot_files(root: &Path, id: Uuid) -> shinu::Result<()> {
+    remove_file_if_missing(&space_snapshot_mem(root, id))?;
+    remove_file_if_missing(&space_snapshot_state(root, id))
+}
+
+fn checkpoint_exclusive(root: &Path, id: Uuid) -> shinu::Result<u64> {
+    let mut total: u64 = 0;
+    for path in [
+        shinu::ckpt_image(root, id),
+        shinu::ckpt_mem(root, id),
+        shinu::ckpt_state(root, id),
+    ] {
+        total = total.saturating_add(shinu::btrfs::exclusive(&path)?);
+    }
+    Ok(total)
+}
+
 
 fn space_size_mib(root: &Path, space: &Space) -> u64 {
     space
@@ -268,12 +302,24 @@ fn space_size_mib(root: &Path, space: &Space) -> u64 {
 }
 
 fn current_disk_mib(root: &Path, state: &State, project: &str) -> u64 {
-    state
+    let spaces = state
         .spaces
         .iter()
         .filter(|space| space.project == project)
         .map(|space| space_size_mib(root, space))
-        .sum()
+        .sum::<u64>();
+    let checkpoints = state
+        .ckpts
+        .iter()
+        .filter(|checkpoint| checkpoint.project == project)
+        .map(|checkpoint| {
+            checkpoint_exclusive(root, checkpoint.id)
+                .unwrap_or(0)
+                .saturating_add(1024 * 1024 - 1)
+                / (1024 * 1024)
+        })
+        .sum::<u64>();
+    spaces.saturating_add(checkpoints)
 }
 
 fn check_space_quota(
@@ -402,14 +448,25 @@ fn require_checkpoint_note(note: &str) -> shinu::Result<()> {
     Ok(())
 }
 
+/// The three independent booleans a new checkpoint carries. Grouping them
+/// keeps callsites readable: a bare `false, false, true` argument tail says
+/// nothing about which flag is which.
+struct CkptFlags {
+    /// Written by the daemon itself rather than requested by a caller.
+    auto: bool,
+    /// Has memory and vCPU state beside the disk image.
+    full: bool,
+    /// Moves the space's head to this checkpoint.
+    update_head: bool,
+}
+
 fn append_checkpoint(
     state: &mut State,
     space_id: Uuid,
     project: &str,
     id: Uuid,
     note: String,
-    auto: bool,
-    update_head: bool,
+    flags: CkptFlags,
 ) -> shinu::Result<Ckpt> {
     let space_index = state
         .spaces
@@ -422,12 +479,13 @@ fn append_checkpoint(
         space: space_id,
         project: project.to_owned(),
         parent,
-        auto,
+        auto: flags.auto,
+        full: flags.full,
         note,
         created_at: Utc::now(),
     };
     state.ckpts.push(checkpoint.clone());
-    if update_head {
+    if flags.update_head {
         state.spaces[space_index].head = Some(id);
     }
     Ok(checkpoint)
@@ -586,7 +644,7 @@ fn fork_space(
     name: String,
 ) -> shinu::Result<Value> {
     let limits = effective_limits(ctx, project)?;
-    let (source, source_space) = {
+    let (source, source_full, source_space) = {
         let _state_guard = lock_state(ctx.registry);
         let connection = lock_db(ctx.db);
         let state = state::load(&connection)?;
@@ -603,7 +661,7 @@ fn fork_space(
             .unwrap_or_else(|| image_size_mib(&shinu::ckpt_image(ctx.root, checkpoint.id)));
         check_space_quota(ctx.root, &connection, project, &limits, source_disk)?;
         check_vm_sizing(ctx, &limits, source_space.vcpus, source_space.mem_mib)?;
-        (checkpoint.id, source_space)
+        (checkpoint.id, checkpoint.full, source_space)
     };
     let id = Uuid::new_v4();
     let space_guard = ctx.registry.space_lock(id);
@@ -611,14 +669,46 @@ fn fork_space(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let image_path = shinu::space_image(ctx.root, id);
+    let snapshot_mem = space_snapshot_mem(ctx.root, id);
+    let snapshot_state = space_snapshot_state(ctx.root, id);
     let source_image = shinu::ckpt_image(ctx.root, source);
     shinu::btrfs::clone_for(&source_image, &image_path, 0, 0)?;
     let mount = ctx.root.join(format!("authorize.{id}.mnt"));
     let result = (|| -> shinu::Result<Value> {
+        if source_full {
+            // A restored guest keeps the sshd and page cache captured in the
+            // snapshot, so rewriting authorized_keys on the reflinked disk
+            // would be invisible to it and every exec would fall back to a
+            // password prompt. Inheriting the source key instead keeps the
+            // fork's credentials consistent with the memory it resumes from;
+            // the disk already trusts that key because it is a reflink.
+            let source_dir = shinu::vm_dir(ctx.root, source_space.id);
+            let fork_dir = shinu::vm_dir(ctx.root, id);
+            std::fs::create_dir_all(&fork_dir)?;
+            for suffix in ["id_ed25519", "id_ed25519.pub"] {
+                std::fs::copy(source_dir.join(suffix), fork_dir.join(suffix))?;
+            }
+        }
         let public_key = shinu::vm::prepare(&shinu::vm_dir(ctx.root, id), 0, 0)?;
-        // A fork has a distinct VM key even though its first disk state is a
-        // reflink of the source checkpoint.
-        shinu::vm::authorize(&image_path, &public_key, &mount)?;
+        if !source_full {
+            // A disk-only fork boots cold, so it can safely be given a
+            // distinct key even though its disk starts as a reflink.
+            shinu::vm::authorize(&image_path, &public_key, &mount)?;
+        }
+        if source_full {
+            shinu::btrfs::clone_for(
+                &shinu::ckpt_mem(ctx.root, source),
+                &snapshot_mem,
+                0,
+                0,
+            )?;
+            shinu::btrfs::clone_for(
+                &shinu::ckpt_state(ctx.root, source),
+                &snapshot_state,
+                0,
+                0,
+            )?;
+        }
         let source_disk = source_space
             .disk_mib
             .unwrap_or_else(|| image_size_mib(&source_image));
@@ -653,12 +743,12 @@ fn fork_space(
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&image_path);
+        let _ = remove_space_snapshot_files(ctx.root, id);
         let _ = std::fs::remove_dir_all(shinu::vm_dir(ctx.root, id));
         let _ = std::fs::remove_dir_all(&mount);
     }
     result
 }
-
 
 fn commit_space(
     ctx: &Ctx<'_>,
@@ -666,6 +756,7 @@ fn commit_space(
     space: String,
     note: String,
     hot: bool,
+    full: bool,
 ) -> shinu::Result<Value> {
     require_checkpoint_note(&note)?;
     let (space_id, space_name) = {
@@ -678,7 +769,12 @@ fn commit_space(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let vm_dir = shinu::vm_dir(ctx.root, space_id);
     let running = shinu::vm::is_running(&vm_dir);
-    if running && !hot {
+    if full && !running {
+        return Err(shinu::Error::Invalid(
+            "a full checkpoint needs a running space; start it or drop --full".into(),
+        ));
+    }
+    if running && !hot && !full {
         return Err(shinu::Error::Invalid(format!(
             "stop the space before checkpointing it: {space_name}"
         )));
@@ -699,14 +795,54 @@ fn commit_space(
         }
     }
     let id = Uuid::new_v4();
+    let full_limits = if full {
+        Some(effective_limits(ctx, project)?)
+    } else {
+        None
+    };
     let image = shinu::ckpt_image(ctx.root, id);
-    shinu::btrfs::clone_for(&shinu::space_image(ctx.root, space_id), &image, 0, 0)?;
-    let result = update_state(ctx.db, ctx.registry, |state| {
-        let checkpoint = append_checkpoint(state, space_id, project, id, note, false, true)?;
+    let jail_snapshot_mem = shinu::vm::jail_root(ctx.root, space_id).join("snap.mem");
+    let jail_snapshot_state = shinu::vm::jail_root(ctx.root, space_id).join("snap.state");
+    let result = (|| -> shinu::Result<Value> {
+        shinu::btrfs::clone_for(&shinu::space_image(ctx.root, space_id), &image, 0, 0)?;
+        if full {
+            let (snapshot_mem, snapshot_state) = shinu::vm::snapshot(&vm_dir)?;
+            std::fs::rename(snapshot_mem, shinu::ckpt_mem(ctx.root, id))?;
+            std::fs::rename(snapshot_state, shinu::ckpt_state(ctx.root, id))?;
+        }
+        let checkpoint = update_state(ctx.db, ctx.registry, |state| {
+            if let Some(limits) = full_limits.as_ref() {
+                let new_checkpoint_mib = checkpoint_exclusive(ctx.root, id)?
+                    .saturating_add(1024 * 1024 - 1)
+                    / (1024 * 1024);
+                quota::check_disk_limit(
+                    current_disk_mib(ctx.root, state, project)
+                        .saturating_add(new_checkpoint_mib),
+                    0,
+                    limits,
+                )?;
+            }
+            append_checkpoint(
+                state,
+                space_id,
+                project,
+                id,
+                note,
+                CkptFlags {
+                    auto: false,
+                    full,
+                    update_head: true,
+                },
+            )
+        })?;
         Ok(serde_json::to_value(checkpoint)?)
-    });
+    })();
     if result.is_err() {
-        let _ = std::fs::remove_file(image);
+        let _ = std::fs::remove_file(&image);
+        let _ = remove_file_if_missing(&shinu::ckpt_mem(ctx.root, id));
+        let _ = remove_file_if_missing(&shinu::ckpt_state(ctx.root, id));
+        let _ = remove_file_if_missing(&jail_snapshot_mem);
+        let _ = remove_file_if_missing(&jail_snapshot_state);
     }
     result
 }
@@ -717,9 +853,9 @@ fn checkout_space(
     space: String,
     commit: Uuid,
 ) -> shinu::Result<Value> {
-    let (space_id, space_name) = {
+    let (space_id, space_name, image_kind, vcpus, mem_mib) = {
         let entry = find_space(ctx.db, &space, project)?;
-        (entry.id, entry.name)
+        (entry.id, entry.name, entry.image, entry.vcpus, entry.mem_mib)
     };
     let space_guard = ctx.registry.space_lock(space_id);
     let _space_guard = space_guard
@@ -759,6 +895,7 @@ fn checkout_space(
             project: project.to_owned(),
             parent: current_head,
             auto: true,
+            full: false,
             note: auto_note.clone(),
             created_at: Utc::now(),
         };
@@ -774,13 +911,47 @@ fn checkout_space(
     shinu::btrfs::clone_for(&shinu::ckpt_image(ctx.root, target.id), &image, 0, 0)?;
     let mount = ctx.root.join(format!("authorize.checkout.{space_id}.mnt"));
     shinu::vm::authorize(&image, &public_key, &mount)?;
+    let snapshot_mem = space_snapshot_mem(ctx.root, space_id);
+    let snapshot_state = space_snapshot_state(ctx.root, space_id);
+    if target.full {
+        remove_space_snapshot_files(ctx.root, space_id)?;
+        shinu::btrfs::clone_for(
+            &shinu::ckpt_mem(ctx.root, target.id),
+            &snapshot_mem,
+            0,
+            0,
+        )?;
+        if let Err(error) = shinu::btrfs::clone_for(
+            &shinu::ckpt_state(ctx.root, target.id),
+            &snapshot_state,
+            0,
+            0,
+        ) {
+            let _ = remove_space_snapshot_files(ctx.root, space_id);
+            return Err(error);
+        }
+    } else {
+        remove_space_snapshot_files(ctx.root, space_id)?;
+    }
     update_state(ctx.db, ctx.registry, |state| {
         shinu::find_ckpt(state, target.id, project)?;
         set_head(state, space_id, project, target.id)?;
         Ok(())
     })?;
+    if target.full {
+        let _ = start_vm_with_pending_restore(
+            ctx,
+            space_id,
+            image_kind,
+            vcpus,
+            mem_mib,
+        )?;
+    }
     Ok(json!({ "head": target.id, "auto_commit": auto_checkpoint.id }))
 }
+
+
+
 
 fn remove_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value> {
     let (id, resolved_name) = {
@@ -798,6 +969,7 @@ fn remove_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Val
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
+    remove_space_snapshot_files(ctx.root, id)?;
     match std::fs::remove_dir_all(shinu::vm_dir(ctx.root, id)) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -820,11 +992,9 @@ fn remove_checkpoint(ctx: &Ctx<'_>, project: &str, id: Uuid) -> shinu::Result<Va
         )));
     }
     let image = shinu::ckpt_image(ctx.root, id);
-    match std::fs::remove_file(&image) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
+    remove_file_if_missing(&image)?;
+    remove_file_if_missing(&shinu::ckpt_mem(ctx.root, id))?;
+    remove_file_if_missing(&shinu::ckpt_state(ctx.root, id))?;
     update_state(ctx.db, ctx.registry, |state| {
         let checkpoint = shinu::find_ckpt(state, id, project)?;
         if !shinu::is_referenced(state, checkpoint.id).is_empty() {
@@ -858,7 +1028,7 @@ fn list_spaces(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
     for checkpoint in state.ckpts.iter().filter(|checkpoint| checkpoint.project == project) {
         let mut value = serde_json::to_value(checkpoint)?;
         if let Some(object) = value.as_object_mut() {
-            let size = shinu::btrfs::exclusive(&shinu::ckpt_image(ctx.root, checkpoint.id)).unwrap_or(0);
+            let size = checkpoint_exclusive(ctx.root, checkpoint.id).unwrap_or(0);
             object.insert("exclusive".into(), Value::from(size));
         }
         checkpoints.push(value);
@@ -877,6 +1047,45 @@ fn list_images(ctx: &Ctx<'_>) -> shinu::Result<Value> {
         })
         .collect::<Vec<_>>();
     Ok(Value::Array(images))
+}
+
+fn start_vm_with_pending_restore(
+    ctx: &Ctx<'_>,
+    id: Uuid,
+    image: Image,
+    vcpus: Option<u32>,
+    mem_mib: Option<u32>,
+) -> shinu::Result<(PathBuf, bool)> {
+    let snapshot_mem = space_snapshot_mem(ctx.root, id);
+    let snapshot_state = space_snapshot_state(ctx.root, id);
+    let has_mem = snapshot_mem.exists();
+    let has_state = snapshot_state.exists();
+    if has_mem != has_state {
+        remove_space_snapshot_files(ctx.root, id)?;
+    }
+    let has_restore = has_mem && has_state;
+    let restore = has_restore.then(|| shinu::vm::RestoreFiles {
+        mem: &snapshot_mem,
+        state: &snapshot_state,
+    });
+    let result = shinu::vm::start(
+        ctx.root,
+        id,
+        image,
+        shinu::vm::Sizing { vcpus, mem_mib },
+        ctx.vm_cfg,
+        ctx.net_cfg,
+        restore.as_ref(),
+    );
+    if has_restore {
+        let cleanup = remove_space_snapshot_files(ctx.root, id);
+        return match (result, cleanup) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), _) => Err(error),
+        };
+    }
+    result
 }
 
 fn start_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value> {
@@ -901,16 +1110,12 @@ fn start_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Valu
         quota::check_running_limit(count_running(ctx.root, &state, project), &limits)?;
     }
     drop(connection);
-    let (_, booted) = shinu::vm::start(
-        ctx.root,
+    let (_, booted) = start_vm_with_pending_restore(
+        ctx,
         space.id,
         space.image,
-        shinu::vm::Sizing {
-            vcpus: space.vcpus,
-            mem_mib: space.mem_mib,
-        },
-        ctx.vm_cfg,
-        ctx.net_cfg,
+        space.vcpus,
+        space.mem_mib,
     )?;
     Ok(json!({ "booted": booted }))
 }
@@ -1060,7 +1265,7 @@ fn gc(ctx: &Ctx<'_>, project: &str, free_below: u64, dry_run: bool) -> shinu::Re
         {
             continue;
         }
-        let exclusive = shinu::btrfs::exclusive(&shinu::ckpt_image(ctx.root, checkpoint.id))?;
+        let exclusive = checkpoint_exclusive(ctx.root, checkpoint.id)?;
         candidates.push((checkpoint.id, checkpoint.note.clone(), exclusive));
     }
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.2));
@@ -1109,11 +1314,9 @@ fn gc(ctx: &Ctx<'_>, project: &str, free_below: u64, dry_run: bool) -> shinu::Re
     let mut deleted = Vec::new();
     for (id, note, exclusive) in claimed {
         let image = shinu::ckpt_image(ctx.root, id);
-        match std::fs::remove_file(&image) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+        remove_file_if_missing(&image)?;
+        remove_file_if_missing(&shinu::ckpt_mem(ctx.root, id))?;
+        remove_file_if_missing(&shinu::ckpt_state(ctx.root, id))?;
         reclaimed += exclusive;
         deleted.push(json!({ "id": id, "note": note, "exclusive": exclusive }));
     }
@@ -1164,7 +1367,12 @@ fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
         } => resize_space(ctx, project, space, vcpus, mem_mib, disk_mib),
         Req::Images => list_images(ctx),
         Req::Fork { ckpt, name } => fork_space(ctx, project, ckpt, name),
-        Req::Commit { space, note, hot } => commit_space(ctx, project, space, note, hot),
+        Req::Commit {
+            space,
+            note,
+            hot,
+            full,
+        } => commit_space(ctx, project, space, note, hot, full),
         Req::Checkout { space, commit } => checkout_space(ctx, project, space, commit),
         Req::Log { space } => {
             let state = snapshot(ctx.db, ctx.registry)?;
@@ -1225,6 +1433,7 @@ enum Endpoint {
     Exec(String),
     Push(String),
     Pull(String),
+    Vnc(String),
     Commit(String),
     Log(String),
     Reflog(String),
@@ -1293,6 +1502,7 @@ fn route(path: &str) -> Option<Endpoint> {
             "exec" => Some(Endpoint::Exec(name)),
             "push" => Some(Endpoint::Push(name)),
             "pull" => Some(Endpoint::Pull(name)),
+            "vnc" => Some(Endpoint::Vnc(name)),
             "commits" => Some(Endpoint::Commit(name)),
             "log" => Some(Endpoint::Log(name)),
             "reflog" => Some(Endpoint::Reflog(name)),
@@ -1397,7 +1607,7 @@ fn method_allowed(endpoint: &Endpoint, method: &str) -> bool {
         | Endpoint::Checkout(_)
         | Endpoint::Fork(_)
         | Endpoint::Gc => method == "POST",
-        Endpoint::Pull(_) => method == "GET",
+        Endpoint::Pull(_) | Endpoint::Vnc(_) => method == "GET",
     }
 }
 
@@ -1425,6 +1635,16 @@ fn body_bool(body: &[u8], field: &str) -> shinu::Result<bool> {
         .and_then(Value::as_bool)
         .ok_or_else(|| shinu::Error::Invalid(format!("body field {field} must be a boolean")))
 }
+fn body_bool_default(body: &[u8], field: &str, default: bool) -> shinu::Result<bool> {
+    let value = parse_body(body)?;
+    match value.get(field) {
+        None => Ok(default),
+        Some(value) => value.as_bool().ok_or_else(|| {
+            shinu::Error::Invalid(format!("body field {field} must be a boolean"))
+        }),
+    }
+}
+
 
 fn body_u64(body: &[u8], field: &str) -> shinu::Result<u64> {
     let value = parse_body(body)?;
@@ -1544,6 +1764,7 @@ fn request_for(
                 space,
                 note: body_string(body, "note")?,
                 hot: body_bool(body, "hot")?,
+                full: body_bool_default(body, "full", false)?,
             },
             201,
         )),
@@ -1685,16 +1906,12 @@ fn prepare_ssh(ctx: &Ctx<'_>, project: &str, space: &str) -> shinu::Result<SshTa
         running
     };
     if !already_running {
-        shinu::vm::start(
-            ctx.root,
+        start_vm_with_pending_restore(
+            ctx,
             space_id,
             entry.image,
-            shinu::vm::Sizing {
-                vcpus: entry.vcpus,
-                mem_mib: entry.mem_mib,
-            },
-            ctx.vm_cfg,
-            ctx.net_cfg,
+            entry.vcpus,
+            entry.mem_mib,
         )?;
     }
     let vm_dir = shinu::vm_dir(ctx.root, space_id);
@@ -1946,6 +2163,75 @@ fn pull_file(stream: &mut TcpStream, target: &SshTarget, path: &str) -> Result<(
     }
     http::respond_chunked_end(stream).map_err(|_| PullFailure::AfterResponse)
 }
+fn respond_vnc_start(stream: &mut TcpStream) -> std::io::Result<()> {
+    // RFB has its own byte stream framing, so HTTP must not add a length or
+    // chunk boundaries that a native VNC client would interpret as payload.
+    stream.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+    )?;
+    stream.flush()
+}
+
+fn stream_vnc(stream: &mut TcpStream, mut vsock: UnixStream) -> shinu::Result<()> {
+    let mut client_to_guest = stream.try_clone()?;
+    let mut guest_writer = vsock.try_clone()?;
+    let stop_client_reader = Arc::new(AtomicBool::new(false));
+    let stop_client_reader_thread = Arc::clone(&stop_client_reader);
+    let client_reader = thread::spawn(move || {
+        // A timeout lets the copy stop after the guest closes without
+        // half-closing either socket, which Firecracker's multiplexer cannot
+        // represent without tearing down the opposite direction.
+        if client_to_guest
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .is_err()
+        {
+            return;
+        }
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            match client_to_guest.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => {
+                    if guest_writer.write_all(&buffer[..count]).is_err() {
+                        break;
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) => {
+                        if stop_client_reader_thread.load(Ordering::Acquire) {
+                            break;
+                        }
+                    }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        match vsock.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => {
+                if stream.write_all(&buffer[..count]).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    stop_client_reader.store(true, Ordering::Release);
+    let _ = client_reader.join();
+    Ok(())
+}
+
+fn vnc_bridge_error(space: &str, error: &shinu::Error) -> shinu::Error {
+    shinu::Error::Invalid(format!(
+        "VNC bridge unavailable for {space}; start the guest desktop with `shinu desktop {space}`: {error}"
+    ))
+}
+
 #[derive(Debug)]
 enum Caller {
     Api { project: String },
@@ -2278,7 +2564,10 @@ fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
         return Ok(());
     }
 
-    let is_transfer = matches!(&endpoint, Endpoint::Push(_) | Endpoint::Pull(_));
+    let is_transfer = matches!(
+        &endpoint,
+        Endpoint::Push(_) | Endpoint::Pull(_) | Endpoint::Vnc(_)
+    );
     let request = if is_transfer {
         metadata
     } else {
@@ -2545,6 +2834,31 @@ fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
         }
         return Ok(());
     }
+    if let Endpoint::Vnc(space) = &endpoint {
+        let target = match prepare_ssh(ctx, project, space) {
+            Ok(target) => target,
+            Err(error) => {
+                let _ = reader.take();
+                respond_error(&mut stream, http::status_for(&error), &error)?;
+                return Ok(());
+            }
+        };
+        let vsock = match shinu::vsock_connect(&shinu::vm::vsock_path(&target.vm_dir), shinu::VSOCK_VNC_PORT) {
+            Ok(vsock) => vsock,
+            Err(error) => {
+                let _ = reader.take();
+                let error = vnc_bridge_error(space, &error);
+                respond_error(&mut stream, http::status_for(&error), &error)?;
+                return Ok(());
+            }
+        };
+        let _ = reader.take();
+        respond_vnc_start(&mut stream)?;
+        stream_vnc(&mut stream, vsock)?;
+        record_usage(ctx.db, project, "api_call", None, 1)?;
+        return Ok(());
+    }
+
     let (req, status) = match request_for(endpoint, &request.method, &request.body, from, to) {
         Ok(request) => request,
         Err(error) => {
@@ -2702,7 +3016,7 @@ fn execute_streaming(
 
 #[cfg(test)]
 mod tests {
-    use super::{append_checkpoint, handle, set_head};
+    use super::{CkptFlags, append_checkpoint, handle, set_head};
     use chrono::Utc;
     use rusqlite::Connection;
     use shinu::{
@@ -2829,6 +3143,10 @@ mod tests {
             .expect("push route");
         let pull = super::route("/v1/spaces/demo/pull?path=%2Ftmp%2Ffile")
             .expect("pull route");
+        let vnc = super::route("/v1/spaces/demo/vnc").expect("vnc route");
+        assert!(matches!(&vnc, super::Endpoint::Vnc(name) if name == "demo"));
+        assert!(super::method_allowed(&vnc, "GET"));
+        assert!(!super::method_allowed(&vnc, "POST"));
         assert!(matches!(&push, super::Endpoint::Push(name) if name == "demo"));
         assert!(matches!(&pull, super::Endpoint::Pull(name) if name == "demo"));
         assert!(super::method_allowed(&push, "POST"));
@@ -2865,6 +3183,31 @@ mod tests {
     }
 
     #[test]
+    fn commit_request_defaults_full_to_false() {
+        let (request, status) = super::request_for(
+            super::Endpoint::Commit("demo".into()),
+            "POST",
+            br#"{"note":"disk","hot":false}"#,
+            None,
+            None,
+        )
+        .expect("parse legacy commit request");
+        assert_eq!(status, 201);
+        assert!(matches!(request, Req::Commit { full: false, .. }));
+
+        let (request, status) = super::request_for(
+            super::Endpoint::Commit("demo".into()),
+            "POST",
+            br#"{"note":"memory","hot":false,"full":true}"#,
+            None,
+            None,
+        )
+        .expect("parse full commit request");
+        assert_eq!(status, 201);
+        assert!(matches!(request, Req::Commit { full: true, .. }));
+    }
+
+    #[test]
     fn push_rejects_relative_paths_and_invalid_lengths() {
         assert!(matches!(
             super::transfer_path("/v1/spaces/demo/push?path=relative"),
@@ -2892,6 +3235,7 @@ mod tests {
                 space: "missing".into(),
                 note: "  ".into(),
                 hot: false,
+                full: false,
             },
             "project-a",
         );
@@ -3078,6 +3422,7 @@ mod tests {
                 project: project.into(),
                 parent: None,
                 auto: false,
+                full: false,
                 note: "before".into(),
                 created_at: Utc::now(),
             }],
@@ -3186,6 +3531,7 @@ mod tests {
                 project: project.into(),
                 parent: None,
                 auto: false,
+                full: false,
                 note: "base".into(),
                 created_at: Utc::now(),
             }],
@@ -3219,6 +3565,7 @@ mod tests {
                 project: "project-b".into(),
                 parent: None,
                 auto: false,
+                full: false,
                 note: "private".into(),
                 created_at: Utc::now(),
             }],
@@ -3255,6 +3602,7 @@ mod tests {
                 space: "running".into(),
                 note: "cold".into(),
                 hot: false,
+                full: false,
             },
             project,
         );
@@ -3292,8 +3640,11 @@ mod tests {
             project,
             Uuid::new_v4(),
             "first".into(),
-            false,
-            true,
+            CkptFlags {
+                auto: false,
+                full: false,
+                update_head: true,
+            },
         )
         .expect("first checkpoint");
         let second = append_checkpoint(
@@ -3302,8 +3653,11 @@ mod tests {
             project,
             Uuid::new_v4(),
             "second".into(),
-            false,
-            true,
+            CkptFlags {
+                auto: false,
+                full: false,
+                update_head: true,
+            },
         )
         .expect("second checkpoint");
         assert_eq!(second.parent, Some(first.id));
@@ -3337,6 +3691,7 @@ mod tests {
                 project: project.into(),
                 parent: None,
                 auto: false,
+                full: false,
                 note: "target".into(),
                 created_at: Utc::now(),
             }],
@@ -3347,8 +3702,11 @@ mod tests {
             project,
             Uuid::new_v4(),
             format!("auto before checkout {}", &target_id.to_string()[..8]),
-            true,
-            false,
+            CkptFlags {
+                auto: true,
+                full: false,
+                update_head: false,
+            },
         )
         .expect("automatic checkpoint");
         set_head(&mut state, space_id, project, target_id).expect("checkout head");
@@ -3385,6 +3743,7 @@ mod tests {
                     project: project.into(),
                     parent: None,
                     auto: false,
+                    full: false,
                     note: "before checkout".into(),
                     created_at: Utc::now(),
                 },
@@ -3394,6 +3753,7 @@ mod tests {
                     project: project.into(),
                     parent: Some(old_id),
                     auto: true,
+                    full: false,
                     note: "auto before checkout".into(),
                     created_at: Utc::now(),
                 },
@@ -3464,6 +3824,7 @@ mod tests {
                     project: project.into(),
                     parent: None,
                     auto: true,
+                    full: false,
                     note: "auto stale".into(),
                     created_at: Utc::now(),
                 },
@@ -3473,6 +3834,7 @@ mod tests {
                     project: project.into(),
                     parent: None,
                     auto: true,
+                    full: false,
                     note: "auto raced".into(),
                     created_at: Utc::now(),
                 },

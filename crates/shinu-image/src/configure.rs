@@ -1,7 +1,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use shinu_core::{is_blocked_guest_destination, Error, Image, Result, VSOCK_SSH_PORT};
+use shinu_core::{is_blocked_guest_destination, Error, Image, Result, VSOCK_SSH_PORT, VSOCK_VNC_PORT};
 
 pub(super) fn guest_dns_fallback() -> String {
     std::env::var("SHINU_GUEST_DNS")
@@ -164,7 +164,26 @@ pub(super) fn configure_image(mnt: &Path, image: Image) -> Result<()> {
     std::fs::write(&sshd_config, contents)?;
 
     let network_script = "#!/bin/sh\nexec 2>&1\nIP=$(sed -n 's/.*shinu\\.ip=\\([^ ]*\\).*/\\1/p' /proc/cmdline)\nGW=$(sed -n 's/.*shinu\\.gw=\\([^ ]*\\).*/\\1/p' /proc/cmdline)\n[ -n \"$IP\" ] || { echo \"no shinu.ip on cmdline\"; exec sleep infinity; }\nip addr add \"$IP\" dev eth0 2>/dev/null\nip link set eth0 up\n[ -n \"$GW\" ] && ip route add default via \"$GW\" 2>/dev/null\necho \"configured $IP via $GW\"\nexec sleep infinity\n";
+    // Keep callers independent of the capture utility baked into each distro.
+    let screenshot_script = match image {
+        Image::Rocky => "#!/bin/sh\nif [ \"$#\" -ne 1 ]; then\n    echo \"usage: shinu-screenshot OUTPUT\" >&2\n    exit 2\nfi\nDISPLAY=${DISPLAY:-:0}\nexport DISPLAY\nexec import -window root \"$1\"\n",
+        Image::Void | Image::Ubuntu | Image::Arch => "#!/bin/sh\nif [ \"$#\" -ne 1 ]; then\n    echo \"usage: shinu-screenshot OUTPUT\" >&2\n    exit 2\nfi\nDISPLAY=${DISPLAY:-:0}\nexport DISPLAY\nexec scrot -o \"$1\"\n",
+    };
+    let screenshot_path = mnt.join("usr/local/bin/shinu-screenshot");
+    if let Some(parent) = screenshot_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&screenshot_path, screenshot_script)?;
+    std::fs::set_permissions(
+        &screenshot_path,
+        std::fs::Permissions::from_mode(0o755),
+    )?;
 
+    let desktop_script = "#!/bin/sh\nexec 2>&1\nXvfb :0 -screen 0 1280x800x24 &\nsleep 1\nDISPLAY=:0 openbox &\nexec x11vnc -display :0 -rfbport 5900 -nopw -forever -shared -localhost\n";
+    let desktop_command = "exec 2>&1; Xvfb :0 -screen 0 1280x800x24 & sleep 1; DISPLAY=:0 openbox & exec x11vnc -display :0 -rfbport 5900 -nopw -forever -shared -localhost";
+    let vsock_vnc_script = format!(
+        "#!/bin/sh\nexec 2>&1\nexec socat VSOCK-LISTEN:{VSOCK_VNC_PORT},fork,reuseaddr TCP:127.0.0.1:5900\n"
+    );
     if image == Image::Arch {
         let pacman = mnt.join("etc/pacman.conf");
         let contents = std::fs::read_to_string(&pacman).unwrap_or_default();
@@ -251,6 +270,23 @@ pub(super) fn configure_image(mnt: &Path, image: Image) -> Result<()> {
                 ),
             )?;
             std::fs::set_permissions(bridge.join("run"), std::fs::Permissions::from_mode(0o755))?;
+            let desktop = mnt.join("etc/sv/shinu-desktop");
+            std::fs::create_dir_all(&desktop)?;
+            std::fs::write(desktop.join("run"), desktop_script)?;
+            std::fs::set_permissions(
+                desktop.join("run"),
+                std::fs::Permissions::from_mode(0o755),
+            )?;
+            let vnc = mnt.join("etc/sv/shinu-vsock-vnc");
+            std::fs::create_dir_all(&vnc)?;
+            std::fs::write(vnc.join("run"), &vsock_vnc_script)?;
+            std::fs::set_permissions(
+                vnc.join("run"),
+                std::fs::Permissions::from_mode(0o755),
+            )?;
+            for service in ["shinu-desktop", "shinu-vsock-vnc"] {
+                let _ = std::fs::remove_file(default.join(service));
+            }
             let network = mnt.join("etc/sv/shinu-net");
             std::fs::create_dir_all(&network)?;
             std::fs::write(network.join("run"), network_script)?;
@@ -297,6 +333,19 @@ pub(super) fn configure_image(mnt: &Path, image: Image) -> Result<()> {
                     "[Unit]\nAfter=shinu-sshd.service\n\n[Service]\nExecStart=/usr/bin/socat VSOCK-LISTEN:{VSOCK_SSH_PORT},fork,reuseaddr TCP:127.0.0.1:22\nRestart=always\n\n[Install]\nWantedBy=multi-user.target\n"
                 ),
             )?;
+            std::fs::write(
+                systemd.join("shinu-desktop.service"),
+                format!(
+                    "[Unit]\nAfter=local-fs.target\n\n[Service]\nExecStart=/bin/sh -c '{desktop_command}'\nRestart=always\n\n[Install]\nWantedBy=multi-user.target\n"
+                ),
+            )?;
+            std::fs::write(
+                systemd.join("shinu-vsock-vnc.service"),
+                format!(
+                    "[Unit]\nAfter=shinu-desktop.service\n\n[Service]\nExecStart=/usr/bin/socat VSOCK-LISTEN:{VSOCK_VNC_PORT},fork,reuseaddr TCP:127.0.0.1:5900\nRestart=always\n\n[Install]\nWantedBy=multi-user.target\n"
+                ),
+            )?;
+
             let network_path = mnt.join("usr/local/sbin/shinu-net");
             if let Some(parent) = network_path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -310,6 +359,10 @@ pub(super) fn configure_image(mnt: &Path, image: Image) -> Result<()> {
 
             let multi = systemd.join("multi-user.target.wants");
             std::fs::create_dir_all(&multi)?;
+            for service in ["shinu-desktop", "shinu-vsock-vnc"] {
+                let _ = std::fs::remove_file(multi.join(format!("{service}.service")));
+            }
+
             for service in ["ssh.service", "sshd.service"] {
                 let _ = std::fs::remove_file(multi.join(service));
             }

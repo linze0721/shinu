@@ -123,11 +123,16 @@ impl Server {
                 let space = required_string(arguments, "space")?;
                 let note = required_string(arguments, "note")?;
                 let hot = required_bool(arguments, "hot")?;
+                let full = required_bool(arguments, "full")?;
                 let path = format!(
                     "/v1/spaces/{}/commits",
                     encode_path_segment(&space)
                 );
-                client.request_text("POST", &path, Some(json!({ "note": note, "hot": hot })))
+                client.request_text(
+                    "POST",
+                    &path,
+                    Some(json!({ "note": note, "hot": hot, "full": full })),
+                )
             }
             "shinu_log" => {
                 let space = required_string(arguments, "space")?;
@@ -521,6 +526,7 @@ fn validate_arguments(name: &str, arguments: &Map<String, Value>) -> Result<(), 
             required_string(arguments, "space")?;
             required_string(arguments, "note")?;
             required_bool(arguments, "hot")?;
+            required_bool(arguments, "full")?;
             Ok(())
         }
         "shinu_log" | "shinu_reflog" => {
@@ -931,12 +937,13 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "shinu_commit",
-            "description": "在需要把当前实验状态存成可回滚的检查点、或在下一轮试错前保留安全副本时使用；space 必须先停止，先调用 shinu_stop 后才能进行 commit。",
+            "description": "在需要把当前实验状态存成可回滚的检查点、或在下一轮试错前保留安全副本时使用；hot 与 full 都必须显式选择，full 检查点需要 space 正在运行并会保存 guest 内存与进程状态。",
             "inputSchema": schema(json!({
                 "space": {"type": "string", "minLength": 1, "description": "要存档的 space。"},
                 "note": {"type": "string", "minLength": 1, "description": "描述这个存档用途的非空备注。"},
-                "hot": {"type": "boolean", "description": "是否创建 hot commit。"}
-            }), &["space", "note", "hot"]),
+                "hot": {"type": "boolean", "description": "是否创建 hot commit。"},
+                "full": {"type": "boolean", "description": "是否同时保存 guest 内存与 CPU 状态；需要 space 正在运行。"}
+            }), &["space", "note", "hot", "full"]),
         }),
         json!({
             "name": "shinu_log",

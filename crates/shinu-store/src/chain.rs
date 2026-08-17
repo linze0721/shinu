@@ -143,6 +143,7 @@ mod chain_tests {
             project: "project".to_owned(),
             parent,
             auto: false,
+            full: false,
             note: "note".to_owned(),
             created_at: Utc::now(),
         }

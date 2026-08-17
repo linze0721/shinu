@@ -47,9 +47,12 @@ fn build_base(root: &Path, base: &Path, image: Image, cfg: &BaseConfig) -> Resul
                 chroot_run(&mnt, "xbps-install -y -S -u xbps")?;
                 chroot_run(&mnt, "xbps-install -y -S socat openssh iproute2 git")?;
             }
+            // ca-certificates is not pulled in by --no-install-recommends, and
+            // without it every HTTPS clone or download in the guest fails with
+            // "server certificate verification failed".
             Image::Ubuntu => chroot_run(
                 &mnt,
-                "export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y --no-install-recommends iproute2 socat openssh-server systemd-sysv",
+                "export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y --no-install-recommends ca-certificates iproute2 socat openssh-server systemd-sysv",
             )?,
             Image::Arch => {
                 chroot_run(&mnt, "pacman-key --init && pacman-key --populate archlinux")?;

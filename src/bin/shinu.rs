@@ -165,12 +165,34 @@ enum Command {
         json: bool,
     },
     Limits {
+        #[command(subcommand)]
+        command: Option<LimitsCommand>,
         #[arg(long)]
         json: bool,
     },
     Token {
         #[command(subcommand)]
         command: TokenCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum LimitsCommand {
+    Set {
+        project: String,
+        #[arg(long, value_name = "N|unlimited")]
+        spaces: Option<String>,
+        #[arg(long, value_name = "N|unlimited")]
+        disk_mib: Option<String>,
+        #[arg(long, value_name = "N|unlimited")]
+        running: Option<String>,
+        #[arg(long, value_name = "N|unlimited")]
+        api_per_min: Option<String>,
+        #[arg(long, value_name = "FIELD", value_delimiter = ',')]
+        inherit: Vec<String>,
+    },
+    Clear {
+        project: String,
     },
 }
 
@@ -792,6 +814,126 @@ fn resize_space_body(
     Ok(body)
 }
 
+fn parse_limit_u32(raw: &str, field: &str) -> Result<u32, String> {
+    if raw.trim().eq_ignore_ascii_case("unlimited") {
+        Ok(0)
+    } else {
+        raw.trim().parse::<u32>().map_err(|error| {
+            format!("--{field} must be a non-negative integer or unlimited: {error}")
+        })
+    }
+}
+
+fn parse_limit_u64(raw: &str, field: &str) -> Result<u64, String> {
+    if raw.trim().eq_ignore_ascii_case("unlimited") {
+        Ok(0)
+    } else {
+        raw.trim().parse::<u64>().map_err(|error| {
+            format!("--{field} must be a non-negative integer or unlimited: {error}")
+        })
+    }
+}
+
+fn inherit_requested(fields: &[String], field: &str) -> Result<bool, String> {
+    let mut found = false;
+    for requested in fields {
+        if !matches!(
+            requested.as_str(),
+            "spaces" | "disk-mib" | "running" | "api-per-min"
+        ) {
+            return Err(format!(
+                "--inherit field must be one of: spaces, disk-mib, running, api-per-min (got {requested})"
+            ));
+        }
+        if requested == field {
+            if found {
+                return Err(format!("--inherit {field} was specified more than once"));
+            }
+            found = true;
+        }
+    }
+    Ok(found)
+}
+
+fn limits_set_body(
+    spaces: Option<String>,
+    disk_mib: Option<String>,
+    running: Option<String>,
+    api_per_min: Option<String>,
+    inherit: &[String],
+) -> Result<Value, String> {
+    let spaces_inherit = inherit_requested(inherit, "spaces")?;
+    let disk_inherit = inherit_requested(inherit, "disk-mib")?;
+    let running_inherit = inherit_requested(inherit, "running")?;
+    let api_inherit = inherit_requested(inherit, "api-per-min")?;
+    let mut body = Value::Object(serde_json::Map::new());
+    let object = body
+        .as_object_mut()
+        .expect("limits body starts as a JSON object");
+    let mut fields = 0;
+
+    if let Some(raw) = spaces {
+        if spaces_inherit {
+            return Err("--spaces and --inherit spaces cannot be combined".into());
+        }
+        object.insert(
+            "max_spaces".into(),
+            Value::from(parse_limit_u32(&raw, "spaces")?),
+        );
+        fields += 1;
+    } else if spaces_inherit {
+        object.insert("max_spaces".into(), Value::Null);
+        fields += 1;
+    }
+
+    if let Some(raw) = disk_mib {
+        if disk_inherit {
+            return Err("--disk-mib and --inherit disk-mib cannot be combined".into());
+        }
+        object.insert(
+            "max_disk_mib".into(),
+            Value::from(parse_limit_u64(&raw, "disk-mib")?),
+        );
+        fields += 1;
+    } else if disk_inherit {
+        object.insert("max_disk_mib".into(), Value::Null);
+        fields += 1;
+    }
+
+    if let Some(raw) = running {
+        if running_inherit {
+            return Err("--running and --inherit running cannot be combined".into());
+        }
+        object.insert(
+            "max_running".into(),
+            Value::from(parse_limit_u32(&raw, "running")?),
+        );
+        fields += 1;
+    } else if running_inherit {
+        object.insert("max_running".into(), Value::Null);
+        fields += 1;
+    }
+
+    if let Some(raw) = api_per_min {
+        if api_inherit {
+            return Err("--api-per-min and --inherit api-per-min cannot be combined".into());
+        }
+        object.insert(
+            "api_per_min".into(),
+            Value::from(parse_limit_u32(&raw, "api-per-min")?),
+        );
+        fields += 1;
+    } else if api_inherit {
+        object.insert("api_per_min".into(), Value::Null);
+        fields += 1;
+    }
+
+    if fields == 0 {
+        return Err("limits set requires at least one limit flag or --inherit field".to_string());
+    }
+    Ok(body)
+}
+
 fn run_command(client: &HttpClient, command: Command) -> Result<i32, String> {
     match command {
         Command::New {
@@ -1072,13 +1214,65 @@ fi"#
                 print_usage(&response_value_from_body(&body)?);
             }
         }
-        Command::Limits { json } => {
+        Command::Limits {
+            command: None,
+            json,
+        } => {
             let response = client.request("GET", "/v1/limits", None)?;
             let body = successful_body(response)?;
             if json {
                 print_raw_json(&body)?;
             } else {
                 print_limits(&response_value_from_body(&body)?);
+            }
+        }
+        Command::Limits {
+            command: Some(LimitsCommand::Set {
+                project,
+                spaces,
+                disk_mib,
+                running,
+                api_per_min,
+                inherit,
+            }),
+            json,
+        } => {
+            let path = format!(
+                "/v1/projects/{}/limits",
+                encode_path_segment(&project)
+            );
+            let response = client.request(
+                "PATCH",
+                &path,
+                Some(limits_set_body(
+                    spaces,
+                    disk_mib,
+                    running,
+                    api_per_min,
+                    &inherit,
+                )?),
+            )?;
+            let body = successful_body(response)?;
+            if json {
+                print_raw_json(&body)?;
+            } else {
+                print_limits(&response_value_from_body(&body)?);
+            }
+        }
+        Command::Limits {
+            command: Some(LimitsCommand::Clear { project }),
+            json,
+        } => {
+            let path = format!(
+                "/v1/projects/{}/limits",
+                encode_path_segment(&project)
+            );
+            let response = client.request("DELETE", &path, None)?;
+            let body = successful_body(response)?;
+            if json {
+                print_raw_json(&body)?;
+            } else {
+                println!("cleared limits for {project}");
             }
         }
         Command::Token { .. } => {
@@ -1959,6 +2153,68 @@ mod tests {
         assert!(body.get("mem_mib").is_none());
     }
 
+
+    #[test]
+    fn limits_set_body_maps_unlimited_and_inherit() {
+        let inherit = vec!["disk-mib".to_owned()];
+        let body = limits_set_body(
+            Some("unlimited".into()),
+            None,
+            Some("3".into()),
+            None,
+            &inherit,
+        )
+        .expect("limit payload");
+        assert_eq!(
+            body,
+            json!({
+                "max_spaces": 0,
+                "max_disk_mib": null,
+                "max_running": 3
+            })
+        );
+    }
+
+    #[test]
+    fn limits_set_body_requires_a_change_and_rejects_conflicts() {
+        assert!(limits_set_body(None, None, None, None, &[]).is_err());
+        let inherit = vec!["spaces".to_owned()];
+        assert!(limits_set_body(Some("4".into()), None, None, None, &inherit).is_err());
+    }
+
+    #[test]
+    fn parses_nested_limits_set_command() {
+        let cli = Cli::try_parse_from([
+            "shinu",
+            "limits",
+            "set",
+            "project-a",
+            "--spaces",
+            "unlimited",
+            "--inherit",
+            "disk-mib",
+        ])
+        .expect("parse limits set command");
+        match cli.command {
+            Command::Limits {
+                command: Some(LimitsCommand::Set {
+                    project,
+                    spaces,
+                    disk_mib,
+                    inherit,
+                    ..
+                }),
+                json,
+            } => {
+                assert_eq!(project, "project-a");
+                assert_eq!(spaces.as_deref(), Some("unlimited"));
+                assert!(disk_mib.is_none());
+                assert_eq!(inherit, vec!["disk-mib"]);
+                assert!(!json);
+            }
+            _ => panic!("unexpected command parsed"),
+        }
+    }
 
     #[test]
     fn dispatches_ndjson_streams_and_exit() {

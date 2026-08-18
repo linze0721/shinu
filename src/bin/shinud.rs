@@ -64,6 +64,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vm_cfg = shinu::VmConfig::from_env();
     let net_cfg = shinu::NetConfig::from_env()?;
     let limits = Limits::from_env();
+    // Only the deployment admin may mutate quotas; an unset secret fails closed.
+    let admin_token = Arc::new(
+        std::env::var("SHINU_ADMIN_TOKEN")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+    );
     let rate = RateLimiter::new();
     // Registration has its own IP-keyed limiter so API traffic cannot consume
     // the account-creation allowance (and vice versa).
@@ -81,6 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let limits = Arc::new(limits);
     let rate = Arc::new(rate);
     let register_rate = Arc::new(register_rate);
+    let admin_token = Arc::new(admin_token);
     let registry = Arc::new(Registry::new());
 
     let sweep_root = Arc::clone(&root);
@@ -138,6 +145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let connection_rate = Arc::clone(&rate);
                 let connection_register_rate = Arc::clone(&register_rate);
                 let connection_registry = Arc::clone(&registry);
+                let connection_admin_token = Arc::clone(&admin_token);
                 thread::spawn(move || {
                     let ctx = Ctx {
                         root: connection_root.as_path(),
@@ -148,6 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         rate: connection_rate.as_ref(),
                         register_rate: connection_register_rate.as_ref(),
                         registry: connection_registry.as_ref(),
+                        admin_token: connection_admin_token.as_deref(),
                     };
                     if let Err(error) = serve_connection(stream, &ctx) {
                         eprintln!("connection: {error}");
@@ -168,6 +177,7 @@ struct Ctx<'a> {
     rate: &'a RateLimiter,
     register_rate: &'a RegistrationLimiter,
     registry: &'a Registry,
+    admin_token: Option<&'a str>,
 }
 
 /// Keeps the parsed header bytes available for proxy forwarding while leaving
@@ -1823,6 +1833,47 @@ fn limits_value(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
         },
     }))
 }
+fn patch_project_limits(ctx: &Ctx<'_>, project: &str, body: &[u8]) -> shinu::Result<Value> {
+    let value = parse_body(body)?;
+    let max_spaces = value_patch_u32(&value, "max_spaces")?;
+    let max_disk_mib = value_patch_u64(&value, "max_disk_mib")?;
+    let max_running = value_patch_u32(&value, "max_running")?;
+    let api_per_min = value_patch_u32(&value, "api_per_min")?;
+    if max_spaces.is_none()
+        && max_disk_mib.is_none()
+        && max_running.is_none()
+        && api_per_min.is_none()
+    {
+        return Err(shinu::Error::Invalid(
+            "limits set requires at least one limit field".into(),
+        ));
+    }
+
+    let existing = {
+        let connection = lock_db(ctx.db);
+        state::project_limit_overrides(&connection, project)?
+    };
+    let (current_spaces, current_disk_mib, current_running, current_api_per_min) =
+        existing.unwrap_or((None, None, None, None));
+    let connection = lock_db(ctx.db);
+    state::set_project_limits(
+        &connection,
+        project,
+        max_spaces.unwrap_or(current_spaces),
+        max_disk_mib.unwrap_or(current_disk_mib),
+        max_running.unwrap_or(current_running),
+        api_per_min.unwrap_or(current_api_per_min),
+    )?;
+    drop(connection);
+    limits_value(ctx, project)
+}
+
+fn clear_project_limits(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
+    let connection = lock_db(ctx.db);
+    state::clear_project_limits(&connection, project)?;
+    Ok(json!({ "project": project, "cleared": true }))
+}
+
 struct DiffSpec {
     space: String,
     from: Option<Uuid>,
@@ -2030,6 +2081,7 @@ enum Endpoint {
     Images,
     Usage,
     Limits,
+    ProjectLimits(String),
     Rm(String),
     Start(String),
     Stop(String),
@@ -2096,6 +2148,13 @@ fn route(path: &str) -> Option<Endpoint> {
     }
     if segments.len() == 3 && segments[2] == "usage" {
         return Some(Endpoint::Usage);
+    }
+    if segments.len() == 5
+        && segments[2] == "projects"
+        && segments[4] == "limits"
+        && !segments[3].is_empty()
+    {
+        return Some(Endpoint::ProjectLimits(segments[3].clone()));
     }
     if segments.len() == 3 && segments[2] == "limits" {
         return Some(Endpoint::Limits);
@@ -2305,6 +2364,7 @@ fn method_allowed(endpoint: &Endpoint, method: &str) -> bool {
         | Endpoint::Log(_)
         | Endpoint::Reflog(_)
         | Endpoint::Diff(_) => method == "GET",
+        Endpoint::ProjectLimits(_) => matches!(method, "GET" | "PATCH" | "DELETE"),
         Endpoint::Rm(_) => method == "DELETE" || method == "PATCH",
         Endpoint::RmCkpt(_) => method == "DELETE",
         Endpoint::Start(_)
@@ -3644,6 +3704,51 @@ fn is_state_changing(method: &str) -> bool {
     matches!(method, "POST" | "PUT" | "DELETE" | "PATCH")
 }
 
+/// The admin bearer is separate from project tokens so a tenant cannot grant
+/// itself a larger quota. Hash both values first, then compare fixed-size
+/// digests without an early return; an unset admin token never authorizes.
+fn admin_token_matches(ctx: &Ctx<'_>, request: &http::Request) -> bool {
+    let Some(expected) = ctx.admin_token else {
+        return false;
+    };
+    let Some(candidate) = request.token.as_deref() else {
+        return false;
+    };
+    let expected = shinu::sha256_hex(expected.as_bytes());
+    let candidate = shinu::sha256_hex(candidate.as_bytes());
+    let mut difference = 0_u8;
+    for index in 0..64 {
+        difference |= expected.as_bytes()[index] ^ candidate.as_bytes()[index];
+    }
+    difference == 0
+}
+
+fn require_admin_token(ctx: &Ctx<'_>, request: &http::Request) -> shinu::Result<()> {
+    if admin_token_matches(ctx, request) {
+        Ok(())
+    } else {
+        Err(shinu::Error::Auth("administrative token required".into()))
+    }
+}
+
+fn authorize_project_limits_read(
+    ctx: &Ctx<'_>,
+    request: &http::Request,
+    project: &str,
+) -> shinu::Result<()> {
+    if admin_token_matches(ctx, request) {
+        return Ok(());
+    }
+    let caller = authenticate(ctx, request)?;
+    if caller_project(&caller) == project {
+        Ok(())
+    } else {
+        Err(shinu::Error::Auth(
+            "project token may only read its own limits".into(),
+        ))
+    }
+}
+
 fn authenticate(ctx: &Ctx<'_>, request: &http::Request) -> shinu::Result<Caller> {
     // A bearer token is deliberately authoritative when present. Falling back
     // to a cookie after an invalid bearer would let a malformed proxy header
@@ -4050,6 +4155,29 @@ fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
         | Endpoint::ConsoleTokens
         | Endpoint::ConsoleToken(_) => {}
         _ => {}
+    }
+
+    if let Endpoint::ProjectLimits(project) = &endpoint {
+        let authorization = if request.method == "GET" {
+            authorize_project_limits_read(ctx, &request, project)
+        } else {
+            require_admin_token(ctx, &request)
+        };
+        if let Err(error) = authorization {
+            respond_error(&mut stream, http::status_for(&error), &error)?;
+            return Ok(());
+        }
+        let result = match request.method.as_str() {
+            "GET" => limits_value(ctx, project),
+            "PATCH" => patch_project_limits(ctx, project, &request.body),
+            "DELETE" => clear_project_limits(ctx, project),
+            _ => unreachable!("project limits method was checked above"),
+        };
+        match result {
+            Ok(value) => http::respond(&mut stream, 200, &value)?,
+            Err(error) => respond_error(&mut stream, http::status_for(&error), &error)?,
+        }
+        return Ok(());
     }
 
     let caller = match authenticate(ctx, &request) {
@@ -4656,6 +4784,7 @@ mod tests {
             rate: test_rate(),
             register_rate: test_register_rate(),
             registry,
+            admin_token: None,
         }
     }
 
@@ -4735,6 +4864,70 @@ mod tests {
                 limit: 12,
             } if space == "demo" && actual_first == first && actual_second == second
         ));
+    }
+
+    #[test]
+    fn project_limit_route_requires_admin_for_mutation() {
+        let root = test_root("project-limit-auth");
+        let db = test_db(&root);
+        let registry = registry();
+        let (vm_cfg, net_cfg) = test_configs();
+        let mut ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        ctx.admin_token = Some("admin-secret");
+
+        let project_token = shinu::token::mint().expect("mint project token");
+        shinu::token::store(
+            &root,
+            &[shinu::token::Token {
+                hash: shinu::token::hash(&project_token),
+                project: "project-a".into(),
+                created_at: Utc::now(),
+            }],
+        )
+        .expect("store project token");
+
+        let endpoint = super::route("/v1/projects/project-a/limits").expect("limits route");
+        assert!(matches!(&endpoint, super::Endpoint::ProjectLimits(project) if project == "project-a"));
+        assert!(super::method_allowed(&endpoint, "GET"));
+        assert!(super::method_allowed(&endpoint, "PATCH"));
+        assert!(super::method_allowed(&endpoint, "DELETE"));
+
+        let body = r#"{"max_spaces":0}"#;
+        let denied = serve_raw(
+            &ctx,
+            &format!(
+                "PATCH /v1/projects/project-a/limits HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {project_token}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        assert!(denied.starts_with("HTTP/1.1 401"), "response: {denied}");
+        assert!(state::project_limits(&super::lock_db(&db), "project-a")
+            .expect("read denied limits")
+            .is_none());
+
+        let granted = serve_raw(
+            &ctx,
+            &format!(
+                "PATCH /v1/projects/project-a/limits HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer admin-secret\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            ),
+        );
+        assert!(granted.starts_with("HTTP/1.1 200"), "response: {granted}");
+        assert_eq!(
+            state::project_limit_overrides(&super::lock_db(&db), "project-a")
+                .expect("read granted limits"),
+            Some((Some(0), None, None, None))
+        );
+
+        let cleared = serve_raw(
+            &ctx,
+            "DELETE /v1/projects/project-a/limits HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer admin-secret\r\nContent-Length: 0\r\n\r\n",
+        );
+        assert!(cleared.starts_with("HTTP/1.1 200"), "response: {cleared}");
+        assert!(state::project_limits(&super::lock_db(&db), "project-a")
+            .expect("read cleared limits")
+            .is_none());
+        std::fs::remove_dir_all(root).expect("remove test root");
     }
 
     #[test]
@@ -5042,6 +5235,7 @@ mod tests {
             rate: &rate,
             register_rate: test_register_rate(),
             registry: &registry,
+            admin_token: None,
         };
         let override_limits = super::effective_limits(&ctx, "project-a").expect("override");
         assert_eq!(override_limits.max_spaces, 7);
@@ -5658,6 +5852,7 @@ mod tests {
             rate: test_rate(),
             register_rate: test_register_rate(),
             registry,
+            admin_token: None,
         }
     }
 

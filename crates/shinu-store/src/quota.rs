@@ -13,6 +13,9 @@ const DEFAULT_API_PER_MIN: u32 = 120;
 const DEFAULT_MAX_VCPUS: u32 = 16;
 const DEFAULT_MAX_MEM_MIB: u32 = 32 * 1024;
 
+/// Resource ceilings applied to a project. The global environment provides SaaS
+/// defaults and rejects zero; a zero is unlimited only when an individual
+/// project row explicitly grants it, never through the environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     pub max_spaces: u32,
@@ -34,16 +37,12 @@ impl Limits {
         F: Fn(&str) -> Option<String>,
     {
         Self {
-            max_spaces: nonnegative_u32(&lookup, "SHINU_LIMIT_SPACES", DEFAULT_MAX_SPACES),
-            max_disk_mib: nonnegative_u64(
-                &lookup,
-                "SHINU_LIMIT_DISK_MIB",
-                DEFAULT_MAX_DISK_MIB,
-            ),
+            max_spaces: positive_u32(&lookup, "SHINU_LIMIT_SPACES", DEFAULT_MAX_SPACES),
+            max_disk_mib: positive_u64(&lookup, "SHINU_LIMIT_DISK_MIB", DEFAULT_MAX_DISK_MIB),
             max_vcpus: positive_u32(&lookup, "SHINU_LIMIT_VCPUS", DEFAULT_MAX_VCPUS),
             max_mem_mib: positive_u32(&lookup, "SHINU_LIMIT_MEM_MIB", DEFAULT_MAX_MEM_MIB),
-            max_running: nonnegative_u32(&lookup, "SHINU_LIMIT_RUNNING", DEFAULT_MAX_RUNNING),
-            api_per_min: nonnegative_u32(&lookup, "SHINU_LIMIT_API_PER_MIN", DEFAULT_API_PER_MIN),
+            max_running: positive_u32(&lookup, "SHINU_LIMIT_RUNNING", DEFAULT_MAX_RUNNING),
+            api_per_min: positive_u32(&lookup, "SHINU_LIMIT_API_PER_MIN", DEFAULT_API_PER_MIN),
         }
     }
 }
@@ -58,21 +57,13 @@ where
         .unwrap_or(default)
 }
 
-fn nonnegative_u32<F>(lookup: &F, key: &str, default: u32) -> u32
-where
-    F: Fn(&str) -> Option<String>,
-{
-    lookup(key)
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        .unwrap_or(default)
-}
-
-fn nonnegative_u64<F>(lookup: &F, key: &str, default: u64) -> u64
+fn positive_u64<F>(lookup: &F, key: &str, default: u64) -> u64
 where
     F: Fn(&str) -> Option<String>,
 {
     lookup(key)
         .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
         .unwrap_or(default)
 }
 
@@ -251,7 +242,7 @@ mod quota_tests {
     }
 
     #[test]
-    fn zero_environment_values_disable_quota_checks() {
+    fn zero_environment_values_use_saas_defaults() {
         let limits = Limits::from_lookup(|key| {
             Some(match key {
                 "SHINU_LIMIT_SPACES"
@@ -262,18 +253,24 @@ mod quota_tests {
             }
             .to_owned())
         });
-        assert_eq!(limits.max_spaces, 0);
-        assert_eq!(limits.max_disk_mib, 0);
-        assert_eq!(limits.max_running, 0);
-        assert_eq!(limits.api_per_min, 0);
-        assert_eq!(limits.max_vcpus, 16);
-        assert_eq!(limits.max_mem_mib, 32 * 1024);
+        assert_eq!(limits.max_spaces, 5);
+        assert_eq!(limits.max_disk_mib, 10_240);
+        assert_eq!(limits.max_running, 2);
+        assert_eq!(limits.api_per_min, 120);
+    }
 
-        // These values are deliberately beyond the normal defaults: zero is
-        // an explicit unlimited setting, not a request for the defaults.
-        assert!(check_space_limit(6, &limits).is_ok());
+    #[test]
+    fn project_zero_limits_are_unlimited() {
+        let limits = Limits {
+            max_spaces: 0,
+            max_disk_mib: 0,
+            max_running: 0,
+            api_per_min: 0,
+            ..Limits::from_lookup(|_| None)
+        };
+        assert!(check_space_limit(u32::MAX, &limits).is_ok());
         assert!(check_disk_limit(u64::MAX, u64::MAX, &limits).is_ok());
-        assert!(check_running_limit(3, &limits).is_ok());
+        assert!(check_running_limit(u32::MAX, &limits).is_ok());
 
         let limiter = RateLimiter::new();
         for _ in 0..100 {

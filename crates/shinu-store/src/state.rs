@@ -630,31 +630,43 @@ pub fn usage_summary(
     }))
 }
 
-fn project_u32(value: Option<i64>, fallback: u32, field: &str) -> Result<u32> {
+type ProjectLimitRow = (Option<i64>, Option<i64>, Option<i64>, Option<i64>);
+
+pub type ProjectLimitOverrides = (Option<u32>, Option<u64>, Option<u32>, Option<u32>);
+
+fn project_optional_u32(value: Option<i64>, field: &str) -> Result<Option<u32>> {
     value
         .map(|value| {
             u32::try_from(value).map_err(|error| {
                 Error::Invalid(format!("{field} limit out of range: {error}"))
             })
         })
-        .unwrap_or(Ok(fallback))
+        .transpose()
 }
 
-fn project_u64(value: Option<i64>, fallback: u64, field: &str) -> Result<u64> {
+fn project_optional_u64(value: Option<i64>, field: &str) -> Result<Option<u64>> {
     value
         .map(|value| {
             u64::try_from(value).map_err(|error| {
                 Error::Invalid(format!("{field} limit out of range: {error}"))
             })
         })
-        .unwrap_or(Ok(fallback))
+        .transpose()
 }
 
-pub fn project_limits(
+fn project_u32(value: Option<i64>, fallback: u32, field: &str) -> Result<u32> {
+    project_optional_u32(value, field)?.map_or(Ok(fallback), Ok)
+}
+
+fn project_u64(value: Option<i64>, fallback: u64, field: &str) -> Result<u64> {
+    project_optional_u64(value, field)?.map_or(Ok(fallback), Ok)
+}
+
+fn project_limit_row(
     conn: &Connection,
     project: &str,
-) -> Result<Option<(u32, u64, u32, u32)>> {
-    let values = conn
+) -> Result<Option<ProjectLimitRow>> {
+    Ok(conn
         .query_row(
             "SELECT max_spaces, max_disk_mib, max_running, api_per_min FROM projects WHERE project = ?1",
             params![project],
@@ -667,8 +679,75 @@ pub fn project_limits(
                 ))
             },
         )
-        .optional()?;
-    let Some((max_spaces, max_disk_mib, max_running, api_per_min)) = values else {
+        .optional()?)
+}
+
+/// Returns the nullable values stored for a project without applying defaults.
+pub fn project_limit_overrides(
+    conn: &Connection,
+    project: &str,
+) -> Result<Option<ProjectLimitOverrides>> {
+    let Some((max_spaces, max_disk_mib, max_running, api_per_min)) =
+        project_limit_row(conn, project)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some((
+        project_optional_u32(max_spaces, "max_spaces")?,
+        project_optional_u64(max_disk_mib, "max_disk_mib")?,
+        project_optional_u32(max_running, "max_running")?,
+        project_optional_u32(api_per_min, "api_per_min")?,
+    )))
+}
+
+/// Upserts nullable project overrides. `Some(0)` is an explicit unlimited
+/// grant; `None` stores SQL NULL so the project inherits the environment.
+pub fn set_project_limits(
+    conn: &Connection,
+    project: &str,
+    max_spaces: Option<u32>,
+    max_disk_mib: Option<u64>,
+    max_running: Option<u32>,
+    api_per_min: Option<u32>,
+) -> Result<()> {
+    let max_disk_mib = max_disk_mib
+        .map(|value| {
+            i64::try_from(value).map_err(|error| {
+                Error::Invalid(format!("max_disk_mib limit out of range: {error}"))
+            })
+        })
+        .transpose()?;
+    conn.execute(
+        "INSERT INTO projects (project, max_spaces, max_disk_mib, max_running, api_per_min)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(project) DO UPDATE SET
+             max_spaces = excluded.max_spaces,
+             max_disk_mib = excluded.max_disk_mib,
+             max_running = excluded.max_running,
+             api_per_min = excluded.api_per_min",
+        params![
+            project,
+            max_spaces.map(i64::from),
+            max_disk_mib,
+            max_running.map(i64::from),
+            api_per_min.map(i64::from),
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn clear_project_limits(conn: &Connection, project: &str) -> Result<()> {
+    conn.execute("DELETE FROM projects WHERE project = ?1", params![project])?;
+    Ok(())
+}
+
+pub fn project_limits(
+    conn: &Connection,
+    project: &str,
+) -> Result<Option<(u32, u64, u32, u32)>> {
+    let Some((max_spaces, max_disk_mib, max_running, api_per_min)) =
+        project_limit_row(conn, project)?
+    else {
         return Ok(None);
     };
     let defaults = crate::quota::Limits::from_env();
@@ -1149,4 +1228,50 @@ mod db_tests {
         assert_eq!(project_limits(&conn, "alpha").unwrap(), Some((3, 2048, 1, 60)));
         assert!(project_limits(&conn, "missing").unwrap().is_none());
     }
+    #[test]
+    fn project_limit_writes_round_trip_null_zero_and_values() {
+        let conn = db();
+        let defaults = crate::quota::Limits::from_env();
+
+        set_project_limits(&conn, "alpha", None, None, None, None).unwrap();
+        let raw: (Option<i64>, Option<i64>, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT max_spaces, max_disk_mib, max_running, api_per_min FROM projects WHERE project = 'alpha'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(raw, (None, None, None, None));
+        assert_eq!(
+            project_limit_overrides(&conn, "alpha").unwrap(),
+            Some((None, None, None, None))
+        );
+        assert_eq!(
+            project_limits(&conn, "alpha").unwrap(),
+            Some((
+                defaults.max_spaces,
+                defaults.max_disk_mib,
+                defaults.max_running,
+                defaults.api_per_min
+            ))
+        );
+
+        set_project_limits(&conn, "alpha", Some(0), Some(0), Some(0), Some(0)).unwrap();
+        assert_eq!(
+            project_limit_overrides(&conn, "alpha").unwrap(),
+            Some((Some(0), Some(0), Some(0), Some(0)))
+        );
+        assert_eq!(project_limits(&conn, "alpha").unwrap(), Some((0, 0, 0, 0)));
+
+        set_project_limits(&conn, "alpha", Some(7), Some(2048), Some(3), Some(600)).unwrap();
+        assert_eq!(
+            project_limits(&conn, "alpha").unwrap(),
+            Some((7, 2048, 3, 600))
+        );
+
+        clear_project_limits(&conn, "alpha").unwrap();
+        assert!(project_limit_overrides(&conn, "alpha").unwrap().is_none());
+        assert!(project_limits(&conn, "alpha").unwrap().is_none());
+    }
+
 }

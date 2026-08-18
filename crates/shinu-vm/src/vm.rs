@@ -143,6 +143,13 @@ fn ensure_address_free(id: Uuid, tap: &str, address: &str) -> Result<()> {
     Ok(())
 }
 
+/// The daemon owns this chain so callback ACCEPTs and tap fences have one
+/// stable ordering independent of which VM happens to start first.
+const SHINU_INPUT_CHAIN: &str = "SHINU-INPUT";
+// iptables serialises each command, not the check-plus-append sequence. Keep
+// concurrent VM starts from placing a tap DROP between shared ACCEPT updates.
+static INPUT_CHAIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Runs an iptables check, then the add if the rule is absent.
 ///
 /// Every invocation waits for /run/xtables.lock rather than failing fast:
@@ -160,6 +167,56 @@ fn ensure_iptables_rule(check: &[&str], add: &[&str]) -> Result<()> {
         return Ok(());
     }
     require_success("iptables", &with_wait(add))
+}
+
+fn input_chain_create_args() -> [&'static str; 2] {
+    ["-N", SHINU_INPUT_CHAIN]
+}
+
+fn input_chain_jump_check_args() -> [&'static str; 4] {
+    ["-C", "INPUT", "-j", SHINU_INPUT_CHAIN]
+}
+
+fn input_chain_jump_add_args() -> [&'static str; 5] {
+    ["-I", "INPUT", "1", "-j", SHINU_INPUT_CHAIN]
+}
+
+/// Creates the shared chain and places its sole INPUT jump at position one.
+fn ensure_input_chain() -> Result<()> {
+    let create = input_chain_create_args();
+    let mut create_wait = vec!["-w", "5"];
+    create_wait.extend_from_slice(&create);
+    let output = run_command("iptables", &create_wait)?;
+    if !output.status.success()
+        && !String::from_utf8_lossy(&output.stderr).contains("already exists")
+    {
+        return Err(command_failure("iptables", &create_wait, &output));
+    }
+    let check = input_chain_jump_check_args();
+    let add = input_chain_jump_add_args();
+    ensure_iptables_rule(&check, &add)
+}
+
+fn input_rule_args(rule: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut check = vec!["-C".to_owned(), SHINU_INPUT_CHAIN.to_owned()];
+    check.extend(rule.iter().cloned());
+    let mut add = vec!["-A".to_owned(), SHINU_INPUT_CHAIN.to_owned()];
+    add.extend(rule.iter().cloned());
+    (check, add)
+}
+
+fn ensure_input_rule(rule: &[String]) -> Result<()> {
+    let (check, add) = input_rule_args(rule);
+    let check = check.iter().map(String::as_str).collect::<Vec<_>>();
+    let add = add.iter().map(String::as_str).collect::<Vec<_>>();
+    ensure_iptables_rule(&check, &add)
+}
+
+fn delete_iptables_rule(chain: &str, rule: &[String]) {
+    let mut args = vec!["-w".to_owned(), "5".to_owned(), "-D".to_owned(), chain.to_owned()];
+    args.extend(rule.iter().cloned());
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let _ = run_command("iptables", &args);
 }
 
 fn ensure_forward_rule(rule: &[String], position: usize) -> Result<()> {
@@ -294,13 +351,21 @@ pub fn tap_up_with_peers(id: Uuid, cfg: &NetConfig, peers: &[String]) -> Result<
     {
         ensure_forward_rule(rule, position + 1)?;
     }
+    let _input_chain_guard = INPUT_CHAIN_LOCK
+        .lock()
+        .map_err(|_| Error::Invalid("input firewall lock poisoned".to_owned()))?;
     // The guest uses a static /30 address and a public resolver baked into
-    // the image; it has no DHCP or host DNS dependency. Drop all other
-    // traffic destined for this host in INPUT. Public egress still takes
-    // FORWARD because its destination is not a host-local address.
-    let input_check = ["-C", "INPUT", "-i", &tap, "-j", "DROP"];
-    let input_add = ["-I", "INPUT", "1", "-i", &tap, "-j", "DROP"];
-    ensure_iptables_rule(&input_check, &input_add)
+    // the image; it has no DHCP or host DNS dependency. Public egress still
+    // takes FORWARD because its destination is not a host-local address.
+    ensure_input_chain()?;
+    for allow in &cfg.host_allow {
+        ensure_input_rule(&crate::net::host_allow_rule(allow))?;
+    }
+    // SHINU-INPUT is shared: callback ACCEPTs are appended before the first
+    // tap DROP, and every later tap appends only its DROP. Therefore accepts
+    // stay ahead of every per-tap DROP even when taps start concurrently.
+    ensure_input_rule(&crate::net::input_drop_rule(&tap))?;
+    Ok(())
 }
 /// Adds the current named-network peer exceptions to an existing tap.
 ///
@@ -413,9 +478,11 @@ pub fn tap_down_with_peers(id: Uuid, cfg: &NetConfig, peers: &[String]) {
             .args(args)
             .output();
     }
-    let _ = std::process::Command::new("iptables")
-        .args(["-D", "INPUT", "-i", &tap, "-j", "DROP"])
-        .output();
+    let input_drop = crate::net::input_drop_rule(&tap);
+    delete_iptables_rule(SHINU_INPUT_CHAIN, &input_drop);
+    // Older binaries inserted the fence directly into INPUT. Keep deleting
+    // that legacy rule so upgraded hosts converge after each VM stops.
+    delete_iptables_rule("INPUT", &input_drop);
     let _ = std::process::Command::new("ip")
         .args(["link", "del", &tap])
         .output();
@@ -1605,10 +1672,63 @@ mod reclaim_tests {
             base: [172, 31],
             uplink: String::new(),
             allow: Vec::new(),
+            host_allow: Vec::new(),
         };
         let stopped = sweep_idle(&root, 0, &config).expect("sweep ignores reclaim errors");
+
         assert!(stopped.is_empty());
         std::fs::remove_dir_all(root).expect("test fixture cleanup");
+    }
+}
+#[cfg(test)]
+mod input_chain_tests {
+    use super::{
+        input_chain_create_args, input_chain_jump_add_args, input_chain_jump_check_args,
+        input_rule_args, SHINU_INPUT_CHAIN,
+    };
+
+    #[test]
+    fn chain_creation_and_input_jump_are_idempotent_argv() {
+        assert_eq!(input_chain_create_args(), ["-N", "SHINU-INPUT"]);
+        assert_eq!(input_chain_jump_check_args(), ["-C", "INPUT", "-j", "SHINU-INPUT"]);
+        assert_eq!(
+            input_chain_jump_add_args(),
+            ["-I", "INPUT", "1", "-j", "SHINU-INPUT"]
+        );
+        assert_eq!(SHINU_INPUT_CHAIN, "SHINU-INPUT");
+    }
+
+    #[test]
+    fn chain_rule_check_and_add_append_to_shared_chain() {
+        let rule = vec![
+            "-i".to_owned(),
+            "shinu0123456789".to_owned(),
+            "-j".to_owned(),
+            "DROP".to_owned(),
+        ];
+        let (check, add) = input_rule_args(&rule);
+        assert_eq!(
+            check,
+            vec![
+                "-C".to_owned(),
+                "SHINU-INPUT".to_owned(),
+                "-i".to_owned(),
+                "shinu0123456789".to_owned(),
+                "-j".to_owned(),
+                "DROP".to_owned(),
+            ]
+        );
+        assert_eq!(
+            add,
+            vec![
+                "-A".to_owned(),
+                "SHINU-INPUT".to_owned(),
+                "-i".to_owned(),
+                "shinu0123456789".to_owned(),
+                "-j".to_owned(),
+                "DROP".to_owned(),
+            ]
+        );
     }
 }
 

@@ -34,16 +34,16 @@ impl Limits {
         F: Fn(&str) -> Option<String>,
     {
         Self {
-            max_spaces: positive_u32(&lookup, "SHINU_LIMIT_SPACES", DEFAULT_MAX_SPACES),
-            max_disk_mib: positive_u64(
+            max_spaces: nonnegative_u32(&lookup, "SHINU_LIMIT_SPACES", DEFAULT_MAX_SPACES),
+            max_disk_mib: nonnegative_u64(
                 &lookup,
                 "SHINU_LIMIT_DISK_MIB",
                 DEFAULT_MAX_DISK_MIB,
             ),
             max_vcpus: positive_u32(&lookup, "SHINU_LIMIT_VCPUS", DEFAULT_MAX_VCPUS),
             max_mem_mib: positive_u32(&lookup, "SHINU_LIMIT_MEM_MIB", DEFAULT_MAX_MEM_MIB),
-            max_running: positive_u32(&lookup, "SHINU_LIMIT_RUNNING", DEFAULT_MAX_RUNNING),
-            api_per_min: positive_u32(&lookup, "SHINU_LIMIT_API_PER_MIN", DEFAULT_API_PER_MIN),
+            max_running: nonnegative_u32(&lookup, "SHINU_LIMIT_RUNNING", DEFAULT_MAX_RUNNING),
+            api_per_min: nonnegative_u32(&lookup, "SHINU_LIMIT_API_PER_MIN", DEFAULT_API_PER_MIN),
         }
     }
 }
@@ -58,13 +58,21 @@ where
         .unwrap_or(default)
 }
 
-fn positive_u64<F>(lookup: &F, key: &str, default: u64) -> u64
+fn nonnegative_u32<F>(lookup: &F, key: &str, default: u32) -> u32
+where
+    F: Fn(&str) -> Option<String>,
+{
+    lookup(key)
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
+fn nonnegative_u64<F>(lookup: &F, key: &str, default: u64) -> u64
 where
     F: Fn(&str) -> Option<String>,
 {
     lookup(key)
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|value| *value > 0)
         .unwrap_or(default)
 }
 
@@ -84,6 +92,10 @@ impl RateLimiter {
     }
 
     fn check_at(&self, project: &str, per_min: u32, now: Instant) -> Result<()> {
+        if per_min == 0 {
+            return Ok(());
+        }
+
         const WINDOW: Duration = Duration::from_secs(60);
 
         let mut requests = self
@@ -126,7 +138,7 @@ impl Default for RateLimiter {
 }
 
 pub fn check_space_limit(current_spaces: u32, limits: &Limits) -> Result<()> {
-    if current_spaces >= limits.max_spaces {
+    if limits.max_spaces != 0 && current_spaces >= limits.max_spaces {
         return Err(Error::Quota(format!(
             "space limit reached ({current_spaces}/{}); delete a space or upgrade",
             limits.max_spaces
@@ -160,6 +172,9 @@ pub fn check_disk_limit(
     adding_mib: u64,
     limits: &Limits,
 ) -> Result<()> {
+    if limits.max_disk_mib == 0 {
+        return Ok(());
+    }
     let projected_mib = current_mib.saturating_add(adding_mib);
     if projected_mib > limits.max_disk_mib {
         return Err(Error::Quota(format!(
@@ -171,7 +186,7 @@ pub fn check_disk_limit(
 }
 
 pub fn check_running_limit(current_running: u32, limits: &Limits) -> Result<()> {
-    if current_running >= limits.max_running {
+    if limits.max_running != 0 && current_running >= limits.max_running {
         return Err(Error::Quota(format!(
             "running VM limit reached ({current_running}/{}); stop a VM or upgrade",
             limits.max_running
@@ -224,7 +239,7 @@ mod quota_tests {
             Some(match key {
                 "SHINU_LIMIT_SPACES" => "not-a-number",
                 "SHINU_LIMIT_DISK_MIB" => " ",
-                "SHINU_LIMIT_RUNNING" => "0",
+                "SHINU_LIMIT_RUNNING" => "-1",
                 "SHINU_LIMIT_API_PER_MIN" => "-1",
                 "SHINU_LIMIT_VCPUS" => "0",
                 "SHINU_LIMIT_MEM_MIB" => " ",
@@ -233,6 +248,42 @@ mod quota_tests {
             .to_owned())
         });
         assert_eq!(limits, Limits::from_lookup(|_| None));
+    }
+
+    #[test]
+    fn zero_environment_values_disable_quota_checks() {
+        let limits = Limits::from_lookup(|key| {
+            Some(match key {
+                "SHINU_LIMIT_SPACES"
+                | "SHINU_LIMIT_DISK_MIB"
+                | "SHINU_LIMIT_RUNNING"
+                | "SHINU_LIMIT_API_PER_MIN" => "0",
+                _ => return None,
+            }
+            .to_owned())
+        });
+        assert_eq!(limits.max_spaces, 0);
+        assert_eq!(limits.max_disk_mib, 0);
+        assert_eq!(limits.max_running, 0);
+        assert_eq!(limits.api_per_min, 0);
+        assert_eq!(limits.max_vcpus, 16);
+        assert_eq!(limits.max_mem_mib, 32 * 1024);
+
+        // These values are deliberately beyond the normal defaults: zero is
+        // an explicit unlimited setting, not a request for the defaults.
+        assert!(check_space_limit(6, &limits).is_ok());
+        assert!(check_disk_limit(u64::MAX, u64::MAX, &limits).is_ok());
+        assert!(check_running_limit(3, &limits).is_ok());
+
+        let limiter = RateLimiter::new();
+        for _ in 0..100 {
+            assert!(limiter.check("demo", limits.api_per_min).is_ok());
+        }
+        let requests = limiter
+            .requests
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(requests.is_empty());
     }
 
     #[test]

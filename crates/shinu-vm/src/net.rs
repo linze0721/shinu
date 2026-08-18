@@ -1,5 +1,13 @@
-use shinu_core::{parse_ipv4_cidr, parse_net_base, Error, Result, GUEST_BLOCKED_CIDRS};
+use shinu_core::{parse_ipv4, parse_ipv4_cidr, parse_net_base, Error, Result, GUEST_BLOCKED_CIDRS};
 use uuid::Uuid;
+
+/// A host service that guests may call through the host-side firewall.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostAllow {
+    pub protocol: String,
+    pub port: u16,
+    pub destination: Option<String>,
+}
 
 /// A private /30 network for each VM. The host owns `.1`, the guest `.2`.
 ///
@@ -15,6 +23,13 @@ pub struct NetConfig {
     /// `SHINU_NET_ALLOW` — comma-separated IPv4 CIDRs allowed before the
     /// private-address egress filter. Empty means no private destinations.
     pub allow: Vec<String>,
+    /// `SHINU_HOST_ALLOW` — comma-separated `tcp:PORT` or
+    /// `tcp:PORT@DESTINATION` (with `tcp` replaced by `udp` as needed).
+    ///
+    /// Guests may call back into host services through DNATed loopback ports;
+    /// these ACCEPTs must stay before per-tap DROP rules without racing VM
+    /// starts, so `tap_up` keeps them in the daemon-owned input chain.
+    pub host_allow: Vec<HostAllow>,
     /// `SHINU_NET_UPLINK` — host interface used for NAT egress.
     pub uplink: String,
 }
@@ -37,6 +52,87 @@ pub fn parse_net_allow(value: &str) -> Result<Vec<String>> {
             Ok(entry.to_owned())
         })
         .collect()
+}
+
+/// Parses `SHINU_HOST_ALLOW` without silently dropping malformed entries.
+pub fn parse_host_allow(value: &str) -> Result<Vec<HostAllow>> {
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    value
+        .split(',')
+        .map(str::trim)
+        .map(|entry| {
+            let invalid = || {
+                Error::Invalid(format!(
+                    "invalid SHINU_HOST_ALLOW entry {entry:?}; expected tcp:23000, udp:5353, or tcp:23000@127.0.0.1"
+                ))
+            };
+            let Some((protocol, port_and_destination)) = entry.split_once(':') else {
+                return Err(invalid());
+            };
+            if !matches!(protocol, "tcp" | "udp") {
+                return Err(invalid());
+            }
+            let (port_text, destination) = match port_and_destination.split_once('@') {
+                Some((port, destination))
+                    if !destination.is_empty() && destination == destination.trim() =>
+                {
+                    if destination.contains('@') {
+                        return Err(invalid());
+                    }
+                    (port, Some(destination))
+                }
+                Some(_) => return Err(invalid()),
+                None => (port_and_destination, None),
+            };
+            let port = port_text
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port != 0)
+                .ok_or_else(invalid)?;
+            if let Some(destination) = destination
+                && parse_ipv4(destination).is_none()
+            {
+                return Err(invalid());
+            }
+            Ok(HostAllow {
+                protocol: protocol.to_owned(),
+                port,
+                destination: destination.map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
+/// Builds the rule matched by a host callback allowlist entry.
+pub(crate) fn host_allow_rule(allow: &HostAllow) -> Vec<String> {
+    let mut rule = vec![
+        "-i".to_owned(),
+        "shinu+".to_owned(),
+        "-p".to_owned(),
+        allow.protocol.clone(),
+    ];
+    if let Some(destination) = &allow.destination {
+        rule.extend(["-d".to_owned(), destination.clone()]);
+    }
+    rule.extend([
+        "--dport".to_owned(),
+        allow.port.to_string(),
+        "-j".to_owned(),
+        "ACCEPT".to_owned(),
+    ]);
+    rule
+}
+
+/// Builds the input-fence rule for one tap.
+pub(crate) fn input_drop_rule(tap: &str) -> Vec<String> {
+    vec![
+        "-i".to_owned(),
+        tap.to_owned(),
+        "-j".to_owned(),
+        "DROP".to_owned(),
+    ]
 }
 
 fn default_uplink() -> Option<String> {
@@ -77,6 +173,10 @@ impl NetConfig {
             Ok(value) => parse_net_allow(&value)?,
             Err(_) => Vec::new(),
         };
+        let host_allow = match std::env::var("SHINU_HOST_ALLOW") {
+            Ok(value) => parse_host_allow(&value)?,
+            Err(_) => Vec::new(),
+        };
         let uplink = match std::env::var("SHINU_NET_UPLINK") {
             Ok(value) if !value.trim().is_empty() => value.trim().to_owned(),
             _ if enabled => default_uplink().ok_or_else(|| {
@@ -90,6 +190,7 @@ impl NetConfig {
             enabled,
             base,
             allow,
+            host_allow,
             uplink,
         })
     }
@@ -229,7 +330,8 @@ pub(crate) fn egress_rules_with_peers(
 #[cfg(test)]
 mod network_tests {
     use super::{
-        egress_rules_with_peers, net_slot, parse_net_allow, peer_rules, tap_name, NetSpec,
+        egress_rules_with_peers, host_allow_rule, input_drop_rule, net_slot, parse_host_allow,
+        parse_net_allow, peer_rules, tap_name, HostAllow, NetSpec,
     };
     use crate::config::vm_config_json;
     use crate::vm::egress_rules;
@@ -349,6 +451,100 @@ mod network_tests {
         assert!(parse_net_allow("").expect("empty allow list").is_empty());
         assert!(parse_net_allow("10.0.0.0/33").is_err());
         assert!(parse_net_allow("10.0.0.0/8,").is_err());
+    }
+
+    #[test]
+    fn parses_host_allow_entries_strictly() {
+        assert_eq!(
+            parse_host_allow("tcp:23000, udp:5353").expect("valid host ports"),
+            vec![
+                HostAllow {
+                    protocol: "tcp".to_owned(),
+                    port: 23000,
+                    destination: None,
+                },
+                HostAllow {
+                    protocol: "udp".to_owned(),
+                    port: 5353,
+                    destination: None,
+                },
+            ]
+        );
+        assert_eq!(
+            parse_host_allow("tcp:23000@127.0.0.1").expect("valid destination"),
+            vec![HostAllow {
+                protocol: "tcp".to_owned(),
+                port: 23000,
+                destination: Some("127.0.0.1".to_owned()),
+            }]
+        );
+        assert!(parse_host_allow("").expect("empty host allow list").is_empty());
+        for malformed in [
+            "icmp:23000",
+            "tcp",
+            "tcp:",
+            "tcp:0",
+            "tcp:65536",
+            "tcp:23000@",
+            "tcp:23000@127.0.0.999",
+            "tcp:23000@127.0.0.1@127.0.0.2",
+            "tcp:23000,",
+        ] {
+            assert!(parse_host_allow(malformed).is_err(), "accepted {malformed:?}");
+        }
+    }
+
+    #[test]
+    fn host_allow_rules_match_tap_wildcard_and_optional_destination() {
+        assert_eq!(
+            host_allow_rule(&HostAllow {
+                protocol: "tcp".to_owned(),
+                port: 23000,
+                destination: None,
+            }),
+            vec![
+                "-i".to_owned(),
+                "shinu+".to_owned(),
+                "-p".to_owned(),
+                "tcp".to_owned(),
+                "--dport".to_owned(),
+                "23000".to_owned(),
+                "-j".to_owned(),
+                "ACCEPT".to_owned(),
+            ]
+        );
+        assert_eq!(
+            host_allow_rule(&HostAllow {
+                protocol: "udp".to_owned(),
+                port: 5353,
+                destination: Some("127.0.0.1".to_owned()),
+            }),
+            vec![
+                "-i".to_owned(),
+                "shinu+".to_owned(),
+                "-p".to_owned(),
+                "udp".to_owned(),
+                "-d".to_owned(),
+                "127.0.0.1".to_owned(),
+                "--dport".to_owned(),
+                "5353".to_owned(),
+                "-j".to_owned(),
+                "ACCEPT".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn input_drop_rule_targets_only_the_tap() {
+        assert_eq!(
+            input_drop_rule("shinu0123456789"),
+            vec![
+                "-i".to_owned(),
+                "shinu0123456789".to_owned(),
+                "-j".to_owned(),
+                "DROP".to_owned(),
+            ]
+        );
     }
 
 

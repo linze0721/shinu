@@ -4458,6 +4458,17 @@ fn execute_streaming(
     let mut readers = 2;
     let mut child_status = None;
     let mut stream_broken = false;
+    // A VM with an exec in flight is not idle, but nothing else refreshes
+    // `last_used` while a command runs: `touch` fires only inside vm::start,
+    // so a single long exec (a keigetsu agent run) would cross the idle
+    // window and get reaped mid-command by sweep_idle, killing the ssh
+    // channel from under the guest. Refresh it here for the lifetime of the
+    // child; the warm-VM case (start already running, no touch at all) is
+    // covered by the first refresh below.
+    const TOUCH_EVERY: Duration = Duration::from_secs(30);
+    let mut last_touch = Instant::now();
+    let _ = shinu::vm::touch(&target.vm_dir);
+
     while readers > 0 || child_status.is_none() {
         match receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(line) => {
@@ -4469,6 +4480,11 @@ fn execute_streaming(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => readers = 0,
         }
+        if last_touch.elapsed() >= TOUCH_EVERY {
+            let _ = shinu::vm::touch(&target.vm_dir);
+            last_touch = Instant::now();
+        }
+
         if child_status.is_none() {
             match child.try_wait() {
                 Ok(status) => child_status = status,
@@ -4546,6 +4562,7 @@ mod tests {
                 enabled: false,
                 base: [172, 31],
                 allow: Vec::new(),
+                host_allow: Vec::new(),
                 uplink: String::new(),
             },
         )
@@ -4998,6 +5015,12 @@ mod tests {
                     [],
                 )
                 .expect("insert project limits");
+            connection
+                .execute(
+                    "INSERT INTO projects(project,max_spaces,max_disk_mib,max_running,api_per_min) VALUES ('project-unlimited',0,0,0,0)",
+                    [],
+                )
+                .expect("insert unlimited project limits");
         }
         let (vm_cfg, net_cfg) = test_configs();
         let registry = registry();
@@ -5026,6 +5049,18 @@ mod tests {
         let default_limits = super::effective_limits(&ctx, "project-b").expect("default");
         assert_eq!(default_limits.max_spaces, 5);
         assert_eq!(default_limits.max_disk_mib, 10);
+        let unlimited_limits =
+            super::effective_limits(&ctx, "project-unlimited").expect("unlimited override");
+        assert_eq!(unlimited_limits.max_spaces, 0);
+        assert_eq!(unlimited_limits.max_disk_mib, 0);
+        assert_eq!(unlimited_limits.max_running, 0);
+        assert_eq!(unlimited_limits.api_per_min, 0);
+        assert!(shinu::quota::check_space_limit(7, &unlimited_limits).is_ok());
+        assert!(shinu::quota::check_disk_limit(u64::MAX, u64::MAX, &unlimited_limits).is_ok());
+        assert!(shinu::quota::check_running_limit(3, &unlimited_limits).is_ok());
+        assert!(RateLimiter::new()
+            .check("project-unlimited", unlimited_limits.api_per_min)
+            .is_ok());
         std::fs::remove_dir_all(root).expect("remove test root");
     }
 
@@ -5611,6 +5646,7 @@ mod tests {
             enabled: false,
             base: [172, 31],
             allow: Vec::new(),
+            host_allow: Vec::new(),
             uplink: String::new(),
         });
         super::Ctx {

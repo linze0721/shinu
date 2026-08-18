@@ -12,10 +12,18 @@ fn default_image() -> Image {
     Image::Void
 }
 
+/// Pre-project state files (before multi-tenancy) carried no project field;
+/// their spaces belong to the implicit "default" project so existing tokens
+/// minted for it keep seeing them after migration.
+fn default_project() -> String {
+    "default".to_string()
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Space {
     pub id: Uuid,
     pub name: String,
+    #[serde(default = "default_project")]
     pub project: String,
     #[serde(default = "default_image")]
     pub image: Image,
@@ -37,7 +45,7 @@ pub struct Space {
 pub struct Ckpt {
     pub id: Uuid,
     pub space: Uuid,
-    #[serde(default)]
+    #[serde(default = "default_project")]
     pub project: String,
     #[serde(default)]
     pub parent: Option<Uuid>,
@@ -1080,6 +1088,53 @@ mod db_tests {
         assert!(migrate_from_json(&root, &conn).is_err());
         assert_eq!(count_spaces(&conn, "alpha").unwrap(), 0);
         assert!(root.join("state.json").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migration_reads_pre_project_state_files() {
+        // The exact shape shinud wrote before multi-tenancy: no project,
+        // image, head, sizing, or network fields. A deployed host upgrading
+        // across that boundary must not brick on `missing field`.
+        let root = root();
+        let legacy = r#"{
+          "spaces": [
+            {
+              "id": "9ae9f76a-0031-40a7-b620-a328298c35e7",
+              "name": "05d48e52-e935-4009-ba1d-ece1aa240034",
+              "owner": "0",
+              "parent": null,
+              "created_at": "2026-08-15T03:53:19.100581133Z"
+            }
+          ],
+          "ckpts": [
+            {
+              "id": "0d18bb37-6cf1-4be3-8c2a-1f2f9d3a4b5c",
+              "space": "9ae9f76a-0031-40a7-b620-a328298c35e7",
+              "owner": "0",
+              "note": "baseline",
+              "created_at": "2026-08-15T04:00:00Z"
+            }
+          ]
+        }"#;
+        fs::write(root.join("state.json"), legacy).unwrap();
+        let conn = db();
+        assert!(migrate_from_json(&root, &conn).unwrap());
+        let state = load(&conn).unwrap();
+        assert_eq!(state.spaces.len(), 1);
+        assert_eq!(state.spaces[0].project, "default");
+        assert_eq!(state.spaces[0].image, Image::Void);
+        assert_eq!(state.ckpts.len(), 1);
+        assert_eq!(state.ckpts[0].project, "default");
+        assert!(find_space(
+            &conn,
+            "05d48e52-e935-4009-ba1d-ece1aa240034",
+            "default"
+        )
+        .unwrap()
+        .is_some());
+        assert!(!root.join("state.json").exists());
+        assert!(root.join("state.json.migrated").exists());
         fs::remove_dir_all(root).unwrap();
     }
 

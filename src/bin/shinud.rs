@@ -4500,6 +4500,16 @@ struct StreamLine {
     data: String,
 }
 
+/// Reads one output stream of the child, framing on newlines.
+///
+/// Deliberately byte-oriented. `read_line` requires valid UTF-8 and returns
+/// an error on the first stray byte, and treating that error as end-of-stream
+/// silently discarded everything the command printed afterwards: a single
+/// non-UTF-8 byte anywhere in the output truncated the response while the
+/// exit status still said success, so callers could not tell. Guest output is
+/// arbitrary bytes (compiler diagnostics, binary dumps, any non-UTF-8 locale),
+/// so the transport must carry them. Invalid sequences become replacement
+/// characters because the wire format is JSON, which cannot express them.
 fn read_stream<R: Read + Send + 'static>(
     stream: &'static str,
     reader: R,
@@ -4508,14 +4518,12 @@ fn read_stream<R: Read + Send + 'static>(
     thread::spawn(move || {
         let mut reader = BufReader::new(reader);
         loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
+            let mut line = Vec::new();
+            match reader.read_until(b'\n', &mut line) {
                 Ok(0) => break,
                 Ok(_) => {
-                    if sender
-                        .send(StreamLine { stream, data: line })
-                        .is_err()
-                    {
+                    let data = String::from_utf8_lossy(&line).into_owned();
+                    if sender.send(StreamLine { stream, data }).is_err() {
                         break;
                     }
                 }
@@ -4650,7 +4658,7 @@ fn execute_streaming(
 
 #[cfg(test)]
 mod tests {
-    use super::{CkptFlags, append_checkpoint, handle, set_head};
+    use super::{CkptFlags, append_checkpoint, handle, read_stream, set_head};
     use chrono::Utc;
     use rusqlite::Connection;
     use shinu::{
@@ -6035,5 +6043,22 @@ mod tests {
         );
         assert!(response.starts_with("HTTP/1.1 403"), "response: {response}");
         std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    /// Guest output is arbitrary bytes, and a line-oriented UTF-8 read used to
+    /// treat the first invalid byte as end-of-stream: everything printed after
+    /// it vanished while the exit status still reported success, so a caller
+    /// saw a silently truncated response.
+    #[test]
+    fn output_after_invalid_utf8_still_reaches_the_client() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let payload: &[u8] = b"before\n\xff\xfe\nafter\n";
+        read_stream("stdout", std::io::Cursor::new(payload), sender)
+            .join()
+            .expect("reader thread");
+        let lines: Vec<String> = receiver.iter().map(|line| line.data).collect();
+        assert_eq!(lines.len(), 3, "lines: {lines:?}");
+        assert_eq!(lines[0], "before\n");
+        assert_eq!(lines[2], "after\n");
     }
 }

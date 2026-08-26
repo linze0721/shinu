@@ -7,7 +7,7 @@ mod fetch;
 
 pub use assets::ensure_assets;
 pub use build::{ensure_base, repair_base_resolv};
-pub use configure::{filter_guest_nameservers, guest_resolv_needs_repair, seed_resolv};
+pub use configure::seed_resolv;
 pub use extract::{mount_image, umount};
 pub use diff::{
     compare_trees, diff_images, is_excluded, DiffEntry, DiffOptions, DiffResult, DiffStatus,

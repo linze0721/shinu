@@ -62,6 +62,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Rename the one legacy Void base before any lazy image lookup; this is
     // idempotent so restarts never rebuild or fork the old filename.
     shinu::migrate_base(&root)?;
+    // A base built before the current egress policy carries a resolver the
+    // guest firewall now blocks — or, since IPv6 entries began counting as
+    // unreachable, one the guest cannot route at all. Either silently breaks
+    // package installs in every VM forked from it. Images that were never
+    // built are skipped, so this stays compatible with lazy base creation.
+    // Best effort: a busy or damaged base is an operator problem, not a
+    // reason to refuse service.
+    match shinu::repair_base_resolv(&root) {
+        Ok(true) => eprintln!("rewrote a base image resolv.conf to a reachable resolver"),
+        Ok(false) => {}
+        Err(error) => eprintln!("base resolv repair: {error}"),
+    }
     // Assets are shared by all guests and cheap compared with rootfs builds;
     // image bases themselves are ensured only when their first space is made.
     shinu::ensure_assets(&root)?;

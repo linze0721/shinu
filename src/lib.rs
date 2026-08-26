@@ -23,10 +23,7 @@ pub use shinu_store::{
     find, find_ckpt, is_referenced, log_chain, quota, reflog_entries, registry, state,
 };
 
-pub use shinu_image::{
-    BaseConfig, ensure_assets, ensure_base, filter_guest_nameservers, guest_resolv_needs_repair,
-    repair_base_resolv, seed_resolv,
-};
+pub use shinu_image::{BaseConfig, ensure_assets, ensure_base, repair_base_resolv};
 
 pub use shinu_proto::{http, proto};
 

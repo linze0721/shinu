@@ -1384,10 +1384,14 @@ fn remove_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Val
     let _space_guard = space_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // The record is claimed under the same lock that verifies it, before any
+    // file is unlinked: a later failure then leaves an orphan for gc rather
+    // than a space whose image is already gone. `previous_running` is taken
+    // before the removal because it is the "before" set the rule diff needs.
     let (state, previous_running, peers) = {
         let _state_guard = lock_state(ctx.registry);
         let connection = lock_db(ctx.db);
-        let state = state::load(&connection)?;
+        let mut state = state::load(&connection)?;
         let space = state
             .spaces
             .iter()
@@ -1401,6 +1405,8 @@ fn remove_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Val
             network.as_deref(),
         );
         let peers = peer_ips(&space, &previous_running, ctx.net_cfg);
+        state.spaces.retain(|space| space.id != id);
+        state::store(&connection, &state)?;
         (state, previous_running, peers)
     };
     shinu::vm::stop_with_peers(&shinu::vm_dir(ctx.root, id), ctx.net_cfg, &peers)?;
@@ -1411,11 +1417,12 @@ fn remove_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Val
         network.as_deref(),
         &previous_running,
     )?;
-    let all_members = network_members(&state, project, network.as_deref())
-        .into_iter()
-        .filter(|member| member.id != id)
-        .collect::<Vec<_>>();
+    // The claimed state no longer contains this space, so the peer set it
+    // yields is already the post-removal one.
+    let all_members = network_members(&state, project, network.as_deref());
     sync_network_hosts(ctx, &current_running, &all_members);
+    // The record is already gone, so a failure here leaves an orphaned file for
+    // gc rather than a space whose image has been deleted out from under it.
     let image = shinu::space_image(ctx.root, id);
     match std::fs::remove_file(&image) {
         Ok(()) => {}
@@ -1428,10 +1435,6 @@ fn remove_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Val
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    update_state(ctx.db, ctx.registry, |state| {
-        state.spaces.retain(|space| space.id != id);
-        Ok(())
-    })?;
     Ok(json!({ "removed": resolved_name, "id": id }))
 }
 fn remove_checkpoint(ctx: &Ctx<'_>, project: &str, id: Uuid) -> shinu::Result<Value> {
@@ -5572,6 +5575,61 @@ mod tests {
             matches!(result, Err(shinu::Error::Quota(_))),
             "resize must be rejected once the sibling's allocation is visible, got {result:?}"
         );
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    /// AGENTS.md invariant 8: the record is claimed under the state lock before
+    /// any file is unlinked. A failure partway through the deletes must
+    /// therefore leave an orphaned file for gc, never a surviving record whose
+    /// image is already gone — that state needs the user to retry `rm`, and
+    /// meanwhile the space looks present but cannot boot.
+    #[test]
+    fn remove_space_claims_the_record_before_unlinking_files() {
+        let root = test_root("rm-claim");
+        let project = "project-a";
+        let id = Uuid::new_v4();
+        store_state(
+            &root,
+            &State {
+                spaces: vec![Space {
+                    id,
+                    name: "doomed".into(),
+                    project: project.to_owned(),
+                    image: shinu::Image::Void,
+                    vcpus: None,
+                    mem_mib: None,
+                    disk_mib: Some(10),
+                    network: None,
+                    parent: None,
+                    head: None,
+                    created_at: Utc::now(),
+                }],
+                ckpts: Vec::new(),
+            },
+        );
+        let image = shinu::space_image(&root, id);
+        std::fs::create_dir_all(image.parent().expect("image parent"))
+            .expect("create image directory");
+        std::fs::write(&image, b"disk").expect("create image");
+        // The snapshot path is a non-empty directory, so remove_file returns
+        // EISDIR and the delete phase fails after the record was claimed. A
+        // permission trick would not do: these tests run as root.
+        let blocked = super::space_snapshot_mem(&root, id);
+        std::fs::create_dir_all(blocked.join("occupied")).expect("block snapshot path");
+
+        let (vm_cfg, net_cfg) = test_configs();
+        let registry = registry();
+        let db = test_db(&root);
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        let result = handle(&ctx, Req::Rm { space: "doomed".into() }, project);
+
+        assert!(result.is_err(), "the delete phase must fail, got {result:?}");
+        let state = super::snapshot(&db, &registry).expect("read state after failed rm");
+        assert!(
+            state.spaces.iter().all(|space| space.id != id),
+            "the record must stay claimed after a failed delete, leaving only an orphan for gc"
+        );
+
         std::fs::remove_dir_all(root).expect("remove test root");
     }
 

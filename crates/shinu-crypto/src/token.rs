@@ -6,8 +6,8 @@
     use chrono::{DateTime, Utc};
     use serde::{Deserialize, Serialize};
     use shinu_core::{Error, Result};
-    use std::io::Read;
-    use std::os::unix::fs::PermissionsExt;
+    use std::io::{Read, Write};
+    use std::os::unix::fs::OpenOptionsExt;
     use std::path::Path;
 
     use crate::sha2::sha256_hex;
@@ -31,8 +31,17 @@
     pub fn store(root: &Path, tokens: &[Token]) -> Result<()> {
         let contents = serde_json::to_string_pretty(tokens)?;
         let tmp = root.join("tokens.json.tmp");
-        std::fs::write(&tmp, contents)?;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        // Mode at open: chmod-after-create leaves hashes world-readable
+        // and an fd opened in that window survives the later chmod.
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            file.write_all(contents.as_bytes())?;
+        }
         std::fs::rename(tmp, root.join("tokens.json"))?;
         Ok(())
     }
@@ -62,7 +71,10 @@
         let left = left.as_bytes();
         let right = right.as_bytes();
         let mut difference = left.len() ^ right.len();
-        for index in 0..64 {
+        // Floor at 64 so SHA-256 hex comparisons keep a fixed iteration
+        // count; extend past 64 so a shared prefix cannot hide a suffix
+        // difference on a longer digest.
+        for index in 0..left.len().max(right.len()).max(64) {
             let a = left.get(index).copied().unwrap_or(0);
             let b = right.get(index).copied().unwrap_or(0);
             difference |= usize::from(a ^ b);
@@ -155,5 +167,15 @@
                 & 0o777;
             assert_eq!(mode, 0o600);
             std::fs::remove_dir_all(root).expect("remove token test root");
+        }
+
+        #[test]
+        fn constant_time_eq_rejects_shared_prefix_beyond_64_bytes() {
+            let left = "a".repeat(64) + &"b".repeat(64);
+            let right = "a".repeat(64) + &"c".repeat(64);
+            assert_eq!(left.len(), 128);
+            assert_eq!(right.len(), 128);
+            assert_ne!(&left[64..], &right[64..]);
+            assert!(!constant_time_eq(&left, &right));
         }
     }

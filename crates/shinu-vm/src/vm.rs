@@ -85,10 +85,17 @@ fn command_failure(program: &str, args: &[&str], output: &std::process::Output) 
         .chain(args.iter().copied())
         .collect::<Vec<_>>()
         .join(" ");
-    Error::Invalid(format!(
+    Error::Internal(format!(
         "{command} failed: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     ))
+}
+
+fn console_tail(dir: &Path) -> String {
+    const MAX: usize = 4 * 1024;
+    let bytes = std::fs::read(dir.join("console.log")).unwrap_or_default();
+    let start = bytes.len().saturating_sub(MAX);
+    String::from_utf8_lossy(&bytes[start..]).into_owned()
 }
 
 fn run_command(program: &str, args: &[&str]) -> Result<std::process::Output> {
@@ -135,7 +142,7 @@ fn ensure_address_free(id: Uuid, tap: &str, address: &str) -> Result<()> {
             continue;
         };
         if family == "inet" && candidate == address && interface != tap {
-            return Err(Error::Invalid(format!(
+            return Err(Error::Internal(format!(
                 "network address conflict for uuid {id}: {address} is already on {interface}; set SHINU_NET_BASE"
             )));
         }
@@ -353,7 +360,7 @@ pub fn tap_up_with_peers(id: Uuid, cfg: &NetConfig, peers: &[String]) -> Result<
     }
     let _input_chain_guard = INPUT_CHAIN_LOCK
         .lock()
-        .map_err(|_| Error::Invalid("input firewall lock poisoned".to_owned()))?;
+        .map_err(|_| Error::Internal("input firewall lock poisoned".to_owned()))?;
     // The guest uses a static /30 address and a public resolver baked into
     // the image; it has no DHCP or host DNS dependency. Public egress still
     // takes FORWARD because its destination is not a host-local address.
@@ -502,7 +509,7 @@ pub fn prepare(dir: &Path, uid: u32, gid: u32) -> Result<String> {
             .arg(&key)
             .status()?;
         if !status.success() {
-            return Err(Error::Invalid("ssh-keygen failed for space key".to_owned()));
+            return Err(Error::Internal("ssh-keygen failed for space key".to_owned()));
         }
     }
     let public = std::fs::read_to_string(key.with_extension("pub"))?;
@@ -620,10 +627,15 @@ pub fn touch(dir: &Path) -> Result<()> {
 /// One request against a VM's control API. `curl` is already this crate's
 /// HTTP client (see `fetch_tarball`), and it speaks unix sockets, so no
 /// hand-rolled HTTP and no new dependency.
+///
+/// `None` means the transfer failed or Firecracker refused the request:
+/// without `--fail`, curl exits 0 on a completed HTTP 4xx/5xx and callers
+/// would treat a `fault_message` body as success.
 fn api(dir: &Path, method: &str, path: &str, body: Option<&str>) -> Option<String> {
     let mut command = std::process::Command::new("curl");
     command
         .arg("-s")
+        .arg("--fail")
         .arg("--max-time")
         .arg("5")
         .arg("--unix-socket")
@@ -728,7 +740,7 @@ pub fn snapshot(dir: &Path, kind: SnapshotKind) -> Result<(PathBuf, PathBuf)> {
     )
     .is_none()
     {
-        return Err(Error::Invalid(
+        return Err(Error::Internal(
             "failed to pause VM for snapshot".to_owned(),
         ));
     }
@@ -745,7 +757,7 @@ pub fn snapshot(dir: &Path, kind: SnapshotKind) -> Result<(PathBuf, PathBuf)> {
             "/vm",
             Some("{\"state\": \"Resumed\"}"),
         );
-        return Err(Error::Invalid(
+        return Err(Error::Internal(
             "failed to create VM snapshot".to_owned(),
         ));
     }
@@ -757,7 +769,7 @@ pub fn snapshot(dir: &Path, kind: SnapshotKind) -> Result<(PathBuf, PathBuf)> {
     )
     .is_none()
     {
-        return Err(Error::Invalid(
+        return Err(Error::Internal(
             "failed to resume VM after snapshot".to_owned(),
         ));
     }
@@ -796,13 +808,13 @@ fn written_extents(file: &std::fs::File, size: u64) -> Result<Vec<(u64, u64)>> {
             if error.raw_os_error() == Some(6) {
                 break;
             }
-            return Err(Error::Invalid(format!(
+            return Err(Error::Internal(format!(
                 "cannot map written extents of a diff snapshot: {error}"
             )));
         }
         let end = unsafe { lseek(fd, start, SEEK_HOLE) };
         if end < 0 {
-            return Err(Error::Invalid(format!(
+            return Err(Error::Internal(format!(
                 "cannot map the end of a diff snapshot extent: {}",
                 std::io::Error::last_os_error()
             )));
@@ -913,7 +925,7 @@ fn link_resource(src: &Path, dst: &Path) -> Result<()> {
     // hardlink is O(1) and preserves CoW accounting, while copying would
     // consume the whole image and silently destroy that invariant.
     std::fs::hard_link(src, dst).map_err(|error| {
-        Error::Invalid(format!(
+        Error::Internal(format!(
             "hard-link {} -> {} failed (cross-device links are not supported): {error}",
             src.display(),
             dst.display()
@@ -1095,7 +1107,10 @@ pub fn start(
             .stdout(log)
             .status()?;
         if !status.success() {
-            return Err(Error::Invalid("could not launch jailer".to_owned()));
+            return Err(Error::Internal(format!(
+                "could not launch jailer: {}",
+                console_tail(&dir).trim()
+            )));
         }
 
         // The jailer writes this pid inside the chroot. Scan as a fallback
@@ -1116,10 +1131,9 @@ pub fn start(
             std::thread::sleep(Duration::from_millis(50));
         }
         let Some(pid) = pid else {
-            let console = std::fs::read_to_string(dir.join("console.log")).unwrap_or_default();
-            return Err(Error::Invalid(format!(
+            return Err(Error::Internal(format!(
                 "firecracker exited immediately: {}",
-                console
+                console_tail(&dir)
                     .lines()
                     .rev()
                     .take(5)
@@ -1147,7 +1161,7 @@ pub fn start(
                 let _ = stop(&dir, net_cfg);
                 let _ = std::fs::remove_file(jail.join(JAIL_SNAP_MEM));
                 let _ = std::fs::remove_file(jail.join(JAIL_SNAP_STATE));
-                return Err(Error::Invalid(
+                return Err(Error::Internal(
                     "snapshot restore API socket did not appear".to_owned(),
                 ));
             }
@@ -1166,18 +1180,17 @@ pub fn start(
                 let _ = stop(&dir, net_cfg);
                 let _ = std::fs::remove_file(jail.join(JAIL_SNAP_MEM));
                 let _ = std::fs::remove_file(jail.join(JAIL_SNAP_STATE));
-                return Err(Error::Invalid(
+                return Err(Error::Internal(
                     "failed to load VM snapshot".to_owned(),
                 ));
             }
         }
 
         if !wait_ready(&dir, &vsock) {
-            let console = std::fs::read_to_string(dir.join("console.log")).unwrap_or_default();
             let _ = stop(&dir, net_cfg);
-            return Err(Error::Invalid(format!(
+            return Err(Error::Internal(format!(
                 "vm did not come up: {}",
-                console
+                console_tail(&dir)
                     .lines()
                     .rev()
                     .take(5)
@@ -1256,9 +1269,9 @@ fn dir_id(dir: &Path) -> Result<Uuid> {
     let name = dir
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| Error::Invalid(format!("VM directory has no UUID: {}", dir.display())))?;
+        .ok_or_else(|| Error::Internal(format!("VM directory has no UUID: {}", dir.display())))?;
     Uuid::parse_str(name).map_err(|error| {
-        Error::Invalid(format!("VM directory is not a UUID ({}): {error}", dir.display()))
+        Error::Internal(format!("VM directory is not a UUID ({}): {error}", dir.display()))
     })
 }
 /// Whether an `e2fsck` exit status means the image is usable.
@@ -1280,7 +1293,7 @@ pub fn reclaim_image(image: &Path) -> Result<u64> {
 
     let before = shinu_core::btrfs::exclusive(image)?;
     let image_arg = image.to_str().ok_or_else(|| {
-        Error::Invalid(format!("image path is not valid UTF-8: {}", image.display()))
+        Error::Internal(format!("image path is not valid UTF-8: {}", image.display()))
     })?;
     let args = ["-E", "discard", "-fp", image_arg];
     let output = std::process::Command::new("e2fsck").args(args).output()?;
@@ -1453,7 +1466,7 @@ pub fn stop_with_peers(dir: &Path, cfg: &NetConfig, peers: &[String]) -> Result<
     }
     if !gone {
         tap_down_with_peers(id, cfg, peers);
-        return Err(Error::Invalid(format!(
+        return Err(Error::Internal(format!(
             "firecracker pid {pid} did not stop"
         )));
     }
@@ -1512,7 +1525,10 @@ pub fn sweep_idle(root: &Path, idle_secs: u64, cfg: &NetConfig) -> Result<Vec<Pa
             .unwrap_or(now);
         let idle_for = now.saturating_sub(last);
         if idle_for >= idle_secs {
-            stop(&dir, cfg)?;
+            if let Err(error) = stop(&dir, cfg) {
+                eprintln!("idle sweep failed to stop {}: {error}", dir.display());
+                continue;
+            }
             stopped.push(dir);
         } else if idle_for >= (idle_secs / 10).max(30) {
             reclaim(&dir, KEEP_MIB);

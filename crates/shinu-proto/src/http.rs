@@ -302,8 +302,10 @@ fn reason_phrase(status: u16) -> &'static str {
         201 => "Created",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
         _ => "Unknown",
     }
@@ -466,7 +468,10 @@ pub fn status_for(error: &shinu_core::Error) -> u16 {
         shinu_core::Error::NotFound(_) => 404,
         shinu_core::Error::Invalid(_) => 400,
         shinu_core::Error::Quota(_) => 429,
-        shinu_core::Error::Btrfs(_) | shinu_core::Error::Io(_) | shinu_core::Error::Json(_) => 500,
+        shinu_core::Error::Btrfs(_)
+        | shinu_core::Error::Io(_)
+        | shinu_core::Error::Json(_)
+        | shinu_core::Error::Internal(_) => 500,
     }
 }
 
@@ -738,5 +743,15 @@ mod http_tests {
         );
         let json_error = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
         assert_eq!(status_for(&shinu_core::Error::Json(json_error)), 500);
+        assert_eq!(
+            status_for(&shinu_core::Error::Internal("sql: database is locked".into())),
+            500
+        );
+    }
+
+    #[test]
+    fn reason_phrase_covers_quota_and_csrf_statuses() {
+        assert_eq!(reason_phrase(403), "Forbidden");
+        assert_eq!(reason_phrase(429), "Too Many Requests");
     }
 }

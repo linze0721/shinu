@@ -597,25 +597,26 @@ fn space_size_mib(root: &Path, space: &Space) -> u64 {
         .unwrap_or_else(|| image_size_mib(&shinu::space_image(root, space.id)))
 }
 
-fn current_disk_mib(root: &Path, state: &State, project: &str) -> u64 {
+fn current_disk_mib(root: &Path, state: &State, project: &str) -> shinu::Result<u64> {
     let spaces = state
         .spaces
         .iter()
         .filter(|space| space.project == project)
         .map(|space| space_size_mib(root, space))
         .sum::<u64>();
-    let checkpoints = state
+    let mut checkpoints = 0u64;
+    for checkpoint in state
         .ckpts
         .iter()
         .filter(|checkpoint| checkpoint.project == project)
-        .map(|checkpoint| {
-            checkpoint_exclusive(root, checkpoint.id)
-                .unwrap_or(0)
+    {
+        checkpoints = checkpoints.saturating_add(
+            checkpoint_exclusive(root, checkpoint.id)?
                 .saturating_add(1024 * 1024 - 1)
-                / (1024 * 1024)
-        })
-        .sum::<u64>();
-    spaces.saturating_add(checkpoints)
+                / (1024 * 1024),
+        );
+    }
+    Ok(spaces.saturating_add(checkpoints))
 }
 
 fn check_space_quota(
@@ -628,7 +629,7 @@ fn check_space_quota(
     let spaces = state::count_spaces(connection, project)?;
     quota::check_space_limit(spaces, limits)?;
     let state = state::load(connection)?;
-    let disk_mib = current_disk_mib(root, &state, project);
+    let disk_mib = current_disk_mib(root, &state, project)?;
     // Capacity quota is an instantaneous allocation check, separate from the
     // usage_events.disk_mib_hour billing time series.
     quota::check_disk_limit(disk_mib, adding_mib, limits)
@@ -695,6 +696,7 @@ fn record_sweep_usage(
     let state = state::load(&connection)?;
     for space in &state.spaces {
         let image = shinu::space_image(root, space.id);
+        // Billing time series: a du failure must not abort the 30-second sweep.
         let disk_mib = shinu::btrfs::exclusive(&image)
             .unwrap_or(0)
             .saturating_add(1024 * 1024 - 1)
@@ -1190,7 +1192,7 @@ fn commit_space(
                     .saturating_add(1024 * 1024 - 1)
                     / (1024 * 1024);
                 quota::check_disk_limit(
-                    current_disk_mib(ctx.root, state, project)
+                    current_disk_mib(ctx.root, state, project)?
                         .saturating_add(new_checkpoint_mib),
                     0,
                     limits,
@@ -1382,7 +1384,7 @@ fn remove_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Val
     let _space_guard = space_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (current_running, all_members) = {
+    let (state, previous_running, peers) = {
         let _state_guard = lock_state(ctx.registry);
         let connection = lock_db(ctx.db);
         let state = state::load(&connection)?;
@@ -1399,20 +1401,20 @@ fn remove_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Val
             network.as_deref(),
         );
         let peers = peer_ips(&space, &previous_running, ctx.net_cfg);
-        shinu::vm::stop_with_peers(&shinu::vm_dir(ctx.root, id), ctx.net_cfg, &peers)?;
-        let current_running = refresh_network_rules(
-            ctx,
-            &state,
-            project,
-            network.as_deref(),
-            &previous_running,
-        )?;
-        let all_members = network_members(&state, project, network.as_deref())
-            .into_iter()
-            .filter(|member| member.id != id)
-            .collect::<Vec<_>>();
-        (current_running, all_members)
+        (state, previous_running, peers)
     };
+    shinu::vm::stop_with_peers(&shinu::vm_dir(ctx.root, id), ctx.net_cfg, &peers)?;
+    let current_running = refresh_network_rules(
+        ctx,
+        &state,
+        project,
+        network.as_deref(),
+        &previous_running,
+    )?;
+    let all_members = network_members(&state, project, network.as_deref())
+        .into_iter()
+        .filter(|member| member.id != id)
+        .collect::<Vec<_>>();
     sync_network_hosts(ctx, &current_running, &all_members);
     let image = shinu::space_image(ctx.root, id);
     match std::fs::remove_file(&image) {
@@ -1544,29 +1546,40 @@ fn start_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Valu
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let limits = effective_limits(ctx, project)?;
     check_vm_sizing(ctx, &limits, space.vcpus, space.mem_mib)?;
-    // The registry state lock is held across the check and spawn. This closes
-    // the race where two starts both observe the same running count.
-    let _state_guard = lock_state(ctx.registry);
-    let connection = lock_db(ctx.db);
-    let state = state::load(&connection)?;
-    let previous_running = running_network_members(
-        ctx.root,
-        &state,
-        project,
-        space.network.as_deref(),
-    );
-    let already_running = shinu::vm::is_running(&shinu::vm_dir(ctx.root, space.id));
-    if !already_running {
-        quota::check_running_limit(count_running(ctx.root, &state, project), &limits)?;
-    }
-    drop(connection);
-    let (_, booted) = start_vm_with_pending_restore(
-        ctx,
-        space.id,
-        space.image,
-        space.vcpus,
-        space.mem_mib,
-    )?;
+    // The quota check must be serialised so concurrent callers cannot all
+    // observe the same free slot, but booting must not be: vm::start blocks
+    // until the guest's sshd answers, so holding the state lock across it
+    // serialised every concurrent boot behind one VM's readiness wait.
+    // vm::start writes the pid file before waiting, so a VM counts as running
+    // as soon as it is spawned and the next caller sees an accurate count.
+    let (already_running, state, previous_running) = {
+        let _state_guard = lock_state(ctx.registry);
+        let connection = lock_db(ctx.db);
+        let state = state::load(&connection)?;
+        let previous_running = running_network_members(
+            ctx.root,
+            &state,
+            project,
+            space.network.as_deref(),
+        );
+        let already_running = shinu::vm::is_running(&shinu::vm_dir(ctx.root, space.id));
+        if !already_running {
+            quota::check_running_limit(count_running(ctx.root, &state, project), &limits)?;
+        }
+        (already_running, state, previous_running)
+    };
+    let booted = if already_running {
+        false
+    } else {
+        start_vm_with_pending_restore(
+            ctx,
+            space.id,
+            space.image,
+            space.vcpus,
+            space.mem_mib,
+        )?
+        .1
+    };
     let current_running = refresh_network_rules(
         ctx,
         &state,
@@ -1589,7 +1602,7 @@ fn stop_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value
     let _space_guard = space_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (was_running, current_running, all_members) = {
+    let (state, previous_running, peers) = {
         let _state_guard = lock_state(ctx.registry);
         let connection = lock_db(ctx.db);
         let state = state::load(&connection)?;
@@ -1600,21 +1613,21 @@ fn stop_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value
             space.network.as_deref(),
         );
         let peers = peer_ips(&space, &previous_running, ctx.net_cfg);
-        let was_running = shinu::vm::stop_with_peers(
-            &shinu::vm_dir(ctx.root, space.id),
-            ctx.net_cfg,
-            &peers,
-        )?;
-        let current_running = refresh_network_rules(
-            ctx,
-            &state,
-            project,
-            space.network.as_deref(),
-            &previous_running,
-        )?;
-        let all_members = network_members(&state, project, space.network.as_deref());
-        (was_running, current_running, all_members)
+        (state, previous_running, peers)
     };
+    let was_running = shinu::vm::stop_with_peers(
+        &shinu::vm_dir(ctx.root, space.id),
+        ctx.net_cfg,
+        &peers,
+    )?;
+    let current_running = refresh_network_rules(
+        ctx,
+        &state,
+        project,
+        space.network.as_deref(),
+        &previous_running,
+    )?;
+    let all_members = network_members(&state, project, space.network.as_deref());
     sync_network_hosts(ctx, &current_running, &all_members);
     Ok(json!({ "was_running": was_running }))
 }
@@ -1638,72 +1651,81 @@ fn resize_space(
             "stop the space before resizing it: {name}"
         )));
     }
-    // The quota check and disk operation share the state lock so concurrent
-    // resizes cannot both reserve the same project disk allowance.
-    let _state_guard = lock_state(ctx.registry);
-    let connection = lock_db(ctx.db);
-    let mut state = state::load(&connection)?;
-    let index = state
-        .spaces
-        .iter()
-        .position(|space| space.id == existing.id && space.project == project)
-        .ok_or_else(|| shinu::Error::NotFound(name.clone()))?;
-    let current = state.spaces[index].clone();
-    let new_vcpus = vcpus.map_or(current.vcpus, |value| value);
-    let new_mem_mib = mem_mib.map_or(current.mem_mib, |value| value);
-    ensure_positive_size("vcpus", new_vcpus.map(u64::from))?;
-    ensure_positive_size("mem_mib", new_mem_mib.map(u64::from))?;
-    check_vm_sizing(ctx, &limits, new_vcpus, new_mem_mib)?;
+    // Quota is checked under the state lock so concurrent resizes cannot both
+    // reserve the same project disk allowance; the grow is not. truncate,
+    // e2fsck and resize2fs can run for minutes on a multi-gigabyte image, so
+    // we drop both guards, resize the file, then reacquire and re-find the
+    // space before storing the new sizes.
+    let (new_vcpus, new_mem_mib, new_disk_mib, image_path, actual_disk, target_disk) = {
+        let _state_guard = lock_state(ctx.registry);
+        let connection = lock_db(ctx.db);
+        let state = state::load(&connection)?;
+        let index = state
+            .spaces
+            .iter()
+            .position(|space| space.id == existing.id && space.project == project)
+            .ok_or_else(|| shinu::Error::NotFound(name.clone()))?;
+        let current = state.spaces[index].clone();
+        let new_vcpus = vcpus.map_or(current.vcpus, |value| value);
+        let new_mem_mib = mem_mib.map_or(current.mem_mib, |value| value);
+        ensure_positive_size("vcpus", new_vcpus.map(u64::from))?;
+        ensure_positive_size("mem_mib", new_mem_mib.map(u64::from))?;
+        check_vm_sizing(ctx, &limits, new_vcpus, new_mem_mib)?;
 
-    let image_path = shinu::space_image(ctx.root, current.id);
-    let current_disk = space_size_mib(ctx.root, &current);
-    let actual_disk = image_size_mib(&image_path);
-    // A fork may inherit a larger allocation than an older checkpoint file;
-    // compare requested capacity with both the declaration and the file so a
-    // resize to the declared value still grows the guest disk.
-    let minimum_disk = current_disk.max(actual_disk);
-    let (new_disk_mib, target_disk) = match disk_mib {
-        None => (current.disk_mib, current_disk),
-        Some(None) => {
-            let base = shinu::base_path(ctx.root, current.image);
-            let default_disk = if base.exists() {
-                image_size_mib(&base)
-            } else {
-                current_disk
-            };
-            if minimum_disk > default_disk {
-                return Err(shinu::Error::Invalid(
-                    "disk cannot shrink because that could cause data loss".into(),
-                ));
+        let image_path = shinu::space_image(ctx.root, current.id);
+        let current_disk = space_size_mib(ctx.root, &current);
+        let actual_disk = image_size_mib(&image_path);
+        // A fork may inherit a larger allocation than an older checkpoint file;
+        // compare requested capacity with both the declaration and the file so a
+        // resize to the declared value still grows the guest disk.
+        let minimum_disk = current_disk.max(actual_disk);
+        let (new_disk_mib, target_disk) = match disk_mib {
+            None => (current.disk_mib, current_disk),
+            Some(None) => {
+                let base = shinu::base_path(ctx.root, current.image);
+                let default_disk = if base.exists() {
+                    image_size_mib(&base)
+                } else {
+                    current_disk
+                };
+                if minimum_disk > default_disk {
+                    return Err(shinu::Error::Invalid(
+                        "disk cannot shrink because that could cause data loss".into(),
+                    ));
+                }
+                (None, default_disk)
             }
-            (None, default_disk)
-        }
-        Some(Some(requested)) => {
-            ensure_positive_size("disk_mib", Some(requested))?;
-            if requested < minimum_disk {
-                return Err(shinu::Error::Invalid(
-                    "disk cannot shrink because that could cause data loss".into(),
-                ));
+            Some(Some(requested)) => {
+                ensure_positive_size("disk_mib", Some(requested))?;
+                if requested < minimum_disk {
+                    return Err(shinu::Error::Invalid(
+                        "disk cannot shrink because that could cause data loss".into(),
+                    ));
+                }
+                (Some(requested), requested)
             }
-            (Some(requested), requested)
+        };
+        if target_disk > current_disk {
+            let used_without_current = current_disk_mib(ctx.root, &state, project)?
+                .saturating_sub(current_disk);
+            quota::check_disk_limit(used_without_current, target_disk, &limits)?;
         }
+        (new_vcpus, new_mem_mib, new_disk_mib, image_path, actual_disk, target_disk)
     };
-    if target_disk > current_disk {
-        let used_without_current = current_disk_mib(ctx.root, &state, project)
-            .saturating_sub(current_disk);
-        quota::check_disk_limit(used_without_current, target_disk, &limits)?;
-    }
     if target_disk > actual_disk {
         resize_disk_image(&image_path, target_disk)?;
     }
-    let updated = {
-        let space = &mut state.spaces[index];
+    let updated = update_state(ctx.db, ctx.registry, |state| {
+        let space = state
+            .spaces
+            .iter_mut()
+            .find(|space| space.id == existing.id && space.project == project)
+            .ok_or_else(|| shinu::Error::NotFound(name.clone()))?;
         space.vcpus = new_vcpus;
         space.mem_mib = new_mem_mib;
         space.disk_mib = new_disk_mib;
-        space.clone()
-    };
-    state::store(&connection, &state)?;
+        Ok(space.clone())
+    })?;
     Ok(serde_json::to_value(updated)?)
 }
 
@@ -1817,7 +1839,7 @@ fn limits_value(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
     let connection = lock_db(ctx.db);
     let state = state::load(&connection)?;
     let used_spaces = state::count_spaces(&connection, project)?;
-    let used_disk = current_disk_mib(ctx.root, &state, project);
+    let used_disk = current_disk_mib(ctx.root, &state, project)?;
     let used_running = count_running(ctx.root, &state, project);
     Ok(json!({
         "max_spaces": limits.max_spaces,

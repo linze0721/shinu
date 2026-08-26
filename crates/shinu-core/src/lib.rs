@@ -36,6 +36,12 @@ pub enum Error {
     Invalid(String),
     Auth(String),
     Quota(String),
+    /// A fault in the daemon or its host, not in the request. Kept distinct
+    /// from `Invalid` so `http::status_for` can answer 500 rather than 400:
+    /// a client told its own request was malformed will not retry a
+    /// transient database lock, and 5xx alerting stays silent through an
+    /// outage.
+    Internal(String),
     Io(std::io::Error),
     Json(serde_json::Error),
 }
@@ -50,13 +56,22 @@ impl std::fmt::Display for Error {
             Error::Invalid(message) => write!(f, "invalid: {message}"),
             Error::Auth(message) => write!(f, "auth: {message}"),
             Error::Quota(message) => write!(f, "quota: {message}"),
+            Error::Internal(message) => write!(f, "internal: {message}"),
             Error::Io(error) => write!(f, "{error}"),
             Error::Json(error) => write!(f, "{error}"),
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io(error) => Some(error),
+            Error::Json(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
@@ -75,7 +90,7 @@ impl From<serde_json::Error> for Error {
 // every `?` on a rusqlite call working without a per-callsite adapter.
 impl From<rusqlite::Error> for Error {
     fn from(error: rusqlite::Error) -> Self {
-        Self::Invalid(format!("sql: {error}"))
+        Self::Internal(format!("sql: {error}"))
     }
 }
 

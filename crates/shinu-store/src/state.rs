@@ -207,8 +207,25 @@ pub fn open(root: &Path) -> Result<Connection> {
     let conn = Connection::open(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    restrict_sqlite_sidecars(root)?;
     init_schema(&conn)?;
+    // Schema writes can create -shm after the WAL pragma, so tighten
+    // again rather than leaving a umask-mode sidecar behind.
+    restrict_sqlite_sidecars(root)?;
     Ok(conn)
+}
+
+fn restrict_sqlite_sidecars(root: &Path) -> Result<()> {
+    // WAL/SHM are created at umask mode and hold committed pages, so
+    // 0600 on shinu.db is meaningless unless the sidecars match.
+    for name in ["shinu.db-wal", "shinu.db-shm"] {
+        match std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o600)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 fn parse_uuid(value: String, column: usize) -> rusqlite::Result<Uuid> {
@@ -1049,6 +1066,18 @@ mod db_tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+        for sidecar in ["shinu.db-wal", "shinu.db-shm"] {
+            let sidecar_path = root.join(sidecar);
+            if !sidecar_path.exists() {
+                continue;
+            }
+            let sidecar_mode = fs::metadata(&sidecar_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(sidecar_mode, 0o600, "{sidecar}");
+        }
         drop(conn);
         fs::remove_dir_all(root).unwrap();
     }

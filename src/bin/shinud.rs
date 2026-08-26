@@ -37,6 +37,10 @@ const REGISTER_REQUESTS_PER_HOUR: usize = 5;
 const LOGIN_FAILURE_MESSAGE: &str = "invalid email or password";
 const DUMMY_PASSWORD_HASH: &str =
     "pbkdf2$210000$0000000000000000000000000000000000000000000000000000000000000000$0000000000000000000000000000000000000000000000000000000000000000";
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+// Normal requests complete in milliseconds; fifteen seconds leaves room for a
+// slow client without letting an incomplete request retain a worker. This
+// deadline is cleared before any unbounded stream begins.
 
 
 
@@ -137,6 +141,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
+                let timeout_setup = stream
+                    .set_read_timeout(Some(REQUEST_TIMEOUT))
+                    .and_then(|_| stream.set_write_timeout(Some(REQUEST_TIMEOUT)));
+                if let Err(error) = timeout_setup {
+                    eprintln!("connection timeout setup: {error}");
+                    continue;
+                }
                 let connection_root = Arc::clone(&root);
                 let connection_db = Arc::clone(&db);
                 let connection_vm_cfg = Arc::clone(&vm_cfg);
@@ -206,6 +217,10 @@ impl<'a> RequestReader<'a> {
         self.capture = false;
         std::mem::take(&mut self.captured)
     }
+    fn clear_socket_timeouts(&mut self) -> shinu::Result<()> {
+        clear_stream_timeouts(&**self.inner.get_mut())
+    }
+
 }
 
 impl Read for RequestReader<'_> {
@@ -4068,7 +4083,13 @@ fn delete_console_token(ctx: &Ctx<'_>, project: &str, prefix: &str) -> shinu::Re
 
 
 fn respond_error(stream: &mut impl Write, status: u16, error: &shinu::Error) -> shinu::Result<()> {
-    http::respond(stream, status, &json!({ "error": error.to_string() }))?;
+    let body = if status >= 500 {
+        eprintln!("{error}");
+        json!({ "error": "internal server error" })
+    } else {
+        json!({ "error": error.to_string() })
+    };
+    http::respond(stream, status, &body)?;
     Ok(())
 }
 
@@ -4076,6 +4097,30 @@ fn is_console_path(path: &str) -> bool {
     path.split_once('?')
         .map_or(path, |(path, _)| path)
         .starts_with("/console/")
+}
+fn is_socket_timeout(error: &shinu::Error) -> bool {
+    matches!(
+        error,
+        shinu::Error::Io(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            )
+    )
+}
+
+fn respond_request_timeout(stream: &mut TcpStream) {
+    // A request timeout is transport policy, not a domain error; avoid the
+    // diagnostic path and close with the standard status for an incomplete request.
+    let _ = stream
+        .write_all(b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        .and_then(|_| stream.flush());
+}
+
+fn clear_stream_timeouts(stream: &TcpStream) -> shinu::Result<()> {
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(None)?;
+    Ok(())
 }
 fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
     let client_ip = stream
@@ -4087,7 +4132,11 @@ fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
         Ok(head) => head,
         Err(error) => {
             let _ = reader.take();
-            respond_error(&mut stream, http::status_for(&error), &error)?;
+            if is_socket_timeout(&error) {
+                respond_request_timeout(&mut stream);
+            } else {
+                respond_error(&mut stream, http::status_for(&error), &error)?;
+            }
             return Ok(());
         }
     };
@@ -4123,6 +4172,14 @@ fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
         &endpoint,
         Endpoint::Push(_) | Endpoint::Pull(_) | Endpoint::Vnc(_) | Endpoint::Proxy { .. }
     );
+    if is_transfer {
+        // Transfer bodies and tunnel payloads are unbounded; only the request
+        // head gets the admission deadline, so clear it before any body read.
+        reader
+            .as_mut()
+            .expect("request reader present")
+            .clear_socket_timeouts()?;
+    }
     let request = if is_transfer {
         metadata
     } else {
@@ -4137,7 +4194,11 @@ fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
             Ok(body) => body,
             Err(error) => {
                 let _ = reader.take();
-                respond_error(&mut stream, http::status_for(&error), &error)?;
+                if is_socket_timeout(&error) {
+                    respond_request_timeout(&mut stream);
+                } else {
+                    respond_error(&mut stream, http::status_for(&error), &error)?;
+                }
                 return Ok(());
             }
         };
@@ -4354,6 +4415,7 @@ fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
                 return Ok(());
             }
         };
+        clear_stream_timeouts(&stream)?;
         match execute_streaming(&mut stream, ctx, project, space.clone(), command, stdin) {
             Ok(()) => {
                 record_usage(ctx.db, project, "api_call", None, 1)?;
@@ -6130,6 +6192,28 @@ mod tests {
             response
         })
     }
+    #[test]
+    fn error_responses_hide_server_details_but_preserve_client_details() {
+        let infrastructure = shinu::Error::Internal(
+            "sql: no such column host_cidr in /srv/shinu/shinu.db".into(),
+        );
+        let mut server_response = Vec::new();
+        super::respond_error(&mut server_response, 500, &infrastructure)
+            .expect("write server error response");
+        let server_response = String::from_utf8(server_response).expect("UTF-8 server response");
+        assert!(server_response.starts_with("HTTP/1.1 500"));
+        assert!(!server_response.contains("host_cidr"));
+        assert!(server_response.contains("\"error\":\"internal server error\""));
+
+        let client_error = shinu::Error::NotFound("missing-space".into());
+        let mut client_response = Vec::new();
+        super::respond_error(&mut client_response, 404, &client_error)
+            .expect("write client error response");
+        let client_response = String::from_utf8(client_response).expect("UTF-8 client response");
+        assert!(client_response.starts_with("HTTP/1.1 404"));
+        assert!(client_response.contains("missing-space"));
+    }
+
 
     #[test]
     fn console_register_then_login_creates_sessions() {

@@ -20,11 +20,54 @@ shinu-crypto = { path = "crates/shinu-crypto" }
 shinu-image = { path = "crates/shinu-image" }
 shinu-vm = { path = "crates/shinu-vm" }
 shinu-proto = { path = "crates/shinu-proto" }
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = { level = "deny", priority = 0 }
+unused_must_use = { level = "deny", priority = 0 }
+non_ascii_idents = { level = "deny", priority = 0 }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -2 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+
+todo = { level = "deny", priority = 0 }
+unimplemented = { level = "deny", priority = 0 }
+dbg_macro = { level = "deny", priority = 0 }
+mem_forget = { level = "deny", priority = 0 }
+float_cmp = { level = "deny", priority = 0 }
+explicit_auto_deref = { level = "allow", priority = 0 } # 1 hit
+
+missing_errors_doc = { level = "allow", priority = 0 } # 91 hits
+unreadable_literal = { level = "allow", priority = 0 } # 72 hits
+must_use_candidate = { level = "allow", priority = 0 } # 58 hits
+needless_pass_by_value = { level = "allow", priority = 0 } # 48 hits
+redundant_closure_for_method_calls = { level = "allow", priority = 0 } # 31 hits
+significant_drop_tightening = { level = "allow", priority = 0 } # 29 hits
+large_stack_arrays = { level = "allow", priority = 0 } # 26 hits
+map_unwrap_or = { level = "allow", priority = 0 } # 22 hits
+missing_const_for_fn = { level = "allow", priority = 0 } # 18 hits
+too_many_lines = { level = "allow", priority = 0 } # 17 hits
+single_match_else = { level = "allow", priority = 0 } # 17 hits
+match_same_arms = { level = "allow", priority = 0 } # 16 hits
+manual_let_else = { level = "allow", priority = 0 } # 16 hits
+redundant_pub_crate = { level = "allow", priority = 0 } # 14 hits
+too_long_first_doc_paragraph = { level = "allow", priority = 0 } # 13 hits
+format_push_string = { level = "allow", priority = 0 } # 12 hits
+use_self = { level = "allow", priority = 0 } # 11 hits
+option_option = { level = "allow", priority = 0 } # 10 hits
+
+# These patterns are deliberate in the daemon and command clients.
+exit = { level = "allow", priority = 0 }
+string_slice = { level = "allow", priority = 0 }
+str_to_string = { level = "allow", priority = 0 }
 
 [package]
 name = "shinu"
 version.workspace = true
 edition.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 name = "shinu"

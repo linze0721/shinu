@@ -1,13 +1,25 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use shinu_core::{is_blocked_guest_destination, Error, Image, Result, VSOCK_SSH_PORT, VSOCK_VNC_PORT};
+use shinu_core::{
+    is_blocked_guest_destination, parse_ipv4, Error, Image, Result, VSOCK_SSH_PORT, VSOCK_VNC_PORT,
+};
 
 pub(super) fn guest_dns_fallback() -> String {
     std::env::var("SHINU_GUEST_DNS")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "1.1.1.1".to_owned())
+}
+
+/// Whether the guest could actually reach this resolver. One decision, used by
+/// both the filter and the repair check: the guest has no IPv6 configuration,
+/// so a v6 resolver is as unreachable as a private or loopback v4 one, and
+/// keeping either would suppress the fallback and leave the guest without DNS.
+fn guest_can_reach_resolver(address: &str) -> bool {
+    parse_ipv4(address).is_some()
+        && !is_blocked_guest_destination(address)
+        && !address.starts_with("127.")
 }
 
 /// Filters host resolver entries before baking them into the guest image.
@@ -24,9 +36,7 @@ pub fn filter_guest_nameservers(resolv: &str, fallback: &str) -> String {
         .filter(|line| {
             let mut fields = line.split_whitespace();
             match (fields.next(), fields.next()) {
-                (Some("nameserver"), Some(address)) => {
-                    !is_blocked_guest_destination(address) && !address.starts_with("127.")
-                }
+                (Some("nameserver"), Some(address)) => guest_can_reach_resolver(address),
                 (Some("nameserver"), None) => false,
                 _ => true,
             }
@@ -34,7 +44,10 @@ pub fn filter_guest_nameservers(resolv: &str, fallback: &str) -> String {
         .collect::<Vec<_>>();
     let has_nameserver = filtered.iter().any(|line| {
         let mut fields = line.split_whitespace();
-        fields.next() == Some("nameserver") && fields.next().is_some()
+        matches!(
+            (fields.next(), fields.next()),
+            (Some("nameserver"), Some(address)) if guest_can_reach_resolver(address)
+        )
     });
     if has_nameserver {
         format!("{}\n", filtered.join("\n"))
@@ -57,7 +70,7 @@ pub fn guest_resolv_needs_repair(resolv: &str) -> bool {
             return true;
         };
         has_nameserver = true;
-        if is_blocked_guest_destination(address) || address.starts_with("127.") {
+        if !guest_can_reach_resolver(address) {
             return true;
         }
     }
@@ -507,6 +520,28 @@ mod resolver_tests {
             filter_guest_nameservers(resolv, "1.1.1.1"),
             "nameserver 1.1.1.1\n"
         );
+    }
+
+    #[test]
+    fn resolver_filter_falls_back_when_only_nameserver_is_ipv6() {
+        assert_eq!(
+            filter_guest_nameservers("nameserver 2001:db8::1\n", "1.1.1.1"),
+            "nameserver 1.1.1.1\n"
+        );
+    }
+
+    #[test]
+    fn resolver_filter_falls_back_when_blocked_ipv4_precedes_ipv6() {
+        let resolv = "nameserver 192.168.5.123\nnameserver 2001:db8::1\n";
+        assert_eq!(
+            filter_guest_nameservers(resolv, "1.1.1.1"),
+            "nameserver 1.1.1.1\n"
+        );
+    }
+
+    #[test]
+    fn detects_ipv6_only_guest_resolver_for_repair() {
+        assert!(guest_resolv_needs_repair("nameserver 2001:db8::1\n"));
     }
 
     #[test]

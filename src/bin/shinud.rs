@@ -1651,12 +1651,12 @@ fn resize_space(
             "stop the space before resizing it: {name}"
         )));
     }
-    // Quota is checked under the state lock so concurrent resizes cannot both
-    // reserve the same project disk allowance; the grow is not. truncate,
-    // e2fsck and resize2fs can run for minutes on a multi-gigabyte image, so
-    // we drop both guards, resize the file, then reacquire and re-find the
-    // space before storing the new sizes.
-    let (new_vcpus, new_mem_mib, new_disk_mib, image_path, actual_disk, target_disk) = {
+    // The grow cannot hold the state lock: truncate, e2fsck and resize2fs run
+    // for minutes on a multi-gigabyte image. So the allowance is checked twice
+    // — once here to fail fast, and again under the lock that stores the new
+    // sizes. Only the second check is authoritative: two concurrent grows can
+    // both clear this one against the same stale state.
+    let (new_vcpus, new_mem_mib, new_disk_mib, image_path, actual_disk, target_disk, grew) = {
         let _state_guard = lock_state(ctx.registry);
         let connection = lock_db(ctx.db);
         let state = state::load(&connection)?;
@@ -1705,17 +1705,31 @@ fn resize_space(
                 (Some(requested), requested)
             }
         };
-        if target_disk > current_disk {
+        let grew = target_disk > current_disk;
+        if grew {
             let used_without_current = current_disk_mib(ctx.root, &state, project)?
                 .saturating_sub(current_disk);
             quota::check_disk_limit(used_without_current, target_disk, &limits)?;
         }
-        (new_vcpus, new_mem_mib, new_disk_mib, image_path, actual_disk, target_disk)
+        (
+            new_vcpus,
+            new_mem_mib,
+            new_disk_mib,
+            image_path,
+            actual_disk,
+            target_disk,
+            grew,
+        )
     };
     if target_disk > actual_disk {
         resize_disk_image(&image_path, target_disk)?;
     }
-    let updated = update_state(ctx.db, ctx.registry, |state| {
+    // The grow above runs unguarded for minutes on a real image, which is the
+    // window another request can commit an allocation in. Tests stand in for
+    // that duration by committing one here.
+    #[cfg(test)]
+    tests::during_resize_grow();
+    let (updated, exceeded) = update_state(ctx.db, ctx.registry, |state| {
         let space = state
             .spaces
             .iter_mut()
@@ -1724,8 +1738,23 @@ fn resize_space(
         space.vcpus = new_vcpus;
         space.mem_mib = new_mem_mib;
         space.disk_mib = new_disk_mib;
-        Ok(space.clone())
+        let updated = space.clone();
+        // Only a grow reserves anything, matching the pre-check: a request that
+        // just changes vcpus must not start failing because the project is
+        // already over its ceiling for unrelated reasons.
+        //
+        // The image is already grown by this point, so the bytes are spent
+        // whether or not the check passes. Record them either way and report the
+        // overrun afterwards: dropping the write would leave the larger file
+        // uncounted and let the next request overshoot from a stale total.
+        let exceeded = if grew {
+            quota::check_disk_limit(current_disk_mib(ctx.root, state, project)?, 0, &limits)
+        } else {
+            Ok(())
+        };
+        Ok((updated, exceeded))
     })?;
+    exceeded?;
     Ok(serde_json::to_value(updated)?)
 }
 
@@ -4696,7 +4725,7 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
-    use std::sync::{LazyLock, Mutex};
+    use std::sync::{Arc, LazyLock, Mutex};
     use std::thread;
     use std::time::Duration;
     use uuid::Uuid;
@@ -5418,6 +5447,131 @@ mod tests {
         ));
         child.kill().expect("stop fake firecracker");
         child.wait().expect("wait fake firecracker");
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    thread_local! {
+        /// Runs inside `resize_space`, between the unguarded grow and the store,
+        /// standing in for the minutes `resize2fs` leaves that window open.
+        static DURING_RESIZE_GROW: std::cell::RefCell<Option<Arc<dyn Fn()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn during_resize_grow() {
+        let hook = DURING_RESIZE_GROW.with(|slot| slot.borrow().clone());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn with_resize_grow_hook<T>(hook: Arc<dyn Fn()>, body: impl FnOnce() -> T) -> T {
+        DURING_RESIZE_GROW.with(|slot| *slot.borrow_mut() = Some(hook));
+        let value = body();
+        DURING_RESIZE_GROW.with(|slot| *slot.borrow_mut() = None);
+        value
+    }
+
+    /// The pre-check clears against the state as it was before the grow, so it
+    /// cannot see an allocation another request commits while `resize2fs` runs.
+    /// Committing a sibling's growth inside that window leaves only the
+    /// re-check under the storing lock able to reject the resize, so this fails
+    /// if the authoritative check is dropped and only the pre-check remains.
+    #[test]
+    fn resize_rechecks_quota_against_state_committed_during_the_grow() {
+        let root = test_root("resize-recheck");
+        let project = "project-a";
+        let target = Uuid::new_v4();
+        let sibling = Uuid::new_v4();
+        let space = |id: Uuid, name: &str, disk_mib: u64| Space {
+            id,
+            name: name.to_owned(),
+            project: project.to_owned(),
+            image: shinu::Image::Void,
+            vcpus: None,
+            mem_mib: None,
+            disk_mib: Some(disk_mib),
+            network: None,
+            parent: None,
+            head: None,
+            created_at: Utc::now(),
+        };
+        store_state(
+            &root,
+            &State {
+                spaces: vec![space(target, "target", 10), space(sibling, "sibling", 10)],
+                ckpts: Vec::new(),
+            },
+        );
+        // Sized at the request already, so resize_disk_image is skipped and the
+        // test needs no e2fsck or resize2fs on the host.
+        for id in [target, sibling] {
+            let image = shinu::space_image(&root, id);
+            std::fs::create_dir_all(image.parent().expect("image parent"))
+                .expect("create image directory");
+            std::fs::File::create(&image)
+                .expect("create image")
+                .set_len(30 * 1024 * 1024)
+                .expect("size image");
+        }
+        let (vm_cfg, net_cfg) = test_configs();
+        let registry = Arc::new(registry());
+        let db = Arc::new(test_db(&root));
+        // 20 MiB declared, 50 MiB cap: growing target to 30 passes the pre-check
+        // against 10+10, but 30+30 exceeds the cap once the sibling commits.
+        let limits = Limits {
+            max_spaces: 5,
+            max_disk_mib: 50,
+            max_vcpus: 16,
+            max_mem_mib: 262_144,
+            max_running: 2,
+            api_per_min: 120,
+        };
+        let rate = RateLimiter::new();
+        let register_rate = super::RegistrationLimiter::new();
+        let ctx = super::Ctx {
+            root: &root,
+            db: &db,
+            vm_cfg: &vm_cfg,
+            net_cfg: &net_cfg,
+            limits: &limits,
+            rate: &rate,
+            register_rate: &register_rate,
+            registry: &registry,
+            admin_token: None,
+        };
+        // Committed only after resize_space has already cleared its pre-check.
+        let grow_sibling = {
+            let db = Arc::clone(&db);
+            let registry = Arc::clone(&registry);
+            Arc::new(move || {
+                super::update_state(&db, &registry, |state| {
+                    let entry = state
+                        .spaces
+                        .iter_mut()
+                        .find(|entry| entry.id == sibling)
+                        .expect("sibling present");
+                    entry.disk_mib = Some(30);
+                    Ok(())
+                })
+                .expect("commit sibling growth inside the grow window");
+            }) as Arc<dyn Fn()>
+        };
+        let result = with_resize_grow_hook(grow_sibling, || {
+            handle(
+                &ctx,
+                Req::Resize {
+                    space: "target".into(),
+                    vcpus: None,
+                    mem_mib: None,
+                    disk_mib: Some(Some(30)),
+                },
+                project,
+            )
+        });
+        assert!(
+            matches!(result, Err(shinu::Error::Quota(_))),
+            "resize must be rejected once the sibling's allocation is visible, got {result:?}"
+        );
         std::fs::remove_dir_all(root).expect("remove test root");
     }
 

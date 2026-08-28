@@ -57,6 +57,11 @@ pub struct Ckpt {
     /// Memory state this checkpoint overlays; `None` means a standalone full snapshot.
     #[serde(default)]
     pub base: Option<Uuid>,
+    /// Firecracker snapshot data format version the memory state was captured
+    /// with; `None` for disk-only checkpoints and for checkpoints written before
+    /// this was recorded.
+    #[serde(default)]
+    pub snapshot_version: Option<String>,
     pub note: String,
     pub created_at: DateTime<Utc>,
 }
@@ -90,7 +95,8 @@ const SCHEMA: &str = r#"
         note TEXT NOT NULL,
         created_at TEXT NOT NULL,
         full INTEGER NOT NULL DEFAULT 0,
-        base TEXT
+        base TEXT,
+        snapshot_version TEXT
     );
     CREATE TABLE IF NOT EXISTS projects (
         project TEXT PRIMARY KEY,
@@ -179,7 +185,11 @@ pub fn validate_network_name(network: Option<&str>) -> Result<()> {
 }
 
 fn migrate_ckpt_columns(conn: &Connection) -> Result<()> {
-    for (name, definition) in [("full", "INTEGER NOT NULL DEFAULT 0"), ("base", "TEXT")] {
+    for (name, definition) in [
+        ("full", "INTEGER NOT NULL DEFAULT 0"),
+        ("base", "TEXT"),
+        ("snapshot_version", "TEXT"),
+    ] {
         let present: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('ckpts') WHERE name = ?1",
             params![name],
@@ -280,12 +290,13 @@ fn ckpt_from_row(row: &Row<'_>) -> rusqlite::Result<Ckpt> {
         auto: row.get::<_, i64>(4)? != 0,
         full: row.get::<_, i64>(5)? != 0,
         base: parse_optional_uuid(row.get(6)?, 6)?,
-        note: row.get(7)?,
-        created_at: parse_datetime(row.get(8)?, 8)?,
+        snapshot_version: row.get(7)?,
+        note: row.get(8)?,
+        created_at: parse_datetime(row.get(9)?, 9)?,
     })
 }
 
-fn ckpt_params(ckpt: &Ckpt) -> [String; 9] {
+fn ckpt_params(ckpt: &Ckpt) -> [String; 10] {
     [
         ckpt.id.to_string(),
         ckpt.space.to_string(),
@@ -294,6 +305,7 @@ fn ckpt_params(ckpt: &Ckpt) -> [String; 9] {
         if ckpt.auto { "1".to_owned() } else { "0".to_owned() },
         if ckpt.full { "1".to_owned() } else { "0".to_owned() },
         ckpt.base.map(|id| id.to_string()).unwrap_or_default(),
+        ckpt.snapshot_version.clone().unwrap_or_default(),
         ckpt.note.clone(),
         ckpt.created_at.to_rfc3339(),
     ]
@@ -353,8 +365,8 @@ pub fn migrate_from_json(root: &Path, conn: &Connection) -> Result<bool> {
     for ckpt in &state.ckpts {
         let values = ckpt_params(ckpt);
         tx.execute(
-            "INSERT INTO ckpts (id, space, project, parent, auto, full, base, note, created_at) VALUES (?1, ?2, ?3, NULLIF(?4, ''), ?5, ?6, NULLIF(?7, ''), ?8, ?9)",
-            params![values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8]],
+            "INSERT INTO ckpts (id, space, project, parent, auto, full, base, snapshot_version, note, created_at) VALUES (?1, ?2, ?3, NULLIF(?4, ''), ?5, ?6, NULLIF(?7, ''), NULLIF(?8, ''), ?9, ?10)",
+            params![values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[9]],
         )?;
     }
     tx.commit()?;
@@ -374,7 +386,7 @@ pub fn load(conn: &Connection) -> Result<State> {
     };
     let ckpts = {
         let mut statement = conn.prepare(
-            "SELECT id, space, project, parent, auto, full, base, note, created_at FROM ckpts ORDER BY rowid",
+            "SELECT id, space, project, parent, auto, full, base, snapshot_version, note, created_at FROM ckpts ORDER BY rowid",
         )?;
         statement
             .query_map([], ckpt_from_row)?
@@ -412,8 +424,8 @@ pub fn store(conn: &Connection, state: &State) -> Result<()> {
     for ckpt in &state.ckpts {
         let values = ckpt_params(ckpt);
         tx.execute(
-            "INSERT INTO ckpts (id, space, project, parent, auto, full, base, note, created_at) VALUES (?1, ?2, ?3, NULLIF(?4, ''), ?5, ?6, NULLIF(?7, ''), ?8, ?9)",
-            params![values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8]],
+            "INSERT INTO ckpts (id, space, project, parent, auto, full, base, snapshot_version, note, created_at) VALUES (?1, ?2, ?3, NULLIF(?4, ''), ?5, ?6, NULLIF(?7, ''), NULLIF(?8, ''), ?9, ?10)",
+            params![values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[9]],
         )?;
     }
     tx.commit()?;
@@ -453,7 +465,7 @@ pub fn find_ckpt(
     project: &str,
 ) -> Result<Option<Ckpt>> {
     conn.query_row(
-        "SELECT id, space, project, parent, auto, full, base, note, created_at FROM ckpts WHERE project = ?1 AND id = ?2 LIMIT 1",
+        "SELECT id, space, project, parent, auto, full, base, snapshot_version, note, created_at FROM ckpts WHERE project = ?1 AND id = ?2 LIMIT 1",
         params![project, id.to_string()],
         ckpt_from_row,
     )
@@ -821,6 +833,7 @@ mod db_tests {
             auto: false,
             full: false,
             base: None,
+            snapshot_version: None,
             note: "initial".into(),
             created_at,
         };
@@ -900,7 +913,7 @@ mod db_tests {
         .expect("insert legacy checkpoint");
 
         init_schema(&conn).expect("apply complete schema");
-        for name in ["full", "base"] {
+        for name in ["full", "base", "snapshot_version"] {
             let columns: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM pragma_table_info('ckpts') WHERE name = ?1",
@@ -914,6 +927,7 @@ mod db_tests {
         assert_eq!(state.ckpts.len(), 1);
         assert!(!state.ckpts[0].full);
         assert_eq!(state.ckpts[0].base, None);
+        assert_eq!(state.ckpts[0].snapshot_version, None);
     }
 
     #[test]
@@ -1093,6 +1107,38 @@ mod db_tests {
     }
 
     #[test]
+    fn checkpoint_snapshot_versions_round_trip() {
+        let conn = db();
+        let (mut state, _, unversioned) = sample_state("alpha");
+        let mut versioned = unversioned.clone();
+        versioned.id = Uuid::new_v4();
+        versioned.snapshot_version = Some("10.0.0".into());
+        versioned.note = "versioned".into();
+        let versioned_id = versioned.id;
+        state.ckpts.push(versioned);
+
+        store(&conn, &state).unwrap();
+        let loaded = load(&conn).unwrap();
+        assert_eq!(loaded, state);
+        assert_eq!(
+            loaded
+                .ckpts
+                .iter()
+                .find(|ckpt| ckpt.id == unversioned.id)
+                .and_then(|ckpt| ckpt.snapshot_version.as_deref()),
+            None
+        );
+        assert_eq!(
+            loaded
+                .ckpts
+                .iter()
+                .find(|ckpt| ckpt.id == versioned_id)
+                .and_then(|ckpt| ckpt.snapshot_version.as_deref()),
+            Some("10.0.0")
+        );
+    }
+
+    #[test]
     fn lookups_hide_rows_from_other_projects() {
         let conn = db();
         let (state, _, ckpt) = sample_state("alpha");
@@ -1234,6 +1280,7 @@ mod db_tests {
         assert_eq!(state.spaces[0].image, Image::Void);
         assert_eq!(state.ckpts.len(), 1);
         assert_eq!(state.ckpts[0].project, "default");
+        assert_eq!(state.ckpts[0].snapshot_version, None);
         assert!(find_space(
             &conn,
             "05d48e52-e935-4009-ba1d-ece1aa240034",

@@ -624,6 +624,18 @@ pub fn touch(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Control-plane requests answer promptly; anything slower is a wedged VMM,
+/// so five seconds is a deadline rather than a guess.
+const API_TIMEOUT_SECS: u32 = 5;
+
+/// Snapshot creation is bounded by how fast guest RAM reaches the disk, not
+/// by VMM responsiveness. Measured at 5.4s for a 1 GiB guest on local flash,
+/// which sits right on the control-plane deadline; a large guest on slower
+/// storage is minutes away. Cutting the request off does not stop Firecracker,
+/// it just abandons a snapshot that is still being written, so allow room for
+/// the write to finish and let the VM-level wedge detection catch real hangs.
+const SNAPSHOT_TIMEOUT_SECS: u32 = 900;
+
 /// One request against a VM's control API. `curl` is already this crate's
 /// HTTP client (see `fetch_tarball`), and it speaks unix sockets, so no
 /// hand-rolled HTTP and no new dependency.
@@ -632,12 +644,24 @@ pub fn touch(dir: &Path) -> Result<()> {
 /// without `--fail`, curl exits 0 on a completed HTTP 4xx/5xx and callers
 /// would treat a `fault_message` body as success.
 fn api(dir: &Path, method: &str, path: &str, body: Option<&str>) -> Option<String> {
+    api_with_timeout(dir, method, path, body, API_TIMEOUT_SECS)
+}
+
+/// `api` with an explicit deadline, for requests whose duration scales with
+/// guest size rather than VMM latency.
+fn api_with_timeout(
+    dir: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    timeout_secs: u32,
+) -> Option<String> {
     let mut command = std::process::Command::new("curl");
     command
         .arg("-s")
         .arg("--fail")
         .arg("--max-time")
-        .arg("5")
+        .arg(timeout_secs.to_string())
         .arg("--unix-socket")
         .arg(api_path(dir))
         .arg("-X")
@@ -674,11 +698,12 @@ fn stat_field(stats: &str, key: &str) -> Option<u64> {
 
 /// Hands the guest's unused memory back to the host.
 ///
-/// Firecracker never reclaims on its own: a guest that once touched 500
-/// MiB keeps that resident on the host forever, even after freeing it
-/// (measured: RSS 91 MiB → 593 MiB, unchanged after the guest freed it;
-/// inflating the balloon brought it to 100 MiB). This version has no
-/// free-page reporting, so the reclaim has to be asked for explicitly.
+/// Cold boot enables the balloon's free page reporting, which already returns
+/// pages the guest kernel has on its free list (measured: RSS 102.7 MiB → 596.9
+/// MiB → 105.0 MiB within 5s of the guest freeing 500 MiB, no inflate issued).
+/// Reporting cannot see memory the guest is still using, so an idle guest
+/// holding hundreds of MiB of page cache stays resident on the host; inflating
+/// the balloon makes the guest drop that cache and return it.
 ///
 /// The target comes from the guest's own `available_memory` rather than a
 /// guess, less `keep_mib` so the page cache and a working margin survive.
@@ -748,7 +773,15 @@ pub fn snapshot(dir: &Path, kind: SnapshotKind) -> Result<(PathBuf, PathBuf)> {
         "{{\"snapshot_type\":\"{}\",\"snapshot_path\":\"snap.state\",\"mem_file_path\":\"snap.mem\"}}",
         kind.firecracker_name()
     );
-    if api(dir, "PUT", "/snapshot/create", Some(&body)).is_none() {
+    if api_with_timeout(
+        dir,
+        "PUT",
+        "/snapshot/create",
+        Some(&body),
+        SNAPSHOT_TIMEOUT_SECS,
+    )
+    .is_none()
+    {
         // A failed create leaves Firecracker paused, so always make the best
         // effort to restore normal VM operation before reporting the error.
         let _ = api(
@@ -984,6 +1017,29 @@ pub struct RestoreFiles<'a> {
     pub state: &'a Path,
 }
 
+/// Builds the `PUT /snapshot/load` request body.
+///
+/// `track_dirty_pages` does not survive a restore: Firecracker rebuilds the
+/// bitmap from this request and does not inherit it from the snapshot. Omitting
+/// it leaves a restored VM with no dirty tracking, so every later diff degrades
+/// to a full memory dump (measured: three successive diffs of an idle restored
+/// guest were 268 MiB each, against 8 MiB once the flag was sent). Cold boot
+/// sets the same flag in `fc.json`; a restore has to ask for it again.
+///
+/// `tap` repoints the interface when restoring into a different space. A
+/// snapshot records the tap it was captured on, so a fork or any re-derived tap
+/// must override it or Firecracker reopens the source's tap and fails with
+/// EBUSY while that VM still owns it.
+fn snapshot_load_body(tap: Option<&str>) -> String {
+    let base = "\"snapshot_path\":\"snap.state\",\"mem_backend\":{\"backend_path\":\"snap.mem\",\"backend_type\":\"File\"},\"track_dirty_pages\":true,\"resume_vm\":true";
+    match tap {
+        Some(tap) => format!(
+            "{{{base},\"network_overrides\":[{{\"iface_id\":\"eth0\",\"host_dev_name\":\"{tap}\"}}]}}"
+        ),
+        None => format!("{{{base}}}"),
+    }
+}
+
 /// Boots the VM unless it is already up. Returns whether a boot happened.
 pub fn start(
     root: &Path,
@@ -1165,17 +1221,7 @@ pub fn start(
                     "snapshot restore API socket did not appear".to_owned(),
                 ));
             }
-            // A snapshot records the tap it was captured on. Restoring into a
-            // different space (fork, or any re-derived tap) must repoint the
-            // interface or Firecracker reopens the source's tap and fails with
-            // EBUSY while that VM still owns it.
-            let body = match net.as_ref() {
-                Some(spec) => format!(
-                    "{{\"snapshot_path\":\"snap.state\",\"mem_backend\":{{\"backend_path\":\"snap.mem\",\"backend_type\":\"File\"}},\"resume_vm\":true,\"network_overrides\":[{{\"iface_id\":\"eth0\",\"host_dev_name\":\"{}\"}}]}}",
-                    spec.tap
-                ),
-                None => "{\"snapshot_path\":\"snap.state\",\"mem_backend\":{\"backend_path\":\"snap.mem\",\"backend_type\":\"File\"},\"resume_vm\":true}".to_owned(),
-            };
+            let body = snapshot_load_body(net.as_ref().map(|spec| spec.tap.as_str()));
             if api(&dir, "PUT", "/snapshot/load", Some(&body)).is_none() {
                 let _ = stop(&dir, net_cfg);
                 let _ = std::fs::remove_file(jail.join(JAIL_SNAP_MEM));
@@ -1789,4 +1835,36 @@ pub fn exec_in_vm(vsock_uds: &Path, key: &Path, port: u16, cmd: &[String]) -> Re
         .arg(shinu_core::shell_quote(cmd))
         .status()?;
     Ok(status.code().unwrap_or(255))
+}
+
+#[cfg(test)]
+mod snapshot_load_tests {
+    use super::snapshot_load_body;
+
+    // Firecracker rebuilds the dirty-page bitmap from the load request rather
+    // than inheriting it from the snapshot, and silently accepts a body that
+    // omits the flag. The failure is invisible until diffs of an idle restored
+    // guest come back at 268 MiB instead of 8 MiB, so pin the flag on both
+    // branches rather than relying on a live re-measurement to catch it.
+    #[test]
+    fn every_restore_requests_dirty_page_tracking() {
+        assert!(snapshot_load_body(None).contains("\"track_dirty_pages\":true"));
+        assert!(snapshot_load_body(Some("shinu0123456789")).contains("\"track_dirty_pages\":true"));
+    }
+
+    #[test]
+    fn a_tap_override_repoints_only_the_interface() {
+        let body = snapshot_load_body(Some("shinudeadbeef0"));
+        assert!(body.contains("\"iface_id\":\"eth0\""));
+        assert!(body.contains("\"host_dev_name\":\"shinudeadbeef0\""));
+        assert!(body.contains("\"resume_vm\":true"));
+    }
+
+    #[test]
+    fn no_tap_omits_the_override_entirely() {
+        let body = snapshot_load_body(None);
+        assert!(!body.contains("network_overrides"));
+        assert!(body.contains("\"snapshot_path\":\"snap.state\""));
+        assert!(body.contains("\"backend_type\":\"File\""));
+    }
 }

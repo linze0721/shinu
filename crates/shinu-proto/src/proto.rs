@@ -85,6 +85,18 @@ pub enum Req {
     Stop {
         space: String,
     },
+    /// Executes a command in the guest. Without `session`, each request is stateless;
+    /// a session lives only as long as its VM and preserves shell state between calls.
+    /// The command runs in that shell, so built-ins such as `cd` and `export` persist;
+    /// state changed inside an explicit child process does not.
+    Exec {
+        space: String,
+        cmd: Vec<String>,
+        #[serde(default)]
+        stdin: Option<String>,
+        #[serde(default)]
+        session: Option<String>,
+    },
     /// Marks the VM as in use so the idle sweeper leaves it alone.
     Touch {
         space: String,

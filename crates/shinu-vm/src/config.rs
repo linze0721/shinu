@@ -73,7 +73,15 @@ pub fn vm_config_json(
         // `deflate_on_oom` is what makes that safe: if the guest needs the
         // memory back before the daemon deflates, the balloon yields instead
         // of letting the OOM killer run.
-        "balloon": { "amount_mib": 0, "deflate_on_oom": true, "stats_polling_interval_s": 1 },
+        // Free-page reporting arrived in Firecracker v1.14.0 (PR #5491): it
+        // lets the guest report freed pages continuously so the host can
+        // release them, shrinking resident memory and memory captured in full
+        // snapshots. Upstream marks it as a developer preview, and it does
+        // not replace `vm::reclaim`: `vstate/memory.rs` still discards via
+        // `madvise(MADV_DONTNEED)`, which upstream notes is ineffective for
+        // shared/memfd mappings, so periodic explicit inflate remains the
+        // fallback.
+        "balloon": { "amount_mib": 0, "deflate_on_oom": true, "stats_polling_interval_s": 1, "free_page_reporting": true },
         // Diff snapshots depend on Firecracker's dirty-page bitmap, which cannot be enabled after boot.
         "machine-config": { "vcpu_count": vcpus, "mem_size_mib": mem_mib, "track_dirty_pages": true }
     });

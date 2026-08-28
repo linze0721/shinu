@@ -94,6 +94,8 @@ enum Command {
         space: String,
         #[arg(long, value_name = "FILE")]
         stdin: Option<String>,
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
     },
@@ -437,10 +439,14 @@ impl HttpClient {
         space: &str,
         command: &[String],
         stdin_path: Option<&str>,
+        session_id: Option<&str>,
     ) -> Result<i32, String> {
         let mut body = json!({ "cmd": command });
         if let Some(path) = stdin_path {
             body["stdin"] = Value::String(read_exec_stdin(path)?);
+        }
+        if let Some(session) = session_id {
+            body["session"] = Value::String(session.to_owned());
         }
         let encoded = serde_json::to_vec(&body).map_err(|error| error.to_string())?;
         let (mut reader, head) = self.open_request(
@@ -1044,7 +1050,7 @@ else
 fi"#
                     .to_owned(),
             ];
-            let status = client.stream_exec(&space, &command, None)?;
+            let status = client.stream_exec(&space, &command, None, None)?;
             if status == 0 {
                 println!("desktop services enabled and running for {space}");
             }
@@ -1052,8 +1058,13 @@ fi"#
         }
         Command::Proxy { space, port, path } => return client.proxy_once(&space, port, &path),
         Command::Vnc { space, port } => return client.proxy_vnc(&space, port),
-        Command::Exec { space, stdin, cmd } => {
-            return client.stream_exec(&space, &cmd, stdin.as_deref());
+        Command::Exec {
+            space,
+            stdin,
+            session,
+            cmd,
+        } => {
+            return client.stream_exec(&space, &cmd, stdin.as_deref(), session.as_deref());
         }
         Command::Push {
             space,
@@ -2211,6 +2222,35 @@ mod tests {
                 assert!(disk_mib.is_none());
                 assert_eq!(inherit, vec!["disk-mib"]);
                 assert!(!json);
+            }
+            _ => panic!("unexpected command parsed"),
+        }
+    }
+
+    #[test]
+    fn parses_exec_session_flag_before_command_separator() {
+        let cli = Cli::try_parse_from([
+            "shinu",
+            "exec",
+            "demo",
+            "--session",
+            "agent_1",
+            "--",
+            "cd",
+            "/tmp",
+        ])
+        .expect("parse exec session command");
+        match cli.command {
+            Command::Exec {
+                space,
+                session,
+                cmd,
+                stdin,
+            } => {
+                assert_eq!(space, "demo");
+                assert_eq!(session.as_deref(), Some("agent_1"));
+                assert_eq!(cmd, vec!["cd", "/tmp"]);
+                assert!(stdin.is_none());
             }
             _ => panic!("unexpected command parsed"),
         }

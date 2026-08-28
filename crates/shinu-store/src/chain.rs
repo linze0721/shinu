@@ -146,6 +146,7 @@ mod chain_tests {
             auto: false,
             full: false,
             base: None,
+            snapshot_version: None,
             note: "note".to_owned(),
             created_at: Utc::now(),
         }

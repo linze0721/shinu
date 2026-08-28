@@ -390,7 +390,7 @@ mod network_tests {
                 "is_read_only": false
             }],
             "vsock": { "vsock_id": "vsock0", "guest_cid": 3, "uds_path": "/vsock" },
-            "balloon": { "amount_mib": 0, "deflate_on_oom": true, "stats_polling_interval_s": 1 },
+            "balloon": { "amount_mib": 0, "deflate_on_oom": true, "stats_polling_interval_s": 1, "free_page_reporting": true },
             "machine-config": { "vcpu_count": 2, "mem_size_mib": 128, "track_dirty_pages": true }
         })
         .to_string();

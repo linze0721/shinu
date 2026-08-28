@@ -8,6 +8,7 @@
 
 pub use shinu_core::{
     btrfs, ckpt_image, ckpt_mem, ckpt_state, DEFAULT_ROOT, Error, FC_URL, FC_VERSION,
+    FC_SNAPSHOT_VERSION,
     GUEST_BLOCKED_CIDRS, Image, KERNEL_URL, MAX_UPLOAD_BYTES, Result, USAGE_SAMPLE_SECS,
     VSOCK_SSH_PORT, VSOCK_VNC_PORT, assets_dir, avail_bytes, base_path, cache_dir, chown_tree,
     env_u32, firecracker_bin, init_layout, is_blocked_guest_destination, is_rfc1918, jailer_bin,

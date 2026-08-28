@@ -5,14 +5,20 @@ use uuid::Uuid;
 
 pub const DEFAULT_ROOT: &str = "/var/lib/shinu";
 
-pub const FC_VERSION: &str = "v1.13.1";
-pub const FC_URL: &str = "https://github.com/firecracker-microvm/firecracker/releases/download/v1.13.1/firecracker-v1.13.1-x86_64.tgz";
-/// Firecracker's CI kernel: an uncompressed 6.1.141 vmlinux with virtio-blk,
+pub const FC_VERSION: &str = "v1.16.1";
+/// Firecracker's snapshot data format version, which its binary validates on
+/// `PUT /snapshot/load`. Bumping `FC_VERSION` across a change to this value
+/// makes every snapshot captured by the old binary unloadable, so checkpoints
+/// record it and restore refuses a mismatch instead of failing opaquely.
+pub const FC_SNAPSHOT_VERSION: &str = "10.0.0";
+pub const FC_URL: &str = "https://github.com/firecracker-microvm/firecracker/releases/download/v1.16.1/firecracker-v1.16.1-x86_64.tgz";
+/// Firecracker's CI kernel: an uncompressed 6.1.155 vmlinux with virtio-blk,
 /// virtio-vsock and ext4 built in (`=y`), which is what booting without an
 /// initrd requires. The host kernel cannot stand in for it — this host builds
-/// those as modules.
+/// those as modules. No `firecracker-ci/v1.16` bucket is published, so the
+/// v1.15 kernel is used with the v1.16.1 binaries.
 pub const KERNEL_URL: &str =
-    "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.13/x86_64/vmlinux-6.1.141";
+    "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/vmlinux-6.1.155";
 /// Guest vsock port the in-VM socat bridge listens on; forwarded to sshd.
 pub const VSOCK_SSH_PORT: u16 = 2222;
 /// GUI VNC uses a separate vsock connection because each Firecracker vsock

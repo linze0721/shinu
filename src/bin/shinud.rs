@@ -41,6 +41,11 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 // Normal requests complete in milliseconds; fifteen seconds leaves room for a
 // slow client without letting an incomplete request retain a worker. This
 // deadline is cleared before any unbounded stream begins.
+/// Maximum number of diff snapshots anchored to one full base before a new
+/// full snapshot is captured. `SHINU_FULL_EVERY` overrides this value; zero
+/// disables automatic degradation.
+const DEFAULT_FULL_EVERY: usize = 8;
+
 
 
 
@@ -772,6 +777,23 @@ fn require_checkpoint_note(note: &str) -> shinu::Result<()> {
     }
     Ok(())
 }
+/// Refuses to hand an incompatible memory snapshot to Firecracker.
+///
+/// Firecracker validates the snapshot data format version on
+/// `PUT /snapshot/load`. Upgrading the binary can strand old memory state, so
+/// a typed refusal is safer than surfacing an opaque load failure; the
+/// checkpoint's disk image remains usable.
+fn ensure_snapshot_loadable(ckpt: &state::Ckpt) -> shinu::Result<()> {
+    if !ckpt.full || ckpt.snapshot_version.as_deref() == Some(shinu::FC_SNAPSHOT_VERSION) {
+        return Ok(());
+    }
+    let recorded = ckpt.snapshot_version.as_deref().unwrap_or("unrecorded");
+    Err(shinu::Error::Invalid(format!(
+        "checkpoint {} memory state uses snapshot format {recorded}, but running Firecracker uses {}; the checkpoint's disk image is still usable",
+        ckpt.id,
+        shinu::FC_SNAPSHOT_VERSION
+    )))
+}
 
 /// The checkpoint metadata needed when appending a state transition.
 struct CkptFlags {
@@ -808,6 +830,7 @@ fn append_checkpoint(
         full: flags.full,
         base: flags.base,
         note,
+        snapshot_version: flags.full.then(|| shinu::FC_SNAPSHOT_VERSION.to_owned()),
         created_at: Utc::now(),
     };
     state.ckpts.push(checkpoint.clone());
@@ -817,18 +840,107 @@ fn append_checkpoint(
     Ok(checkpoint)
 }
 
-fn latest_full_checkpoint(state: &State, space: &Space) -> Option<Ckpt> {
-    shinu::log_chain(state, space)
-        .into_iter()
-        .find(|checkpoint| checkpoint.full && checkpoint.base.is_none())
-        .cloned()
+fn full_every_from(value: Option<&str>) -> usize {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_FULL_EVERY)
 }
+
+fn full_every() -> usize {
+    full_every_from(std::env::var("SHINU_FULL_EVERY").ok().as_deref())
+}
+
+fn is_usable_full_base(root: &Path, space: &Space, checkpoint: &Ckpt) -> bool {
+    let space_id = space.id;
+    let project = space.project.as_str();
+    checkpoint.full
+        && checkpoint.base.is_none()
+        && checkpoint.space == space_id
+        && checkpoint.project == project
+        && checkpoint.snapshot_version.as_deref() == Some(shinu::FC_SNAPSHOT_VERSION)
+        && shinu::ckpt_mem(root, checkpoint.id).is_file()
+        && shinu::ckpt_state(root, checkpoint.id).is_file()
+}
+
+/// Finds the nearest valid full ancestor and counts diffs anchored to it.
+///
+/// [`shinu::log_chain`] stops on malformed parent links and cycles, so a
+/// damaged history cannot make this walk unbounded.
+fn latest_usable_full_checkpoint(
+    root: &Path,
+    state: &State,
+    space: &Space,
+) -> Option<(Ckpt, usize)> {
+    let chain = shinu::log_chain(state, space);
+    let base_index = chain
+        .iter()
+        .position(|checkpoint| is_usable_full_base(root, space, checkpoint))?;
+    let base = chain[base_index];
+    let space_id = space.id;
+    let project = space.project.as_str();
+    let diff_count = chain[..base_index]
+        .iter()
+        .filter(|checkpoint| {
+            checkpoint.full
+                && checkpoint.space == space_id
+                && checkpoint.project == project
+                && checkpoint.base == Some(base.id)
+        })
+        .count();
+    Some((base.clone(), diff_count))
+}
+
+fn resolve_snapshot_mode(
+    root: &Path,
+    state: &State,
+    space: &Space,
+    requested: SnapshotMode,
+    full_every: usize,
+) -> shinu::Result<(SnapshotMode, Option<Ckpt>)> {
+    // The frequency budget only governs transparent Full-to-Diff degradation;
+    // an explicit Diff request intentionally bypasses it.
+    match requested {
+        SnapshotMode::None => Ok((SnapshotMode::None, None)),
+        SnapshotMode::Full => {
+            let Some((base, diff_count)) = latest_usable_full_checkpoint(root, state, space)
+            else {
+                return Ok((SnapshotMode::Full, None));
+            };
+            if full_every > 0 && diff_count < full_every {
+                Ok((SnapshotMode::Diff, Some(base)))
+            } else {
+                Ok((SnapshotMode::Full, None))
+            }
+        }
+        SnapshotMode::Diff => {
+            let Some((base, _)) = latest_usable_full_checkpoint(root, state, space) else {
+                return Err(shinu::Error::Invalid(
+                    "a diff checkpoint needs an existing full checkpoint in this space's history"
+                        .into(),
+                ));
+            };
+            Ok((SnapshotMode::Diff, Some(base)))
+        }
+    }
+}
+
+fn checkpoint_snapshot_mode(checkpoint: &Ckpt) -> &'static str {
+    if !checkpoint.full {
+        "none"
+    } else if checkpoint.base.is_some() {
+        "diff"
+    } else {
+        "full"
+    }
+}
+
 
 fn materialize_checkpoint_memory(
     root: &Path,
     checkpoint: &Ckpt,
     destination: &Path,
 ) -> shinu::Result<()> {
+    ensure_snapshot_loadable(checkpoint)?;
     if !checkpoint.full {
         return Err(shinu::Error::Invalid(format!(
             "checkpoint {} has no memory snapshot",
@@ -1023,6 +1135,15 @@ fn fork_space(
         let state = state::load(&connection)?;
         let checkpoint = state::find_ckpt(&connection, ckpt, project)?
             .ok_or_else(|| shinu::Error::NotFound(ckpt.to_string()))?;
+        ensure_snapshot_loadable(&checkpoint)?;
+        if let Some(base_id) = checkpoint.base {
+            let base = state
+                .ckpts
+                .iter()
+                .find(|candidate| candidate.id == base_id)
+                .ok_or_else(|| shinu::Error::NotFound(base_id.to_string()))?;
+            ensure_snapshot_loadable(base)?;
+        }
         let source_space = state
             .spaces
             .iter()
@@ -1139,6 +1260,24 @@ fn commit_space(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let vm_dir = shinu::vm_dir(ctx.root, space_id);
+    let (mode, diff_base) = match mode {
+        SnapshotMode::None => (SnapshotMode::None, None),
+        requested => {
+            let state = snapshot(ctx.db, ctx.registry)?;
+            let current_space = state
+                .spaces
+                .iter()
+                .find(|entry| entry.id == space_id && entry.project == project)
+                .ok_or_else(|| shinu::Error::NotFound(space_name.clone()))?;
+            resolve_snapshot_mode(
+                ctx.root,
+                &state,
+                current_space,
+                requested,
+                full_every(),
+            )?
+        }
+    };
     let running = shinu::vm::is_running(&vm_dir);
     let has_snapshot = !matches!(mode, SnapshotMode::None);
     if has_snapshot && !running {
@@ -1156,31 +1295,6 @@ fn commit_space(
             "stop the space before checkpointing it: {space_name}"
         )));
     }
-    let diff_base = if mode == SnapshotMode::Diff {
-        let state = snapshot(ctx.db, ctx.registry)?;
-        let current_space = state
-            .spaces
-            .iter()
-            .find(|entry| entry.id == space_id && entry.project == project)
-            .ok_or_else(|| shinu::Error::NotFound(space_name.clone()))?;
-        let base = latest_full_checkpoint(&state, current_space).ok_or_else(|| {
-            shinu::Error::Invalid(
-                "a diff checkpoint needs an existing full checkpoint in this space's history"
-                    .into(),
-            )
-        })?;
-        let base_mem = shinu::ckpt_mem(ctx.root, base.id);
-        let base_state = shinu::ckpt_state(ctx.root, base.id);
-        if !base_mem.exists() || !base_state.exists() {
-            return Err(shinu::Error::Invalid(format!(
-                "full checkpoint {} is missing memory or state files",
-                base.id
-            )));
-        }
-        Some(base)
-    } else {
-        None
-    };
     if running {
         // A hot commit flushes once, but writes after sync and before reflink
         // completion remain outside the image by design.
@@ -1229,7 +1343,11 @@ fn commit_space(
                 let still_present = state
                     .ckpts
                     .iter()
-                    .any(|checkpoint| checkpoint.id == base.id && checkpoint.project == project);
+                    .any(|checkpoint| {
+                        checkpoint.id == base.id
+                            && checkpoint.space == space_id
+                            && checkpoint.project == project
+                    });
                 if !still_present {
                     return Err(shinu::Error::Invalid(format!(
                         "diff checkpoint base {} was deleted before commit completed",
@@ -1251,7 +1369,7 @@ fn commit_space(
                 },
             )
         })?;
-        Ok(serde_json::to_value(checkpoint)?)
+        checkpoint_json(&checkpoint)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&image);
@@ -1289,6 +1407,7 @@ fn checkout_space(
         let target = find_checkpoint(ctx.db, commit, project)?;
         (target, entry.head)
     };
+    ensure_snapshot_loadable(&target)?;
 
     let auto_id = Uuid::new_v4();
     let auto_image = shinu::ckpt_image(ctx.root, auto_id);
@@ -1315,6 +1434,7 @@ fn checkout_space(
             base: None,
             note: auto_note.clone(),
             created_at: Utc::now(),
+            snapshot_version: None,
         };
         state.ckpts.push(checkpoint.clone());
         Ok(checkpoint)
@@ -1334,6 +1454,7 @@ fn checkout_space(
         remove_space_snapshot_files(ctx.root, space_id)?;
         if let Some(base_id) = target.base {
             let base = find_checkpoint(ctx.db, base_id, project)?;
+            ensure_snapshot_loadable(&base)?;
             if !base.full || base.base.is_some() {
                 return Err(shinu::Error::Invalid(format!(
                     "diff checkpoint {} does not have a standalone full base {}",
@@ -1384,6 +1505,7 @@ fn checkout_space(
             image_kind,
             vcpus,
             mem_mib,
+            Some(&target),
         )?;
         let state = snapshot(ctx.db, ctx.registry)?;
         let current_running = refresh_network_rules(
@@ -1502,7 +1624,7 @@ fn list_spaces(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
     }
     let mut checkpoints = Vec::new();
     for checkpoint in state.ckpts.iter().filter(|checkpoint| checkpoint.project == project) {
-        let mut value = serde_json::to_value(checkpoint)?;
+        let mut value = checkpoint_json(checkpoint)?;
         if let Some(object) = value.as_object_mut() {
             let size = checkpoint_exclusive(ctx.root, checkpoint.id).unwrap_or(0);
             object.insert("exclusive".into(), Value::from(size));
@@ -1531,6 +1653,7 @@ fn start_vm_with_pending_restore(
     image: Image,
     vcpus: Option<u32>,
     mem_mib: Option<u32>,
+    restore_checkpoint: Option<&Ckpt>,
 ) -> shinu::Result<(PathBuf, bool)> {
     let snapshot_mem = space_snapshot_mem(ctx.root, id);
     let snapshot_state = space_snapshot_state(ctx.root, id);
@@ -1540,6 +1663,9 @@ fn start_vm_with_pending_restore(
         remove_space_snapshot_files(ctx.root, id)?;
     }
     let has_restore = has_mem && has_state;
+    if has_restore {
+        restore_checkpoint.map_or(Ok(()), ensure_snapshot_loadable)?;
+    }
     let restore = has_restore.then(|| shinu::vm::RestoreFiles {
         mem: &snapshot_mem,
         state: &snapshot_state,
@@ -1598,6 +1724,9 @@ fn start_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Valu
         }
         (already_running, state, previous_running)
     };
+    let restore_checkpoint = space
+        .head
+        .and_then(|head| state.ckpts.iter().find(|checkpoint| checkpoint.id == head));
     let booted = if already_running {
         false
     } else {
@@ -1607,6 +1736,7 @@ fn start_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Valu
             space.image,
             space.vcpus,
             space.mem_mib,
+            restore_checkpoint,
         )?
         .1
     };
@@ -1889,7 +2019,14 @@ fn gc(ctx: &Ctx<'_>, project: &str, free_below: u64, dry_run: bool) -> shinu::Re
 }
 
 fn checkpoint_json(checkpoint: &Ckpt) -> shinu::Result<Value> {
-    Ok(serde_json::to_value(checkpoint)?)
+    let mut value = serde_json::to_value(checkpoint)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "snapshot".into(),
+            Value::String(checkpoint_snapshot_mode(checkpoint).to_owned()),
+        );
+    }
+    Ok(value)
 }
 
 fn limits_value(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
@@ -2133,6 +2270,9 @@ fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
         Req::Start { space } => start_space(ctx, project, space),
         Req::Stop { space } => stop_space(ctx, project, space),
         Req::Touch { space } => touch_space(ctx, project, space),
+        Req::Exec { .. } => Err(shinu::Error::Invalid(
+            "exec requires the streaming handler".into(),
+        )),
         Req::Gc {
             free_below,
             dry_run,
@@ -2143,6 +2283,78 @@ fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
         }
         Req::Limits => limits_value(ctx, project),
     }
+}
+const MAX_EXEC_SESSION_ID_BYTES: usize = 64;
+
+fn validate_exec_session_id(session: &str) -> shinu::Result<()> {
+    if session.is_empty() {
+        return Err(shinu::Error::Invalid("session id must not be empty".into()));
+    }
+    if session.len() > MAX_EXEC_SESSION_ID_BYTES {
+        return Err(shinu::Error::Invalid(format!(
+            "session id must be at most {MAX_EXEC_SESSION_ID_BYTES} bytes"
+        )));
+    }
+    if !session
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(shinu::Error::Invalid(
+            "session id may contain only ASCII letters, digits, '-' and '_'".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn exec_session(body: &[u8]) -> shinu::Result<Option<String>> {
+    let value = parse_body(body)?;
+    match value.get("session") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => {
+            let session = value
+                .as_str()
+                .ok_or_else(|| shinu::Error::Invalid("session must be a string".into()))?;
+            validate_exec_session_id(session)?;
+            Ok(Some(session.to_owned()))
+        }
+    }
+}
+
+fn exec_request(body: &[u8], space: String) -> shinu::Result<Req> {
+    let (cmd, stdin) = exec_command(body)?;
+    Ok(Req::Exec {
+        space,
+        cmd,
+        stdin,
+        session: exec_session(body)?,
+    })
+}
+
+fn exec_command(body: &[u8]) -> shinu::Result<(Vec<String>, Option<String>)> {
+    let value = parse_body(body)?;
+    let command = value
+        .get("cmd")
+        .and_then(Value::as_array)
+        .ok_or_else(|| shinu::Error::Invalid("body field cmd must be an array".into()))?;
+    let command = command
+        .iter()
+        .map(|argument| {
+            argument
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| shinu::Error::Invalid("cmd arguments must be strings".into()))
+        })
+        .collect::<shinu::Result<Vec<_>>>()?;
+    if command.is_empty() {
+        return Err(shinu::Error::Invalid("exec needs a command".into()));
+    }
+    let stdin = match value.get("stdin") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(value.as_str().ok_or_else(|| {
+            shinu::Error::Invalid("stdin must be a string".into())
+        })?.to_owned()),
+    };
+    Ok((command, stdin))
 }
 
 #[derive(Debug)]
@@ -2670,37 +2882,11 @@ fn request_for(
             },
             200,
         )),
-        Endpoint::Exec(_) => Err(shinu::Error::Invalid("exec requires a command".into())),
+        Endpoint::Exec(space) => Ok((exec_request(body, space)?, 200)),
         _ => Err(shinu::Error::Invalid("endpoint is not an API route".into())),
     }
 }
 
-fn exec_command(body: &[u8]) -> shinu::Result<(Vec<String>, Option<String>)> {
-    let value = parse_body(body)?;
-    let command = value
-        .get("cmd")
-        .and_then(Value::as_array)
-        .ok_or_else(|| shinu::Error::Invalid("body field cmd must be an array".into()))?;
-    let command = command
-        .iter()
-        .map(|argument| {
-            argument
-                .as_str()
-                .map(str::to_owned)
-                .ok_or_else(|| shinu::Error::Invalid("cmd arguments must be strings".into()))
-        })
-        .collect::<shinu::Result<Vec<_>>>()?;
-    if command.is_empty() {
-        return Err(shinu::Error::Invalid("exec needs a command".into()));
-    }
-    let stdin = match value.get("stdin") {
-        None | Some(Value::Null) => None,
-        Some(value) => Some(value.as_str().ok_or_else(|| {
-            shinu::Error::Invalid("stdin must be a string".into())
-        })?.to_owned()),
-    };
-    Ok((command, stdin))
-}
 
 fn transfer_path(path: &str) -> shinu::Result<String> {
     let query = path
@@ -2781,6 +2967,9 @@ fn prepare_ssh(ctx: &Ctx<'_>, project: &str, space: &str) -> shinu::Result<SshTa
         }
         (running, state, previous_running)
     };
+    let restore_checkpoint = entry
+        .head
+        .and_then(|head| state.ckpts.iter().find(|checkpoint| checkpoint.id == head));
     if !already_running {
         start_vm_with_pending_restore(
             ctx,
@@ -2788,6 +2977,7 @@ fn prepare_ssh(ctx: &Ctx<'_>, project: &str, space: &str) -> shinu::Result<SshTa
             entry.image,
             entry.vcpus,
             entry.mem_mib,
+            restore_checkpoint,
         )?;
     }
     let current_running = refresh_network_rules(
@@ -2831,6 +3021,167 @@ fn ssh_command(target: &SshTarget, remote: &[String]) -> Command {
         .arg("--")
         .arg(shinu::shell_quote(remote));
     command
+}
+
+fn session_remote_command(
+    session: &str,
+    command: &[String],
+    has_stdin: bool,
+) -> Vec<String> {
+    let session_dir = format!("/tmp/shinu-session-{session}");
+    let request_id = Uuid::new_v4().to_string();
+    let input_path = format!("{session_dir}/input");
+    let pid_path = format!("{session_dir}/pid");
+    let lock_path = format!("{session_dir}/lock");
+    let stdout_path = format!("{session_dir}/stdout-{request_id}");
+    let stderr_path = format!("{session_dir}/stderr-{request_id}");
+    let status_path = format!("{session_dir}/status-{request_id}");
+    let stdin_path = format!("{session_dir}/stdin-{request_id}");
+    let quote = |value: &str| shinu::shell_quote_word(value);
+    let input = quote(&input_path);
+    let pid = quote(&pid_path);
+    let lock = quote(&lock_path);
+    let stdout = quote(&stdout_path);
+    let stderr = quote(&stderr_path);
+    let status = quote(&status_path);
+    let stdin = quote(&stdin_path);
+    let command = shinu::shell_quote(command);
+    let command_line = format!(
+        "{command} < {stdin} > {stdout} 2> {stderr}",
+        stdin = if has_stdin { stdin.as_str() } else { "'/dev/null'" },
+    );
+    let exit_trap = format!(
+        "trap 'printf \"%s\\n\" \"$?\" > {status_path}' 0"
+    );
+    let status_line = format!("status=$?\ntrap - 0\nprintf '%s\\n' \"$status\" > {status}");
+    let command_payload = quote(&format!("{exit_trap}\n{command_line}\n{status_line}"));
+
+    let mut script = String::new();
+    script.push_str("session_dir=");
+    script.push_str(&quote(&session_dir));
+    script.push_str("\ninput_path=");
+    script.push_str(&input);
+    script.push_str("\npid_path=");
+    script.push_str(&pid);
+    script.push_str("\nlock_path=");
+    script.push_str(&lock);
+    script.push_str("\nstdout_path=");
+    script.push_str(&stdout);
+    script.push_str("\nstderr_path=");
+    script.push_str(&stderr);
+    script.push_str("\nstatus_path=");
+    script.push_str(&status);
+    script.push_str("\nstdin_path=");
+    script.push_str(&stdin);
+    script.push_str("\nstdin_present=");
+    script.push_str(if has_stdin { "1" } else { "0" });
+    script.push_str("\nstdout_cat=");
+    script.push_str("\nstderr_cat=");
+    script.push_str(
+        r#"
+cleanup() {
+    if [ -n "$stdout_cat" ]; then
+        kill "$stdout_cat" 2>/dev/null || :
+    fi
+    if [ -n "$stderr_cat" ]; then
+        kill "$stderr_cat" 2>/dev/null || :
+    fi
+    rm -f "$stdout_path" "$stderr_path" "$status_path"
+    if [ "$stdin_present" = 1 ]; then
+        rm -f "$stdin_path"
+    fi
+    rm -rf "$lock_path"
+}
+mkdir -p "$session_dir" || {
+    echo "could not create guest session directory" >&2
+    exit 255
+}
+trap cleanup 0 1 2 3 15
+if [ "$stdin_present" = 1 ]; then
+    cat > "$stdin_path" || exit 255
+fi
+while ! mkdir "$lock_path" 2>/dev/null; do
+    owner=$(cat "$lock_path/pid" 2>/dev/null || :)
+    if [ -n "$owner" ] && ! kill -0 "$owner" 2>/dev/null; then
+        rm -rf "$lock_path"
+    else
+        sleep 0.01
+    fi
+done
+printf '%s\n' "$$" > "$lock_path/pid" || exit 255
+if [ ! -p "$input_path" ]; then
+    rm -f "$input_path" "$pid_path"
+    mkfifo "$input_path" || {
+        echo "could not create guest session pipe" >&2
+        exit 255
+    }
+fi
+shell_pid=$(cat "$pid_path" 2>/dev/null || :)
+if [ -z "$shell_pid" ] || ! kill -0 "$shell_pid" 2>/dev/null; then
+    rm -f "$input_path" "$pid_path"
+    mkfifo "$input_path" || {
+        echo "could not recreate guest session pipe" >&2
+        exit 255
+    }
+    nohup sh -c 'exec 3<> "$1"; exec sh <&3' sh "$input_path" >/dev/null 2>&1 &
+    shell_pid=$!
+    printf '%s\n' "$shell_pid" > "$pid_path" || exit 255
+fi
+rm -f "$stdout_path" "$stderr_path" "$status_path" || exit 255
+mkfifo "$stdout_path" "$stderr_path" || exit 255
+cat "$stdout_path" &
+stdout_cat=$!
+cat "$stderr_path" >&2 &
+stderr_cat=$!
+exec 4>"$input_path" || exit 255
+"#,
+    );
+    script.push_str("printf '%s\\n' ");
+    script.push_str(&command_payload);
+    script.push_str(
+        r#" >&4
+exec 4>&-
+while [ ! -s "$status_path" ]; do
+    if ! kill -0 "$shell_pid" 2>/dev/null; then
+        echo "guest session shell exited unexpectedly" >&2
+        printf '%s\n' 255 > "$status_path"
+        break
+    fi
+    sleep 0.01
+done
+drain_loops=0
+while [ -n "$stdout_cat" ] || [ -n "$stderr_cat" ]; do
+    if [ -n "$stdout_cat" ] && ! kill -0 "$stdout_cat" 2>/dev/null; then
+        stdout_cat=
+    fi
+    if [ -n "$stderr_cat" ] && ! kill -0 "$stderr_cat" 2>/dev/null; then
+        stderr_cat=
+    fi
+    if [ -z "$stdout_cat" ] && [ -z "$stderr_cat" ]; then
+        break
+    fi
+    if [ "$drain_loops" -ge 100 ]; then
+        break
+    fi
+    drain_loops=$((drain_loops + 1))
+    sleep 0.01
+done
+if [ -n "$stdout_cat" ]; then
+    kill "$stdout_cat" 2>/dev/null || :
+    wait "$stdout_cat" 2>/dev/null || :
+fi
+if [ -n "$stderr_cat" ]; then
+    kill "$stderr_cat" 2>/dev/null || :
+    wait "$stderr_cat" 2>/dev/null || :
+fi
+status=$(cat "$status_path" 2>/dev/null || :)
+case "$status" in
+    ''|*[!0-9]*) status=255 ;;
+esac
+exit "$status"
+"#,
+    );
+    vec!["sh".to_owned(), "-c".to_owned(), script]
 }
 
 fn spawn_ssh(
@@ -4420,15 +4771,38 @@ fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
         return Ok(());
     }
     if let Endpoint::Exec(space) = &endpoint {
-        let (command, stdin) = match exec_command(&request.body) {
-            Ok(command) => command,
+        let req = match request_for(
+            Endpoint::Exec(space.clone()),
+            &request.method,
+            &request.body,
+            None,
+            None,
+        ) {
+            Ok((req, _)) => req,
             Err(error) => {
                 respond_error(&mut stream, http::status_for(&error), &error)?;
                 return Ok(());
             }
         };
+        let Req::Exec {
+            cmd: command,
+            stdin,
+            session,
+            ..
+        } = req
+        else {
+            unreachable!("exec route must produce an Exec request");
+        };
         clear_stream_timeouts(&stream)?;
-        match execute_streaming(&mut stream, ctx, project, space.clone(), command, stdin) {
+        match execute_streaming(
+            &mut stream,
+            ctx,
+            project,
+            space.clone(),
+            command,
+            stdin,
+            session,
+        ) {
             Ok(()) => {
                 record_usage(ctx.db, project, "api_call", None, 1)?;
             }
@@ -4673,8 +5047,15 @@ fn execute_streaming(
     space: String,
     command: Vec<String>,
     stdin_data: Option<String>,
+    session: Option<String>,
 ) -> shinu::Result<()> {
     let target = prepare_ssh(ctx, project, &space)?;
+    let session_command = session
+        .as_deref()
+        .map(|session| session_remote_command(session, &command, stdin_data.is_some()));
+    let remote = session_command
+        .as_deref()
+        .unwrap_or(command.as_slice());
     let stdin_mode = if stdin_data.is_some() {
         Stdio::piped()
     } else {
@@ -4682,7 +5063,7 @@ fn execute_streaming(
     };
     let mut child = spawn_ssh(
         &target,
-        &command,
+        remote,
         stdin_mode,
         Stdio::piped(),
         Stdio::piped(),
@@ -4923,6 +5304,444 @@ mod tests {
             admin_token: None,
         }
     }
+    fn snapshot_test_space(id: Uuid, head: Option<Uuid>) -> Space {
+        Space {
+            id,
+            name: "snapshot-space".into(),
+            project: "project-a".into(),
+            image: Image::Void,
+            parent: None,
+            head,
+            vcpus: None,
+            mem_mib: None,
+            disk_mib: None,
+            network: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    fn snapshot_test_checkpoint(
+        id: Uuid,
+        space: Uuid,
+        parent: Option<Uuid>,
+        base: Option<Uuid>,
+        snapshot_version: Option<&str>,
+    ) -> Ckpt {
+        Ckpt {
+            id,
+            space,
+            project: "project-a".into(),
+            parent,
+            auto: false,
+            full: true,
+            base,
+            note: "snapshot test".into(),
+            created_at: Utc::now(),
+            snapshot_version: snapshot_version.map(str::to_owned),
+        }
+    }
+
+    fn write_snapshot_test_files(root: &std::path::Path, id: Uuid) {
+        std::fs::create_dir_all(root.join("ckpts")).expect("create checkpoint directory");
+        std::fs::write(shinu::ckpt_mem(root, id), b"memory")
+            .expect("write memory snapshot");
+        std::fs::write(shinu::ckpt_state(root, id), b"state")
+            .expect("write snapshot state");
+    }
+
+    fn snapshot_test_chain(root: &std::path::Path, diff_count: usize) -> (State, Uuid) {
+        let space_id = Uuid::new_v4();
+        let base_id = Uuid::new_v4();
+        let mut space = snapshot_test_space(space_id, Some(base_id));
+        let base = snapshot_test_checkpoint(
+            base_id,
+            space_id,
+            None,
+            None,
+            Some(shinu::FC_SNAPSHOT_VERSION),
+        );
+        write_snapshot_test_files(root, base_id);
+        let mut checkpoints = vec![base];
+        let mut parent = base_id;
+        for _ in 0..diff_count {
+            let id = Uuid::new_v4();
+            checkpoints.push(snapshot_test_checkpoint(
+                id,
+                space_id,
+                Some(parent),
+                Some(base_id),
+                Some(shinu::FC_SNAPSHOT_VERSION),
+            ));
+            parent = id;
+        }
+        space.head = Some(parent);
+        (
+            State {
+                spaces: vec![space],
+                ckpts: checkpoints,
+            },
+            base_id,
+        )
+    }
+
+    #[test]
+    fn first_full_snapshot_request_stays_full_without_an_ancestor() {
+        let root = test_root("full-first");
+        let space = snapshot_test_space(Uuid::new_v4(), None);
+        let state = State {
+            spaces: vec![space.clone()],
+            ckpts: Vec::new(),
+        };
+
+        let (mode, base) = super::resolve_snapshot_mode(
+            &root,
+            &state,
+            &space,
+            SnapshotMode::Full,
+            8,
+        )
+        .expect("resolve first full snapshot");
+        assert_eq!(mode, SnapshotMode::Full);
+        assert!(base.is_none());
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn second_full_snapshot_request_degrades_to_diff_against_the_base() {
+        let root = test_root("full-second");
+        let space_id = Uuid::new_v4();
+        let base_id = Uuid::new_v4();
+        let space = snapshot_test_space(space_id, Some(base_id));
+        let base = snapshot_test_checkpoint(
+            base_id,
+            space_id,
+            None,
+            None,
+            Some(shinu::FC_SNAPSHOT_VERSION),
+        );
+        write_snapshot_test_files(&root, base_id);
+        let state = State {
+            spaces: vec![space.clone()],
+            ckpts: vec![base],
+        };
+
+        let (mode, selected) = super::resolve_snapshot_mode(
+            &root,
+            &state,
+            &space,
+            SnapshotMode::Full,
+            8,
+        )
+        .expect("resolve second full snapshot");
+        assert_eq!(mode, SnapshotMode::Diff);
+        assert_eq!(selected.as_ref().map(|checkpoint| checkpoint.id), Some(base_id));
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn full_snapshot_frequency_bounds_diffs_on_one_base() {
+        for (diff_count, expected_mode) in [(7, SnapshotMode::Diff), (8, SnapshotMode::Full)] {
+            let root = test_root("full-frequency");
+            let (state, base_id) = snapshot_test_chain(&root, diff_count);
+            let space = &state.spaces[0];
+            let (mode, selected) = super::resolve_snapshot_mode(
+                &root,
+                &state,
+                space,
+                SnapshotMode::Full,
+                8,
+            )
+            .expect("resolve frequency-bounded full snapshot");
+            assert_eq!(mode, expected_mode);
+            if expected_mode == SnapshotMode::Diff {
+                assert_eq!(selected.as_ref().map(|checkpoint| checkpoint.id), Some(base_id));
+            } else {
+                assert!(selected.is_none());
+            }
+            std::fs::remove_dir_all(root).expect("remove test root");
+        }
+    }
+
+    #[test]
+    fn mismatched_snapshot_version_forces_a_new_full_snapshot() {
+        let root = test_root("full-stale-version");
+        let space_id = Uuid::new_v4();
+        let base_id = Uuid::new_v4();
+        let space = snapshot_test_space(space_id, Some(base_id));
+        let base = snapshot_test_checkpoint(base_id, space_id, None, None, Some("8.0.0"));
+        write_snapshot_test_files(&root, base_id);
+        let state = State {
+            spaces: vec![space.clone()],
+            ckpts: vec![base],
+        };
+
+        let (mode, selected) = super::resolve_snapshot_mode(
+            &root,
+            &state,
+            &space,
+            SnapshotMode::Full,
+            8,
+        )
+        .expect("resolve stale full snapshot");
+        assert_eq!(mode, SnapshotMode::Full);
+        assert!(selected.is_none());
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn missing_base_snapshot_file_forces_a_new_full_snapshot() {
+        let root = test_root("full-missing-file");
+        let space_id = Uuid::new_v4();
+        let base_id = Uuid::new_v4();
+        let space = snapshot_test_space(space_id, Some(base_id));
+        let base = snapshot_test_checkpoint(
+            base_id,
+            space_id,
+            None,
+            None,
+            Some(shinu::FC_SNAPSHOT_VERSION),
+        );
+        write_snapshot_test_files(&root, base_id);
+        std::fs::remove_file(shinu::ckpt_mem(&root, base_id))
+            .expect("remove base memory snapshot");
+        let state = State {
+            spaces: vec![space.clone()],
+            ckpts: vec![base],
+        };
+
+        let (mode, selected) = super::resolve_snapshot_mode(
+            &root,
+            &state,
+            &space,
+            SnapshotMode::Full,
+            8,
+        )
+        .expect("resolve missing base snapshot");
+        assert_eq!(mode, SnapshotMode::Full);
+        assert!(selected.is_none());
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn zero_full_frequency_disables_automatic_degradation() {
+        let root = test_root("full-frequency-zero");
+        assert_eq!(super::full_every_from(Some("0")), 0);
+        let (state, _) = snapshot_test_chain(&root, 0);
+        let space = &state.spaces[0];
+
+        let (mode, selected) = super::resolve_snapshot_mode(
+            &root,
+            &state,
+            space,
+            SnapshotMode::Full,
+            0,
+        )
+        .expect("resolve zero frequency full snapshot");
+        assert_eq!(mode, SnapshotMode::Full);
+        assert!(selected.is_none());
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn explicit_diff_without_a_valid_base_remains_an_error() {
+        let root = test_root("diff-no-base");
+        let space = snapshot_test_space(Uuid::new_v4(), None);
+        let state = State {
+            spaces: vec![space.clone()],
+            ckpts: Vec::new(),
+        };
+
+        let result = super::resolve_snapshot_mode(
+            &root,
+            &state,
+            &space,
+            SnapshotMode::Diff,
+            8,
+        );
+        assert!(matches!(
+            result,
+            Err(shinu::Error::Invalid(message)) if message.contains("existing full checkpoint")
+        ));
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn full_resolution_skips_invalid_newer_full_ancestors() {
+        let root = test_root("full-skip-invalid");
+        let space_id = Uuid::new_v4();
+        let old_base_id = Uuid::new_v4();
+        let stale_base_id = Uuid::new_v4();
+        let space = snapshot_test_space(space_id, Some(stale_base_id));
+        let old_base = snapshot_test_checkpoint(
+            old_base_id,
+            space_id,
+            None,
+            None,
+            Some(shinu::FC_SNAPSHOT_VERSION),
+        );
+        let stale_base = snapshot_test_checkpoint(
+            stale_base_id,
+            space_id,
+            Some(old_base_id),
+            None,
+            Some("8.0.0"),
+        );
+        write_snapshot_test_files(&root, old_base_id);
+        write_snapshot_test_files(&root, stale_base_id);
+        let state = State {
+            spaces: vec![space.clone()],
+            ckpts: vec![old_base, stale_base],
+        };
+
+        let (mode, selected) = super::resolve_snapshot_mode(
+            &root,
+            &state,
+            &space,
+            SnapshotMode::Full,
+            8,
+        )
+        .expect("resolve full snapshot past stale ancestor");
+        assert_eq!(mode, SnapshotMode::Diff);
+        assert_eq!(selected.as_ref().map(|checkpoint| checkpoint.id), Some(old_base_id));
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn log_reports_the_recorded_diff_snapshot_mode() {
+        let root = test_root("log-diff-mode");
+        let space_id = Uuid::new_v4();
+        let base_id = Uuid::new_v4();
+        let diff_id = Uuid::new_v4();
+        let space = snapshot_test_space(space_id, Some(diff_id));
+        let base = snapshot_test_checkpoint(
+            base_id,
+            space_id,
+            None,
+            None,
+            Some(shinu::FC_SNAPSHOT_VERSION),
+        );
+        let diff = snapshot_test_checkpoint(
+            diff_id,
+            space_id,
+            Some(base_id),
+            Some(base_id),
+            Some(shinu::FC_SNAPSHOT_VERSION),
+        );
+        store_state(
+            &root,
+            &State {
+                spaces: vec![space],
+                ckpts: vec![base, diff],
+            },
+        );
+        let db = test_db(&root);
+        let (vm_cfg, net_cfg) = test_configs();
+        let registry = registry();
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+
+        let log = handle(
+            &ctx,
+            Req::Log {
+                space: "snapshot-space".into(),
+            },
+            "project-a",
+        )
+        .expect("read snapshot log");
+        assert_eq!(log["commits"][0]["snapshot"], "diff");
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn checkpoint_responses_report_the_actual_snapshot_mode() {
+        let base_id = Uuid::new_v4();
+        let space_id = Uuid::new_v4();
+        let diff = super::Ckpt {
+            id: Uuid::new_v4(),
+            space: space_id,
+            project: "project-a".into(),
+            parent: Some(base_id),
+            auto: false,
+            full: true,
+            base: Some(base_id),
+            note: "diff".into(),
+            created_at: Utc::now(),
+            snapshot_version: Some(shinu::FC_SNAPSHOT_VERSION.into()),
+        };
+        let full = super::Ckpt {
+            base: None,
+            full: true,
+            note: "full".into(),
+            ..diff.clone()
+        };
+        let disk = super::Ckpt {
+            base: None,
+            full: false,
+            note: "disk".into(),
+            snapshot_version: None,
+            ..diff.clone()
+        };
+        assert_eq!(super::checkpoint_json(&diff).expect("diff response")["snapshot"], "diff");
+        assert_eq!(super::checkpoint_json(&full).expect("full response")["snapshot"], "full");
+        assert_eq!(super::checkpoint_json(&disk).expect("disk response")["snapshot"], "none");
+    }
+
+    fn checkpoint_for_snapshot_gate(full: bool, snapshot_version: Option<&str>) -> Ckpt {
+        Ckpt {
+            id: Uuid::new_v4(),
+            space: Uuid::new_v4(),
+            project: "project-a".into(),
+            parent: None,
+            auto: false,
+            full,
+            base: None,
+            note: "snapshot gate test".into(),
+            created_at: Utc::now(),
+            snapshot_version: snapshot_version.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn snapshot_load_gate_accepts_disk_only_checkpoint() {
+        let checkpoint = checkpoint_for_snapshot_gate(false, None);
+        assert!(super::ensure_snapshot_loadable(&checkpoint).is_ok());
+    }
+
+    #[test]
+    fn snapshot_load_gate_accepts_matching_version() {
+        let checkpoint =
+            checkpoint_for_snapshot_gate(true, Some(shinu::FC_SNAPSHOT_VERSION));
+        assert!(super::ensure_snapshot_loadable(&checkpoint).is_ok());
+    }
+
+    #[test]
+    fn snapshot_load_gate_rejects_unrecorded_memory_state() {
+        let checkpoint = checkpoint_for_snapshot_gate(true, None);
+        let id = checkpoint.id.to_string();
+        let result = super::ensure_snapshot_loadable(&checkpoint);
+        assert!(matches!(
+            result,
+            Err(shinu::Error::Invalid(message))
+                if message.contains(&id)
+                    && message.contains("unrecorded")
+                    && message.contains(shinu::FC_SNAPSHOT_VERSION)
+                    && message.contains("disk image is still usable")
+        ));
+    }
+
+    #[test]
+    fn snapshot_load_gate_rejects_stale_memory_state_as_invalid() {
+        let checkpoint = checkpoint_for_snapshot_gate(true, Some("8.0.0"));
+        let id = checkpoint.id.to_string();
+        let result = super::ensure_snapshot_loadable(&checkpoint);
+        assert!(matches!(
+            result,
+            Err(shinu::Error::Invalid(message))
+                if message.contains(&id)
+                    && message.contains("8.0.0")
+                    && message.contains(shinu::FC_SNAPSHOT_VERSION)
+                    && message.contains("disk image is still usable")
+        ));
+    }
 
     #[test]
     fn exec_command_accepts_absent_and_present_stdin() {
@@ -4944,6 +5763,165 @@ mod tests {
             super::exec_command(br#"{"cmd":["cat"],"stdin":7}"#),
             Err(shinu::Error::Invalid(message)) if message == "stdin must be a string"
         ));
+    }
+
+    #[test]
+    fn exec_request_defaults_session_and_rejects_unsafe_ids() {
+        let (request, status) = super::request_for(
+            super::Endpoint::Exec("demo".into()),
+            "POST",
+            br#"{"cmd":["pwd"]}"#,
+            None,
+            None,
+        )
+        .expect("parse stateless exec request");
+        assert_eq!(status, 200);
+        assert!(matches!(
+            request,
+            Req::Exec {
+                space,
+                session: None,
+                ..
+            } if space == "demo"
+        ));
+
+        let (request, _) = super::request_for(
+            super::Endpoint::Exec("demo".into()),
+            "POST",
+            br#"{"cmd":["pwd"],"session":"agent_1"}"#,
+            None,
+            None,
+        )
+        .expect("parse persistent exec request");
+        assert!(matches!(
+            request,
+            Req::Exec {
+                session: Some(session),
+                ..
+            } if session == "agent_1"
+        ));
+
+        for session in ["agent;rm", "agent/name"] {
+            let error = super::exec_session(
+                format!(r#"{{"session":"{session}"}}"#).as_bytes(),
+            )
+            .expect_err("unsafe session id should be rejected");
+            assert!(
+                error.to_string().contains("session id"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_exec_session_preserves_state_and_output_markers() {
+        fn run(session: &str, command: &[&str]) -> std::process::Output {
+            let command = command
+                .iter()
+                .map(|part| (*part).to_owned())
+                .collect::<Vec<_>>();
+            let remote = super::session_remote_command(session, &command, false);
+            Command::new(&remote[0])
+                .args(&remote[1..])
+                .output()
+                .expect("run guest session wrapper")
+        }
+        fn run_with_stdin(
+            session: &str,
+            command: &[&str],
+            input: &[u8],
+        ) -> std::process::Output {
+            let command = command
+                .iter()
+                .map(|part| (*part).to_owned())
+                .collect::<Vec<_>>();
+            let remote = super::session_remote_command(session, &command, true);
+            let mut child = Command::new(&remote[0])
+                .args(&remote[1..])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn guest session wrapper");
+            child
+                .stdin
+                .take()
+                .expect("session wrapper stdin")
+                .write_all(input)
+                .expect("write session wrapper stdin");
+            child
+                .wait_with_output()
+                .expect("wait for guest session wrapper")
+        }
+        let session = format!("test-{}", Uuid::new_v4());
+        let session_dir = PathBuf::from(format!("/tmp/shinu-session-{session}"));
+        let cleanup = || {
+            if let Some(pid) = std::fs::read_to_string(session_dir.join("pid"))
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+            {
+                let pid = pid.to_string();
+                let alive = Command::new("kill")
+                    .args(["-0", &pid])
+                    .stderr(Stdio::null())
+                    .status()
+                    .map(|status| status.success())
+                    .unwrap_or(false);
+                if alive {
+                    let _ = Command::new("kill")
+                        .arg(pid)
+                        .stderr(Stdio::null())
+                        .status();
+                }
+            }
+            let _ = std::fs::remove_dir_all(&session_dir);
+        };
+
+        let changed = run(&session, &["cd", "/tmp"]);
+        assert!(changed.status.success(), "stderr: {:?}", changed.stderr);
+        let exported = run(&session, &["export", "SHINU_SESSION_TEST=ok"]);
+        assert!(exported.status.success(), "stderr: {:?}", exported.stderr);
+        let pwd = run(&session, &["pwd"]);
+        assert_eq!(pwd.status.code(), Some(0));
+        assert_eq!(pwd.stdout, b"/tmp\n");
+        let env = run(
+            &session,
+            &["sh", "-c", "printf '%s\\n' \"$SHINU_SESSION_TEST\""],
+        );
+        assert_eq!(env.status.code(), Some(0));
+        assert_eq!(env.stdout, b"ok\n");
+        let child_exported = run(&session, &["sh", "-c", "export SHINU_CHILD_TEST=child"]);
+        assert_eq!(child_exported.status.code(), Some(0));
+        let child_env = run(
+            &session,
+            &["sh", "-c", "printf '%s' \"$SHINU_CHILD_TEST\""],
+        );
+        assert_eq!(child_env.status.code(), Some(0));
+        assert!(child_env.stdout.is_empty());
+        let echoed = run_with_stdin(&session, &["cat"], b"session input\n");
+        assert_eq!(echoed.status.code(), Some(0));
+        assert_eq!(echoed.stdout, b"session input\n");
+        let streams = run(
+            &session,
+            &["sh", "-c", "printf stdout; printf stderr >&2"],
+        );
+        assert_eq!(streams.status.code(), Some(0));
+        assert_eq!(streams.stdout, b"stdout");
+        assert_eq!(streams.stderr, b"stderr");
+
+
+        // The wrapper has no sentinel in the command output protocol. A value
+        // that looks like a framing delimiter therefore remains ordinary output.
+        let marker = "__SHINU_EXEC_FRAME_MARKER__";
+        let marked = run(&session, &["printf", "%s\\n", marker]);
+        assert_eq!(marked.status.code(), Some(0));
+        assert_eq!(marked.stdout, format!("{marker}\n").into_bytes());
+
+        let failed = run(&session, &["sh", "-c", "exit 3"]);
+        assert_eq!(failed.status.code(), Some(3));
+        let failed_builtin = run(&session, &["exit", "3"]);
+        assert_eq!(failed_builtin.status.code(), Some(3));
+        cleanup();
     }
     #[test]
     fn new_request_round_trips_and_validates_network() {
@@ -4971,6 +5949,10 @@ mod tests {
             .expect("pull route");
         let vnc = super::route("/v1/spaces/demo/vnc").expect("vnc route");
         let diff = super::route("/v1/spaces/demo/diff").expect("diff route");
+        let exec = super::route("/v1/spaces/demo/exec").expect("exec route");
+        assert!(matches!(&exec, super::Endpoint::Exec(name) if name == "demo"));
+        assert!(super::method_allowed(&exec, "POST"));
+        assert!(!super::method_allowed(&exec, "GET"));
         assert!(matches!(&vnc, super::Endpoint::Vnc(name) if name == "demo"));
         assert!(super::method_allowed(&vnc, "GET"));
         assert!(!super::method_allowed(&vnc, "POST"));
@@ -5472,6 +6454,7 @@ mod tests {
                 base: None,
                 note: "before".into(),
                 created_at: Utc::now(),
+                snapshot_version: None,
             }],
         };
         store_state(root, &state);
@@ -5763,6 +6746,7 @@ mod tests {
                 base: None,
                 note: "base".into(),
                 created_at: Utc::now(),
+                snapshot_version: None,
             }],
         };
         store_state(&root, &state);
@@ -5798,6 +6782,7 @@ mod tests {
                 base: None,
                 note: "private".into(),
                 created_at: Utc::now(),
+                snapshot_version: None,
             }],
         };
         store_state(&root, &state);
@@ -5929,6 +6914,7 @@ mod tests {
                 base: None,
                 note: "target".into(),
                 created_at: Utc::now(),
+                snapshot_version: None,
             }],
         };
         let auto = append_checkpoint(
@@ -5984,6 +6970,7 @@ mod tests {
                     base: None,
                     note: "before checkout".into(),
                     created_at: Utc::now(),
+                    snapshot_version: None,
                 },
                 Ckpt {
                     id: auto_id,
@@ -5995,6 +6982,7 @@ mod tests {
                     base: None,
                     note: "auto before checkout".into(),
                     created_at: Utc::now(),
+                    snapshot_version: None,
                 },
             ],
         };
@@ -6068,6 +7056,7 @@ mod tests {
                     base: None,
                     note: "auto stale".into(),
                     created_at: Utc::now(),
+                    snapshot_version: None,
                 },
                 Ckpt {
                     id: raced_id,
@@ -6079,6 +7068,7 @@ mod tests {
                     base: None,
                     note: "auto raced".into(),
                     created_at: Utc::now(),
+                    snapshot_version: None,
                 },
             ],
         };
@@ -6177,7 +7167,7 @@ mod tests {
             method: "POST".into(),
             path: "/v1/spaces".into(),
             token: None,
-            body: br#"{}"#.to_vec(),
+            body: br"{}".to_vec(),
             cookies: HashMap::new(),
             origin: origin.map(str::to_owned),
             forwarded_proto: None,

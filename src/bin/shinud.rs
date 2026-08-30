@@ -47,6 +47,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// full snapshot is captured. `SHINU_FULL_EVERY` overrides this value; zero
 /// disables automatic degradation.
 const DEFAULT_FULL_EVERY: usize = 8;
+const DIFF_TMP_DIR: &str = "diff-tmp";
 
 #[derive(Parser)]
 #[command(name = "shinud")]
@@ -59,6 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let root = shinu::resolve_root(cli.root.as_deref());
     shinu::init_daemon_layout(&root)?;
+    purge_diff_temp(&root)?;
     let connection = state::open(&root)?;
     if state::migrate_from_json(&root, &connection)? {
         eprintln!("imported state.json into shinu.db (renamed to state.json.migrated)");
@@ -382,6 +384,22 @@ fn remove_file_if_missing(path: &Path) -> shinu::Result<()> {
     }
 }
 
+fn diff_temp_dir(root: &Path) -> PathBuf {
+    root.join(DIFF_TMP_DIR)
+}
+
+fn purge_diff_temp(root: &Path) -> shinu::Result<()> {
+    match std::fs::remove_dir_all(diff_temp_dir(root)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn diff_temp_path(root: &Path) -> PathBuf {
+    diff_temp_dir(root).join(format!("input-{}.ext4", Uuid::new_v4()))
+}
+
 fn remove_space_snapshot_files(root: &Path, id: Uuid) -> shinu::Result<()> {
     remove_file_if_missing(&space_snapshot_mem(root, id))?;
     remove_file_if_missing(&space_snapshot_state(root, id))
@@ -623,6 +641,26 @@ fn checkpoint_exclusive(root: &Path, id: Uuid) -> shinu::Result<u64> {
     Ok(total)
 }
 
+/// Takes a stable reflink of one checkpoint image for a read-only diff.
+///
+/// A diff needs two images at once, while the lock contract forbids holding
+/// multiple checkpoint locks. Copying each image while holding only its own
+/// lock gives the comparison a stable input without deadlocking GC/removal.
+fn copy_checkpoint_image_for_diff(ctx: &Ctx<'_>, id: Uuid) -> shinu::Result<PathBuf> {
+    let temp_dir = diff_temp_dir(ctx.root);
+    std::fs::create_dir_all(&temp_dir)?;
+    let destination = diff_temp_path(ctx.root);
+    let checkpoint_guard = ctx.registry.checkpoint_lock(id);
+    let _checkpoint_guard = checkpoint_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let result = shinu::btrfs::clone_for(&shinu::ckpt_image(ctx.root, id), &destination, 0, 0);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&destination);
+    }
+    result.map(|()| destination)
+}
+
 fn space_size_mib(root: &Path, space: &Space) -> u64 {
     space
         .disk_mib
@@ -740,28 +778,57 @@ fn record_sweep_usage(
     db: &Mutex<Connection>,
     registry: &Registry,
 ) -> shinu::Result<()> {
+    // Only identity is needed to associate a sample with a usage event. Do
+    // not retain state/DB locks while btrfs or VM probes inspect the host.
+    let spaces = {
+        let _state_guard = lock_state(registry);
+        let connection = lock_db(db);
+        state::load(&connection)?
+            .spaces
+            .into_iter()
+            .map(|space| (space.id, space.project))
+            .collect::<Vec<_>>()
+    };
+    let mut samples = Vec::with_capacity(spaces.len());
+    for (id, project) in spaces {
+        #[cfg(test)]
+        tests::during_sweep_probe();
+        let image = shinu::space_image(root, id);
+        // A disk-usage probe failure must not abort the 30-second sweep.
+        let disk_mib = bytes_to_mib(shinu::btrfs::exclusive(&image).unwrap_or(0));
+        let running = shinu::vm::is_running(&shinu::vm_dir(root, id));
+        samples.push((id, project, disk_mib, running));
+    }
+
+    // A space may have been removed while probes ran. Re-check both identity
+    // fields before recording, so an old sample cannot be charged to a
+    // replacement or to a tenant that no longer owns the id.
     let _state_guard = lock_state(registry);
     let connection = lock_db(db);
     let state = state::load(&connection)?;
-    for space in &state.spaces {
-        let image = shinu::space_image(root, space.id);
-        // A disk-usage probe failure must not abort the 30-second sweep.
-        let disk_mib = bytes_to_mib(shinu::btrfs::exclusive(&image).unwrap_or(0));
+    for (id, project, disk_mib, running) in samples {
+        if !state
+            .spaces
+            .iter()
+            .any(|space| space.id == id && space.project == project)
+        {
+            continue;
+        }
         // `disk_mib_hour` stores one MiB snapshot per sweep, not a duration;
         // later pricing can multiply the sum by the 30-second sample period.
         state::record_usage(
             &connection,
-            &space.project,
+            &project,
             "disk_mib_hour",
-            Some(space.id),
+            Some(id),
             i64::try_from(disk_mib).unwrap_or(i64::MAX),
         )?;
-        if shinu::vm::is_running(&shinu::vm_dir(root, space.id)) {
+        if running {
             state::record_usage(
                 &connection,
-                &space.project,
+                &project,
                 "vm_seconds",
-                Some(space.id),
+                Some(id),
                 i64::try_from(shinu::USAGE_SAMPLE_SECS).unwrap_or(30),
             )?;
         }
@@ -998,9 +1065,27 @@ fn find_space(db: &Mutex<Connection>, name: &str, project: &str) -> shinu::Resul
         .ok_or_else(|| shinu::Error::NotFound(name.to_owned()))
 }
 
-fn find_checkpoint(db: &Mutex<Connection>, id: Uuid, project: &str) -> shinu::Result<Ckpt> {
-    state::find_ckpt(&lock_db(db), id, project)?
-        .ok_or_else(|| shinu::Error::NotFound(id.to_string()))
+/// Re-resolves a space by its stable id after the per-space lock is held.
+///
+/// The name lookup that precedes lock acquisition only chooses which lock to
+/// wait on.  A deletion or metadata update can complete while that lookup is
+/// waiting, so lifecycle operations must use this state snapshot for every
+/// sizing, network, and checkpoint-head decision.  The original name is kept
+/// only for the tenant-scoped 404 response.
+fn revalidate_space(
+    ctx: &Ctx<'_>,
+    project: &str,
+    id: Uuid,
+    not_found: &str,
+) -> shinu::Result<Space> {
+    let _state_guard = lock_state(ctx.registry);
+    let connection = lock_db(ctx.db);
+    let state = state::load(&connection)?;
+    state
+        .spaces
+        .into_iter()
+        .find(|space| space.id == id && space.project == project)
+        .ok_or_else(|| shinu::Error::NotFound(not_found.to_owned()))
 }
 
 fn resize_disk_image(image: &Path, disk_mib: u64) -> shinu::Result<()> {
@@ -1135,18 +1220,34 @@ fn create_space(ctx: &Ctx<'_>, project: &str, spec: SpaceSpec) -> shinu::Result<
 
 fn fork_space(ctx: &Ctx<'_>, project: &str, ckpt: Uuid, name: String) -> shinu::Result<Value> {
     let limits = effective_limits(ctx, project)?;
+    let id = Uuid::new_v4();
+    let space_guard = ctx.registry.space_lock(id);
+    let _space_guard = space_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // The source checkpoint owns the files cloned below. Holding its lock
+    // through the authoritative lookup and final state claim prevents
+    // rmckpt/gc from unlinking them between validation and materialization.
+    let checkpoint_guard = ctx.registry.checkpoint_lock(ckpt);
+    let _checkpoint_guard = checkpoint_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (source_checkpoint, source_space) = {
         let _state_guard = lock_state(ctx.registry);
         let connection = lock_db(ctx.db);
         let state = state::load(&connection)?;
-        let checkpoint = state::find_ckpt(&connection, ckpt, project)?
+        let checkpoint = state
+            .ckpts
+            .iter()
+            .find(|checkpoint| checkpoint.id == ckpt && checkpoint.project == project)
+            .cloned()
             .ok_or_else(|| shinu::Error::NotFound(ckpt.to_string()))?;
         ensure_snapshot_loadable(&checkpoint)?;
         if let Some(base_id) = checkpoint.base {
             let base = state
                 .ckpts
                 .iter()
-                .find(|candidate| candidate.id == base_id)
+                .find(|candidate| candidate.id == base_id && candidate.project == project)
                 .ok_or_else(|| shinu::Error::NotFound(base_id.to_string()))?;
             ensure_snapshot_loadable(base)?;
         }
@@ -1165,11 +1266,6 @@ fn fork_space(ctx: &Ctx<'_>, project: &str, ckpt: Uuid, name: String) -> shinu::
     };
     let source = source_checkpoint.id;
     let source_full = source_checkpoint.full;
-    let id = Uuid::new_v4();
-    let space_guard = ctx.registry.space_lock(id);
-    let _space_guard = space_guard
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let image_path = shinu::space_image(ctx.root, id);
     let snapshot_mem = space_snapshot_mem(ctx.root, id);
     let snapshot_state = space_snapshot_state(ctx.root, id);
@@ -1378,33 +1474,73 @@ fn checkout_space(
     space: String,
     commit: Uuid,
 ) -> shinu::Result<Value> {
-    let (space_id, space_name, image_kind, vcpus, mem_mib) = {
-        let entry = find_space(ctx.db, &space, project)?;
+    let initial = find_space(ctx.db, &space, project)?;
+    let space_id = initial.id;
+    let space_guard = ctx.registry.space_lock(space_id);
+    let _space_guard = space_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // The target files remain live through the auto-commit, reflink, memory
+    // materialization, and final HEAD update. GC/rmckpt use this same lock
+    // before claiming the target row.
+    let checkpoint_guard = ctx.registry.checkpoint_lock(commit);
+    let _checkpoint_guard = checkpoint_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (target, current_head, space_name, image_kind, vcpus, mem_mib) = {
+        let _state_guard = lock_state(ctx.registry);
+        let connection = lock_db(ctx.db);
+        let state = state::load(&connection)?;
+        let entry = state
+            .spaces
+            .iter()
+            .find(|entry| entry.id == space_id && entry.project == project)
+            .ok_or_else(|| shinu::Error::NotFound(space.clone()))?;
+        let vm_dir = shinu::vm_dir(ctx.root, entry.id);
+        if shinu::vm::is_running(&vm_dir) {
+            return Err(shinu::Error::Invalid(format!(
+                "stop the space before checking it out: {}",
+                entry.name
+            )));
+        }
+        let target = state
+            .ckpts
+            .iter()
+            .find(|checkpoint| checkpoint.id == commit && checkpoint.project == project)
+            .cloned()
+            .ok_or_else(|| shinu::Error::NotFound(commit.to_string()))?;
         (
-            entry.id,
-            entry.name,
+            target,
+            entry.head,
+            entry.name.clone(),
             entry.image,
             entry.vcpus,
             entry.mem_mib,
         )
     };
-    let space_guard = ctx.registry.space_lock(space_id);
-    let _space_guard = space_guard
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (target, current_head) = {
-        let _state_guard = lock_state(ctx.registry);
-        let entry = find_space(ctx.db, &space_name, project)?;
-        let vm_dir = shinu::vm_dir(ctx.root, entry.id);
-        if shinu::vm::is_running(&vm_dir) {
+    ensure_snapshot_loadable(&target)?;
+    if let Some(base_id) = target.base {
+        // `target` retains a reference to its base in state, so the base's
+        // files cannot be claimed while the target checkpoint lock is held.
+        let base = {
+            let _state_guard = lock_state(ctx.registry);
+            let connection = lock_db(ctx.db);
+            let state = state::load(&connection)?;
+            state
+                .ckpts
+                .iter()
+                .find(|checkpoint| checkpoint.id == base_id && checkpoint.project == project)
+                .cloned()
+                .ok_or_else(|| shinu::Error::NotFound(base_id.to_string()))?
+        };
+        ensure_snapshot_loadable(&base)?;
+        if !base.full || base.base.is_some() {
             return Err(shinu::Error::Invalid(format!(
-                "stop the space before checking it out: {space_name}"
+                "diff checkpoint {} does not have a standalone full base {}",
+                target.id, base_id
             )));
         }
-        let target = find_checkpoint(ctx.db, commit, project)?;
-        (target, entry.head)
-    };
-    ensure_snapshot_loadable(&target)?;
+    }
 
     let auto_id = Uuid::new_v4();
     let auto_image = shinu::ckpt_image(ctx.root, auto_id);
@@ -1432,8 +1568,8 @@ fn checkout_space(
         Ok(checkpoint)
     })?;
 
-    // Keep the VM directory and keypair: changing that identity would invalidate
-    // credentials already used by the daemon to reach this space.
+    // Keep the VM directory and keypair: changing that identity would
+    // invalidate credentials already used by the daemon to reach this space.
     let vm_dir = shinu::vm_dir(ctx.root, space_id);
     let public_key = std::fs::read_to_string(shinu::vm::key_path(&vm_dir).with_extension("pub"))?;
     let image = shinu::space_image(ctx.root, space_id);
@@ -1444,16 +1580,6 @@ fn checkout_space(
     let snapshot_state = space_snapshot_state(ctx.root, space_id);
     remove_space_snapshot_files(ctx.root, space_id)?;
     if target.full {
-        if let Some(base_id) = target.base {
-            let base = find_checkpoint(ctx.db, base_id, project)?;
-            ensure_snapshot_loadable(&base)?;
-            if !base.full || base.base.is_some() {
-                return Err(shinu::Error::Invalid(format!(
-                    "diff checkpoint {} does not have a standalone full base {}",
-                    target.id, base_id
-                )));
-            }
-        }
         if let Err(error) = materialize_checkpoint_memory(ctx.root, &target, &snapshot_mem) {
             let _ = remove_space_snapshot_files(ctx.root, space_id);
             return Err(error);
@@ -1503,15 +1629,15 @@ fn checkout_space(
 }
 
 fn remove_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value> {
-    let (id, resolved_name, network) = {
-        let entry = find_space(ctx.db, &name, project)?;
-        (entry.id, entry.name, entry.network)
-    };
+    let initial = find_space(ctx.db, &name, project)?;
+    let id = initial.id;
     let space_guard = ctx.registry.space_lock(id);
     let _space_guard = space_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // Claim the record before unlinking; failures leave an orphan for gc.
+    let current = revalidate_space(ctx, project, id, &name)?;
+    let resolved_name = current.name;
+    let network = current.network;
     // Capture previous_running before removal for the network rule diff.
     let (state, previous_running, peers) = {
         let _state_guard = lock_state(ctx.registry);
@@ -1548,9 +1674,19 @@ fn remove_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Val
     Ok(json!({ "removed": resolved_name, "id": id }))
 }
 fn remove_checkpoint(ctx: &Ctx<'_>, project: &str, id: Uuid) -> shinu::Result<Value> {
-    find_checkpoint(ctx.db, id, project)?;
+    // Serialize the claim with every consumer that can read these files. The
+    // row and its references are re-evaluated under state+DB locks, after the
+    // checkpoint lock has excluded checkout, fork, GC, and other removals.
+    let checkpoint_guard = ctx.registry.checkpoint_lock(id);
+    let _checkpoint_guard = checkpoint_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     update_state(ctx.db, ctx.registry, |state| {
-        let checkpoint = shinu::find_ckpt(state, id, project)?;
+        let checkpoint = state
+            .ckpts
+            .iter()
+            .find(|checkpoint| checkpoint.id == id && checkpoint.project == project)
+            .ok_or_else(|| shinu::Error::NotFound(id.to_string()))?;
         let referenced = shinu::is_referenced(state, checkpoint.id);
         if !referenced.is_empty() {
             return Err(shinu::Error::Invalid(format!(
@@ -1561,6 +1697,8 @@ fn remove_checkpoint(ctx: &Ctx<'_>, project: &str, id: Uuid) -> shinu::Result<Va
         state.ckpts.retain(|entry| entry.id != id);
         Ok(())
     })?;
+    // Keep the checkpoint lock through unlinking. A consumer that already
+    // holds it finishes before the claim; later consumers see the missing row.
     remove_file_if_missing(&shinu::ckpt_image(ctx.root, id))?;
     remove_file_if_missing(&shinu::ckpt_mem(ctx.root, id))?;
     remove_file_if_missing(&shinu::ckpt_state(ctx.root, id))?;
@@ -1591,6 +1729,8 @@ fn list_spaces(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
     {
         let mut value = checkpoint_json(checkpoint)?;
         if let Some(object) = value.as_object_mut() {
+            // Missing checkpoint files are represented as zero by the probe;
+            // listing must not wait behind a long-running materialization.
             let size = checkpoint_exclusive(ctx.root, checkpoint.id).unwrap_or(0);
             object.insert("exclusive".into(), Value::from(size));
         }
@@ -1656,15 +1796,16 @@ fn start_vm_with_pending_restore(
 }
 
 fn start_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value> {
-    let space = {
+    let initial = {
         let connection = lock_db(ctx.db);
         state::find_space(&connection, &name, project)?
             .ok_or_else(|| shinu::Error::NotFound(name.clone()))?
     };
-    let space_guard = ctx.registry.space_lock(space.id);
+    let space_guard = ctx.registry.space_lock(initial.id);
     let _space_guard = space_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let space = revalidate_space(ctx, project, initial.id, &name)?;
     let limits = effective_limits(ctx, project)?;
     check_vm_sizing(ctx, &limits, space.vcpus, space.mem_mib)?;
     let (already_running, state, previous_running) =
@@ -1697,15 +1838,16 @@ fn start_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Valu
     Ok(json!({ "booted": booted }))
 }
 fn stop_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value> {
-    let space = {
+    let initial = {
         let connection = lock_db(ctx.db);
         state::find_space(&connection, &name, project)?
             .ok_or_else(|| shinu::Error::NotFound(name.clone()))?
     };
-    let space_guard = ctx.registry.space_lock(space.id);
+    let space_guard = ctx.registry.space_lock(initial.id);
     let _space_guard = space_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let space = revalidate_space(ctx, project, initial.id, &name)?;
     let (state, previous_running, peers) = {
         let _state_guard = lock_state(ctx.registry);
         let connection = lock_db(ctx.db);
@@ -1866,7 +2008,8 @@ fn touch_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Valu
     let _space_guard = space_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    shinu::vm::touch(&shinu::vm_dir(ctx.root, id))?;
+    let space = revalidate_space(ctx, project, id, &name)?;
+    shinu::vm::touch(&shinu::vm_dir(ctx.root, space.id))?;
     Ok(json!({ "ok": true }))
 }
 
@@ -1882,22 +2025,43 @@ fn gc(ctx: &Ctx<'_>, project: &str, free_below: u64, dry_run: bool) -> shinu::Re
         .unwrap_or(7);
     let retention_secs = retention_days.saturating_mul(24 * 60 * 60);
     let now = Utc::now();
-    let mut candidates = Vec::new();
-    for checkpoint in state
+    // Take only ids from the initial snapshot. Each candidate is then
+    // re-evaluated under state+DB before its best-effort size probe; this list
+    // is only a work queue and never an authority for deletion.
+    let candidate_ids = state
         .ckpts
         .iter()
         .filter(|checkpoint| checkpoint.project == project && checkpoint.auto)
-    {
-        let age = now
-            .signed_duration_since(checkpoint.created_at)
-            .num_seconds();
-        if age <= i64::try_from(retention_secs).unwrap_or(i64::MAX)
-            || !shinu::is_referenced(&state, checkpoint.id).is_empty()
-        {
-            continue;
-        }
-        let exclusive = checkpoint_exclusive(ctx.root, checkpoint.id)?;
-        candidates.push((checkpoint.id, checkpoint.note.clone(), exclusive));
+        .map(|checkpoint| checkpoint.id)
+        .collect::<Vec<_>>();
+    let mut candidates = Vec::new();
+    for id in candidate_ids {
+        let candidate = {
+            let _state_guard = lock_state(ctx.registry);
+            let connection = lock_db(ctx.db);
+            let state = state::load(&connection)?;
+            let Some(checkpoint) = state
+                .ckpts
+                .iter()
+                .find(|checkpoint| checkpoint.id == id && checkpoint.project == project)
+            else {
+                continue;
+            };
+            let age = now
+                .signed_duration_since(checkpoint.created_at)
+                .num_seconds();
+            if age <= i64::try_from(retention_secs).unwrap_or(i64::MAX)
+                || !shinu::is_referenced(&state, checkpoint.id).is_empty()
+            {
+                continue;
+            }
+            checkpoint.note.clone()
+        };
+        // Missing files are represented as zero by this read-only probe. The
+        // claim below takes the checkpoint lock only when deletion is needed,
+        // so dry-run never waits behind checkout/fork materialization.
+        let exclusive = checkpoint_exclusive(ctx.root, id)?;
+        candidates.push((id, candidate, exclusive));
     }
     candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.2));
     if dry_run {
@@ -1908,47 +2072,47 @@ fn gc(ctx: &Ctx<'_>, project: &str, free_below: u64, dry_run: bool) -> shinu::Re
         return Ok(json!({ "dry_run": true, "reclaimed": 0, "deleted": deleted }));
     }
     let need = free_below.saturating_sub(available);
-    // Claim before deleting. The candidate list was computed from a snapshot
-    // taken without the state lock, so a concurrent fork or commit may have
-    // started referencing one of these commits in the meantime. Removing the
-    // rows inside the lock — re-checking `is_referenced` against the authoritative
-    // state as we go — makes the claim atomic: once a commit is gone from the
-    // state, `find_ckpt` fails for every later request, so no new reference to
-    // it can appear while the images are being unlinked outside the lock.
-    //
-    // Deleting first and pruning afterwards was the other option and is worse:
-    // it leaves a window where a space's `parent`/`head` points at a commit whose
-    // image is already gone. Crashing between the claim and the unlink instead
-    // leaks an unreferenced image file, which is recoverable garbage.
-    let claimed = update_state(ctx.db, ctx.registry, |state| {
-        let mut claimed = Vec::new();
-        let mut budget = 0u64;
-        for (id, note, exclusive) in &candidates {
-            if budget >= need {
-                break;
-            }
-            let still_present = state
-                .ckpts
-                .iter()
-                .any(|checkpoint| checkpoint.id == *id && checkpoint.project == project);
-            if !still_present || !shinu::is_referenced(state, *id).is_empty() {
-                continue;
-            }
-            state.ckpts.retain(|checkpoint| checkpoint.id != *id);
-            budget += exclusive;
-            claimed.push((*id, note.clone(), *exclusive));
-        }
-        Ok(claimed)
-    })?;
-
     let mut reclaimed = 0;
     let mut deleted = Vec::new();
-    for (id, note, exclusive) in claimed {
-        let image = shinu::ckpt_image(ctx.root, id);
-        remove_file_if_missing(&image)?;
+    for (id, _candidate_note, exclusive) in candidates {
+        if reclaimed >= need {
+            break;
+        }
+        let checkpoint_guard = ctx.registry.checkpoint_lock(id);
+        let _checkpoint_guard = checkpoint_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Claim one row at a time. No checkpoint lock is retained while a
+        // different checkpoint is considered, and no state/DB lock spans the
+        // file unlink below.
+        let note = {
+            let _state_guard = lock_state(ctx.registry);
+            let connection = lock_db(ctx.db);
+            let mut state = state::load(&connection)?;
+            let Some(checkpoint) = state
+                .ckpts
+                .iter()
+                .find(|checkpoint| checkpoint.id == id && checkpoint.project == project)
+            else {
+                continue;
+            };
+            let age = now
+                .signed_duration_since(checkpoint.created_at)
+                .num_seconds();
+            if age <= i64::try_from(retention_secs).unwrap_or(i64::MAX)
+                || !shinu::is_referenced(&state, id).is_empty()
+            {
+                continue;
+            }
+            let note = checkpoint.note.clone();
+            state.ckpts.retain(|checkpoint| checkpoint.id != id);
+            state::store(&connection, &state)?;
+            note
+        };
+        remove_file_if_missing(&shinu::ckpt_image(ctx.root, id))?;
         remove_file_if_missing(&shinu::ckpt_mem(ctx.root, id))?;
         remove_file_if_missing(&shinu::ckpt_state(ctx.root, id))?;
-        reclaimed += exclusive;
+        reclaimed = reclaimed.saturating_add(exclusive);
         deleted.push(json!({ "id": id, "note": note, "exclusive": exclusive }));
     }
     Ok(json!({ "dry_run": false, "reclaimed": reclaimed, "deleted": deleted }))
@@ -2040,62 +2204,69 @@ struct DiffSpec {
 
 fn diff_space(ctx: &Ctx<'_>, project: &str, spec: DiffSpec) -> shinu::Result<Value> {
     let state = snapshot(ctx.db, ctx.registry)?;
-    let (old_image, new_image) = match (spec.from, spec.to) {
-        (Some(from), Some(to)) => {
-            shinu::find_ckpt(&state, from, project)?;
-            shinu::find_ckpt(&state, to, project)?;
-            (
-                shinu::ckpt_image(ctx.root, from),
-                shinu::ckpt_image(ctx.root, to),
-            )
-        }
-        (Some(from), None) => {
-            let space = shinu::find(&state, &spec.space, project)?;
-            shinu::find_ckpt(&state, from, project)?;
-            (
-                shinu::ckpt_image(ctx.root, from),
-                shinu::space_image(ctx.root, space.id),
-            )
-        }
-        (None, Some(to)) => {
-            if let Ok(from) = spec.space.parse::<Uuid>() {
+    let mut temporary_images = Vec::new();
+    let result = (|| -> shinu::Result<DiffResult> {
+        let mut checkpoint_image = |id| -> shinu::Result<PathBuf> {
+            let path = copy_checkpoint_image_for_diff(ctx, id)?;
+            temporary_images.push(path.clone());
+            Ok(path)
+        };
+        let (old_image, new_image) = match (spec.from, spec.to) {
+            (Some(from), Some(to)) => {
                 shinu::find_ckpt(&state, from, project)?;
                 shinu::find_ckpt(&state, to, project)?;
-                (
-                    shinu::ckpt_image(ctx.root, from),
-                    shinu::ckpt_image(ctx.root, to),
-                )
-            } else {
+                (checkpoint_image(from)?, checkpoint_image(to)?)
+            }
+            (Some(from), None) => {
                 let space = shinu::find(&state, &spec.space, project)?;
-                shinu::find_ckpt(&state, to, project)?;
+                shinu::find_ckpt(&state, from, project)?;
                 (
+                    checkpoint_image(from)?,
                     shinu::space_image(ctx.root, space.id),
-                    shinu::ckpt_image(ctx.root, to),
                 )
             }
-        }
-        (None, None) => {
-            let space = shinu::find(&state, &spec.space, project)?;
-            let head = space.head.ok_or_else(|| {
-                shinu::Error::Invalid(format!("space {} has no HEAD checkpoint", space.name))
-            })?;
-            shinu::find_ckpt(&state, head, project)?;
-            (
-                shinu::ckpt_image(ctx.root, head),
-                shinu::space_image(ctx.root, space.id),
-            )
-        }
-    };
+            (None, Some(to)) => {
+                if let Ok(from) = spec.space.parse::<Uuid>() {
+                    shinu::find_ckpt(&state, from, project)?;
+                    shinu::find_ckpt(&state, to, project)?;
+                    (checkpoint_image(from)?, checkpoint_image(to)?)
+                } else {
+                    let space = shinu::find(&state, &spec.space, project)?;
+                    shinu::find_ckpt(&state, to, project)?;
+                    (
+                        shinu::space_image(ctx.root, space.id),
+                        checkpoint_image(to)?,
+                    )
+                }
+            }
+            (None, None) => {
+                let space = shinu::find(&state, &spec.space, project)?;
+                let head = space.head.ok_or_else(|| {
+                    shinu::Error::Invalid(format!("space {} has no HEAD checkpoint", space.name))
+                })?;
+                shinu::find_ckpt(&state, head, project)?;
+                (
+                    checkpoint_image(head)?,
+                    shinu::space_image(ctx.root, space.id),
+                )
+            }
+        };
+        let limit = spec.limit.min(MAX_DIFF_LIMIT);
+        diff_images(
+            &old_image,
+            &new_image,
+            ctx.root,
+            DiffOptions {
+                all: spec.all,
+                limit,
+            },
+        )
+    })();
+    for path in temporary_images {
+        let _ = std::fs::remove_file(path);
+    }
+    let result = result?;
     let limit = spec.limit.min(MAX_DIFF_LIMIT);
-    let result = diff_images(
-        &old_image,
-        &new_image,
-        ctx.root,
-        DiffOptions {
-            all: spec.all,
-            limit,
-        },
-    )?;
     Ok(diff_json(&result, spec.all, limit))
 }
 
@@ -2928,14 +3099,15 @@ struct SshTarget {
 }
 
 fn prepare_ssh(ctx: &Ctx<'_>, project: &str, space: &str) -> shinu::Result<SshTarget> {
-    let entry = find_space(ctx.db, space, project)?;
-    let space_id = entry.id;
-    let limits = effective_limits(ctx, project)?;
-    check_vm_sizing(ctx, &limits, entry.vcpus, entry.mem_mib)?;
+    let initial = find_space(ctx.db, space, project)?;
+    let space_id = initial.id;
     let space_guard = ctx.registry.space_lock(space_id);
     let _space_guard = space_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = revalidate_space(ctx, project, space_id, space)?;
+    let limits = effective_limits(ctx, project)?;
+    check_vm_sizing(ctx, &limits, entry.vcpus, entry.mem_mib)?;
     let (already_running, state, previous_running) =
         space_start_state(ctx, project, &entry, &limits)?;
     let restore_checkpoint = entry
@@ -5249,6 +5421,63 @@ mod tests {
         root
     }
 
+    #[test]
+    fn startup_purges_diff_temp_and_allocates_unique_paths() {
+        let root = test_root("diff-temp-cleanup");
+        let temp_dir = super::diff_temp_dir(&root);
+        std::fs::create_dir_all(&temp_dir).expect("create diff temp directory");
+        std::fs::write(temp_dir.join("stale.ext4"), b"stale").expect("write stale diff input");
+        let first = super::diff_temp_path(&root);
+        let second = super::diff_temp_path(&root);
+        assert_eq!(first.parent(), Some(temp_dir.as_path()));
+        assert_eq!(second.parent(), Some(temp_dir.as_path()));
+        assert_ne!(first, second, "diff inputs need per-operation paths");
+        super::purge_diff_temp(&root).expect("purge stale diff inputs");
+        assert!(
+            !temp_dir.exists(),
+            "startup purge must remove derived inputs"
+        );
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn read_only_checkpoint_probes_do_not_wait_for_checkpoint_lock() {
+        let root = test_root("checkpoint-read-lock-scope");
+        let project = "project-a";
+        let checkpoint_id = Uuid::new_v4();
+        store_state(
+            &root,
+            &State {
+                spaces: Vec::new(),
+                ckpts: vec![Ckpt {
+                    id: checkpoint_id,
+                    space: Uuid::new_v4(),
+                    project: project.into(),
+                    parent: None,
+                    auto: true,
+                    full: false,
+                    base: None,
+                    note: "old auto checkpoint".into(),
+                    created_at: Utc::now() - chrono::Duration::days(30),
+                    snapshot_version: None,
+                }],
+            },
+        );
+        let db = test_db(&root);
+        let registry = registry();
+        let (vm_cfg, net_cfg) = test_configs();
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        let checkpoint_guard = registry.checkpoint_lock(checkpoint_id);
+        let _checkpoint_guard = checkpoint_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let listing = super::list_spaces(&ctx, project).expect("list checkpoint while locked");
+        assert_eq!(listing["ckpts"][0]["exclusive"], 0);
+        let dry_run = super::gc(&ctx, project, u64::MAX, true).expect("GC dry run while locked");
+        assert_eq!(dry_run["dry_run"], true);
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
     fn test_configs() -> (VmConfig, NetConfig) {
         (
             VmConfig {
@@ -6610,11 +6839,85 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove test root");
     }
 
+    #[test]
+    fn locked_space_revalidation_reads_current_sizing_network_and_head() {
+        let root = test_root("space-revalidation");
+        let project = "project-a";
+        let space_id = Uuid::new_v4();
+        let head = Uuid::new_v4();
+        store_state(
+            &root,
+            &State {
+                spaces: vec![Space {
+                    id: space_id,
+                    name: "web".into(),
+                    project: project.into(),
+                    image: Image::Void,
+                    parent: None,
+                    head: None,
+                    vcpus: Some(1),
+                    mem_mib: Some(512),
+                    disk_mib: Some(10),
+                    network: Some("old".into()),
+                    created_at: Utc::now(),
+                }],
+                ckpts: Vec::new(),
+            },
+        );
+        let db = test_db(&root);
+        let registry = registry();
+        let (vm_cfg, net_cfg) = test_configs();
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        let initial = super::find_space(&db, "web", project).expect("initial lookup");
+        let space_guard = registry.space_lock(initial.id);
+        let _space_guard = space_guard
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        super::update_state(&db, &registry, |state| {
+            let space = state
+                .spaces
+                .iter_mut()
+                .find(|space| space.id == space_id)
+                .expect("space present");
+            space.head = Some(head);
+            space.vcpus = Some(4);
+            space.mem_mib = Some(2048);
+            space.network = Some("new".into());
+            Ok(())
+        })
+        .expect("update metadata while waiting operation owns lock");
+        let fresh =
+            super::revalidate_space(&ctx, project, initial.id, "web").expect("fresh locked lookup");
+        assert_eq!(fresh.vcpus, Some(4));
+        assert_eq!(fresh.mem_mib, Some(2048));
+        assert_eq!(fresh.network.as_deref(), Some("new"));
+        assert_eq!(fresh.head, Some(head));
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
     thread_local! {
         /// Runs inside `resize_space`, between the unguarded grow and the store,
         /// standing in for the minutes `resize2fs` leaves that window open.
         static DURING_RESIZE_GROW: std::cell::RefCell<Option<Arc<dyn Fn()>>> =
             const { std::cell::RefCell::new(None) };
+        /// Runs after a sweep snapshots identities and before host probes.
+        /// Tests use it to commit a removal without timing sleeps.
+        static DURING_SWEEP_PROBE: std::cell::RefCell<Option<Arc<dyn Fn()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn during_sweep_probe() {
+        let hook = DURING_SWEEP_PROBE.with(|slot| slot.borrow().clone());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    fn with_sweep_probe_hook<T>(hook: Arc<dyn Fn()>, body: impl FnOnce() -> T) -> T {
+        DURING_SWEEP_PROBE.with(|slot| *slot.borrow_mut() = Some(hook));
+        let value = body();
+        DURING_SWEEP_PROBE.with(|slot| *slot.borrow_mut() = None);
+        value
     }
 
     pub(super) fn during_resize_grow() {
@@ -6629,6 +6932,58 @@ mod tests {
         let value = body();
         DURING_RESIZE_GROW.with(|slot| *slot.borrow_mut() = None);
         value
+    }
+
+    #[test]
+    fn sweep_releases_state_locks_before_probes_and_skips_removed_spaces() {
+        let root = test_root("sweep-lock-scope");
+        let project = "project-a";
+        let space_id = Uuid::new_v4();
+        store_state(
+            &root,
+            &State {
+                spaces: vec![Space {
+                    id: space_id,
+                    name: "swept".into(),
+                    project: project.into(),
+                    image: Image::Void,
+                    parent: None,
+                    head: None,
+                    vcpus: None,
+                    mem_mib: None,
+                    disk_mib: None,
+                    network: None,
+                    created_at: Utc::now(),
+                }],
+                ckpts: Vec::new(),
+            },
+        );
+        let db = Arc::new(test_db(&root));
+        let registry = Arc::new(registry());
+        let remove = {
+            let db = Arc::clone(&db);
+            let registry = Arc::clone(&registry);
+            Arc::new(move || {
+                super::update_state(&db, &registry, |state| {
+                    state.spaces.retain(|space| space.id != space_id);
+                    Ok(())
+                })
+                .expect("remove swept space during probe");
+            }) as Arc<dyn Fn()>
+        };
+        let result =
+            with_sweep_probe_hook(remove, || super::record_sweep_usage(&root, &db, &registry));
+        assert!(
+            result.is_ok(),
+            "sweep failed after concurrent removal: {result:?}"
+        );
+        let connection = db.lock().expect("lock sweep database");
+        let events: i64 = connection
+            .query_row("SELECT COUNT(*) FROM usage_events", [], |row| row.get(0))
+            .expect("count sweep events");
+        assert_eq!(events, 0, "removed space must not receive stale samples");
+        drop(connection);
+        std::fs::remove_dir_all(root).expect("remove test root");
     }
 
     /// The pre-check clears against the state as it was before the grow, so it

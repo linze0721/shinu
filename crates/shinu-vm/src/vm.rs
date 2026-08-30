@@ -3,7 +3,8 @@ pub use crate::net::{egress_rules, peer_rules};
 use crate::config::VmConfig;
 use crate::net::NetConfig;
 use shinu_core::{Error, Image, Result};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -1098,7 +1099,9 @@ pub fn start(
     std::fs::create_dir_all(&dir)?;
     clean_jail(&dir)?;
     let jail = jail_root(root, id);
-    std::fs::create_dir_all(&jail)?;
+    let mut jail_builder = std::fs::DirBuilder::new();
+    jail_builder.recursive(true).mode(0o700).create(&jail)?;
+    std::fs::set_permissions(&jail, std::fs::Permissions::from_mode(0o700))?;
 
     let net = crate::net::net_spec(id, net_cfg);
     if let Err(error) = tap_up(id, net_cfg) {
@@ -1131,18 +1134,29 @@ pub fn start(
         }
 
         if restore.is_none() {
-            std::fs::write(
-                config_path(&dir),
-                crate::config::vm_config_json(
-                    Path::new(JAIL_KERNEL),
-                    Path::new(JAIL_ROOTFS),
-                    image_kind,
-                    Path::new(JAIL_VSOCK),
-                    vcpus,
-                    mem_mib,
-                    net.as_ref(),
-                ),
-            )?;
+            let config = config_path(&dir);
+            let body = crate::config::vm_config_json(
+                Path::new(JAIL_KERNEL),
+                Path::new(JAIL_ROOTFS),
+                image_kind,
+                Path::new(JAIL_VSOCK),
+                vcpus,
+                mem_mib,
+                net.as_ref(),
+            );
+            let mut config_file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&config)?;
+            config_file.write_all(body.as_bytes())?;
+            config_file.sync_all()?;
+            drop(config_file);
+            // The jailer drops to the dedicated uid/gid before Firecracker
+            // opens its config. Make that single file group-readable rather
+            // than depending on the daemon process umask.
+            std::os::unix::fs::chown(&config, None, Some(cfg.jail_gid))?;
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o640))?;
         }
 
         // Keep the VM outside the daemon's session so daemon restart does

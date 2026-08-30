@@ -1,12 +1,10 @@
 use serde_json::{Map, Value, json};
 use shinu::shell_quote_word;
-use std::borrow::Cow;
+use shinu_client::{Client, Endpoint, Response};
 use std::env;
 use std::fmt::Write as _;
 use std::io::{self, BufRead, BufReader, Write};
-use std::net::TcpStream;
 
-const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:7878";
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "shinu-mcp";
 
@@ -17,17 +15,14 @@ struct Server {
 
 impl Server {
     fn from_env() -> Self {
-        let endpoint = env::var("SHINU_ENDPOINT")
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
+        let endpoint = shinu_client::endpoint_value_from_env();
         let token = env::var("SHINU_TOKEN")
             .ok()
             .filter(|value| !value.is_empty());
         Self { endpoint, token }
     }
 
-    fn client(&self) -> Result<HttpClient<'_>, String> {
+    fn client(&self) -> Result<Client, String> {
         let token = self.token.as_deref().ok_or_else(|| {
             "SHINU_TOKEN is not configured; set SHINU_TOKEN to a Shinu API bearer token before calling a tool"
                 .to_string()
@@ -35,37 +30,42 @@ impl Server {
         if token.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
             return Err("SHINU_TOKEN must not contain carriage returns or newlines".to_string());
         }
-        Ok(HttpClient {
-            endpoint: Endpoint::parse(&self.endpoint)?,
-            token,
-        })
+        let endpoint =
+            Endpoint::parse_environment(&self.endpoint).map_err(|error| error.to_string())?;
+        Client::new(endpoint, token.to_owned()).map_err(|error| error.to_string())
     }
 
     fn execute_tool(&self, name: &str, arguments: &Map<String, Value>) -> Result<String, String> {
         let client = self.client()?;
         match name {
-            "shinu_list_spaces" => client.request_text("GET", "/v1/spaces", None),
-            "shinu_list_images" => client.request_text("GET", "/v1/images", None),
+            "shinu_list_spaces" => request_text(&client, "GET", "/v1/spaces", None),
+            "shinu_list_images" => request_text(&client, "GET", "/v1/images", None),
             "shinu_create_space" => {
                 let name = required_string(arguments, "name")?;
                 let body = create_space_body(name, arguments)?;
-                client.request_text("POST", "/v1/spaces", Some(body))
+                request_text(&client, "POST", "/v1/spaces", Some(body))
             }
             "shinu_resize_space" => {
                 let space = required_string(arguments, "space")?;
-                let path = format!("/v1/spaces/{}", encode_path_segment(space));
+                let path = format!("/v1/spaces/{}", shinu_client::encode_path_segment(space));
                 let body = resize_space_body(arguments)?;
-                client.request_text("PATCH", &path, Some(body))
+                request_text(&client, "PATCH", &path, Some(body))
             }
             "shinu_start" => {
                 let space = required_string(arguments, "space")?;
-                let path = format!("/v1/spaces/{}/start", encode_path_segment(space));
-                client.request_text("POST", &path, None)
+                let path = format!(
+                    "/v1/spaces/{}/start",
+                    shinu_client::encode_path_segment(space)
+                );
+                request_text(&client, "POST", &path, None)
             }
             "shinu_stop" => {
                 let space = required_string(arguments, "space")?;
-                let path = format!("/v1/spaces/{}/stop", encode_path_segment(space));
-                client.request_text("POST", &path, None)
+                let path = format!(
+                    "/v1/spaces/{}/stop",
+                    shinu_client::encode_path_segment(space)
+                );
+                request_text(&client, "POST", &path, None)
             }
             "shinu_write_file" => {
                 let space = required_string(arguments, "space")?;
@@ -76,8 +76,12 @@ impl Server {
                     "-c".to_string(),
                     format!("cat > {}", shell_quote_word(path)),
                 ];
-                let request_path = format!("/v1/spaces/{}/exec", encode_path_segment(space));
-                let response = client.request_checked(
+                let request_path = format!(
+                    "/v1/spaces/{}/exec",
+                    shinu_client::encode_path_segment(space)
+                );
+                let response = request_checked_json(
+                    &client,
                     "POST",
                     &request_path,
                     Some(json!({ "cmd": command, "stdin": content })),
@@ -88,8 +92,12 @@ impl Server {
                 let space = required_string(arguments, "space")?;
                 let path = required_string(arguments, "path")?;
                 let command = vec!["cat".to_string(), path.to_owned()];
-                let request_path = format!("/v1/spaces/{}/exec", encode_path_segment(space));
-                let response = client.request_checked(
+                let request_path = format!(
+                    "/v1/spaces/{}/exec",
+                    shinu_client::encode_path_segment(space)
+                );
+                let response = request_checked_json(
+                    &client,
                     "POST",
                     &request_path,
                     Some(json!({ "cmd": command })),
@@ -99,9 +107,12 @@ impl Server {
             "shinu_exec" => {
                 let space = required_string(arguments, "space")?;
                 let command = required_command(arguments)?;
-                let path = format!("/v1/spaces/{}/exec", encode_path_segment(space));
+                let path = format!(
+                    "/v1/spaces/{}/exec",
+                    shinu_client::encode_path_segment(space)
+                );
                 let response =
-                    client.request_checked("POST", &path, Some(json!({ "cmd": command })))?;
+                    request_checked_json(&client, "POST", &path, Some(json!({ "cmd": command })))?;
                 aggregate_exec(&response.body)
             }
             "shinu_commit" => {
@@ -109,8 +120,12 @@ impl Server {
                 let note = required_string(arguments, "note")?;
                 let hot = required_bool(arguments, "hot")?;
                 let snapshot = required_snapshot_mode(arguments, "snapshot")?;
-                let path = format!("/v1/spaces/{}/commits", encode_path_segment(space));
-                client.request_text(
+                let path = format!(
+                    "/v1/spaces/{}/commits",
+                    shinu_client::encode_path_segment(space)
+                );
+                request_text(
+                    &client,
                     "POST",
                     &path,
                     Some(json!({ "note": note, "hot": hot, "snapshot": snapshot })),
@@ -118,233 +133,81 @@ impl Server {
             }
             "shinu_log" => {
                 let space = required_string(arguments, "space")?;
-                let path = format!("/v1/spaces/{}/log", encode_path_segment(space));
-                client.request_text("GET", &path, None)
+                let path = format!(
+                    "/v1/spaces/{}/log",
+                    shinu_client::encode_path_segment(space)
+                );
+                request_text(&client, "GET", &path, None)
             }
             "shinu_reflog" => {
                 let space = required_string(arguments, "space")?;
-                let path = format!("/v1/spaces/{}/reflog", encode_path_segment(space));
-                client.request_text("GET", &path, None)
+                let path = format!(
+                    "/v1/spaces/{}/reflog",
+                    shinu_client::encode_path_segment(space)
+                );
+                request_text(&client, "GET", &path, None)
             }
             "shinu_checkout" => {
                 let space = required_string(arguments, "space")?;
                 let commit = required_string(arguments, "commit")?;
-                let path = format!("/v1/spaces/{}/checkout", encode_path_segment(space));
-                client.request_text("POST", &path, Some(json!({ "commit": commit })))
+                let path = format!(
+                    "/v1/spaces/{}/checkout",
+                    shinu_client::encode_path_segment(space)
+                );
+                request_text(&client, "POST", &path, Some(json!({ "commit": commit })))
             }
             "shinu_fork" => {
                 let commit = required_string(arguments, "commit")?;
                 let name = required_string(arguments, "name")?;
-                let path = format!("/v1/commits/{}/fork", encode_path_segment(commit));
-                client.request_text("POST", &path, Some(json!({ "name": name })))
+                let path = format!(
+                    "/v1/commits/{}/fork",
+                    shinu_client::encode_path_segment(commit)
+                );
+                request_text(&client, "POST", &path, Some(json!({ "name": name })))
             }
             "shinu_delete_space" => {
                 let space = required_string(arguments, "space")?;
-                let path = format!("/v1/spaces/{}", encode_path_segment(space));
-                client.request_text("DELETE", &path, None)
+                let path = format!("/v1/spaces/{}", shinu_client::encode_path_segment(space));
+                request_text(&client, "DELETE", &path, None)
             }
             _ => Err(format!("unknown Shinu tool {name}")),
         }
     }
 }
 
-struct Endpoint {
-    host: String,
-    authority: String,
-    port: u16,
-    base_path: String,
+fn request_json(
+    client: &Client,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Result<Response, String> {
+    let body = body
+        .map(|value| serde_json::to_vec(&value).map_err(|error| error.to_string()))
+        .transpose()?;
+    client
+        .request(method, path, body.as_deref())
+        .map_err(|error| error.to_string())
 }
 
-impl Endpoint {
-    fn parse(input: &str) -> Result<Self, String> {
-        let input = input.trim();
-        if input.is_empty() {
-            return Err("SHINU_ENDPOINT must not be empty".to_string());
-        }
-        if input
-            .bytes()
-            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
-        {
-            return Err(
-                "SHINU_ENDPOINT must not contain whitespace or control characters".to_string(),
-            );
-        }
-        let remainder = if let Some(value) = input.strip_prefix("http://") {
-            value
-        } else if input.starts_with("https://") {
-            return Err(
-                "HTTPS endpoints are not supported by the stdio client; use an HTTP endpoint behind the configured proxy"
-                    .to_string(),
-            );
-        } else if input.contains("://") {
-            return Err("SHINU_ENDPOINT must use the http:// scheme".to_string());
-        } else {
-            input
-        };
-        let (authority, path) = remainder
-            .split_once('/')
-            .map_or((remainder, ""), |(authority, path)| (authority, path));
-        if authority.is_empty() {
-            return Err("SHINU_ENDPOINT must contain a host".to_string());
-        }
-        let (host, port) = if authority.starts_with('[') {
-            let end = authority
-                .find(']')
-                .ok_or_else(|| "IPv6 endpoint is missing the closing ']'".to_string())?;
-            let host = &authority[1..end];
-            if host.is_empty() {
-                return Err("SHINU_ENDPOINT host must not be empty".to_string());
-            }
-            let suffix = &authority[end + 1..];
-            let port = if suffix.is_empty() {
-                80
-            } else {
-                let port = suffix
-                    .strip_prefix(':')
-                    .ok_or_else(|| "invalid SHINU_ENDPOINT port".to_string())?;
-                parse_port(port)?
-            };
-            (host.to_string(), port)
-        } else if authority.matches(':').count() > 1 {
-            return Err(
-                "IPv6 SHINU_ENDPOINT values must use bracket notation, for example http://[::1]:7878"
-                    .to_string(),
-            );
-        } else if let Some((host, port)) = authority.rsplit_once(':') {
-            if host.is_empty() {
-                return Err("SHINU_ENDPOINT host must not be empty".to_string());
-            }
-            (host.to_string(), parse_port(port)?)
-        } else {
-            (authority.to_string(), 80)
-        };
-        let base_path = if path.is_empty() {
-            String::new()
-        } else {
-            format!("/{}", path.trim_matches('/'))
-        };
-        Ok(Self {
-            host,
-            authority: authority.to_string(),
-            port,
-            base_path,
-        })
-    }
-
-    fn target<'a>(&self, path: &'a str) -> Cow<'a, str> {
-        if self.base_path.is_empty() && path.starts_with('/') {
-            return Cow::Borrowed(path);
-        }
-        let mut target = String::with_capacity(self.base_path.len() + path.len() + 1);
-        target.push_str(&self.base_path);
-        if !path.starts_with('/') {
-            target.push('/');
-        }
-        target.push_str(path);
-        Cow::Owned(target)
-    }
+fn request_checked_json(
+    client: &Client,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Result<Response, String> {
+    request_json(client, method, path, body)?
+        .into_success()
+        .map_err(|error| error.to_string())
 }
 
-fn parse_port(value: &str) -> Result<u16, String> {
-    let port = value
-        .parse::<u16>()
-        .map_err(|_| format!("invalid SHINU_ENDPOINT port {value:?}"))?;
-    if port == 0 {
-        return Err("SHINU_ENDPOINT port must be between 1 and 65535".to_string());
-    }
-    Ok(port)
-}
-
-struct HttpClient<'a> {
-    endpoint: Endpoint,
-    token: &'a str,
-}
-
-struct HttpResponse {
-    status: u16,
-    body: Vec<u8>,
-}
-
-struct ResponseHead {
-    status: u16,
-    headers: Vec<(String, String)>,
-}
-
-impl HttpClient<'_> {
-    fn request(
-        &self,
-        method: &str,
-        path: &str,
-        body: Option<Value>,
-    ) -> Result<HttpResponse, String> {
-        let body = body
-            .map(|value| serde_json::to_vec(&value).map_err(|error| error.to_string()))
-            .transpose()?;
-        let (mut reader, head) = self.open_request(method, path, body.as_deref())?;
-        let body = read_body(&mut reader, &head.headers)?;
-        Ok(HttpResponse {
-            status: head.status,
-            body,
-        })
-    }
-
-    fn request_checked(
-        &self,
-        method: &str,
-        path: &str,
-        body: Option<Value>,
-    ) -> Result<HttpResponse, String> {
-        let response = self.request(method, path, body)?;
-        if !(200..300).contains(&response.status) {
-            return Err(http_error(response.status, &response.body));
-        }
-        Ok(response)
-    }
-
-    fn request_text(
-        &self,
-        method: &str,
-        path: &str,
-        body: Option<Value>,
-    ) -> Result<String, String> {
-        let response = self.request_checked(method, path, body)?;
-        body_text(&response.body)
-    }
-
-    fn open_request(
-        &self,
-        method: &str,
-        path: &str,
-        body: Option<&[u8]>,
-    ) -> Result<(BufReader<TcpStream>, ResponseHead), String> {
-        let mut stream = TcpStream::connect((self.endpoint.host.as_str(), self.endpoint.port))
-            .map_err(|error| {
-                format!("could not connect to {}: {error}", self.endpoint.authority)
-            })?;
-        let target = self.endpoint.target(path);
-        let content_length = body.map_or(0, <[u8]>::len);
-        let content_type = if body.is_some() {
-            "Content-Type: application/json\r\n"
-        } else {
-            ""
-        };
-        let request = format!(
-            "{method} {} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n{content_type}Content-Length: {content_length}\r\n\r\n",
-            target.as_ref(),
-            self.endpoint.authority,
-            self.token
-        );
-        stream
-            .write_all(request.as_bytes())
-            .map_err(|error| error.to_string())?;
-        if let Some(body) = body {
-            stream.write_all(body).map_err(|error| error.to_string())?;
-        }
-        stream.flush().map_err(|error| error.to_string())?;
-        let mut reader = BufReader::new(stream);
-        let head = read_response_head(&mut reader)?;
-        Ok((reader, head))
-    }
+fn request_text(
+    client: &Client,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Result<String, String> {
+    let response = request_checked_json(client, method, path, body)?;
+    shinu_client::body_text(&response.body).map_err(|error| error.to_string())
 }
 
 fn required_string<'a>(arguments: &'a Map<String, Value>, field: &str) -> Result<&'a str, String> {
@@ -407,31 +270,78 @@ fn optional_u64(arguments: &Map<String, Value>, field: &str) -> Result<Option<u6
     }
 }
 
+fn optional_positive_u64(
+    arguments: &Map<String, Value>,
+    field: &str,
+) -> Result<Option<u64>, String> {
+    let value = optional_u64(arguments, field)?;
+    if value == Some(0) {
+        Err(format!("argument {field} must be at least 1"))
+    } else {
+        Ok(value)
+    }
+}
+
+fn optional_image<'a>(
+    arguments: &'a Map<String, Value>,
+    field: &str,
+) -> Result<Option<&'a str>, String> {
+    let value = optional_string(arguments, field)?;
+    if value.is_some_and(|image| !matches!(image, "void" | "ubuntu" | "arch" | "rocky")) {
+        Err(format!(
+            "argument {field} must be one of: void, ubuntu, arch, rocky"
+        ))
+    } else {
+        Ok(value)
+    }
+}
+
+fn optional_network<'a>(
+    arguments: &'a Map<String, Value>,
+    field: &str,
+) -> Result<Option<&'a str>, String> {
+    let value = optional_string(arguments, field)?;
+    if let Some(network) = value {
+        if network.len() > 32 {
+            return Err(format!("argument {field} must be at most 32 characters"));
+        }
+        if !network
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(format!(
+                "argument {field} must contain only lowercase letters, digits, or hyphens"
+            ));
+        }
+    }
+    Ok(value)
+}
+
 fn create_space_body(name: &str, arguments: &Map<String, Value>) -> Result<Value, String> {
     let mut object = Map::new();
     object.insert("name".to_string(), Value::String(name.to_owned()));
-    if let Some(image) = optional_string(arguments, "image")? {
+    if let Some(image) = optional_image(arguments, "image")? {
         object.insert("image".to_string(), Value::String(image.to_owned()));
     }
-    if let Some(vcpus) = optional_u64(arguments, "vcpus")? {
+    if let Some(vcpus) = optional_positive_u64(arguments, "vcpus")? {
         object.insert("vcpus".to_string(), Value::from(vcpus));
     }
-    if let Some(mem_mib) = optional_u64(arguments, "mem_mib")? {
+    if let Some(mem_mib) = optional_positive_u64(arguments, "mem_mib")? {
         object.insert("mem_mib".to_string(), Value::from(mem_mib));
     }
-    if let Some(disk_mib) = optional_u64(arguments, "disk_mib")? {
+    if let Some(disk_mib) = optional_positive_u64(arguments, "disk_mib")? {
         object.insert("disk_mib".to_string(), Value::from(disk_mib));
     }
-    if let Some(network) = optional_string(arguments, "network")? {
+    if let Some(network) = optional_network(arguments, "network")? {
         object.insert("network".to_string(), Value::String(network.to_owned()));
     }
     Ok(Value::Object(object))
 }
 
 fn resize_space_body(arguments: &Map<String, Value>) -> Result<Value, String> {
-    let vcpus = optional_u64(arguments, "vcpus")?;
-    let mem_mib = optional_u64(arguments, "mem_mib")?;
-    let disk_mib = optional_u64(arguments, "disk_mib")?;
+    let vcpus = optional_positive_u64(arguments, "vcpus")?;
+    let mem_mib = optional_positive_u64(arguments, "mem_mib")?;
+    let disk_mib = optional_positive_u64(arguments, "disk_mib")?;
     if vcpus.is_none() && mem_mib.is_none() && disk_mib.is_none() {
         return Err("resize requires at least one of vcpus, mem_mib, or disk_mib".to_string());
     }
@@ -459,8 +369,11 @@ fn required_command(arguments: &Map<String, Value>) -> Result<&[Value], String> 
         return Err("argument cmd must contain at least one command argument".to_string());
     }
     for (index, value) in values.iter().enumerate() {
-        if value.as_str().is_none() {
+        let Some(command) = value.as_str() else {
             return Err(format!("argument cmd[{index}] must be a string"));
+        };
+        if index == 0 && command.trim().is_empty() {
+            return Err("argument cmd[0] must not be empty".to_string());
         }
     }
     Ok(values)
@@ -471,11 +384,11 @@ fn validate_arguments(name: &str, arguments: &Map<String, Value>) -> Result<(), 
         "shinu_list_spaces" | "shinu_list_images" => Ok(()),
         "shinu_create_space" => {
             required_string(arguments, "name")?;
-            optional_string(arguments, "image")?;
-            optional_u64(arguments, "vcpus")?;
-            optional_u64(arguments, "mem_mib")?;
-            optional_u64(arguments, "disk_mib")?;
-            optional_string(arguments, "network")?;
+            optional_image(arguments, "image")?;
+            optional_positive_u64(arguments, "vcpus")?;
+            optional_positive_u64(arguments, "mem_mib")?;
+            optional_positive_u64(arguments, "disk_mib")?;
+            optional_network(arguments, "network")?;
             Ok(())
         }
         "shinu_resize_space" => {
@@ -529,42 +442,6 @@ fn validate_arguments(name: &str, arguments: &Map<String, Value>) -> Result<(), 
             Ok(())
         }
         _ => Err(format!("unknown Shinu tool {name}")),
-    }
-}
-
-fn encode_path_segment(value: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            encoded.push(byte as char);
-        } else {
-            encoded.push('%');
-            encoded.push(HEX[(byte >> 4) as usize] as char);
-            encoded.push(HEX[(byte & 0x0f) as usize] as char);
-        }
-    }
-    encoded
-}
-
-fn body_text(body: &[u8]) -> Result<String, String> {
-    std::str::from_utf8(body)
-        .map(str::to_owned)
-        .map_err(|error| format!("HTTP response was not valid UTF-8: {error}"))
-}
-
-fn http_error(status: u16, body: &[u8]) -> String {
-    if let Ok(value) = serde_json::from_slice::<Value>(body)
-        && let Some(message) = value.get("error").and_then(Value::as_str)
-    {
-        return format!("HTTP {status}: {message}");
-    }
-    let detail = String::from_utf8_lossy(body);
-    let detail = detail.trim();
-    if detail.is_empty() {
-        format!("HTTP {status}")
-    } else {
-        format!("HTTP {status}: {detail}")
     }
 }
 
@@ -661,150 +538,6 @@ fn aggregate_stdout(body: &[u8]) -> Result<String, String> {
         return Err(format!("guest command exited with status {exit}: {stderr}"));
     }
     Ok(stdout)
-}
-
-fn parse_port_status(line: &str) -> Result<u16, String> {
-    let mut fields = line.trim_end_matches(&['\r', '\n'][..]).splitn(3, ' ');
-    let version = fields.next().unwrap_or_default();
-    if !version.starts_with("HTTP/1.") {
-        return Err(format!("unsupported HTTP status line: {line:?}"));
-    }
-    let code = fields
-        .next()
-        .ok_or_else(|| "HTTP status line is missing a status code".to_string())?;
-    let status = code
-        .parse::<u16>()
-        .map_err(|error| format!("invalid HTTP status code {code:?}: {error}"))?;
-    if !(100..=599).contains(&status) {
-        return Err(format!("invalid HTTP status code: {status}"));
-    }
-    Ok(status)
-}
-
-fn read_response_head<R: BufRead>(reader: &mut R) -> Result<ResponseHead, String> {
-    let mut status_line = String::new();
-    if reader
-        .read_line(&mut status_line)
-        .map_err(|error| error.to_string())?
-        == 0
-    {
-        return Err("HTTP response ended before the status line".to_string());
-    }
-    let status = parse_port_status(&status_line)?;
-    let mut headers = Vec::new();
-    let mut line = String::new();
-    loop {
-        line.clear();
-        if reader
-            .read_line(&mut line)
-            .map_err(|error| error.to_string())?
-            == 0
-        {
-            return Err("HTTP response ended before the headers".to_string());
-        }
-        if line == "\r\n" || line == "\n" {
-            break;
-        }
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| "malformed HTTP response header".to_string())?;
-        headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
-    }
-    Ok(ResponseHead { status, headers })
-}
-
-fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.as_str())
-}
-
-fn is_chunked(headers: &[(String, String)]) -> bool {
-    header(headers, "transfer-encoding").is_some_and(|value| {
-        value
-            .split(',')
-            .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"))
-    })
-}
-
-fn content_length(headers: &[(String, String)]) -> Result<Option<usize>, String> {
-    header(headers, "content-length")
-        .map(|value| {
-            value
-                .parse::<usize>()
-                .map_err(|error| format!("invalid Content-Length: {error}"))
-        })
-        .transpose()
-}
-
-fn read_body<R: BufRead>(reader: &mut R, headers: &[(String, String)]) -> Result<Vec<u8>, String> {
-    if is_chunked(headers) {
-        return read_chunked(reader);
-    }
-    if let Some(length) = content_length(headers)? {
-        let mut body = vec![0u8; length];
-        reader
-            .read_exact(&mut body)
-            .map_err(|error| error.to_string())?;
-        return Ok(body);
-    }
-    let mut body = Vec::new();
-    reader
-        .read_to_end(&mut body)
-        .map_err(|error| error.to_string())?;
-    Ok(body)
-}
-
-fn read_chunked<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, String> {
-    let mut body = Vec::new();
-    let mut size_line = String::new();
-    let mut trailer = String::new();
-    loop {
-        size_line.clear();
-        if reader
-            .read_line(&mut size_line)
-            .map_err(|error| error.to_string())?
-            == 0
-        {
-            return Err("chunked HTTP body ended before a chunk size".to_string());
-        }
-        let size_text = size_line
-            .trim_end_matches(&['\r', '\n'][..])
-            .split(';')
-            .next()
-            .unwrap_or_default()
-            .trim();
-        let size = usize::from_str_radix(size_text, 16)
-            .map_err(|error| format!("invalid chunk size {size_text:?}: {error}"))?;
-        if size == 0 {
-            loop {
-                trailer.clear();
-                if reader
-                    .read_line(&mut trailer)
-                    .map_err(|error| error.to_string())?
-                    == 0
-                {
-                    return Err("chunked HTTP body ended before trailers".to_string());
-                }
-                if trailer == "\r\n" || trailer == "\n" {
-                    return Ok(body);
-                }
-            }
-        }
-        let chunk_start = body.len();
-        body.resize(chunk_start + size, 0);
-        reader
-            .read_exact(&mut body[chunk_start..])
-            .map_err(|error| error.to_string())?;
-        let mut line_end = [0u8; 2];
-        reader
-            .read_exact(&mut line_end)
-            .map_err(|error| error.to_string())?;
-        if line_end != *b"\r\n" {
-            return Err("chunked HTTP body is missing its CRLF".to_string());
-        }
-    }
 }
 
 fn schema(properties: Value, required: &[&str]) -> Value {
@@ -1192,6 +925,113 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn validates_all_advertised_resource_and_network_boundaries() {
+        for (field, value) in [
+            ("vcpus", json!(0)),
+            ("mem_mib", json!(0)),
+            ("disk_mib", json!(0)),
+        ] {
+            let mut args = arguments(json!({"name": "dev"}));
+            args.insert(field.to_owned(), value);
+            assert!(
+                validate_arguments("shinu_create_space", &args).is_err(),
+                "zero {field} must be rejected"
+            );
+        }
+
+        for field in ["vcpus", "mem_mib", "disk_mib"] {
+            let mut args = arguments(json!({"name": "dev"}));
+            args.insert(field.to_owned(), json!(1));
+            assert!(
+                validate_arguments("shinu_create_space", &args).is_ok(),
+                "minimum {field} must be accepted"
+            );
+        }
+        for image in ["void", "ubuntu", "arch", "rocky"] {
+            let args = arguments(json!({"name": "dev", "image": image}));
+            assert!(validate_arguments("shinu_create_space", &args).is_ok());
+        }
+        let invalid_image = arguments(json!({"name": "dev", "image": "debian"}));
+        assert!(validate_arguments("shinu_create_space", &invalid_image).is_err());
+
+        let too_long_network = "a".repeat(33);
+        for network in [
+            "",
+            "A",
+            "network_name",
+            "network name",
+            too_long_network.as_str(),
+        ] {
+            let args = arguments(json!({"name": "dev", "network": network}));
+            assert!(
+                validate_arguments("shinu_create_space", &args).is_err(),
+                "invalid network {network:?} must be rejected"
+            );
+        }
+        let boundary_network = "a".repeat(32);
+        let args = arguments(json!({"name": "dev", "network": boundary_network}));
+        assert!(validate_arguments("shinu_create_space", &args).is_ok());
+        for field in ["vcpus", "mem_mib", "disk_mib"] {
+            let mut args = arguments(json!({"space": "dev"}));
+            args.insert(field.to_owned(), json!(0));
+            assert!(
+                validate_arguments("shinu_resize_space", &args).is_err(),
+                "zero resize {field} must be rejected"
+            );
+        }
+        let mut args = arguments(json!({"space": "dev", "cmd": [""]}));
+        assert!(validate_arguments("shinu_exec", &args).is_err());
+
+        for field in ["vcpus", "mem_mib", "disk_mib"] {
+            let mut args = arguments(json!({"space": "dev"}));
+            args.insert(field.to_owned(), json!(1));
+            assert!(
+                validate_arguments("shinu_resize_space", &args).is_ok(),
+                "minimum resize {field} must be accepted"
+            );
+        }
+        args.insert("cmd".to_owned(), json!(["echo", ""]));
+        assert!(validate_arguments("shinu_exec", &args).is_ok());
+
+        for (tool, value) in [
+            ("shinu_create_space", json!({"name": "   "})),
+            ("shinu_start", json!({"space": "\t"})),
+            (
+                "shinu_write_file",
+                json!({"space": "dev", "path": " ", "content": "ok"}),
+            ),
+            (
+                "shinu_commit",
+                json!({"space": "dev", "note": "", "hot": false, "snapshot": "none"}),
+            ),
+        ] {
+            assert!(
+                validate_arguments(tool, &arguments(value)).is_err(),
+                "trim-empty string for {tool} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_tool_arguments_keep_json_rpc_invalid_params_code() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {
+                "name": "shinu_create_space",
+                "arguments": {"name": "dev", "vcpus": 0}
+            }
+        });
+        let request = request.as_object().expect("request object");
+        let server = Server {
+            endpoint: shinu_client::DEFAULT_ENDPOINT.to_owned(),
+            token: None,
+        };
+        let response = dispatch(&server, request, json!(1));
+        assert_eq!(response["error"]["code"], json!(-32602));
     }
 
     #[test]

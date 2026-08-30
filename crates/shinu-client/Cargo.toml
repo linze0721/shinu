@@ -1,0 +1,10 @@
+[package]
+name = "shinu-client"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json.workspace = true

@@ -350,7 +350,15 @@ pub fn vm_dir(root: &Path, id: Uuid) -> PathBuf {
 }
 
 const DAEMON_UID: u32 = 0;
-const PROTECTED_LAYOUT_DIRS: [&str; 5] = ["spaces", "ckpts", "vm", "assets", "cache"];
+const PROTECTED_LAYOUT_DIRS: [&str; 7] = [
+    "spaces",
+    "ckpts",
+    "vm",
+    "assets",
+    "cache",
+    "jail",
+    "jail/firecracker",
+];
 
 /// Checks the ownership and permission invariant for a daemon-owned directory.
 ///
@@ -507,6 +515,8 @@ pub fn init_layout(root: &Path) -> Result<()> {
         (root.join("vm"), 0o700),
         (assets_dir(root), 0o755),
         (cache_dir(root), 0o755),
+        (root.join("jail"), 0o700),
+        (root.join("jail/firecracker"), 0o700),
     ] {
         std::fs::create_dir_all(&dir)?;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode))?;

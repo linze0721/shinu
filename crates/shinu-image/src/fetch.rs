@@ -1,6 +1,30 @@
+use std::fs::OpenOptions;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use shinu_core::{Error, Image, Result, cache_dir};
+
+static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Returns a private sibling name for a staged file. The process id prevents
+/// ordinary cross-process collisions, while the monotonic counter and clock
+/// component also cover pid reuse and repeated calls in one process.
+pub(super) fn unique_staging_path(path: &Path) -> PathBuf {
+    let basename = path.file_name().map_or_else(
+        || "stage".to_owned(),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let pid = std::process::id();
+    let clock = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let sequence = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
+    path.with_file_name(format!(
+        ".{basename}.{pid}.{clock:032x}.{sequence:016x}.part"
+    ))
+}
 
 /// Where the guest rootfs comes from. Read from the environment so no config
 /// file format has to exist.
@@ -300,9 +324,15 @@ pub(super) fn fetch_tarball(root: &Path, image: Image, cfg: &BaseConfig) -> Resu
             if target.exists() && sha256_file(&target)? == digest {
                 return Ok(target);
             }
-            let tmp = cache.join(format!("{name}.part"));
-            let _ = std::fs::remove_file(&tmp);
+            let tmp = unique_staging_path(&target);
+            let mut owns_tmp = false;
             let result = (|| -> Result<PathBuf> {
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&tmp)?;
+                owns_tmp = true;
                 let status = std::process::Command::new("curl")
                     .args(["-sSfL", "--max-time", "1800", "-o"])
                     .arg(&tmp)
@@ -320,7 +350,7 @@ pub(super) fn fetch_tarball(root: &Path, image: Image, cfg: &BaseConfig) -> Resu
                 std::fs::rename(&tmp, &target)?;
                 Ok(target)
             })();
-            if result.is_err() {
+            if owns_tmp && result.is_err() {
                 let _ = std::fs::remove_file(&tmp);
             }
             result
@@ -455,13 +485,45 @@ mod sums_tests {
         assert!(pick_sums_digest("nothex  ./x\n", "x").is_err());
     }
 }
-/// Download to a sibling `.part` path and rename on success, the same
-/// anti-truncation rule [`fetch_tarball`] uses: a half-transferred file must
-/// never be mistaken for a finished one.
+#[cfg(test)]
+mod staging_tests {
+    use super::unique_staging_path;
+    use std::path::Path;
+
+    #[test]
+    fn staging_paths_are_unique_private_siblings() {
+        let destination = Path::new("/var/lib/shinu/assets/manifest.json");
+        let first = unique_staging_path(destination);
+        let second = unique_staging_path(destination);
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), destination.parent());
+        assert_eq!(second.parent(), destination.parent());
+        for staged in [first, second] {
+            let name = staged
+                .file_name()
+                .expect("staging filename")
+                .to_string_lossy();
+            assert!(name.starts_with(".manifest.json."));
+            assert!(name.ends_with(".part"));
+            assert!(name.contains(&std::process::id().to_string()));
+        }
+    }
+}
+
+/// Download to a unique private sibling and rename on success. A half-
+/// transferred file must never be mistaken for a finished one, and a failed
+/// process must only clean up its own staging path.
 pub(super) fn curl_to_file(url: &str, dst: &Path) -> Result<()> {
-    let tmp = dst.with_extension("part");
-    let _ = std::fs::remove_file(&tmp);
+    let tmp = unique_staging_path(dst);
+    let mut owns_tmp = false;
     let result = (|| -> Result<()> {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        owns_tmp = true;
         let status = std::process::Command::new("curl")
             .args(["-sSfL", "--max-time", "1800", "-o"])
             .arg(&tmp)
@@ -473,7 +535,7 @@ pub(super) fn curl_to_file(url: &str, dst: &Path) -> Result<()> {
         std::fs::rename(&tmp, dst)?;
         Ok(())
     })();
-    if result.is_err() {
+    if owns_tmp && result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     result

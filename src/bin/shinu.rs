@@ -3,10 +3,12 @@ use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use shinu::proto::SnapshotMode;
 use shinu::token::{self, Token};
+use shinu_client::{
+    Client, Endpoint, Response, ResponseStream, encode_path_segment, encode_query_value,
+};
 use shinu_image::DEFAULT_DIFF_LIMIT;
-use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process;
@@ -17,8 +19,6 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
-
-const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:7878";
 
 #[derive(Parser)]
 #[command(name = "shinu")]
@@ -218,429 +218,267 @@ enum TokenCommand {
     },
 }
 
-#[derive(Clone)]
-struct Endpoint {
-    host: String,
-    authority: String,
-    port: u16,
-    base_path: String,
+fn request_json(
+    client: &Client,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Result<Response, String> {
+    let body = body
+        .map(|value| serde_json::to_vec(&value).map_err(|error| error.to_string()))
+        .transpose()?;
+    client
+        .request(method, path, body.as_deref())
+        .map_err(|error| error.to_string())
 }
 
-impl Endpoint {
-    fn parse(input: &str) -> Result<Self, String> {
-        let input = input.trim();
-        if input.is_empty() {
-            return Err("endpoint must not be empty".to_string());
-        }
-        let remainder = if let Some(value) = input.strip_prefix("http://") {
-            value
-        } else if input.starts_with("https://") {
-            return Err("HTTPS endpoints are not supported; use an http:// endpoint".to_string());
-        } else if input.contains("://") {
-            return Err("endpoint must use the http:// scheme".to_string());
-        } else {
-            input
-        };
-        let (authority, path) = remainder
-            .split_once('/')
-            .map_or((remainder, ""), |(authority, path)| (authority, path));
-        if path
-            .bytes()
-            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
-        {
-            return Err("endpoint must not contain whitespace or control characters".to_string());
-        }
-        if authority.is_empty()
-            || authority
-                .bytes()
-                .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
-        {
-            return Err("endpoint must contain a valid host".to_string());
-        }
-
-        let (host, port) = if authority.starts_with('[') {
-            let end = authority
-                .find(']')
-                .ok_or_else(|| "IPv6 endpoint is missing the closing ']'".to_string())?;
-            let host = &authority[1..end];
-            if host.is_empty() {
-                return Err("endpoint host must not be empty".to_string());
-            }
-            let suffix = &authority[end + 1..];
-            let port = if suffix.is_empty() {
-                80
-            } else {
-                let port = suffix
-                    .strip_prefix(':')
-                    .ok_or_else(|| "invalid endpoint port".to_string())?;
-                parse_port(port)?
-            };
-            (host.to_string(), port)
-        } else if authority.matches(':').count() > 1 {
-            return Err(
-                "IPv6 endpoints must use bracket notation, for example http://[::1]:7878"
-                    .to_string(),
-            );
-        } else if let Some((host, port)) = authority.rsplit_once(':') {
-            if host.is_empty() {
-                return Err("endpoint host must not be empty".to_string());
-            }
-            (host.to_string(), parse_port(port)?)
-        } else {
-            (authority.to_string(), 80)
-        };
-
-        let base_path = if path.is_empty() {
-            String::new()
-        } else {
-            format!("/{}", path.trim_matches('/'))
-        };
-        Ok(Self {
-            host,
-            authority: authority.to_string(),
-            port,
-            base_path,
-        })
+fn stream_exec(
+    client: &Client,
+    space: &str,
+    command: &[String],
+    stdin_path: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<i32, String> {
+    let mut body = json!({ "cmd": command });
+    if let Some(path) = stdin_path {
+        body["stdin"] = Value::String(read_exec_stdin(path)?);
     }
-
-    fn target<'a>(&self, path: &'a str) -> Cow<'a, str> {
-        if self.base_path.is_empty() && path.starts_with('/') {
-            return Cow::Borrowed(path);
-        }
-        let mut target = String::with_capacity(self.base_path.len() + path.len() + 1);
-        target.push_str(&self.base_path);
-        if !path.starts_with('/') {
-            target.push('/');
-        }
-        target.push_str(path);
-        Cow::Owned(target)
+    if let Some(session) = session_id {
+        body["session"] = Value::String(session.to_owned());
     }
-
-    fn connect_address(&self) -> String {
-        if self.host.contains(':') {
-            format!("[{}]:{}", self.host, self.port)
-        } else {
-            format!("{}:{}", self.host, self.port)
-        }
+    let encoded = serde_json::to_vec(&body).map_err(|error| error.to_string())?;
+    let path = format!(
+        "/v1/spaces/{}/exec",
+        shinu_client::encode_path_segment(space)
+    );
+    let mut response = client
+        .open_request("POST", &path, Some(&encoded))
+        .map_err(|error| error.to_string())?;
+    if !response.head().is_success() {
+        let status = response.head().status;
+        let body = response.read_body().map_err(|error| error.to_string())?;
+        return Err(shinu_client::Error::http(status, body).to_string());
     }
+    let mut stdout = io::stdout();
+    let mut stderr = io::stderr();
+    stream_ndjson(&mut response, &mut stdout, &mut stderr)
 }
 
-fn parse_port(value: &str) -> Result<u16, String> {
-    let port = value
-        .parse::<u16>()
-        .map_err(|_| format!("invalid endpoint port {value:?}"))?;
-    if port == 0 {
-        return Err("endpoint port must be between 1 and 65535".to_string());
+fn push_file(
+    client: &Client,
+    space: &str,
+    local_path: &str,
+    guest_path: &str,
+) -> Result<u64, String> {
+    let mut source = upload_source(local_path)?;
+    let target = format!(
+        "/v1/spaces/{}/push?path={}",
+        shinu_client::encode_path_segment(space),
+        shinu_client::encode_query_value(guest_path)
+    );
+    let mut stream = client
+        .start_request("POST", &target, source.length, false)
+        .map_err(|error| error.to_string())?;
+    copy_upload(&mut source.file, &mut stream, source.length)?;
+    stream.flush().map_err(|error| error.to_string())?;
+    let mut response = Client::read_response(stream).map_err(|error| error.to_string())?;
+    let body = response.read_body().map_err(|error| error.to_string())?;
+    let status = response.head().status;
+    if !(200..300).contains(&status) {
+        return Err(shinu_client::Error::http(status, body).to_string());
     }
-    Ok(port)
+    let response = response_value_from_body(&body)?;
+    response
+        .get("bytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "push response did not include a byte count".to_string())
 }
 
-#[derive(Clone)]
-struct HttpClient {
-    endpoint: Endpoint,
-    token: String,
-}
-
-struct HttpResponse {
-    status: u16,
-    body: Vec<u8>,
-}
-
-struct ResponseHead {
-    status: u16,
-    headers: Vec<(String, String)>,
-}
-
-impl HttpClient {
-    fn new(endpoint: Endpoint, token: String) -> Result<Self, String> {
-        if token.is_empty() {
-            return Err("missing bearer token; create one with `shinu token new --project <id>` and set SHINU_TOKEN or pass --token".to_string());
-        }
-        if token.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
-            return Err("token must not contain carriage returns or newlines".to_string());
-        }
-        Ok(Self { endpoint, token })
+fn pull_file(
+    client: &Client,
+    space: &str,
+    guest_path: &str,
+    local_path: &str,
+) -> Result<u64, String> {
+    let target = format!(
+        "/v1/spaces/{}/pull?path={}",
+        shinu_client::encode_path_segment(space),
+        shinu_client::encode_query_value(guest_path)
+    );
+    let mut response = client
+        .open_request("GET", &target, None)
+        .map_err(|error| error.to_string())?;
+    if !response.head().is_success() {
+        let status = response.head().status;
+        let body = response.read_body().map_err(|error| error.to_string())?;
+        return Err(shinu_client::Error::http(status, body).to_string());
     }
-
-    fn request(
-        &self,
-        method: &str,
-        path: &str,
-        body: Option<Value>,
-    ) -> Result<HttpResponse, String> {
-        let body = body
-            .map(|value| serde_json::to_vec(&value).map_err(|error| error.to_string()))
-            .transpose()?;
-        let (mut reader, head) = self.open_request(method, path, body.as_deref())?;
-        let response_body = read_body(&mut reader, &head.headers)?;
-        Ok(HttpResponse {
-            status: head.status,
-            body: response_body,
-        })
-    }
-
-    fn open_request(
-        &self,
-        method: &str,
-        path: &str,
-        body: Option<&[u8]>,
-    ) -> Result<(BufReader<TcpStream>, ResponseHead), String> {
-        let content_length = body.map_or(0, |body| body.len() as u64);
-        let mut stream = self.start_request(method, path, content_length, body.is_some())?;
-        if let Some(body) = body {
-            stream.write_all(body).map_err(|error| error.to_string())?;
-        }
-        stream.flush().map_err(|error| error.to_string())?;
-        Self::read_response(stream)
-    }
-
-    fn start_request(
-        &self,
-        method: &str,
-        path: &str,
-        content_length: u64,
-        json_body: bool,
-    ) -> Result<TcpStream, String> {
-        let mut stream = TcpStream::connect(self.endpoint.connect_address()).map_err(|error| {
-            format!("could not connect to {}: {error}", self.endpoint.authority)
-        })?;
-        let target = self.endpoint.target(path);
-        let content_type = if json_body {
-            "Content-Type: application/json\r\n"
-        } else {
-            ""
-        };
-        let request = format!(
-            "{method} {target} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n{content_type}Content-Length: {content_length}\r\n\r\n",
-            self.endpoint.authority, self.token
-        );
-        stream
-            .write_all(request.as_bytes())
-            .map_err(|error| error.to_string())?;
-        Ok(stream)
-    }
-
-    fn read_response(stream: TcpStream) -> Result<(BufReader<TcpStream>, ResponseHead), String> {
-        let mut reader = BufReader::new(stream);
-        let head = read_response_head(&mut reader)?;
-        Ok((reader, head))
-    }
-    fn open_raw_request(
-        &self,
-        method: &str,
-        path: &str,
-    ) -> Result<(TcpStream, ResponseHead), String> {
-        let mut stream = self.start_request(method, path, 0, false)?;
-        let mut head_bytes = Vec::new();
-        let mut byte = [0u8; 1];
-        while head_bytes.len() < 64 * 1024 {
-            let count = stream.read(&mut byte).map_err(|error| error.to_string())?;
-            if count == 0 {
-                return Err("HTTP response ended before the VNC headers".to_string());
-            }
-            head_bytes.push(byte[0]);
-            if head_bytes.ends_with(b"\r\n\r\n") {
-                let mut cursor = Cursor::new(head_bytes);
-                let head = read_response_head(&mut cursor)?;
-                return Ok((stream, head));
-            }
-        }
-        Err("HTTP response headers exceed 64 KiB".to_string())
-    }
-
-    fn stream_exec(
-        &self,
-        space: &str,
-        command: &[String],
-        stdin_path: Option<&str>,
-        session_id: Option<&str>,
-    ) -> Result<i32, String> {
-        let mut body = json!({ "cmd": command });
-        if let Some(path) = stdin_path {
-            body["stdin"] = Value::String(read_exec_stdin(path)?);
-        }
-        if let Some(session) = session_id {
-            body["session"] = Value::String(session.to_owned());
-        }
-        let encoded = serde_json::to_vec(&body).map_err(|error| error.to_string())?;
-        let (mut reader, head) = self.open_request(
-            "POST",
-            &format!("/v1/spaces/{}/exec", encode_path_segment(space)),
-            Some(&encoded),
-        )?;
-        if !(200..300).contains(&head.status) {
-            let response_body = read_body(&mut reader, &head.headers)?;
-            return Err(http_error(head.status, &response_body));
-        }
-        let mut stdout = io::stdout();
-        let mut stderr = io::stderr();
-        stream_ndjson(&mut reader, &head.headers, &mut stdout, &mut stderr)
-    }
-
-    fn push_file(&self, space: &str, local_path: &str, guest_path: &str) -> Result<u64, String> {
-        let mut source = upload_source(local_path)?;
-        let target = format!(
-            "/v1/spaces/{}/push?path={}",
-            encode_path_segment(space),
-            encode_query_value(guest_path)
-        );
-        let mut stream = self.start_request("POST", &target, source.length, false)?;
-        copy_upload(&mut source.file, &mut stream, source.length)?;
-        stream.flush().map_err(|error| error.to_string())?;
-        let (mut reader, head) = Self::read_response(stream)?;
-        let response_body = read_body(&mut reader, &head.headers)?;
-        if !(200..300).contains(&head.status) {
-            return Err(http_error(head.status, &response_body));
-        }
-        let response = response_value_from_body(&response_body)?;
-        response
-            .get("bytes")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| "push response did not include a byte count".to_string())
-    }
-
-    fn pull_file(&self, space: &str, guest_path: &str, local_path: &str) -> Result<u64, String> {
-        let target = format!(
-            "/v1/spaces/{}/pull?path={}",
-            encode_path_segment(space),
-            encode_query_value(guest_path)
-        );
-        let (mut reader, head) = self.open_request("GET", &target, None)?;
-        if !(200..300).contains(&head.status) {
-            let response_body = read_body(&mut reader, &head.headers)?;
-            return Err(http_error(head.status, &response_body));
-        }
-        if local_path == "-" {
-            let stdout = io::stdout();
-            let mut output = stdout.lock();
-            stream_body(&mut reader, &head.headers, &mut output)
-        } else {
-            let mut output = File::create(local_path)
-                .map_err(|error| format!("could not create {local_path:?}: {error}"))?;
-            stream_body(&mut reader, &head.headers, &mut output)
-        }
-    }
-    fn proxy_once(&self, space: &str, port: u16, path: &str) -> Result<i32, String> {
-        if port == 0 {
-            return Err("proxy port must be between 1 and 65535".to_string());
-        }
-        if !path.starts_with('/')
-            || path
-                .bytes()
-                .any(|byte| byte.is_ascii_control() || byte == b' ')
-        {
-            return Err(
-                "proxy path must start with / and contain no control characters".to_string(),
-            );
-        }
-        let target = format!(
-            "/v1/spaces/{}/proxy/{port}{path}",
-            encode_path_segment(space)
-        );
-        let (mut reader, head) = self.open_request("GET", &target, None)?;
-        let body = read_body(&mut reader, &head.headers)?;
+    if local_path == "-" {
         let stdout = io::stdout();
         let mut output = stdout.lock();
-        writeln!(output, "HTTP/1.1 {}", head.status).map_err(|error| error.to_string())?;
-        for (name, value) in &head.headers {
-            writeln!(output, "{name}: {value}").map_err(|error| error.to_string())?;
-        }
-        output
-            .write_all(b"\r\n")
-            .map_err(|error| error.to_string())?;
-        output.write_all(&body).map_err(|error| error.to_string())?;
-        output.flush().map_err(|error| error.to_string())?;
-        Ok(i32::from(!(200..300).contains(&head.status)))
+        stream_pull_body(&mut response, &mut output)
+    } else {
+        let mut output = File::create(local_path)
+            .map_err(|error| format!("could not create {local_path:?}: {error}"))?;
+        stream_pull_body(&mut response, &mut output)
     }
+}
 
-    fn proxy_vnc(&self, space: &str, port: u16) -> Result<i32, String> {
-        let listener = TcpListener::bind(("127.0.0.1", port))
-            .map_err(|error| format!("could not listen on localhost:{port}: {error}"))?;
-        let address = listener
-            .local_addr()
-            .map_err(|error| format!("could not inspect VNC listener address: {error}"))?;
-        println!("VNC proxy listening on {address}");
-        for incoming in listener.incoming() {
-            let local =
-                incoming.map_err(|error| format!("could not accept VNC client: {error}"))?;
-            let client = self.clone();
-            let space = space.to_owned();
-            thread::spawn(move || {
-                if let Err(error) = client.proxy_vnc_connection(&space, local) {
-                    eprintln!("VNC connection: {error}");
-                }
-            });
-        }
-        Ok(0)
-    }
-
-    fn proxy_vnc_connection(&self, space: &str, mut local: TcpStream) -> Result<(), String> {
-        let path = format!("/v1/spaces/{}/vnc", encode_path_segment(space));
-        let (mut remote, head) = self.open_raw_request("GET", &path)?;
-        if !(200..300).contains(&head.status) {
-            let mut reader = BufReader::new(remote);
-            let body = read_body(&mut reader, &head.headers)?;
-            return Err(http_error(head.status, &body));
-        }
-
-        let mut client_reader = local
-            .try_clone()
-            .map_err(|error| format!("could not clone VNC client stream: {error}"))?;
-        let mut remote_writer = remote
-            .try_clone()
-            .map_err(|error| format!("could not clone VNC endpoint stream: {error}"))?;
-        let stop_client_reader = Arc::new(AtomicBool::new(false));
-        let stop_client_reader_thread = Arc::clone(&stop_client_reader);
-        let client_thread = thread::spawn(move || {
-            // Do not half-close either socket: Firecracker's vsock
-            // multiplexer treats that as closing both directions.
-            if client_reader
-                .set_read_timeout(Some(Duration::from_millis(100)))
-                .is_err()
-            {
-                return;
+fn stream_pull_body(response: &mut ResponseStream, output: &mut impl Write) -> Result<u64, String> {
+    let mut total = 0u64;
+    response
+        .stream_body(|fragment| {
+            output.write_all(fragment).map_err(|error| {
+                shinu_client::Error::invalid(format!("could not write pull output: {error}"))
+            })?;
+            total = total
+                .checked_add(u64::try_from(fragment.len()).unwrap_or(u64::MAX))
+                .ok_or_else(|| shinu_client::Error::invalid("pull response was too large"))?;
+            Ok(())
+        })
+        .map_err(|error| {
+            let message = error.to_string();
+            if message == "HTTP response body ended before Content-Length" {
+                "pull HTTP body ended before Content-Length".to_owned()
+            } else {
+                message
             }
-            let mut buffer = [0u8; 64 * 1024];
-            loop {
-                match client_reader.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(count) => {
-                        if remote_writer.write_all(&buffer[..count]).is_err() {
-                            break;
-                        }
-                    }
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                        ) =>
-                    {
-                        if stop_client_reader_thread.load(Ordering::Acquire) {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
+        })?;
+    output
+        .flush()
+        .map_err(|error| format!("could not flush pull output: {error}"))?;
+    Ok(total)
+}
+
+fn proxy_once(client: &Client, space: &str, port: u16, path: &str) -> Result<i32, String> {
+    if port == 0 {
+        return Err("proxy port must be between 1 and 65535".to_string());
+    }
+    if !path.starts_with('/')
+        || path
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte == b' ')
+    {
+        return Err("proxy path must start with / and contain no control characters".to_string());
+    }
+    let target = format!(
+        "/v1/spaces/{}/proxy/{port}{path}",
+        shinu_client::encode_path_segment(space)
+    );
+    let mut response = client
+        .open_request("GET", &target, None)
+        .map_err(|error| error.to_string())?;
+    let body = response.read_body().map_err(|error| error.to_string())?;
+    let head = response.head();
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    writeln!(output, "HTTP/1.1 {}", head.status).map_err(|error| error.to_string())?;
+    for (name, value) in &head.headers {
+        writeln!(output, "{name}: {value}").map_err(|error| error.to_string())?;
+    }
+    output
+        .write_all(b"\r\n")
+        .map_err(|error| error.to_string())?;
+    output.write_all(&body).map_err(|error| error.to_string())?;
+    output.flush().map_err(|error| error.to_string())?;
+    Ok(i32::from(!(200..300).contains(&head.status)))
+}
+
+fn proxy_vnc(client: &Client, space: &str, port: u16) -> Result<i32, String> {
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .map_err(|error| format!("could not listen on localhost:{port}: {error}"))?;
+    let address = listener
+        .local_addr()
+        .map_err(|error| format!("could not inspect VNC listener address: {error}"))?;
+    println!("VNC proxy listening on {address}");
+    for incoming in listener.incoming() {
+        let local = incoming.map_err(|error| format!("could not accept VNC client: {error}"))?;
+        let client = client.clone();
+        let space = space.to_owned();
+        thread::spawn(move || {
+            if let Err(error) = proxy_vnc_connection(&client, &space, local) {
+                eprintln!("VNC connection: {error}");
             }
         });
+    }
+    Ok(0)
+}
 
+fn proxy_vnc_connection(client: &Client, space: &str, mut local: TcpStream) -> Result<(), String> {
+    let path = format!(
+        "/v1/spaces/{}/vnc",
+        shinu_client::encode_path_segment(space)
+    );
+    let (mut remote, head) = client.open_raw_request("GET", &path).map_err(|error| {
+        let message = error.to_string();
+        if message == "HTTP response ended before the response headers" {
+            "HTTP response ended before the VNC headers".to_owned()
+        } else {
+            message
+        }
+    })?;
+    if !head.is_success() {
+        let mut reader = BufReader::new(remote);
+        let body =
+            shinu_client::read_body(&mut reader, &head).map_err(|error| error.to_string())?;
+        return Err(shinu_client::Error::http(head.status, body).to_string());
+    }
+
+    let mut client_reader = local
+        .try_clone()
+        .map_err(|error| format!("could not clone VNC client stream: {error}"))?;
+    let mut remote_writer = remote
+        .try_clone()
+        .map_err(|error| format!("could not clone VNC endpoint stream: {error}"))?;
+    let stop_client_reader = Arc::new(AtomicBool::new(false));
+    let stop_client_reader_thread = Arc::clone(&stop_client_reader);
+    let client_thread = thread::spawn(move || {
+        // Do not half-close either socket: Firecracker's vsock multiplexer treats that as closing both directions.
+        if client_reader
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .is_err()
+        {
+            return;
+        }
         let mut buffer = [0u8; 64 * 1024];
         loop {
-            match remote.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
+            match client_reader.read(&mut buffer) {
+                Ok(0) => break,
                 Ok(count) => {
-                    if local.write_all(&buffer[..count]).is_err() {
+                    if remote_writer.write_all(&buffer[..count]).is_err() {
                         break;
                     }
                 }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    if stop_client_reader_thread.load(Ordering::Acquire) {
+                        break;
+                    }
+                }
+                Err(_) => break,
             }
         }
-        stop_client_reader.store(true, Ordering::Release);
-        let _ = client_thread.join();
-        Ok(())
-    }
-}
+    });
 
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        match remote.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(count) => {
+                if local.write_all(&buffer[..count]).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    stop_client_reader.store(true, Ordering::Release);
+    let _ = client_thread.join();
+    Ok(())
+}
 struct UploadSource {
     file: File,
     length: u64,
@@ -754,13 +592,8 @@ fn read_exec_stdin(path: &str) -> Result<String, String> {
     }
 }
 
-fn client_from_options(
-    endpoint: Option<String>,
-    token: Option<String>,
-) -> Result<HttpClient, String> {
-    let endpoint = endpoint
-        .or_else(|| std::env::var("SHINU_ENDPOINT").ok())
-        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
+fn client_from_options(endpoint: Option<String>, token: Option<String>) -> Result<Client, String> {
+    let endpoint = endpoint.unwrap_or_else(shinu_client::endpoint_value_from_env_preserving_empty);
     let token = token
         .or_else(|| std::env::var("SHINU_TOKEN").ok())
         .filter(|value| !value.is_empty())
@@ -768,7 +601,11 @@ fn client_from_options(
             "missing bearer token; create one with `shinu token new --project <id>` and set SHINU_TOKEN or pass --token"
                 .to_string()
         })?;
-    HttpClient::new(Endpoint::parse(&endpoint)?, token)
+    Client::new(
+        Endpoint::parse(&endpoint).map_err(|error| error.to_string())?,
+        token,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn run() -> Result<i32, String> {
@@ -953,7 +790,7 @@ fn limits_set_body(
     Ok(Value::Object(object))
 }
 
-fn run_command(client: &HttpClient, command: Command) -> Result<i32, String> {
+fn run_command(client: &Client, command: Command) -> Result<i32, String> {
     match command {
         Command::New {
             name,
@@ -963,7 +800,8 @@ fn run_command(client: &HttpClient, command: Command) -> Result<i32, String> {
             disk,
             network,
         } => {
-            let data = response_value(client.request(
+            let data = response_value(request_json(
+                client,
                 "POST",
                 "/v1/spaces",
                 Some(create_space_body(&name, image, vcpus, mem, disk, network)),
@@ -976,7 +814,8 @@ fn run_command(client: &HttpClient, command: Command) -> Result<i32, String> {
             mem,
             disk,
         } => {
-            let data = response_value(client.request(
+            let data = response_value(request_json(
+                client,
                 "PATCH",
                 &format!("/v1/spaces/{}", encode_path_segment(&space)),
                 Some(resize_space_body(vcpus, mem, disk)?),
@@ -984,12 +823,12 @@ fn run_command(client: &HttpClient, command: Command) -> Result<i32, String> {
             print_space_summary(&data);
         }
         Command::Images => {
-            let response = client.request("GET", "/v1/images", None)?;
+            let response = request_json(client, "GET", "/v1/images", None)?;
             let body = successful_body(response)?;
             print_images(&response_value_from_body(&body)?);
         }
         Command::Ls { json } => {
-            let response = client.request("GET", "/v1/spaces", None)?;
+            let response = request_json(client, "GET", "/v1/spaces", None)?;
             let body = successful_body(response)?;
             if json {
                 print_raw_json(&body)?;
@@ -998,12 +837,13 @@ fn run_command(client: &HttpClient, command: Command) -> Result<i32, String> {
             }
         }
         Command::Network { name } => {
-            let response = client.request("GET", "/v1/spaces", None)?;
+            let response = request_json(client, "GET", "/v1/spaces", None)?;
             let body = successful_body(response)?;
             print_network(&response_value_from_body(&body)?, &name)?;
         }
         Command::Rm { space } => {
-            let data = response_value(client.request(
+            let data = response_value(request_json(
+                client,
                 "DELETE",
                 &format!("/v1/spaces/{}", encode_path_segment(&space)),
                 None,
@@ -1011,7 +851,8 @@ fn run_command(client: &HttpClient, command: Command) -> Result<i32, String> {
             println!("removed {}", field_text(&data, "removed"));
         }
         Command::Start { space } => {
-            let data = response_value(client.request(
+            let data = response_value(request_json(
+                client,
                 "POST",
                 &format!("/v1/spaces/{}/start", encode_path_segment(&space)),
                 None,
@@ -1023,7 +864,8 @@ fn run_command(client: &HttpClient, command: Command) -> Result<i32, String> {
             }
         }
         Command::Stop { space } => {
-            let data = response_value(client.request(
+            let data = response_value(request_json(
+                client,
                 "POST",
                 &format!("/v1/spaces/{}/stop", encode_path_segment(&space)),
                 None,
@@ -1063,28 +905,28 @@ else
 fi"#
                 .to_owned(),
             ];
-            let status = client.stream_exec(&space, &command, None, None)?;
+            let status = stream_exec(client, &space, &command, None, None)?;
             if status == 0 {
                 println!("desktop services enabled and running for {space}");
             }
             return Ok(status);
         }
-        Command::Proxy { space, port, path } => return client.proxy_once(&space, port, &path),
-        Command::Vnc { space, port } => return client.proxy_vnc(&space, port),
+        Command::Proxy { space, port, path } => return proxy_once(client, &space, port, &path),
+        Command::Vnc { space, port } => return proxy_vnc(client, &space, port),
         Command::Exec {
             space,
             stdin,
             session,
             cmd,
         } => {
-            return client.stream_exec(&space, &cmd, stdin.as_deref(), session.as_deref());
+            return stream_exec(client, &space, &cmd, stdin.as_deref(), session.as_deref());
         }
         Command::Push {
             space,
             local_file,
             guest_path,
         } => {
-            let bytes = client.push_file(&space, &local_file, &guest_path)?;
+            let bytes = push_file(client, &space, &local_file, &guest_path)?;
             println!("pushed {bytes} bytes to {guest_path}");
         }
         Command::Pull {
@@ -1092,7 +934,7 @@ fi"#
             guest_path,
             local_file,
         } => {
-            let bytes = client.pull_file(&space, &guest_path, &local_file)?;
+            let bytes = pull_file(client, &space, &guest_path, &local_file)?;
             if local_file == "-" {
                 eprintln!("pulled {bytes} bytes");
             } else {
@@ -1112,7 +954,8 @@ fi"#
                 (false, false) => SnapshotMode::None,
                 (true, true) => unreachable!("clap rejects --full with --diff"),
             };
-            let data = response_value(client.request(
+            let data = response_value(request_json(
+                client,
                 "POST",
                 &format!("/v1/spaces/{}/commits", encode_path_segment(&space)),
                 Some(json!({ "note": note, "hot": hot, "snapshot": snapshot })),
@@ -1124,7 +967,8 @@ fi"#
             );
         }
         Command::Log { space, json } => {
-            let response = client.request(
+            let response = request_json(
+                client,
                 "GET",
                 &format!("/v1/spaces/{}/log", encode_path_segment(&space)),
                 None,
@@ -1137,7 +981,8 @@ fi"#
             }
         }
         Command::Reflog { space, json } => {
-            let response = client.request(
+            let response = request_json(
+                client,
                 "GET",
                 &format!("/v1/spaces/{}/reflog", encode_path_segment(&space)),
                 None,
@@ -1171,11 +1016,12 @@ fi"#
             query.push(format!("limit={limit}"));
             path.push('?');
             path.push_str(&query.join("&"));
-            let data = response_value(client.request("GET", &path, None)?)?;
+            let data = response_value(request_json(client, "GET", &path, None)?)?;
             print_diff(&data);
         }
         Command::Checkout { space, commit } => {
-            let data = response_value(client.request(
+            let data = response_value(request_json(
+                client,
                 "POST",
                 &format!("/v1/spaces/{}/checkout", encode_path_segment(&space)),
                 Some(json!({ "commit": commit.to_string() })),
@@ -1187,7 +1033,8 @@ fi"#
             );
         }
         Command::Fork { commit, name } => {
-            let data = response_value(client.request(
+            let data = response_value(request_json(
+                client,
                 "POST",
                 &format!("/v1/commits/{commit}/fork"),
                 Some(json!({ "name": name })),
@@ -1195,7 +1042,8 @@ fi"#
             print_space_summary(&data);
         }
         Command::RmCkpt { commit } => {
-            let data = response_value(client.request(
+            let data = response_value(request_json(
+                client,
                 "DELETE",
                 &format!("/v1/commits/{commit}"),
                 None,
@@ -1206,7 +1054,8 @@ fi"#
             free_below,
             dry_run,
         } => {
-            let data = response_value(client.request(
+            let data = response_value(request_json(
+                client,
                 "POST",
                 "/v1/gc",
                 Some(json!({ "free_below": free_below, "dry_run": dry_run })),
@@ -1231,7 +1080,7 @@ fi"#
         }
         Command::Usage { from, to, json } => {
             let path = usage_path(from, to);
-            let response = client.request("GET", &path, None)?;
+            let response = request_json(client, "GET", &path, None)?;
             let body = successful_body(response)?;
             if json {
                 print_raw_json(&body)?;
@@ -1243,7 +1092,7 @@ fi"#
             command: None,
             json,
         } => {
-            let response = client.request("GET", "/v1/limits", None)?;
+            let response = request_json(client, "GET", "/v1/limits", None)?;
             let body = successful_body(response)?;
             if json {
                 print_raw_json(&body)?;
@@ -1264,7 +1113,8 @@ fi"#
             json,
         } => {
             let path = format!("/v1/projects/{}/limits", encode_path_segment(&project));
-            let response = client.request(
+            let response = request_json(
+                client,
                 "PATCH",
                 &path,
                 Some(limits_set_body(
@@ -1287,7 +1137,7 @@ fi"#
             json,
         } => {
             let path = format!("/v1/projects/{}/limits", encode_path_segment(&project));
-            let response = client.request("DELETE", &path, None)?;
+            let response = request_json(client, "DELETE", &path, None)?;
             let body = successful_body(response)?;
             if json {
                 print_raw_json(&body)?;
@@ -1420,16 +1270,15 @@ fn run_token(root: Option<PathBuf>, command: TokenCommand) -> Result<i32, String
     Ok(0)
 }
 
-fn response_value(response: HttpResponse) -> Result<Value, String> {
+fn response_value(response: Response) -> Result<Value, String> {
     response_value_from_body(&successful_body(response)?)
 }
 
-fn successful_body(response: HttpResponse) -> Result<Vec<u8>, String> {
-    if (200..300).contains(&response.status) {
-        Ok(response.body)
-    } else {
-        Err(http_error(response.status, &response.body))
-    }
+fn successful_body(response: Response) -> Result<Vec<u8>, String> {
+    response
+        .into_success()
+        .map(|response| response.body)
+        .map_err(|error| error.to_string())
 }
 
 fn response_value_from_body(body: &[u8]) -> Result<Value, String> {
@@ -1437,21 +1286,6 @@ fn response_value_from_body(body: &[u8]) -> Result<Value, String> {
         Ok(Value::Null)
     } else {
         serde_json::from_slice(body).map_err(|error| format!("invalid JSON response: {error}"))
-    }
-}
-
-fn http_error(status: u16, body: &[u8]) -> String {
-    if let Ok(value) = serde_json::from_slice::<Value>(body)
-        && let Some(message) = value.get("error").and_then(Value::as_str)
-    {
-        return format!("HTTP {status}: {message}");
-    }
-    let detail = String::from_utf8_lossy(body);
-    let detail = detail.trim();
-    if detail.is_empty() {
-        format!("HTTP {status}")
-    } else {
-        format!("HTTP {status}: {detail}")
     }
 }
 
@@ -1752,275 +1586,26 @@ fn table(headers: &[&str], rows: &[Vec<String>]) {
     }
 }
 
-fn encode_path_segment(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            encoded.push(byte as char);
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    encoded
-}
-
-fn encode_query_value(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            encoded.push(byte as char);
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    encoded
-}
-
-fn read_response_head<R: BufRead>(reader: &mut R) -> Result<ResponseHead, String> {
-    let mut status_line = String::new();
-    if reader
-        .read_line(&mut status_line)
-        .map_err(|error| error.to_string())?
-        == 0
-    {
-        return Err("HTTP response ended before the status line".to_string());
-    }
-    let status = parse_status_line(&status_line)?;
-    let mut headers = Vec::new();
-    let mut line = String::new();
-    loop {
-        line.clear();
-        if reader
-            .read_line(&mut line)
-            .map_err(|error| error.to_string())?
-            == 0
-        {
-            return Err("HTTP response ended before the headers".to_string());
-        }
-        if line == "\r\n" || line == "\n" {
-            break;
-        }
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| "malformed HTTP response header".to_string())?;
-        headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
-    }
-    Ok(ResponseHead { status, headers })
-}
-
-fn parse_status_line(line: &str) -> Result<u16, String> {
-    let mut fields = line.trim_end_matches(&['\r', '\n'][..]).splitn(3, ' ');
-    let version = fields.next().unwrap_or_default();
-    if !version.starts_with("HTTP/1.") {
-        return Err(format!("unsupported HTTP status line: {line:?}"));
-    }
-    let code = fields
-        .next()
-        .ok_or_else(|| "HTTP status line is missing a status code".to_string())?;
-    if code.len() != 3 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(format!("invalid HTTP status code: {code:?}"));
-    }
-    let status = code
-        .parse::<u16>()
-        .map_err(|error| format!("invalid HTTP status code: {error}"))?;
-    if !(100..=599).contains(&status) {
-        return Err(format!("invalid HTTP status code: {status}"));
-    }
-    Ok(status)
-}
-
-fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.as_str())
-}
-
-fn is_chunked(headers: &[(String, String)]) -> bool {
-    header(headers, "transfer-encoding").is_some_and(|value| {
-        value
-            .split(',')
-            .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"))
-    })
-}
-
-fn content_length(headers: &[(String, String)]) -> Result<Option<usize>, String> {
-    header(headers, "content-length")
-        .map(|value| {
-            value
-                .parse::<usize>()
-                .map_err(|error| format!("invalid Content-Length: {error}"))
-        })
-        .transpose()
-}
-
-fn read_body<R: BufRead>(reader: &mut R, headers: &[(String, String)]) -> Result<Vec<u8>, String> {
-    if is_chunked(headers) {
-        let mut body = Vec::new();
-        read_chunked(reader, |chunk| {
-            body.extend_from_slice(chunk);
-            Ok(())
-        })?;
-        return Ok(body);
-    }
-    if let Some(length) = content_length(headers)? {
-        let mut body = vec![0u8; length];
-        reader
-            .read_exact(&mut body)
-            .map_err(|error| error.to_string())?;
-        return Ok(body);
-    }
-    let mut body = Vec::new();
-    reader
-        .read_to_end(&mut body)
-        .map_err(|error| error.to_string())?;
-    Ok(body)
-}
-fn stream_body<R: BufRead, W: Write>(
-    reader: &mut R,
-    headers: &[(String, String)],
-    output: &mut W,
-) -> Result<u64, String> {
-    let mut total = 0u64;
-    let mut write_fragment = |fragment: &[u8]| {
-        output
-            .write_all(fragment)
-            .map_err(|error| format!("could not write pull output: {error}"))?;
-        total = total
-            .checked_add(fragment.len() as u64)
-            .ok_or_else(|| "pull response was too large".to_string())?;
-        Ok(())
-    };
-    if is_chunked(headers) {
-        read_chunked(reader, &mut write_fragment)?;
-    } else if let Some(length) = content_length(headers)? {
-        let mut remaining = length;
-        let mut buffer = [0u8; 8192];
-        while remaining > 0 {
-            let amount = remaining.min(buffer.len());
-            let count = reader
-                .read(&mut buffer[..amount])
-                .map_err(|error| error.to_string())?;
-            if count == 0 {
-                return Err("pull HTTP body ended before Content-Length".to_string());
-            }
-            write_fragment(&buffer[..count])?;
-            remaining -= count;
-        }
-    } else {
-        let mut buffer = [0u8; 8192];
-        loop {
-            let count = reader
-                .read(&mut buffer)
-                .map_err(|error| error.to_string())?;
-            if count == 0 {
-                break;
-            }
-            write_fragment(&buffer[..count])?;
-        }
-    }
-    output
-        .flush()
-        .map_err(|error| format!("could not flush pull output: {error}"))?;
-    Ok(total)
-}
-
-fn read_chunked<R: BufRead, F>(reader: &mut R, mut on_chunk: F) -> Result<(), String>
-where
-    F: FnMut(&[u8]) -> Result<(), String>,
-{
-    let mut line = String::new();
-    loop {
-        line.clear();
-        if reader
-            .read_line(&mut line)
-            .map_err(|error| error.to_string())?
-            == 0
-        {
-            return Err("chunked HTTP body ended before a chunk size".to_string());
-        }
-        let size_text = line
-            .trim_end_matches(&['\r', '\n'][..])
-            .split(';')
-            .next()
-            .unwrap_or_default()
-            .trim();
-        let size = usize::from_str_radix(size_text, 16)
-            .map_err(|error| format!("invalid chunk size {size_text:?}: {error}"))?;
-        if size == 0 {
-            loop {
-                line.clear();
-                if reader
-                    .read_line(&mut line)
-                    .map_err(|error| error.to_string())?
-                    == 0
-                {
-                    return Err("chunked HTTP body ended before trailers".to_string());
-                }
-                if line == "\r\n" || line == "\n" {
-                    return Ok(());
-                }
-            }
-        }
-        let mut remaining = size;
-        let mut buffer = [0u8; 8192];
-        while remaining > 0 {
-            let amount = remaining.min(buffer.len());
-            reader
-                .read_exact(&mut buffer[..amount])
-                .map_err(|error| error.to_string())?;
-            on_chunk(&buffer[..amount])?;
-            remaining -= amount;
-        }
-        let mut line_end = [0u8; 2];
-        reader
-            .read_exact(&mut line_end)
-            .map_err(|error| error.to_string())?;
-        if line_end != *b"\r\n" {
-            return Err("chunked HTTP body is missing its CRLF".to_string());
-        }
-    }
-}
-
-fn stream_ndjson<R: BufRead>(
-    reader: &mut R,
-    headers: &[(String, String)],
+fn stream_ndjson(
+    response: &mut ResponseStream,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<i32, String> {
     let mut pending = Vec::new();
     let mut exit_code = None;
-    let mut feed =
-        |fragment: &[u8]| feed_ndjson(fragment, &mut pending, &mut exit_code, stdout, stderr);
-
-    if is_chunked(headers) {
-        read_chunked(reader, &mut feed)?;
-    } else if let Some(length) = content_length(headers)? {
-        let mut remaining = length;
-        let mut buffer = [0u8; 8192];
-        while remaining > 0 {
-            let amount = remaining.min(buffer.len());
-            let count = reader
-                .read(&mut buffer[..amount])
-                .map_err(|error| error.to_string())?;
-            if count == 0 {
-                return Err("exec HTTP body ended before Content-Length".to_string());
+    response
+        .stream_body(|fragment| {
+            feed_ndjson(fragment, &mut pending, &mut exit_code, stdout, stderr)
+                .map_err(shinu_client::Error::from)
+        })
+        .map_err(|error| {
+            let message = error.to_string();
+            if message == "HTTP response body ended before Content-Length" {
+                "exec HTTP body ended before Content-Length".to_owned()
+            } else {
+                message
             }
-            feed(&buffer[..count])?;
-            remaining -= count;
-        }
-    } else {
-        let mut buffer = [0u8; 8192];
-        loop {
-            let count = reader
-                .read(&mut buffer)
-                .map_err(|error| error.to_string())?;
-            if count == 0 {
-                break;
-            }
-            feed(&buffer[..count])?;
-        }
-    }
+        })?;
 
     if !pending.is_empty() {
         let line = std::str::from_utf8(&pending)
@@ -2139,20 +1724,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_http_status_code() {
-        assert_eq!(parse_status_line("HTTP/1.1 201 Created\r\n").unwrap(), 201);
-    }
-
-    #[test]
     fn rejects_control_characters_in_endpoint_base_path() {
         assert!(Endpoint::parse("http://127.0.0.1:7878/base\r\nX-Injected: yes").is_err());
-    }
-    #[test]
-    fn encodes_query_values_without_leaking_reserved_path_bytes() {
-        assert_eq!(
-            encode_query_value("/root/a b?x&y=#%é"),
-            "%2Froot%2Fa%20b%3Fx%26y%3D%23%25%C3%A9"
-        );
     }
 
     #[test]

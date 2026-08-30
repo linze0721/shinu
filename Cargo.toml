@@ -20,6 +20,7 @@ shinu-crypto = { path = "crates/shinu-crypto" }
 shinu-image = { path = "crates/shinu-image" }
 shinu-vm = { path = "crates/shinu-vm" }
 shinu-proto = { path = "crates/shinu-proto" }
+shinu-client = { path = "crates/shinu-client" }
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = { level = "deny", priority = 0 }
 unused_must_use = { level = "deny", priority = 0 }
@@ -101,3 +102,4 @@ shinu-crypto.workspace = true
 shinu-image.workspace = true
 shinu-vm.workspace = true
 shinu-proto.workspace = true
+shinu-client.workspace = true

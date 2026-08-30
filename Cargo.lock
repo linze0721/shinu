@@ -454,6 +454,7 @@ dependencies = [
  "clap",
  "rusqlite",
  "serde_json",
+ "shinu-client",
  "shinu-core",
  "shinu-crypto",
  "shinu-image",
@@ -461,6 +462,13 @@ dependencies = [
  "shinu-store",
  "shinu-vm",
  "uuid",
+]
+
+[[package]]
+name = "shinu-client"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]

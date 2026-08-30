@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use shinu_core::{cache_dir, Error, Image, Result};
+use shinu_core::{Error, Image, Result, cache_dir};
 
 /// Where the guest rootfs comes from. Read from the environment so no config
 /// file format has to exist.
@@ -39,12 +39,10 @@ impl BaseConfig {
     }
 }
 
-const UBUNTU_RELEASE_URL: &str =
-    "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/";
+const UBUNTU_RELEASE_URL: &str = "https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/";
 const ARCH_BOOTSTRAP_URL: &str =
     "https://geo.mirror.pkgbuild.com/iso/latest/archlinux-bootstrap-x86_64.tar.zst";
-const ROCKY_CONTAINER_URL: &str =
-    "https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-Container-Base.latest.x86_64.tar.xz";
+const ROCKY_CONTAINER_URL: &str = "https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-Container-Base.latest.x86_64.tar.xz";
 
 fn uname_machine() -> Result<String> {
     let output = std::process::Command::new("uname").arg("-m").output()?;
@@ -94,7 +92,10 @@ fn pick_ubuntu_tarball_name(index: &str) -> Result<String> {
     let suffix = "-base-amd64.tar.gz";
     let mut best: Option<(u32, &str)> = None;
     for token in index.split(|c: char| !(c.is_ascii_alphanumeric() || "-_.".contains(c))) {
-        let Some(point) = token.strip_prefix(prefix).and_then(|rest| rest.strip_suffix(suffix)) else {
+        let Some(point) = token
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(suffix))
+        else {
             continue;
         };
         let Ok(point) = point.parse::<u32>() else {
@@ -127,7 +128,7 @@ mod base_tests {
         oci_layer_member, oci_manifest_member, pick_sha256, pick_tarball_name,
         pick_ubuntu_tarball_name,
     };
-    use shinu_core::{base_path, migrate_base, Error, Image};
+    use shinu_core::{Error, Image, base_path, migrate_base};
 
     /// Shape copied from the live mirror index.
     const INDEX: &str = r#"<a href="void-x86_64-ROOTFS-20240314.tar.xz">void-x86_64-ROOTFS-20240314.tar.xz</a>
@@ -178,8 +179,7 @@ mod base_tests {
                 format!("\"{id}\"")
             );
             assert_eq!(
-                serde_json::from_str::<Image>(&format!("\"{id}\""))
-                    .expect("image JSON parse"),
+                serde_json::from_str::<Image>(&format!("\"{id}\"")).expect("image JSON parse"),
                 image
             );
         }
@@ -188,14 +188,19 @@ mod base_tests {
     #[test]
     fn image_parser_names_the_valid_ids() {
         let error = "debian".parse::<Image>().expect_err("unknown image");
-        assert!(matches!(error, Error::Invalid(message) if message.contains("void, ubuntu, arch, rocky")));
+        assert!(
+            matches!(error, Error::Invalid(message) if message.contains("void, ubuntu, arch, rocky"))
+        );
     }
 
     #[test]
     fn base_paths_are_explicit_per_image() {
         let root = std::path::Path::new("/var/lib/shinu");
         assert_eq!(base_path(root, Image::Void), root.join("base-void.ext4"));
-        assert_eq!(base_path(root, Image::Ubuntu), root.join("base-ubuntu.ext4"));
+        assert_eq!(
+            base_path(root, Image::Ubuntu),
+            root.join("base-ubuntu.ext4")
+        );
         assert_eq!(base_path(root, Image::Arch), root.join("base-arch.ext4"));
         assert_eq!(base_path(root, Image::Rocky), root.join("base-rocky.ext4"));
     }
@@ -270,8 +275,8 @@ pub(super) fn sha256_file(path: &Path) -> Result<String> {
 
 /// Returns the cached rootfs archive for one image, downloading it lazily.
 ///
-/// Void retains its signed-by-index digest flow. The other verified sources
-/// publish a stable release URL (Ubuntu's point release is selected from its
+/// Void retains its signed-by-index digest flow. The remaining sources are
+/// fetched from stable HTTPS URLs (Ubuntu's point release is selected from its
 /// directory listing), so their archives are cached by filename.
 pub(super) fn fetch_tarball(root: &Path, image: Image, cfg: &BaseConfig) -> Result<PathBuf> {
     if let Some(path) = &cfg.tarball {
@@ -290,34 +295,35 @@ pub(super) fn fetch_tarball(root: &Path, image: Image, cfg: &BaseConfig) -> Resu
         Image::Void => {
             let index_url = cfg.void_index_url();
             let name = pick_tarball_name(&curl_text(&index_url)?, &cfg.arch)?;
-            let digest = pick_sha256(
-                &curl_text(&format!("{index_url}sha256sum.txt"))?,
-                &name,
-            )?;
+            let digest = pick_sha256(&curl_text(&format!("{index_url}sha256sum.txt"))?, &name)?;
             let target = cache.join(&name);
             if target.exists() && sha256_file(&target)? == digest {
                 return Ok(target);
             }
             let tmp = cache.join(format!("{name}.part"));
             let _ = std::fs::remove_file(&tmp);
-            let status = std::process::Command::new("curl")
-                .args(["-sSfL", "--max-time", "1800", "-o"])
-                .arg(&tmp)
-                .arg(format!("{index_url}{name}"))
-                .status()?;
-            if !status.success() {
+            let result = (|| -> Result<PathBuf> {
+                let status = std::process::Command::new("curl")
+                    .args(["-sSfL", "--max-time", "1800", "-o"])
+                    .arg(&tmp)
+                    .arg(format!("{index_url}{name}"))
+                    .status()?;
+                if !status.success() {
+                    return Err(Error::Invalid(format!("download failed: {name}")));
+                }
+                let actual = sha256_file(&tmp)?;
+                if actual != digest {
+                    return Err(Error::Invalid(format!(
+                        "sha256 mismatch for {name}: expected {digest}, got {actual}"
+                    )));
+                }
+                std::fs::rename(&tmp, &target)?;
+                Ok(target)
+            })();
+            if result.is_err() {
                 let _ = std::fs::remove_file(&tmp);
-                return Err(Error::Invalid(format!("download failed: {name}")));
             }
-            let actual = sha256_file(&tmp)?;
-            if actual != digest {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(Error::Invalid(format!(
-                    "sha256 mismatch for {name}: expected {digest}, got {actual}"
-                )));
-            }
-            std::fs::rename(tmp, &target)?;
-            Ok(target)
+            result
         }
         Image::Ubuntu => {
             let index = curl_text(UBUNTU_RELEASE_URL)?;
@@ -357,7 +363,9 @@ fn oci_descriptor_member(descriptor: &serde_json::Value, role: &str) -> Result<S
         )));
     };
     if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(Error::Invalid(format!("OCI {role} digest is not valid sha256")));
+        return Err(Error::Invalid(format!(
+            "OCI {role} digest is not valid sha256"
+        )));
     }
     Ok(format!("blobs/sha256/{hex}"))
 }
@@ -447,21 +455,26 @@ mod sums_tests {
         assert!(pick_sums_digest("nothex  ./x\n", "x").is_err());
     }
 }
-/// Download to `<dst>.part` and rename on success, the same anti-truncation
-/// rule [`fetch_tarball`] uses: a half-transferred file must never be mistaken
-/// for a finished one.
+/// Download to a sibling `.part` path and rename on success, the same
+/// anti-truncation rule [`fetch_tarball`] uses: a half-transferred file must
+/// never be mistaken for a finished one.
 pub(super) fn curl_to_file(url: &str, dst: &Path) -> Result<()> {
     let tmp = dst.with_extension("part");
     let _ = std::fs::remove_file(&tmp);
-    let status = std::process::Command::new("curl")
-        .args(["-sSfL", "--max-time", "1800", "-o"])
-        .arg(&tmp)
-        .arg(url)
-        .status()?;
-    if !status.success() {
+    let result = (|| -> Result<()> {
+        let status = std::process::Command::new("curl")
+            .args(["-sSfL", "--max-time", "1800", "-o"])
+            .arg(&tmp)
+            .arg(url)
+            .status()?;
+        if !status.success() {
+            return Err(Error::Invalid(format!("download failed: {url}")));
+        }
+        std::fs::rename(&tmp, dst)?;
+        Ok(())
+    })();
+    if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
-        return Err(Error::Invalid(format!("download failed: {url}")));
     }
-    std::fs::rename(&tmp, dst)?;
-    Ok(())
+    result
 }

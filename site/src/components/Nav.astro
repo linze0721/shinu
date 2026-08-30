@@ -1,0 +1,39 @@
+---
+import { Icon } from "astro-icon/components";
+import { brand, repo } from "../content/facts";
+---
+
+<header class="rule-b sticky top-0 z-40 bg-canvas/80 backdrop-blur-md">
+  <div class="shell flex h-[4.5rem] items-center justify-between gap-6">
+    <a href="#top" class="press flex min-w-0 shrink-0 items-baseline gap-3">
+      <span class="font-mono text-base font-semibold lowercase tracking-tight text-ink"
+        >{brand.name}</span
+      >
+      <span class="hidden whitespace-nowrap text-xs text-ink-muted sm:inline"
+        >{brand.parentLine}</span
+      >
+    </a>
+
+    {
+      repo ? (
+        <a
+          href={repo}
+          target="_blank"
+          rel="noopener noreferrer"
+          aria-label="shinu source repository"
+          class="press shrink-0 text-ink-muted hover:text-jade-600"
+        >
+          <Icon name="ph:git-branch" class="size-5" />
+        </a>
+      ) : (
+        <a
+          href={`mailto:${brand.contact}`}
+          aria-label={`Email ${brand.contact}`}
+          class="press shrink-0 text-ink-muted hover:text-jade-600"
+        >
+          <Icon name="ph:envelope-simple" class="size-5" />
+        </a>
+      )
+    }
+  </div>
+</header>

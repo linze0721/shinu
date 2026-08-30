@@ -453,7 +453,6 @@ dependencies = [
  "chrono",
  "clap",
  "rusqlite",
- "serde",
  "serde_json",
  "shinu-core",
  "shinu-crypto",
@@ -468,7 +467,6 @@ dependencies = [
 name = "shinu-core"
 version = "0.1.0"
 dependencies = [
- "chrono",
  "rusqlite",
  "serde",
  "serde_json",
@@ -490,7 +488,6 @@ dependencies = [
 name = "shinu-image"
 version = "0.1.0"
 dependencies = [
- "serde",
  "serde_json",
  "shinu-core",
  "uuid",
@@ -500,7 +497,6 @@ dependencies = [
 name = "shinu-proto"
 version = "0.1.0"
 dependencies = [
- "chrono",
  "serde",
  "serde_json",
  "shinu-core",
@@ -523,8 +519,6 @@ dependencies = [
 name = "shinu-vm"
 version = "0.1.0"
 dependencies = [
- "chrono",
- "serde",
  "serde_json",
  "shinu-core",
  "shinu-image",

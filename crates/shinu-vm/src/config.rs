@@ -1,7 +1,6 @@
 use crate::net::NetSpec;
-use shinu_core::{env_u32, Image};
+use shinu_core::{Image, env_u32};
 use std::path::Path;
-
 
 /// Per-VM sizing, jail identity, and lifetime, read from the environment.
 #[derive(Debug, Clone, Copy)]
@@ -11,8 +10,7 @@ pub struct VmConfig {
     /// `SHINU_MEM_MIB`
     pub mem_mib: u32,
     /// `SHINU_IDLE_SECS` — a VM with no `Touch` for this long is shut down.
-    /// One hour: an agent often pauses mid-task while a caller thinks, and a
-    /// shorter window kills detached work such as a tmux session or a build.
+    /// The default leaves detached guest work alive across caller pauses.
     pub idle_secs: u64,
     /// `SHINU_JAIL_UID` — non-root uid used by Firecracker inside the jail.
     pub jail_uid: u32,
@@ -34,8 +32,8 @@ impl VmConfig {
 
 /// Firecracker's `--config-file` body. The init path follows the selected
 /// image because Arch's usr-merged `/sbin/init` symlink is not kernel-safe.
-/// The ext4 image boots directly with no initrd, so the guest kernel must have
-/// virtio-blk and ext4 built in.
+/// The ext4 image boots without an initrd, so the guest kernel must include
+/// virtio-blk and ext4.
 pub fn vm_config_json(
     kernel: &Path,
     rootfs: &Path,
@@ -66,23 +64,19 @@ pub fn vm_config_json(
             "is_root_device": true,
             "is_read_only": false
         }],
-        // Every VM owns a private vsock UDS, so the guest CID never has to be
-        // unique across VMs.
+        // Every VM has a private vsock UDS, so guest CID 3 is safe to reuse.
         "vsock": { "vsock_id": "vsock0", "guest_cid": 3, "uds_path": vsock_uds.to_string_lossy() },
-        // Balloon starts empty and only ever inflates while the VM sits idle.
-        // `deflate_on_oom` is what makes that safe: if the guest needs the
-        // memory back before the daemon deflates, the balloon yields instead
-        // of letting the OOM killer run.
-        // Free-page reporting arrived in Firecracker v1.14.0 (PR #5491): it
-        // lets the guest report freed pages continuously so the host can
-        // release them, shrinking resident memory and memory captured in full
-        // snapshots. Upstream marks it as a developer preview, and it does
-        // not replace `vm::reclaim`: `vstate/memory.rs` still discards via
-        // `madvise(MADV_DONTNEED)`, which upstream notes is ineffective for
-        // shared/memfd mappings, so periodic explicit inflate remains the
-        // fallback.
-        "balloon": { "amount_mib": 0, "deflate_on_oom": true, "stats_polling_interval_s": 1, "free_page_reporting": true },
-        // Diff snapshots depend on Firecracker's dirty-page bitmap, which cannot be enabled after boot.
+        // The balloon starts empty. Deflate-on-OOM lets the guest reclaim
+        // memory while the host holds an inflated balloon.
+        // Free-page reporting returns guest-free pages; explicit reclaim is
+        // still needed for page cache and shared or memfd-backed mappings.
+        "balloon": {
+            "amount_mib": 0,
+            "deflate_on_oom": true,
+            "stats_polling_interval_s": 1,
+            "free_page_reporting": true
+        },
+        // Firecracker must enable dirty-page tracking before the VM boots.
         "machine-config": { "vcpu_count": vcpus, "mem_size_mib": mem_mib, "track_dirty_pages": true }
     });
     if let Some(net) = net {
@@ -94,4 +88,3 @@ pub fn vm_config_json(
     }
     config.to_string()
 }
-

@@ -1,9 +1,9 @@
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use shinu_core::{
-    assets_dir, cache_dir, firecracker_bin, jailer_bin, kernel_path, Error, Result, FC_URL,
-    FC_VERSION, KERNEL_URL,
+    Error, FC_URL, FC_VERSION, KERNEL_URL, Result, assets_dir, cache_dir, firecracker_bin,
+    jailer_bin, kernel_path,
 };
 
 use super::fetch::{curl_to_file, pick_sums_digest, sha256_file};
@@ -46,10 +46,8 @@ fn install_from_tarball(tarball: &Path, member: &str, dst: &Path) -> Result<()> 
         }
         // The release carries its own SHA256SUMS, so both binaries are
         // verified against a digest shipped beside the release artifacts.
-        let digest = pick_sums_digest(
-            &std::fs::read_to_string(unpack.join("SHA256SUMS"))?,
-            member,
-        )?;
+        let digest =
+            pick_sums_digest(&std::fs::read_to_string(unpack.join("SHA256SUMS"))?, member)?;
         let binary = unpack.join(member);
         let actual = sha256_file(&binary)?;
         if actual != digest {
@@ -58,7 +56,7 @@ fn install_from_tarball(tarball: &Path, member: &str, dst: &Path) -> Result<()> 
             )));
         }
         let staged = dst.with_extension("part");
-        std::fs::copy(&binary, &staged)?;
+        std::fs::rename(binary, &staged)?;
         std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
         std::fs::rename(&staged, dst)?;
         Ok(())
@@ -79,12 +77,41 @@ fn install_jailer(root: &Path, dst: &Path) -> Result<()> {
     install_from_tarball(&tarball, &member, dst)
 }
 
-fn executable(path: &Path) -> bool {
-    path.metadata()
-        .map(|metadata| {
-            metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-        })
-        .unwrap_or(false)
+/// Whether metadata describes an executable asset trusted by the daemon.
+///
+/// Keep the attribute check separate from filesystem access so tests can
+/// exercise the expected uid without impersonating root.
+fn trusted_executable_attributes(regular: bool, uid: u32, mode: u32, expected_uid: u32) -> bool {
+    regular && uid == expected_uid && mode & 0o111 != 0 && mode & 0o022 == 0
+}
+
+/// Returns whether an asset is absent, or rejects an unsafe existing asset.
+/// `symlink_metadata` is required: following an existing link would turn a
+/// user-controlled path into a root-executed program.
+fn executable(path: &Path) -> Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(Error::Invalid(format!(
+            "executable asset is a symlink: {}",
+            path.display()
+        )));
+    }
+    if !trusted_executable_attributes(
+        metadata.file_type().is_file(),
+        metadata.uid(),
+        metadata.mode(),
+        0,
+    ) {
+        return Err(Error::Invalid(format!(
+            "unsafe executable asset: {}",
+            path.display()
+        )));
+    }
+    Ok(true)
 }
 
 /// Fetches the hypervisor, jailer, and guest kernel once. Called before
@@ -93,11 +120,11 @@ fn executable(path: &Path) -> bool {
 pub fn ensure_assets(root: &Path) -> Result<()> {
     std::fs::create_dir_all(assets_dir(root))?;
     let fc = firecracker_bin(root);
-    if !fc.exists() {
+    if !executable(&fc)? {
         install_firecracker(root, &fc)?;
     }
     let jailer = jailer_bin(root);
-    if !executable(&jailer) {
+    if !executable(&jailer)? {
         install_jailer(root, &jailer)?;
     }
     let kernel = kernel_path(root);
@@ -109,4 +136,42 @@ pub fn ensure_assets(root: &Path) -> Result<()> {
         curl_to_file(KERNEL_URL, &kernel)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod asset_tests {
+    use super::{executable, trusted_executable_attributes};
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::path::PathBuf;
+    use uuid::Uuid;
+
+    fn test_root() -> PathBuf {
+        std::env::temp_dir().join(format!("shinu-assets-{}", Uuid::new_v4()))
+    }
+
+    #[test]
+    fn executable_attributes_require_regular_root_owned_nonwritable_file() {
+        assert!(trusted_executable_attributes(true, 0, 0o755, 0));
+        assert!(!trusted_executable_attributes(false, 0, 0o755, 0));
+        assert!(!trusted_executable_attributes(true, 1000, 0o755, 0));
+        assert!(!trusted_executable_attributes(true, 0, 0o775, 0));
+        assert!(!trusted_executable_attributes(true, 0, 0o644, 0));
+    }
+
+    #[test]
+    fn existing_symlink_asset_is_rejected_without_following_target() {
+        let root = test_root();
+        std::fs::create_dir_all(&root).expect("create fixture root");
+        let target = root.join("target");
+        let link = root.join("asset");
+        std::fs::write(&target, b"not a trusted binary").expect("write fixture target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))
+            .expect("set fixture mode");
+        symlink(&target, &link).expect("create asset symlink");
+
+        let result = executable(&link);
+
+        assert!(matches!(result, Err(super::Error::Invalid(_))));
+        std::fs::remove_dir_all(root).expect("remove fixture");
+    }
 }

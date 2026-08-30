@@ -1,25 +1,23 @@
 #!/bin/sh
-# runit restarts this automatically when it exits, which is the intended
-# recovery path: the daemon holds no VM state in memory. Running microVMs are
-# re-parented to init by `setsid`, so a restart leaves them alive and they are
-# picked up again from `<root>/vm/<uuid>/fc.pid`.
+# runit restarts the daemon after exit. VM state is recovered from disk, and
+# `setsid` detaches running VM processes so they survive daemon restarts.
 exec 2>&1
 
-# Defaults are compiled in; uncomment to override.
+# Leave optional settings commented to use compiled defaults; set deployment
+# overrides here.  The installer writes the verified jail identity below.
 # export SHINU_ROOT=/var/lib/shinu
-# Tokens travel in cleartext, so keep this on loopback unless a TLS terminator
-# sits in front of it.
+# shinud speaks cleartext HTTP; keep the listener on loopback behind TLS.
 # export SHINU_LISTEN=127.0.0.1:7878
 # export SHINU_REFLOG_DAYS=7          # retention for automatic checkout commits
 # export SHINU_VCPUS=2
 # export SHINU_MEM_MIB=1024
 # export SHINU_IDLE_SECS=600
-# export SHINU_DISK_MIB=2048          # only read when base.ext4 is first built
-# export SHINU_JAIL_UID=30000         # non-privileged un-cgroup uid for jailer
-# export SHINU_JAIL_GID=30000         # non-privileged un-cgroup gid for jailer
+# export SHINU_DISK_MIB=2048          # read only when a base image is built
+export SHINU_JAIL_UID="${SHINU_JAIL_UID:-30000}" # uid used inside the jailer
+export SHINU_JAIL_GID="${SHINU_JAIL_GID:-30000}" # gid used inside the jailer
 # export SHINU_LIMIT_SPACES=5         # max spaces per project
 # export SHINU_LIMIT_DISK_MIB=10240   # max exclusive disk allocation (MiB) per project
 # export SHINU_LIMIT_RUNNING=2        # max active VMs per project
 # export SHINU_LIMIT_API_PER_MIN=120  # rate limit per project (API calls per minute)
 
-exec /usr/local/bin/shinud
+exec "/usr/local/bin/shinud"

@@ -6,11 +6,7 @@ use uuid::Uuid;
 ///
 /// Scoping the lookup rather than filtering afterwards keeps project names
 /// private: a miss in another project is indistinguishable from a missing row.
-pub fn find<'a>(
-    st: &'a state::State,
-    name: &str,
-    project: &str,
-) -> Result<&'a state::Space> {
+pub fn find<'a>(st: &'a state::State, name: &str, project: &str) -> Result<&'a state::Space> {
     let mine = || st.spaces.iter().filter(|space| space.project == project);
     if let Some(space) = mine().find(|space| space.name == name) {
         return Ok(space);
@@ -24,11 +20,7 @@ pub fn find<'a>(
 }
 
 /// Same project-scoped lookup rule for commits; see [`find`].
-pub fn find_ckpt<'a>(
-    st: &'a state::State,
-    id: Uuid,
-    project: &str,
-) -> Result<&'a state::Ckpt> {
+pub fn find_ckpt<'a>(st: &'a state::State, id: Uuid, project: &str) -> Result<&'a state::Ckpt> {
     st.ckpts
         .iter()
         .find(|ckpt| ckpt.id == id && ckpt.project == project)
@@ -39,10 +31,7 @@ pub fn find_ckpt<'a>(
 ///
 /// A malformed state file may contain a missing parent or a cycle; stopping at
 /// either keeps inspection safe without inventing history.
-pub fn log_chain<'a>(
-    st: &'a state::State,
-    space: &state::Space,
-) -> Vec<&'a state::Ckpt> {
+pub fn log_chain<'a>(st: &'a state::State, space: &state::Space) -> Vec<&'a state::Ckpt> {
     let mut chain = Vec::new();
     let mut current = space.head;
     let mut seen = std::collections::HashSet::new();
@@ -71,7 +60,8 @@ pub fn reflog_entries<'a>(st: &'a state::State, space: &state::Space) -> Vec<&'a
     let mut entries = st
         .ckpts
         .iter()
-        .filter(|ckpt| ckpt.space == space.id && ckpt.project == space.project)
+        .filter(|ckpt| ckpt.space == space.id)
+        .filter(|ckpt| ckpt.project == space.project)
         .collect::<Vec<_>>();
     entries.sort_by(|left, right| {
         right
@@ -107,8 +97,8 @@ pub fn is_referenced(st: &state::State, ckpt: Uuid) -> Vec<String> {
 
 #[cfg(test)]
 mod chain_tests {
-    use crate::state::{Ckpt, Space, State};
     use super::{is_referenced, log_chain, reflog_entries};
+    use crate::state::{Ckpt, Space, State};
     use chrono::{TimeZone, Utc};
     use uuid::Uuid;
 
@@ -116,12 +106,7 @@ mod chain_tests {
         Uuid::from_u128(value)
     }
 
-    fn space(
-        id: Uuid,
-        name: &str,
-        parent: Option<Uuid>,
-        head: Option<Uuid>,
-    ) -> Space {
+    fn space(id: Uuid, name: &str, parent: Option<Uuid>, head: Option<Uuid>) -> Space {
         Space {
             id,
             name: name.to_owned(),
@@ -281,12 +266,16 @@ mod chain_tests {
                 .collect::<Vec<_>>(),
             vec![same_second, auto, first]
         );
-        assert!(reflog_entries(&state, &space)
-            .iter()
-            .any(|checkpoint| checkpoint.id == auto && checkpoint.auto));
-        assert!(reflog_entries(&state, &space)
-            .iter()
-            .all(|checkpoint| checkpoint.space == space_id));
+        assert!(
+            reflog_entries(&state, &space)
+                .iter()
+                .any(|checkpoint| checkpoint.id == auto && checkpoint.auto)
+        );
+        assert!(
+            reflog_entries(&state, &space)
+                .iter()
+                .all(|checkpoint| checkpoint.space == space_id)
+        );
     }
 
     #[test]
@@ -298,14 +287,11 @@ mod chain_tests {
                 space(id(31), "derived", Some(target), None),
                 space(id(32), "checked-out", None, Some(target)),
             ],
-            ckpts: vec![
-                ckpt(target, id(33), None),
-                {
-                    let mut diff = ckpt(child, id(33), None);
-                    diff.base = Some(target);
-                    diff
-                },
-            ],
+            ckpts: vec![ckpt(target, id(33), None), {
+                let mut diff = ckpt(child, id(33), None);
+                diff.base = Some(target);
+                diff
+            }],
         };
 
         let references = is_referenced(&state, target);

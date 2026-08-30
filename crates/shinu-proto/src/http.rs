@@ -9,6 +9,7 @@ pub struct Request {
     pub method: String,
     pub path: String,
     pub token: Option<String>,
+    pub authorization_present: bool,
     pub body: Vec<u8>,
     pub cookies: std::collections::HashMap<String, String>,
     pub origin: Option<String>,
@@ -21,11 +22,7 @@ fn invalid(message: impl Into<String>) -> shinu_core::Error {
 }
 
 fn ascii_case_eq(left: &[u8], right: &[u8]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .all(|(left, right)| left.eq_ignore_ascii_case(right))
+    left.eq_ignore_ascii_case(right)
 }
 
 fn is_ows(byte: u8) -> bool {
@@ -33,7 +30,10 @@ fn is_ows(byte: u8) -> bool {
 }
 
 fn trim_ows(value: &[u8]) -> &[u8] {
-    let start = value.iter().position(|byte| !is_ows(*byte)).unwrap_or(value.len());
+    let start = value
+        .iter()
+        .position(|byte| !is_ows(*byte))
+        .unwrap_or(value.len());
     let end = value
         .iter()
         .rposition(|byte| !is_ows(*byte))
@@ -57,11 +57,8 @@ fn read_line<R: BufRead + ?Sized>(
 
         let newline = available.iter().position(|byte| *byte == b'\n');
         let take = newline.map_or(available.len(), |index| index + 1);
-        // Inspect the buffered bytes before extending the line so a peer
-        // cannot make the parser allocate without bound by omitting '\n'.
-        if *total > MAX_HEADER_BYTES
-            || take > MAX_HEADER_BYTES.saturating_sub(*total)
-        {
+        // Check before appending so a missing newline cannot bypass the cap.
+        if *total > MAX_HEADER_BYTES || take > MAX_HEADER_BYTES.saturating_sub(*total) {
             return Err(invalid("HTTP request line and headers exceed 64 KiB"));
         }
         line.extend_from_slice(&available[..take]);
@@ -105,11 +102,7 @@ fn bearer_token(value: &[u8]) -> Option<String> {
         .iter()
         .position(|byte| !is_ows(*byte))
         .map_or(&[][..], |start| &rest[start..]);
-    if token.is_empty()
-        || token
-            .iter()
-            .any(|byte| *byte <= b' ' || *byte == 0x7f)
-    {
+    if token.is_empty() || token.iter().any(|byte| *byte <= b' ' || *byte == 0x7f) {
         return None;
     }
     String::from_utf8(token.to_vec()).ok()
@@ -117,6 +110,11 @@ fn bearer_token(value: &[u8]) -> Option<String> {
 
 pub fn parse_cookies(header: &str) -> std::collections::HashMap<String, String> {
     let mut cookies = std::collections::HashMap::new();
+    parse_cookies_into(header, &mut cookies);
+    cookies
+}
+
+fn parse_cookies_into(header: &str, cookies: &mut std::collections::HashMap<String, String>) {
     for part in header.split(';') {
         let part = part.trim();
         let Some((name, value)) = part.split_once('=') else {
@@ -130,7 +128,6 @@ pub fn parse_cookies(header: &str) -> std::collections::HashMap<String, String> 
         // additional equals signs even though session tokens do not.
         cookies.insert(name.to_owned(), value.trim().to_owned());
     }
-    cookies
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +135,7 @@ pub struct RequestHead {
     pub method: String,
     pub path: String,
     pub token: Option<String>,
+    pub authorization_present: bool,
     pub content_length: Option<usize>,
     pub cookies: std::collections::HashMap<String, String>,
     pub origin: Option<String>,
@@ -151,6 +149,7 @@ impl RequestHead {
             method: self.method,
             path: self.path,
             token: self.token,
+            authorization_present: self.authorization_present,
             body,
             cookies: self.cookies,
             origin: self.origin,
@@ -172,9 +171,7 @@ fn parse_head_inner(
     let method = fields
         .next()
         .ok_or_else(|| invalid("missing HTTP method"))?;
-    let path = fields
-        .next()
-        .ok_or_else(|| invalid("missing HTTP path"))?;
+    let path = fields.next().ok_or_else(|| invalid("missing HTTP path"))?;
     let version = fields
         .next()
         .ok_or_else(|| invalid("missing HTTP version"))?;
@@ -191,6 +188,7 @@ fn parse_head_inner(
     let method = bytes_to_string(method, "method")?;
     let path = bytes_to_string(path, "path")?;
     let mut token = None;
+    let mut authorization_present = false;
     let mut cookies = std::collections::HashMap::new();
     let mut origin = None;
     let mut forwarded_proto = None;
@@ -205,8 +203,7 @@ fn parse_head_inner(
             break;
         }
         header_count += 1;
-        // Bounding the number of fields prevents a peer from forcing
-        // unbounded per-header parsing work with many tiny lines.
+        // Bound field count to limit per-header parsing work.
         if header_count > MAX_HEADERS {
             return Err(invalid("HTTP request has more than 100 headers"));
         }
@@ -215,11 +212,7 @@ fn parse_head_inner(
             .position(|byte| *byte == b':')
             .ok_or_else(|| invalid("HTTP header has no colon"))?;
         let name = &line[..colon];
-        if name.is_empty()
-            || name
-                .iter()
-                .any(|byte| *byte <= b' ' || *byte >= 0x7f)
-        {
+        if name.is_empty() || name.iter().any(|byte| *byte <= b' ' || *byte >= 0x7f) {
             return Err(invalid("invalid HTTP header name"));
         }
         let value = trim_ows(&line[colon + 1..]);
@@ -239,12 +232,16 @@ fn parse_head_inner(
             }
             content_length = Some(length);
         } else if ascii_case_eq(name, b"Authorization") {
-            // A malformed scheme is left as no token so the auth layer
-            // returns its uniform 401 rather than exposing parser detail.
+            if authorization_present {
+                return Err(invalid("duplicate Authorization header"));
+            }
+            // Presence is tracked separately because any supplied value is
+            // authoritative, even when it is not a valid bearer token.
+            authorization_present = true;
             token = bearer_token(value);
         } else if ascii_case_eq(name, b"Cookie") {
             let value = bytes_to_string(value, "Cookie")?;
-            cookies.extend(parse_cookies(&value));
+            parse_cookies_into(&value, &mut cookies);
         } else if ascii_case_eq(name, b"Origin") {
             origin = Some(bytes_to_string(value, "Origin")?);
         } else if ascii_case_eq(name, b"X-Forwarded-Proto") {
@@ -257,6 +254,7 @@ fn parse_head_inner(
         method,
         path,
         token,
+        authorization_present,
         content_length,
         cookies,
         origin,
@@ -270,12 +268,12 @@ pub fn parse_head(stream: &mut impl BufRead) -> shinu_core::Result<RequestHead> 
     parse_head_inner(stream, None)
 }
 
-/// Reads a buffered request body while retaining the historical 1 MiB cap.
+/// Reads a request body, capped at 1 MiB.
 pub fn read_body(
     stream: &mut impl BufRead,
     content_length: Option<usize>,
 ) -> shinu_core::Result<Vec<u8>> {
-    let length = content_length.unwrap_or(0);
+    let length = content_length.unwrap_or_default();
     if length > MAX_BODY_BYTES {
         return Err(invalid("Content-Length exceeds 1 MiB"));
     }
@@ -315,11 +313,7 @@ fn json_io_error(error: serde_json::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
 }
 
-pub fn respond(
-    writer: &mut impl Write,
-    status: u16,
-    body: &serde_json::Value,
-) -> io::Result<()> {
+pub fn respond(writer: &mut impl Write, status: u16, body: &serde_json::Value) -> io::Result<()> {
     let body = serde_json::to_vec(body).map_err(json_io_error)?;
     write!(
         writer,
@@ -330,11 +324,7 @@ pub fn respond(
     writer.write_all(&body)
 }
 
-pub fn respond_html(
-    writer: &mut impl Write,
-    status: u16,
-    body: &str,
-) -> io::Result<()> {
+pub fn respond_html(writer: &mut impl Write, status: u16, body: &str) -> io::Result<()> {
     let body = body.as_bytes();
     write!(
         writer,
@@ -363,13 +353,8 @@ fn asset_content_type(path: &str) -> &'static str {
     }
 }
 
-pub fn respond_asset(
-    writer: &mut impl Write,
-    path: &str,
-    body: &[u8],
-) -> io::Result<()> {
-    // Demo assets are embedded in the binary and change with each build;
-    // no-cache avoids pairing a cached JS bundle with a newer API.
+pub fn respond_asset(writer: &mut impl Write, path: &str, body: &[u8]) -> io::Result<()> {
+    // Embedded assets change per build; no-cache prevents stale JS/API pairing.
     write!(
         writer,
         "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -408,25 +393,19 @@ pub fn respond_with_cookie(
 /// discard the cookie and leaves a successful login immediately unauthenticated.
 pub fn set_cookie(name: &str, value: &str, secure: bool, max_age: u64) -> String {
     let secure_suffix = if secure { "; Secure" } else { "" };
-    format!(
-        "{name}={value}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}{secure_suffix}"
-    )
+    format!("{name}={value}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}{secure_suffix}")
 }
 
 pub fn clear_cookie(name: &str) -> String {
     format!("{name}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0")
 }
 
-fn respond_chunked_start_with_type(
-    writer: &mut impl Write,
-    content_type: &str,
-) -> io::Result<()> {
+fn respond_chunked_start_with_type(writer: &mut impl Write, content_type: &str) -> io::Result<()> {
     write!(
         writer,
         "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
     )?;
-    // Flush the headers before the VM command starts so clients can begin
-    // consuming the stream without waiting for its first output line.
+    // Flush headers before starting the VM command so clients can consume the stream immediately.
     writer.flush()
 }
 
@@ -445,10 +424,7 @@ pub fn respond_chunk_bytes(writer: &mut impl Write, payload: &[u8]) -> io::Resul
     writer.flush()
 }
 
-pub fn respond_chunk(
-    writer: &mut impl Write,
-    line: &serde_json::Value,
-) -> io::Result<()> {
+pub fn respond_chunk(writer: &mut impl Write, line: &serde_json::Value) -> io::Result<()> {
     let mut payload = serde_json::to_vec(line).map_err(json_io_error)?;
     payload.push(b'\n');
     // JSON is serialized to bytes first; binary callers use
@@ -483,13 +459,12 @@ mod http_tests {
 
     #[test]
     fn parses_get_without_body() {
-        let mut input = Cursor::new(
-            b"GET /v1/spaces HTTP/1.1\r\nHost: localhost\r\n\r\n",
-        );
+        let mut input = Cursor::new(b"GET /v1/spaces HTTP/1.1\r\nHost: localhost\r\n\r\n");
         let request = parse(&mut input).unwrap();
         assert_eq!(request.method, "GET");
         assert_eq!(request.path, "/v1/spaces");
         assert_eq!(request.token, None);
+        assert!(!request.authorization_present);
         assert!(request.body.is_empty());
     }
 
@@ -499,6 +474,7 @@ mod http_tests {
         let expected = parse(&mut Cursor::new(raw)).expect("buffered parse");
         let mut split_input = Cursor::new(raw);
         let head = parse_head(&mut split_input).expect("head parse");
+        assert!(head.authorization_present);
         let body = read_body(&mut split_input, head.content_length).expect("body parse");
         assert_eq!(head.into_request(body), expected);
     }
@@ -515,9 +491,8 @@ mod http_tests {
 
     #[test]
     fn reads_exact_content_length() {
-        let mut input = Cursor::new(
-            b"POST /v1/spaces HTTP/1.1\r\nContent-Length: 7\r\n\r\npayloadtrailing",
-        );
+        let mut input =
+            Cursor::new(b"POST /v1/spaces HTTP/1.1\r\nContent-Length: 7\r\n\r\npayloadtrailing");
         let request = parse(&mut input).unwrap();
         assert_eq!(request.body, b"payload");
     }
@@ -529,6 +504,7 @@ mod http_tests {
         );
         let request = parse(&mut input).unwrap();
         assert_eq!(request.body, b"xyz");
+        assert!(request.authorization_present);
         assert_eq!(request.token.as_deref(), Some("abc"));
     }
 
@@ -562,10 +538,7 @@ mod http_tests {
     fn parses_empty_cookie_and_preserves_later_equals() {
         let cookies = parse_cookies("empty=; encoded=a=b=c");
         assert_eq!(cookies.get("empty").map(String::as_str), Some(""));
-        assert_eq!(
-            cookies.get("encoded").map(String::as_str),
-            Some("a=b=c")
-        );
+        assert_eq!(cookies.get("encoded").map(String::as_str), Some("a=b=c"));
     }
 
     #[test]
@@ -578,7 +551,10 @@ mod http_tests {
             request.cookies.get("shinu_session").map(String::as_str),
             Some("abc123")
         );
-        assert_eq!(request.cookies.get("theme").map(String::as_str), Some("dark"));
+        assert_eq!(
+            request.cookies.get("theme").map(String::as_str),
+            Some("dark")
+        );
         assert_eq!(request.origin.as_deref(), Some("https://console.test"));
         assert_eq!(request.forwarded_proto.as_deref(), Some("https"));
         assert_eq!(request.host.as_deref(), Some("console.test:8080"));
@@ -651,25 +627,63 @@ mod http_tests {
         respond_with_cookie(&mut output, 201, &body, "shinu_session=abc123; Path=/").unwrap();
         let response = String::from_utf8_lossy(&output);
         assert!(response.contains("Set-Cookie: shinu_session=abc123; Path=/\r\n"));
-        assert!(response.contains(
-            format!("Content-Length: {}\r\n", serialized.len()).as_str()
-        ));
+        assert!(response.contains(format!("Content-Length: {}\r\n", serialized.len()).as_str()));
         assert!(output.ends_with(&serialized));
     }
 
     #[test]
     fn extracts_case_insensitive_bearer_with_multiple_spaces() {
-        let mut input = Cursor::new(
-            b"GET / HTTP/1.1\r\naUtHoRiZaTiOn: bEaReR    secret\r\n\r\n",
-        );
+        let mut input = Cursor::new(b"GET / HTTP/1.1\r\naUtHoRiZaTiOn: bEaReR    secret\r\n\r\n");
         let request = parse(&mut input).unwrap();
+        assert!(request.authorization_present);
         assert_eq!(request.token.as_deref(), Some("secret"));
     }
 
     #[test]
-    fn missing_authorization_has_no_token() {
-        let mut input = Cursor::new(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        assert_eq!(parse(&mut input).unwrap().token, None);
+    fn missing_authorization_keeps_cookie_authentication_available() {
+        let mut input =
+            Cursor::new(b"GET / HTTP/1.1\r\nCookie: shinu_session=session-token\r\n\r\n");
+        let request = parse(&mut input).unwrap();
+        assert!(!request.authorization_present);
+        assert_eq!(request.token, None);
+        assert_eq!(
+            request.cookies.get("shinu_session").map(String::as_str),
+            Some("session-token")
+        );
+    }
+
+    #[test]
+    fn malformed_authorization_is_present_without_cookie_fallback() {
+        let mut input = Cursor::new(
+            b"GET / HTTP/1.1\r\nAuthorization: Bearer \r\nCookie: shinu_session=session-token\r\n\r\n",
+        );
+        let request = parse(&mut input).unwrap();
+        assert!(request.authorization_present);
+        assert_eq!(request.token, None);
+        assert_eq!(
+            request.cookies.get("shinu_session").map(String::as_str),
+            Some("session-token")
+        );
+    }
+
+    #[test]
+    fn non_bearer_authorization_is_present_without_token() {
+        let mut input = Cursor::new(b"GET / HTTP/1.1\r\nAuthorization: Basic abc\r\n\r\n");
+        let request = parse(&mut input).unwrap();
+        assert!(request.authorization_present);
+        assert_eq!(request.token, None);
+    }
+
+    #[test]
+    fn rejects_duplicate_authorization_headers() {
+        let mut input = Cursor::new(
+            b"GET / HTTP/1.1\r\nAuthorization: Bearer first\r\nauthorization: Bearer second\r\n\r\n",
+        );
+        let error = parse(&mut input).unwrap_err();
+        assert!(matches!(
+            error,
+            shinu_core::Error::Invalid(message) if message == "duplicate Authorization header"
+        ));
     }
 
     #[test]
@@ -694,9 +708,12 @@ mod http_tests {
         let mut output = Vec::new();
         respond(&mut output, 201, &body).unwrap();
         assert!(output.starts_with(b"HTTP/1.1 201 Created\r\n"));
-        assert!(output.windows(format!("Content-Length: {}\r\n", serialized.len()).len()).any(
-            |window| window == format!("Content-Length: {}\r\n", serialized.len()).as_bytes()
-        ));
+        assert!(
+            output
+                .windows(format!("Content-Length: {}\r\n", serialized.len()).len())
+                .any(|window| window
+                    == format!("Content-Length: {}\r\n", serialized.len()).as_bytes())
+        );
         assert!(output.ends_with(&serialized));
     }
 
@@ -709,9 +726,11 @@ mod http_tests {
         respond_chunked_start(&mut output).unwrap();
         respond_chunk(&mut output, &line).unwrap();
         respond_chunked_end(&mut output).unwrap();
-        assert!(output.windows(b"Transfer-Encoding: chunked\r\n".len()).any(
-            |window| window == b"Transfer-Encoding: chunked\r\n"
-        ));
+        assert!(
+            output
+                .windows(b"Transfer-Encoding: chunked\r\n".len())
+                .any(|window| window == b"Transfer-Encoding: chunked\r\n")
+        );
         let mut expected_tail = format!("{:x}\r\n", payload.len()).into_bytes();
         expected_tail.extend_from_slice(&payload);
         expected_tail.extend_from_slice(b"\r\n0\r\n\r\n");
@@ -727,7 +746,9 @@ mod http_tests {
         respond_chunked_end(&mut output).unwrap();
         let frame = b"4\r\n\0\xff\n\x80\r\n";
         assert!(output.windows(frame.len()).any(|window| window == frame));
-        assert!(output.starts_with(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"));
+        assert!(
+            output.starts_with(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n")
+        );
     }
 
     #[test]
@@ -744,7 +765,9 @@ mod http_tests {
         let json_error = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
         assert_eq!(status_for(&shinu_core::Error::Json(json_error)), 500);
         assert_eq!(
-            status_for(&shinu_core::Error::Internal("sql: database is locked".into())),
+            status_for(&shinu_core::Error::Internal(
+                "sql: database is locked".into()
+            )),
             500
         );
     }

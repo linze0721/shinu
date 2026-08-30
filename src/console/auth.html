@@ -3,13 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>shinu — log in</title>
-<link rel="icon" href="data:,">
+<title>shinu: log in</title>
+<meta name="theme-color" content="#f7f8f9">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2032%2032%22%3E%3Crect%20width%3D%2232%22%20height%3D%2232%22%20rx%3D%227%22%20fill%3D%22%23f7f8f9%22%2F%3E%3Cpath%20d%3D%22M10%209v14M10%2016h8%22%20stroke%3D%22%23d6dbe0%22%20stroke-width%3D%221.75%22%20stroke-linecap%3D%22round%22%2F%3E%3Ccircle%20cx%3D%2210%22%20cy%3D%229%22%20r%3D%222.75%22%20fill%3D%22%231f7d5b%22%2F%3E%3Ccircle%20cx%3D%2210%22%20cy%3D%2223%22%20r%3D%222.75%22%20fill%3D%22%237fc9a8%22%2F%3E%3Ccircle%20cx%3D%2221%22%20cy%3D%2216%22%20r%3D%222.75%22%20fill%3D%22%231f7d5b%22%2F%3E%3C%2Fsvg%3E">
 <link rel="stylesheet" href="/assets/app.css">
 <script>
-/* Served by shinud from /assets/…. When the file is opened straight from
-   disk (file://) those absolute paths miss; fall back to the sibling files
-   so the page still renders for local preview. */
+/* Absolute /assets/… paths only resolve when shinud serves the page; a
+   file:// preview falls back to the sibling files. */
 if (location.protocol === 'file:') {
   var fallbackCss = document.createElement('link');
   fallbackCss.rel = 'stylesheet';
@@ -22,17 +22,17 @@ if (location.protocol === 'file:') {
 }
 </script>
 </head>
-<body data-page="auth">
+<body class="page-auth" data-page="auth">
 <main class="auth-wrap">
   <div class="auth-card">
     <div class="auth-masthead">
       <span class="brand">shinu<span class="brand-accent">.</span></span>
-
+      <span class="brand-sub">Presented by Sylvonic AI</span>
     </div>
 
     <div class="auth-body">
       <div class="mode-tabs" role="tablist">
-        <button type="button" id="tab-login" role="tab" aria-selected="true">Log in</button>
+        <button type="button" id="tab-login" class="active" role="tab" aria-selected="true">Log in</button>
         <button type="button" id="tab-register" role="tab" aria-selected="false">Register</button>
       </div>
 

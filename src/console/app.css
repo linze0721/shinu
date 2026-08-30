@@ -1,23 +1,64 @@
-/* shinu console stylesheet — hand-rolled, no frameworks, no external assets.
-   Skin: turn-of-the-century enterprise software, after the Zelix KlassMaster
-   site (ZKM.css). White ground, black text, periwinkle #8888FF chrome,
-   hard 1–2px solid borders, outset/inset bevels instead of shadows.
-   Monospace (Courier New) is reserved for ids, hashes and tokens so machine
-   strings are visually distinct from prose. */
+/* shinu console stylesheet: hand-rolled, no frameworks, no external assets.
+   Skin: the shinu brand, soft minimalism on a light ground with a jade accent.
+   Token names mirror site/src/styles/global.css so the console and the site
+   read as one system. Grouping is by hairlines and space, never bevels.
+
+   Density: this is an operational dashboard, not the marketing page. Rows
+   stay tabular and compact; padding is deliberate but never airy.
+
+   Every contrast pair was measured, not guessed:
+     ink        #191d23 on canvas  15.91:1
+     ink-soft   #4d5560 on canvas   7.09:1
+     ink-muted  #646d79 on canvas   4.93:1  (AA floor for body text)
+     jade-600   #1f7d5b on canvas   4.77:1  (AA body, smallest jade text)
+     jade-700   #176247 on canvas   6.87:1
+     white      on jade-600         5.07:1  (the primary control)
+     red        #b42318 on canvas   5.90:1  (errors only)
+     amber      #8a5a00 on canvas   5.32:1  (warnings only)
+   jade-500 #2f9b73 is 3.26:1: fills and decoration only, never text. */
 
 :root {
-  --peri: #8888ff; /* primary chrome: masthead, navbar, menu, borders */
-  --peri-hover: #9999ff; /* hover state */
-  --peri-sel: #ccccff; /* selected state, black text */
-  --bg: #ffffff;
-  --text: #000000;
-  --muted: #666666; /* secondary text; ZKM palette has no gray, this stays neutral */
-  --green: #009900;
-  --blue: #0000cc;
-  --red: #cc0000;
-  --sans: Verdana, Arial, Helvetica, sans-serif;
-  --head: Arial, Helvetica, sans-serif;
-  --mono: "Courier New", Courier, mono;
+  --canvas: #f7f8f9;
+  --surface: #ffffff;
+  --sunken: #f1f3f5;
+
+  /* ink: never pure black, it is harsh on paper */
+  --ink: #191d23;
+  --ink-soft: #4d5560;
+  --ink-muted: #646d79;
+
+  /* hairlines */
+  --edge: #e6e9ec;
+  --edge-strong: #d6dbe0;
+
+  /* jade: the single accent */
+  --jade-50: #edf7f2;
+  --jade-100: #d9efe4;
+  --jade-300: #7fc9a8;
+  --jade-500: #2f9b73;
+  --jade-600: #1f7d5b;
+  --jade-700: #176247;
+
+  /* semantics: red for errors and over-limit quota, amber for warnings */
+  --red: #b42318;
+  --red-tint: #fef3f2;
+  --red-edge: #f3cdc8;
+  --amber: #8a5a00;
+  --amber-tint: #fbf3e4;
+  --amber-edge: #ecd9b3;
+
+  /* system stacks, no webfont, no CDN */
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas,
+    monospace;
+
+  --radius-lg: 16px;
+  --radius-sm: 10px;
+  --radius-pill: 999px;
+
+  --ease-soft: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --shadow-rest: 0 1px 2px rgba(25, 29, 35, 0.04);
 }
 
 * {
@@ -28,18 +69,15 @@
   display: none !important;
 }
 
-html,
 body {
   margin: 0;
-  padding: 0;
-}
-
-body {
-  background: var(--bg);
-  color: var(--text);
-  font-family: var(--sans);
-  font-size: 80%;
+  background: var(--canvas);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 14px;
   line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 h1,
@@ -51,247 +89,320 @@ p {
 }
 
 h1 {
-  font-family: var(--head);
-  font-size: 170%;
-  font-weight: normal;
-  color: var(--text);
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
 }
 
 h2 {
-  font-family: var(--head);
-  font-size: 140%;
-  font-weight: normal;
-  color: var(--text);
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
 }
 
 h3 {
-  font-family: var(--head);
-  font-size: 110%;
-  font-weight: normal;
-  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
 }
 
-a:link {
-  text-decoration: none;
-  color: var(--blue);
-}
-
+a:link,
 a:visited {
+  color: var(--jade-600);
   text-decoration: none;
-  color: #6600ff;
 }
 
 a:hover {
+  color: var(--jade-700);
   text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 code,
 .mono {
-  font-family: var(--mono);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+}
+
+code {
+  font-size: 0.92em;
 }
 
 .muted {
-  color: var(--muted);
+  color: var(--ink-muted);
 }
 
 .green {
-  color: var(--green);
-}
-
-.blue {
-  color: var(--blue);
+  color: var(--jade-600);
+  font-weight: 500;
 }
 
 .red {
   color: var(--red);
 }
 
-.nobr {
-  white-space: nowrap;
-}
-
-.grow {
-  flex: 1;
-}
-
 ::selection {
-  background: var(--peri-sel);
-  color: var(--text);
+  background: var(--jade-100);
+  color: var(--ink);
 }
 
-/* ---------- buttons: raised bevel at rest, sunken when pressed ---------- */
+/* ---------- accessibility utilities ---------- */
+
+/* visually hidden but reachable: skip links, screen-reader text */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.skip-link {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  z-index: 100;
+  transform: translateY(-250%);
+  background: var(--surface);
+  color: var(--jade-700);
+  font-weight: 500;
+  padding: 8px 16px;
+  border: 1px solid var(--jade-300);
+  border-radius: var(--radius-pill);
+  box-shadow: var(--shadow-rest);
+}
+
+.skip-link:focus-visible {
+  transform: none;
+  outline: 2px solid var(--jade-600);
+  outline-offset: 3px;
+}
+
+/* ---------- buttons: full pills, jade only where the action is primary ---------- */
 
 .btn {
   appearance: none;
   font: inherit;
-  color: var(--text);
-  background: var(--peri-sel);
-  border: 2px outset var(--peri);
-  padding: 2px 12px;
+  font-weight: 500;
+  color: var(--ink-soft);
+  background: var(--surface);
+  border: 1px solid var(--edge-strong);
+  border-radius: var(--radius-pill);
+  padding: 6px 16px;
   cursor: pointer;
   white-space: nowrap;
+  transition:
+    transform 180ms var(--ease-soft),
+    background-color 180ms var(--ease-soft),
+    border-color 180ms var(--ease-soft),
+    color 180ms var(--ease-soft),
+    box-shadow 180ms var(--ease-soft);
 }
 
 .btn:hover:not(:disabled) {
-  background: var(--peri-hover);
+  color: var(--ink);
+  border-color: var(--ink-muted);
 }
 
 .btn:active:not(:disabled) {
-  border-style: inset;
+  transform: translateY(1px);
 }
 
 .btn:focus-visible {
-  outline: 2px solid var(--blue);
-  outline-offset: 1px;
+  outline: 2px solid var(--jade-600);
+  outline-offset: 3px;
 }
 
 .btn:disabled {
-  color: var(--muted);
+  opacity: 0.55;
   cursor: default;
 }
 
 .btn.primary {
-  /* Win95 default pushbutton: same raised #CCCCFF face as the base button */
-  background: var(--peri-sel);
-  color: var(--text);
+  background: var(--jade-600);
+  border-color: var(--jade-600);
+  color: #ffffff;
+}
+
+.btn.primary:hover:not(:disabled) {
+  background: var(--jade-700);
+  border-color: var(--jade-700);
+  color: #ffffff;
 }
 
 .btn.small {
-  font-size: 90%;
-  padding: 1px 8px;
+  font-size: 13px;
+  padding: 3px 12px;
 }
 
 .btn.block {
   display: block;
   width: 100%;
-  padding: 4px 14px;
+  padding: 8px 16px;
 }
 
-/* ---------- forms: sunken fields ---------- */
+/* ---------- forms ---------- */
 
-input[type="email"],
-input[type="password"] {
+.page-auth input {
+  appearance: none;
   font: inherit;
-  color: var(--text);
-  background: var(--bg);
-  border: 2px inset var(--peri);
-  padding: 3px 6px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--edge-strong);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
   width: 100%;
   min-width: 0;
+  transition:
+    border-color 180ms var(--ease-soft),
+    box-shadow 180ms var(--ease-soft);
 }
 
 input::placeholder {
-  color: var(--muted);
+  color: var(--ink-muted);
+  opacity: 1; /* some browsers dim placeholders below the AA floor */
 }
 
-input[type="email"]:focus,
-input[type="password"]:focus {
-  outline: 2px solid var(--blue);
+.page-auth input:focus {
+  outline: none;
+  border-color: var(--jade-600);
+  box-shadow: 0 0 0 3px var(--jade-100);
 }
 
 .field {
   display: block;
-  margin-bottom: 12px;
+  margin-bottom: 14px;
 }
 
 .field > span {
   display: block;
-  margin-bottom: 2px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink-soft);
+  margin-bottom: 4px;
 }
 
 .form-hint {
-  font-size: 90%;
-  color: var(--muted);
-  padding: 6px 8px 0;
+  font-size: 13px;
+  color: var(--ink-muted);
+  margin: -6px 0 12px;
 }
 
 .form-error {
+  font-size: 13px;
   color: var(--red);
-  padding: 8px 8px 0;
+  margin: 0 0 12px;
 }
 
-.auth-body .form-hint,
-.auth-body .form-error {
-  padding: 4px 0 0;
-}
-
-/* ---------- layout shell: masthead / navbar / sidemenu / footer ---------- */
+/* ---------- layout shell ---------- */
 
 .container {
-  max-width: 1100px;
+  max-width: 1200px;
   margin: 0 auto;
-  padding: 0 10px 24px;
+  padding: 0 20px 32px;
 }
 
 .masthead {
-  /* the one place a gradient is allowed, after the reference's backgroundGradient.jpg */
-  background: var(--peri) linear-gradient(#9999ff, #8888ff);
-  color: var(--text);
-  padding: 10px 12px;
-  border: 2px solid var(--peri);
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 18px 0 12px;
 }
 
-.masthead .brand {
-  font-family: var(--head);
-  font-size: 170%;
-  /* large display text only; white on periwinkle stays at ~3:1 like an era title bar */
-  color: #ffffff;
-  display: inline;
+/* the wordmark matches the site nav: mono, lowercase, tight */
+.brand {
+  font-family: var(--font-mono);
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--ink);
 }
 
+/* the trailing dot is the one spot of jade on the chrome */
 .brand-accent {
-  color: var(--text);
+  color: var(--jade-600);
+}
+
+.brand-sub {
+  font-size: 12px;
+  color: var(--ink-muted);
+  white-space: nowrap;
+}
+
+/* only the console page carries the session navbar */
+.page-console .brand-sub {
+  font-size: 13px;
 }
 
 .navbar {
   display: flex;
   align-items: center;
-  gap: 2px;
-  background: var(--peri);
-  color: var(--text);
-  font-family: var(--head);
-  font-size: 100%;
-  padding: 2px 4px;
-  border: 2px solid var(--peri);
-  border-top: none;
+  gap: 14px;
+  padding: 7px 2px;
+  border-top: 1px solid var(--edge);
+  border-bottom: 1px solid var(--edge);
+  font-size: 13px;
+  color: var(--ink-muted);
 }
 
-.navbar .nav-item {
-  padding: 2px 10px;
+.nav-spacer {
+  flex: 1;
+}
+
+.navbar #project-badge {
+  font-size: 12px;
+  color: var(--ink-soft);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.navbar #user-email {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .navbar button.nav-item {
   appearance: none;
   font: inherit;
-  color: var(--text);
-  background: var(--peri);
-  border: 2px solid var(--peri);
+  color: var(--ink-soft);
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-pill);
+  padding: 3px 10px;
   cursor: pointer;
+  transition:
+    background-color 180ms var(--ease-soft),
+    color 180ms var(--ease-soft);
 }
 
-
 .navbar button.nav-item:hover {
-  color: var(--text);
-  background: var(--peri-hover);
-  border-style: outset;
+  color: var(--ink);
+  background: var(--sunken);
 }
 
 .navbar button.nav-item:focus-visible {
-  outline: 2px solid var(--blue);
+  outline: 2px solid var(--jade-600);
+  outline-offset: 3px;
 }
 
 .main {
   display: grid;
-  grid-template-columns: 170px minmax(0, 1fr);
-  gap: 10px;
+  grid-template-columns: 200px minmax(0, 1fr);
+  gap: 20px;
   align-items: start;
-  margin-top: 10px;
+  margin-top: 18px;
 }
 
 .sidemenu {
-  background: var(--peri);
-  border: 2px solid var(--peri);
-  padding: 3px;
+  /* grouping by space, not by a box: the menu sits on the canvas */
+  position: sticky;
+  top: 16px;
+  padding: 4px 0;
 }
 
 .menu-item {
@@ -300,30 +411,32 @@ input[type="password"]:focus {
   text-align: left;
   appearance: none;
   font: inherit;
-  font-family: var(--head);
-  font-size: 100%;
-  color: var(--text);
-  background: var(--peri);
-  border: 2px solid var(--peri);
-  padding: 2px 6px;
+  color: var(--ink-soft);
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-sm);
+  padding: 7px 12px;
   margin: 1px 0;
   cursor: pointer;
+  transition:
+    background-color 180ms var(--ease-soft),
+    color 180ms var(--ease-soft);
 }
 
 .menu-item:hover {
-  color: var(--text);
-  background: var(--peri-hover);
-  border-style: outset;
-}
-
-.menu-item:focus-visible {
-  outline: 2px solid var(--blue);
+  color: var(--ink);
+  background: var(--sunken);
 }
 
 .menu-item.active {
-  color: var(--text);
-  background: var(--peri-sel);
-  border-style: inset;
+  color: var(--jade-700);
+  background: var(--jade-50);
+  font-weight: 500;
+}
+
+.menu-item:focus-visible {
+  outline: 2px solid var(--jade-600);
+  outline-offset: 3px;
 }
 
 .content {
@@ -331,20 +444,26 @@ input[type="password"]:focus {
 }
 
 .footer {
-  margin-top: 14px;
-  background: var(--peri);
-  border: 2px solid var(--peri);
-  color: var(--text);
-  font-family: var(--head);
-  text-align: center;
-  padding: 2px 6px;
+  margin-top: 28px;
+  padding-top: 14px;
+  border-top: 1px solid var(--edge);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-muted);
 }
 
-/* ---------- panels ---------- */
+/* ---------- panels: white 16px surfaces, hairline edge ---------- */
 
 .panel {
-  background: var(--bg);
-  border: 2px solid var(--peri);
+  background: var(--surface);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-rest);
+  overflow: hidden; /* keep panel-head hairline flush with the rounded corner */
+}
+
+.panel + .panel {
+  margin-top: 16px;
 }
 
 .panel-head {
@@ -352,9 +471,8 @@ input[type="password"]:focus {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  padding: 4px 8px;
-  background: var(--peri-sel);
-  border-bottom: 2px solid var(--peri);
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--edge);
 }
 
 .panel-head h2 {
@@ -364,30 +482,35 @@ input[type="password"]:focus {
 }
 
 .panel-foot {
-  font-size: 90%;
-  color: var(--muted);
-  padding: 6px 8px;
-  border-top: 1px solid var(--peri);
+  font-size: 12px;
+  color: var(--ink-muted);
+  padding: 10px 16px;
+  border-top: 1px solid var(--edge);
 }
 
-/* list containers hold either a .data-table or a .state block */
+/* these containers hold either a .data-table or a .state block */
 #spaces-list,
 #commit-list,
 #tokens-list,
 #meters {
-  padding: 8px;
+  padding: 4px 0;
 }
 
 /* ---------- loading / empty / error states ---------- */
 
 .state {
-  padding: 20px 10px;
+  padding: 32px 16px;
   text-align: center;
-  color: var(--muted);
+  color: var(--ink-muted);
 }
 
 .state p + p {
   margin-top: 6px;
+}
+
+.state .mono {
+  font-size: 13px;
+  color: var(--ink-soft);
 }
 
 .state.error {
@@ -395,19 +518,24 @@ input[type="password"]:focus {
 }
 
 .state .btn {
-  margin-top: 10px;
+  margin-top: 12px;
 }
 
 .spin {
   display: inline-block;
-  width: 12px;
-  height: 12px;
+  width: 14px;
+  height: 14px;
   margin-right: 8px;
   vertical-align: -2px;
-  border: 2px solid var(--peri-sel);
-  border-top-color: var(--peri);
+  border: 2px solid var(--jade-100);
+  border-top-color: var(--jade-600);
   border-radius: 50%;
-  animation: spin 0.7s linear infinite;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .spin {
+    animation: spin 0.8s linear infinite;
+  }
 }
 
 @keyframes spin {
@@ -416,7 +544,11 @@ input[type="password"]:focus {
   }
 }
 
-/* ---------- notices: hard edge, palette-pure ---------- */
+/* ---------- notices ---------- */
+
+#notice-area {
+  margin-bottom: 16px;
+}
 
 #notice-area:empty {
   display: none;
@@ -426,15 +558,17 @@ input[type="password"]:focus {
   display: flex;
   align-items: flex-start;
   gap: 10px;
-  padding: 6px 10px;
+  padding: 10px 14px;
   margin-bottom: 8px;
-  background: var(--bg);
-  border: 2px solid;
+  background: var(--surface);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius-sm);
 }
 
 .notice.error {
   color: var(--red);
-  border-color: var(--red);
+  background: var(--red-tint);
+  border-color: var(--red-edge);
 }
 
 .notice-msg {
@@ -447,59 +581,87 @@ input[type="password"]:focus {
   appearance: none;
   background: none;
   border: 0;
+  border-radius: var(--radius-sm);
   color: inherit;
   font: inherit;
   line-height: 1.2;
-  padding: 0 2px;
+  padding: 0 4px;
   cursor: pointer;
 }
 
 .notice-close:hover {
   text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
-/* ---------- data tables (spaces, commits, tokens, quota) ---------- */
+.notice-close:focus-visible {
+  outline: 2px solid var(--jade-600);
+  outline-offset: 3px;
+}
+
+/* ---------- data tables: dense, tabular, hairline row separators ---------- */
 
 .data-table {
   width: 100%;
-  border-collapse: collapse;
-  background: var(--bg);
+  border-collapse: separate;
+  border-spacing: 0;
+  background: var(--surface);
 }
 
 .data-table th {
-  /* reference's selected/emphasis fill: #CCCCFF with black text */
-  background: var(--peri-sel);
-  color: var(--text);
-  font-family: var(--head);
-  font-weight: normal;
+  color: var(--ink-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
   text-align: left;
-  padding: 2px 8px;
-  border: 1px solid var(--peri);
+  padding: 6px 16px;
+  border-bottom: 1px solid var(--edge);
   white-space: nowrap;
 }
 
 .data-table td {
-  border: 1px solid var(--peri);
-  padding: 3px 8px;
-  vertical-align: top;
+  padding: 8px 16px;
+  vertical-align: middle;
+  border-bottom: 1px solid var(--edge);
 }
 
-/* clickable space rows */
+.data-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.data-table td.mono {
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+
+.quota-table .quota-num {
+  color: var(--ink);
+}
+
 tr.space-row {
   cursor: pointer;
 }
 
-tr.space-row:hover td {
-  background: var(--peri-sel);
+tr.space-row td {
+  transition: background-color 180ms var(--ease-soft);
 }
 
+tr.space-row:hover td,
 tr.space-row.selected td {
-  background: var(--peri-sel);
+  background: var(--jade-50);
 }
 
 tr.space-row.selected td:first-child {
-  border-left: 3px solid var(--peri);
-  padding-left: 5px; /* 8px − 3px border: row width stays put */
+  box-shadow: inset 3px 0 0 var(--jade-600);
+}
+
+tr.space-row.selected .rowlink {
+  color: var(--jade-700);
+}
+
+tr.commit-row td {
+  vertical-align: top;
 }
 
 /* the space name is a real button so keyboard users can select a row */
@@ -507,132 +669,157 @@ tr.space-row.selected td:first-child {
   appearance: none;
   background: none;
   border: 0;
+  border-radius: 6px;
   padding: 0;
   font: inherit;
-  color: var(--blue);
+  font-weight: 500;
+  color: var(--jade-600);
   cursor: pointer;
+  transition: color 180ms var(--ease-soft);
 }
 
 .rowlink:hover {
+  color: var(--jade-700);
   text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 .rowlink:focus-visible {
-  outline: 2px solid var(--blue);
+  outline: 2px solid var(--jade-600);
+  outline-offset: 3px;
 }
 
 .commit-id {
-  color: var(--blue);
+  color: var(--ink-soft);
 }
 
-.commit-time {
-  color: var(--muted);
-  font-size: 90%;
-}
-
-.space-created {
-  color: var(--muted);
-  font-size: 90%;
+.commit-time,
+.space-created,
+.token-created {
+  color: var(--ink-muted);
+  font-size: 13px;
 }
 
 .commit-note {
   overflow-wrap: break-word;
 }
 
+/* small status pills; jade marks a running space, head the current commit */
 .badge {
-  font-size: 80%;
-  padding: 0 4px;
-  border: 1px solid var(--peri);
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  padding: 1px 8px;
+  border-radius: var(--radius-pill);
   white-space: nowrap;
+  vertical-align: 1px;
 }
 
 .badge.head {
-  background: var(--peri);
-  color: var(--text);
+  background: var(--jade-100);
+  color: var(--jade-700);
 }
 
 .badge.auto {
-  background: var(--peri-sel);
-  color: var(--text);
+  /* automatic reflog entries read quieter than HEAD */
+  background: var(--sunken);
+  color: var(--ink-muted);
 }
 
-/* ---------- tabs (History / Archive): same bevel idiom as the menu ---------- */
+/* ---------- tabs (History / Archive): segmented pills ---------- */
 
 .tabs {
   display: flex;
-  gap: 4px;
-  padding: 8px 8px 0;
-  border-bottom: 2px solid var(--peri);
+  gap: 2px;
+  margin: 0 16px;
+  padding: 3px;
+  background: var(--sunken);
+  border-radius: var(--radius-pill);
+  width: fit-content;
 }
 
 .tabs button {
   appearance: none;
   font: inherit;
-  font-family: var(--head);
-  color: var(--text);
-  background: var(--peri);
-  /* unselected tabs read raised; the active tab sinks (see .menu-item) */
-  border: 2px outset var(--peri);
-  padding: 2px 12px;
+  font-size: 13px;
+  color: var(--ink-soft);
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-pill);
+  padding: 4px 14px;
   cursor: pointer;
+  transition:
+    background-color 180ms var(--ease-soft),
+    color 180ms var(--ease-soft);
 }
 
 .tabs button:hover {
-  color: var(--text);
-  background: var(--peri-hover);
-  border-style: outset;
+  color: var(--ink);
 }
 
 .tabs button:focus-visible {
-  outline: 2px solid var(--blue);
+  outline: 2px solid var(--jade-600);
+  outline-offset: 3px;
 }
 
 .tabs button.active {
-  color: var(--text);
-  background: var(--peri-sel);
-  border-style: inset;
+  background: var(--surface);
+  color: var(--ink);
+  font-weight: 500;
+  box-shadow: var(--shadow-rest);
 }
 
-/* ---------- quota: table + hard-edged bar, red near the limit ---------- */
+/* ---------- quota: bar turns amber near the cap, red at it ---------- */
 
 .quota-table td.quota-bar-cell {
   width: 40%;
 }
 
 .meter {
-  height: 10px;
-  background: var(--bg);
-  border: 1px solid var(--peri);
+  height: 8px;
+  background: var(--sunken);
+  border-radius: var(--radius-pill);
+  overflow: hidden;
 }
 
 .meter .fill {
   height: 100%;
-  background: var(--peri);
+  background: var(--jade-500);
+  border-radius: var(--radius-pill);
+  transition: width 300ms var(--ease-soft);
 }
 
-.meter.warn .fill,
+.meter.warn .fill {
+  background: var(--amber);
+}
+
 .meter.full .fill {
   background: var(--red);
 }
 
 .usage-line {
-  font-size: 90%;
-  color: var(--muted);
-  padding: 0 8px 8px;
+  font-size: 12px;
+  color: var(--ink-muted);
+  padding: 10px 16px 14px;
 }
 
-/* ---------- token reveal: the reference's .flash, verbatim idea ---------- */
+/* ---------- token reveal: one soft warning, machine string on sunken ---------- */
 
 .token-reveal {
-  margin: 10px 8px;
-  padding: 10px;
-  background: var(--bg);
-  border: thick solid var(--peri); /* .flash from ZKM.css */
+  margin: 12px 16px;
+  padding: 12px 14px;
+  background: var(--amber-tint);
+  border: 1px solid var(--amber-edge);
+  border-radius: var(--radius-sm);
 }
 
 .reveal-warn {
-  color: var(--red);
-  margin-bottom: 6px;
+  color: var(--amber);
+  font-size: 13px;
+  font-weight: 500;
+  margin-bottom: 8px;
 }
 
 .token-line {
@@ -645,26 +832,27 @@ tr.space-row.selected td:first-child {
   flex: 1;
   min-width: 0;
   overflow-wrap: break-word;
-  background: var(--peri-sel);
-  border: 1px solid var(--peri);
-  padding: 4px 6px;
+  background: var(--surface);
+  border: 1px solid var(--edge-strong);
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  font-size: 13px;
   user-select: all;
 }
 
+.token-row td {
+  vertical-align: middle;
+}
+
 .token-prefix {
-  color: var(--blue);
+  color: var(--ink-soft);
 }
 
-.token-created {
-  color: var(--muted);
-  font-size: 90%;
-}
-
-/* ---------- CLI guidance: copyable commands on #CCCCFF chips ---------- */
+/* ---------- CLI guidance: copyable commands on sunken chips ---------- */
 
 .cli-box {
-  padding: 8px 8px 6px;
-  border-bottom: 1px solid var(--peri);
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--edge);
 }
 
 .cli-box:empty,
@@ -673,30 +861,33 @@ tr.space-row.selected td:first-child {
 }
 
 .cli-setup {
-  padding: 6px 8px 8px;
-  border-top: 1px solid var(--peri);
+  padding: 12px 16px;
+  border-top: 1px solid var(--edge);
 }
 
 .cli-title {
-  font-size: 90%;
-  color: var(--muted);
-  margin-bottom: 4px;
+  font-size: 12px;
+  color: var(--ink-muted);
+  margin-bottom: 8px;
 }
 
 .cli-line {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 1px 0;
+  padding: 3px 0;
 }
 
 .cli-line code {
   flex: 1;
   min-width: 0;
   overflow-wrap: anywhere;
-  background: var(--peri-sel);
-  border: 1px solid var(--peri);
-  padding: 1px 6px;
+  background: var(--sunken);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius-sm);
+  padding: 4px 10px;
+  font-size: 12.5px;
+  color: var(--ink-soft);
 }
 
 /* ---------- auth page ---------- */
@@ -711,88 +902,195 @@ tr.space-row.selected td:first-child {
 
 .auth-card {
   width: 100%;
-  max-width: 420px;
-  background: var(--bg);
-  border: 2px solid var(--peri);
+  max-width: 400px;
+  background: var(--surface);
+  border: 1px solid var(--edge);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-rest);
+  overflow: hidden;
 }
 
 .auth-masthead {
-  background: var(--peri);
-  color: var(--text);
-  padding: 8px 14px;
-  border-bottom: 2px solid var(--peri);
-}
-
-.auth-masthead .brand {
-  font-family: var(--head);
-  font-size: 170%;
-  /* large display text only, as in the console masthead */
-  color: #ffffff;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--edge);
 }
 
 .auth-body {
-  padding: 14px;
+  padding: 20px 24px 24px;
 }
 
 .mode-tabs {
   display: flex;
-  gap: 4px;
-  margin-bottom: 14px;
+  gap: 2px;
+  padding: 3px;
+  margin-bottom: 18px;
+  background: var(--sunken);
+  border-radius: var(--radius-pill);
 }
 
 .mode-tabs button {
   flex: 1;
   appearance: none;
   font: inherit;
-  font-family: var(--head);
-  color: var(--text);
-  background: var(--peri);
-  /* unselected tab raised, selected tab sunken — same idiom as .tabs/.menu-item */
-  border: 2px outset var(--peri);
-  padding: 3px 0;
+  font-size: 13px;
+  color: var(--ink-soft);
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-pill);
+  padding: 5px 0;
   cursor: pointer;
+  transition:
+    background-color 180ms var(--ease-soft),
+    color 180ms var(--ease-soft);
 }
 
 .mode-tabs button:hover {
-  color: var(--text);
-  background: var(--peri-hover);
-  border-style: outset;
+  color: var(--ink);
 }
 
 .mode-tabs button:focus-visible {
-  outline: 2px solid var(--blue);
+  outline: 2px solid var(--jade-600);
+  outline-offset: 3px;
 }
 
 .mode-tabs button.active {
-  color: var(--text);
-  background: var(--peri-sel);
-  border-style: inset;
+  background: var(--surface);
+  color: var(--ink);
+  font-weight: 500;
+  box-shadow: var(--shadow-rest);
 }
 
-/* ---------- narrow screens: console assumes desktop, but stay usable ---------- */
+/* ---------- narrow screens: sidebar becomes a scrollable strip ---------- */
 
-@media (max-width: 820px) {
+@media (max-width: 900px) {
+  .container {
+    padding: 0 14px 24px;
+  }
+
   .main {
     grid-template-columns: 1fr;
+    gap: 14px;
+    margin-top: 14px;
   }
 
   .sidemenu {
+    position: static;
     display: flex;
-    flex-wrap: wrap;
-    gap: 2px;
+    gap: 4px;
+    padding: 3px;
+    background: var(--sunken);
+    border-radius: var(--radius-pill);
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .sidemenu::-webkit-scrollbar {
+    display: none;
   }
 
   .menu-item {
     width: auto;
-    flex: 1;
+    flex: 0 0 auto;
     text-align: center;
+    border-radius: var(--radius-pill);
+    padding: 5px 14px;
+    margin: 0;
+    white-space: nowrap;
+  }
+
+  .menu-item:hover {
+    background: transparent;
+  }
+
+  .menu-item.active {
+    background: var(--surface);
+    color: var(--ink);
+    box-shadow: var(--shadow-rest);
   }
 
   .navbar {
     flex-wrap: wrap;
+    row-gap: 2px;
+  }
+
+  .navbar .nav-spacer {
+    flex-basis: 100%;
+    height: 0;
   }
 
   .token-line {
     flex-wrap: wrap;
+  }
+
+  .token-value {
+    flex-basis: 100%;
+  }
+
+  /* tables scroll inside their container instead of overflowing the panel */
+  #spaces-list,
+  #commit-list,
+  #tokens-list,
+  #meters {
+    overflow-x: auto;
+  }
+
+  .data-table {
+    min-width: 480px;
+  }
+}
+
+@media (max-width: 480px) {
+  .masthead {
+    flex-wrap: wrap;
+    row-gap: 2px;
+  }
+
+  .data-table {
+    min-width: 430px;
+  }
+
+  .data-table th,
+  .data-table td,
+  .panel-foot,
+  .usage-line,
+  .cli-box,
+  .cli-setup {
+    padding-left: 12px;
+    padding-right: 12px;
+  }
+
+  .panel-head {
+    padding: 10px 12px;
+  }
+
+  .tabs {
+    margin: 0 12px;
+  }
+
+  .auth-body {
+    padding: 16px;
+  }
+}
+
+/* ---------- reduced motion ---------- */
+
+@media (prefers-reduced-motion: reduce) {
+  .btn,
+  .menu-item,
+  .tabs button,
+  .mode-tabs button,
+  .navbar button.nav-item,
+  .rowlink,
+  tr.space-row td,
+  .page-auth input,
+  .meter .fill {
+    transition: none;
+  }
+
+  .btn:active:not(:disabled) {
+    transform: none;
   }
 }

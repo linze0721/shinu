@@ -1,4 +1,4 @@
-use shinu_core::{parse_ipv4, parse_ipv4_cidr, parse_net_base, Error, Result, GUEST_BLOCKED_CIDRS};
+use shinu_core::{Error, GUEST_BLOCKED_CIDRS, Result, parse_ipv4, parse_ipv4_cidr, parse_net_base};
 use uuid::Uuid;
 
 /// A host service that guests may call through the host-side firewall.
@@ -11,9 +11,8 @@ pub struct HostAllow {
 
 /// A private /30 network for each VM. The host owns `.1`, the guest `.2`.
 ///
-/// The pool is intentionally part of the daemon configuration rather than a
-/// per-space setting: deterministic addresses make restart idempotent, while
-/// rejecting occupied host addresses keeps two VMs from sharing a subnet.
+/// The pool is daemon-wide: deterministic addresses make restarts idempotent,
+/// while rejecting occupied host addresses prevents subnet reuse.
 #[derive(Debug, Clone)]
 pub struct NetConfig {
     /// `SHINU_NET_ENABLE` — "0" and "false" disable guest networking.
@@ -26,15 +25,13 @@ pub struct NetConfig {
     /// `SHINU_HOST_ALLOW` — comma-separated `tcp:PORT` or
     /// `tcp:PORT@DESTINATION` (with `tcp` replaced by `udp` as needed).
     ///
-    /// Guests may call back into host services through DNATed loopback ports;
+    /// Guests may call back into host services through `DNATed` loopback ports;
     /// these ACCEPTs must stay before per-tap DROP rules without racing VM
     /// starts, so `tap_up` keeps them in the daemon-owned input chain.
     pub host_allow: Vec<HostAllow>,
     /// `SHINU_NET_UPLINK` — host interface used for NAT egress.
     pub uplink: String,
 }
-
-
 /// Parses `SHINU_NET_ALLOW` without silently dropping malformed entries.
 pub fn parse_net_allow(value: &str) -> Result<Vec<String>> {
     if value.trim().is_empty() {
@@ -143,24 +140,26 @@ fn default_uplink() -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    output
+    let mut tokens = output
         .stdout
         .split(|byte| *byte == b' ' || *byte == b'\n' || *byte == b'\t')
-        .filter(|token| !token.is_empty())
-        .collect::<Vec<_>>()
-        .windows(2)
-        .find(|tokens| tokens[0] == b"dev")
-        .map(|tokens| String::from_utf8_lossy(tokens[1]).into_owned())
+        .filter(|token| !token.is_empty());
+    while let Some(token) = tokens.next() {
+        if token == b"dev" {
+            return tokens
+                .next()
+                .map(|device| String::from_utf8_lossy(device).into_owned());
+        }
+    }
+    None
 }
 
 impl NetConfig {
     pub fn from_env() -> Result<Self> {
-        let enabled = !std::env::var("SHINU_NET_ENABLE")
-            .ok()
-            .is_some_and(|value| {
-                let value = value.trim();
-                value == "0" || value.eq_ignore_ascii_case("false")
-            });
+        let enabled = !std::env::var("SHINU_NET_ENABLE").ok().is_some_and(|value| {
+            let value = value.trim();
+            value == "0" || value.eq_ignore_ascii_case("false")
+        });
         let base = match std::env::var("SHINU_NET_BASE") {
             Ok(value) => parse_net_base(&value).ok_or_else(|| {
                 Error::Invalid(format!(
@@ -201,7 +200,11 @@ impl NetConfig {
 pub fn net_slot(id: Uuid) -> (u8, u8) {
     let bytes = id.as_bytes();
     let index = u16::from_be_bytes([bytes[0], bytes[1]]) & 0x3fff;
-    ((index >> 6) as u8, ((index & 0x3f) << 2) as u8)
+    let [index_high, index_low] = index.to_be_bytes();
+    (
+        (index_high << 2) | (index_low >> 6),
+        (index_low & 0x3f) << 2,
+    )
 }
 
 /// Linux interface names have fifteen usable bytes; the ten hex characters
@@ -254,46 +257,40 @@ pub fn net_spec(id: Uuid, cfg: &NetConfig) -> Option<NetSpec> {
 
 /// Returns match/action arguments in firewall order. `tap_up` inserts each
 /// rule at its final position so retries preserve this ordering.
-/// The gateway and named-network peer exceptions must stay ahead of the
-/// 172.16/12 drop: the host side of each guest /30 and every peer guest
-/// address live inside that private range.
+/// The gateway exception remains first for host access. Named-network peer
+/// exceptions must precede the inter-tap fence, which must precede operator
+/// allowances so a broad allow cannot bypass tenant isolation.
 pub fn egress_rules(tap: &str, gateway: &str, allow: &[String]) -> Vec<Vec<String>> {
     egress_rules_with_peers(tap, gateway, allow, &[])
 }
 
-/// Returns one ACCEPT rule for each named-network peer guest address.
-///
-/// UUID-derived guest addresses are scattered through the pool, so the mesh
-/// cannot be represented by one aggregate CIDR. The caller supplies bare
-/// guest addresses and this function makes the host firewall's /32 boundary
-/// explicit for each one.
-pub fn peer_rules(tap: &str, peers: &[String]) -> Vec<Vec<String>> {
-    peers
-        .iter()
-        .map(|peer| {
-            vec![
-                "-i".to_owned(),
-                tap.to_owned(),
-                "-d".to_owned(),
-                format!("{peer}/32"),
-                "-j".to_owned(),
-                "ACCEPT".to_owned(),
-            ]
-        })
-        .collect()
+pub(crate) fn peer_rule(tap: &str, peer: &str) -> Vec<String> {
+    vec![
+        "-i".to_owned(),
+        tap.to_owned(),
+        "-d".to_owned(),
+        format!("{peer}/32"),
+        "-j".to_owned(),
+        "ACCEPT".to_owned(),
+    ]
 }
 
-/// Builds the complete ordered rule list, placing peer exceptions directly
-/// before the blanket private-destination drops.
+/// Returns one ACCEPT rule for each named-network peer guest address.
+/// UUID-derived addresses are scattered through the pool, so each peer gets
+/// an explicit /32 exception before the inter-tap and private-destination drops.
+pub fn peer_rules(tap: &str, peers: &[String]) -> Vec<Vec<String>> {
+    peers.iter().map(|peer| peer_rule(tap, peer)).collect()
+}
+
+/// Builds the complete ordered rule list, placing peer exceptions before the
+/// inter-tap fence, then operator allowances and private-destination drops.
 pub(crate) fn egress_rules_with_peers(
     tap: &str,
     gateway: &str,
     allow: &[String],
     peers: &[String],
 ) -> Vec<Vec<String>> {
-    let mut rules = Vec::with_capacity(
-        1 + allow.len() + peers.len() + GUEST_BLOCKED_CIDRS.len(),
-    );
+    let mut rules = Vec::with_capacity(2 + peers.len() + allow.len() + GUEST_BLOCKED_CIDRS.len());
     rules.push(vec![
         "-i".to_owned(),
         tap.to_owned(),
@@ -301,6 +298,17 @@ pub(crate) fn egress_rules_with_peers(
         gateway.to_owned(),
         "-j".to_owned(),
         "ACCEPT".to_owned(),
+    ]);
+    for peer in peers {
+        rules.push(peer_rule(tap, peer));
+    }
+    rules.push(vec![
+        "-i".to_owned(),
+        tap.to_owned(),
+        "-o".to_owned(),
+        "shinu+".to_owned(),
+        "-j".to_owned(),
+        "DROP".to_owned(),
     ]);
     for destination in allow {
         rules.push(vec![
@@ -312,7 +320,6 @@ pub(crate) fn egress_rules_with_peers(
             "ACCEPT".to_owned(),
         ]);
     }
-    rules.extend(peer_rules(tap, peers));
     for destination in GUEST_BLOCKED_CIDRS {
         rules.push(vec![
             "-i".to_owned(),
@@ -326,25 +333,22 @@ pub(crate) fn egress_rules_with_peers(
     rules
 }
 
-
 #[cfg(test)]
 mod network_tests {
     use super::{
-        egress_rules_with_peers, host_allow_rule, input_drop_rule, net_slot, parse_host_allow,
-        parse_net_allow, peer_rules, tap_name, HostAllow, NetSpec,
+        HostAllow, NetSpec, egress_rules_with_peers, host_allow_rule, input_drop_rule, net_slot,
+        parse_host_allow, parse_net_allow, peer_rules, tap_name,
     };
     use crate::config::vm_config_json;
     use crate::vm::egress_rules;
-    use shinu_core::Image;
     use serde_json::Value;
+    use shinu_core::Image;
     use std::path::Path;
     use uuid::Uuid;
 
     #[test]
     fn derives_disjoint_addresses_inside_one_slash_thirty() {
-        let id = Uuid::from_bytes([
-            0xab, 0xcd, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        ]);
+        let id = Uuid::from_bytes([0xab, 0xcd, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         let (third, fourth_base) = net_slot(id);
         assert_eq!(fourth_base, 52);
         let host = fourth_base + 1;
@@ -478,7 +482,11 @@ mod network_tests {
                 destination: Some("127.0.0.1".to_owned()),
             }]
         );
-        assert!(parse_host_allow("").expect("empty host allow list").is_empty());
+        assert!(
+            parse_host_allow("")
+                .expect("empty host allow list")
+                .is_empty()
+        );
         for malformed in [
             "icmp:23000",
             "tcp",
@@ -490,7 +498,10 @@ mod network_tests {
             "tcp:23000@127.0.0.1@127.0.0.2",
             "tcp:23000,",
         ] {
-            assert!(parse_host_allow(malformed).is_err(), "accepted {malformed:?}");
+            assert!(
+                parse_host_allow(malformed).is_err(),
+                "accepted {malformed:?}"
+            );
         }
     }
 
@@ -547,12 +558,11 @@ mod network_tests {
         );
     }
 
-
     #[test]
-    fn egress_rules_put_gateway_and_allowlist_before_private_drops() {
+    fn egress_rules_put_gateway_and_isolation_before_allowlist_and_private_drops() {
         let allow = vec!["10.42.0.0/16".to_owned()];
         let rules = egress_rules("tap0", "172.31.1.1", &allow);
-        assert_eq!(rules.len(), 7);
+        assert_eq!(rules.len(), 8);
         assert_eq!(
             rules[0],
             vec![
@@ -569,13 +579,15 @@ mod network_tests {
             vec![
                 "-i".to_owned(),
                 "tap0".to_owned(),
-                "-d".to_owned(),
-                "10.42.0.0/16".to_owned(),
+                "-o".to_owned(),
+                "shinu+".to_owned(),
                 "-j".to_owned(),
-                "ACCEPT".to_owned(),
+                "DROP".to_owned(),
             ]
         );
-        for (rule, destination) in rules[2..].iter().zip([
+        assert_eq!(rules[2][3], "10.42.0.0/16");
+        assert_eq!(rules[2][5], "ACCEPT");
+        for (rule, destination) in rules[3..].iter().zip([
             "10.0.0.0/8",
             "172.16.0.0/12",
             "192.168.0.0/16",
@@ -586,16 +598,40 @@ mod network_tests {
             assert_eq!(rule[5], "DROP");
         }
     }
+
     #[test]
-    fn ordered_rules_place_peers_between_allowlist_and_private_drops() {
+    fn ordered_rules_place_peers_before_intertap_drop_and_allowlist() {
         let allow = vec!["10.42.0.0/16".to_owned()];
         let peers = vec!["172.31.1.2".to_owned(), "172.31.200.6".to_owned()];
         let rules = egress_rules_with_peers("tap0", "172.31.1.1", &allow, &peers);
-        assert_eq!(rules[2][3], "172.31.1.2/32");
-        assert_eq!(rules[3][3], "172.31.200.6/32");
-        assert_eq!(rules[4][3], "10.0.0.0/8");
-        assert_eq!(rules[4][5], "DROP");
+        assert_eq!(rules[1][3], "172.31.1.2/32");
+        assert_eq!(rules[2][3], "172.31.200.6/32");
+        assert_eq!(rules[3][1], "tap0");
+        assert_eq!(rules[3][3], "shinu+");
+        assert_eq!(rules[3][5], "DROP");
+        assert_eq!(rules[4][3], "10.42.0.0/16");
+        assert_eq!(rules[4][5], "ACCEPT");
+        assert_eq!(rules[5][3], "10.0.0.0/8");
+        assert_eq!(rules[5][5], "DROP");
     }
+
+    #[test]
+    fn global_allow_overlapping_guest_pool_follows_intertap_drop() {
+        let allow = vec!["172.31.0.0/16".to_owned()];
+        let rules = egress_rules_with_peers("tap0", "172.31.1.1", &allow, &[]);
+        let intertap_drop = rules
+            .iter()
+            .position(|rule| {
+                rule[1] == "tap0" && rule[2] == "-o" && rule[3] == "shinu+" && rule[5] == "DROP"
+            })
+            .expect("per-tap intertap drop");
+        let global_allow = rules
+            .iter()
+            .position(|rule| rule[3] == "172.31.0.0/16" && rule[5] == "ACCEPT")
+            .expect("global guest-pool allow");
+        assert!(intertap_drop < global_allow);
+    }
+
     #[test]
     fn peer_rules_keep_peer_order_and_use_host_firewall_slash_thirty_twos() {
         let peers = vec!["172.31.1.2".to_owned(), "172.31.200.6".to_owned()];

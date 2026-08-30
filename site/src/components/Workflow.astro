@@ -1,0 +1,86 @@
+---
+import { workflow } from "../content/facts";
+
+// Step 04 is the pivot of the whole page, so its node on the spine is the
+// only one lit in jade; every other step stays quiet.
+---
+
+<section id="workflow" class="shell py-20 md:py-24" aria-labelledby="workflow-heading">
+  <header class="reveal max-w-[60ch]">
+    <h2
+      id="workflow-heading"
+      class="text-3xl font-medium tracking-tight text-ink md:text-5xl"
+    >
+      {workflow.heading}
+    </h2>
+    <p class="mt-5 leading-relaxed text-ink-soft">
+      {workflow.lede}
+    </p>
+  </header>
+
+  <ol class="mt-10 border-l border-edge md:mt-14">
+    {
+      workflow.steps.map((s) => (
+        <li class="wf-step reveal relative py-8 pl-10 md:py-10 md:pl-16">
+          <span
+            class:list={[
+              "wf-index font-mono text-sm tabular-nums",
+              s.accent ? "text-jade-600" : "text-ink-muted",
+            ]}
+          >
+            {s.n}
+          </span>
+          <h3 class="text-xl tracking-tight text-ink md:text-2xl">{s.title}</h3>
+          <p class="mt-3 max-w-[65ch] leading-relaxed text-ink-soft">{s.body}</p>
+        </li>
+      ))
+    }
+  </ol>
+
+  <p class="reveal mt-4 max-w-[60ch] pl-10 text-sm leading-relaxed text-ink-muted md:pl-16">
+    {workflow.closing}
+  </p>
+</section>
+
+<style>
+  /* The index sits centered on the spine. The li's left padding is the
+     distance from the spine to the content, so pulling the span back by
+     exactly that padding lands it on the border, and translateX(-50%)
+     centers it. The canvas-colored chip masks the line behind it. */
+  .wf-index {
+    position: absolute;
+    left: 0;
+    top: 1.6rem;
+    display: inline-block;
+    background-color: var(--color-canvas);
+    padding: 0.15rem 0.4rem;
+    transform: translateX(-50%);
+  }
+  @media (min-width: 768px) {
+    .wf-index {
+      top: 1.9rem;
+    }
+  }
+
+  /* Staggered cascade, motion-safe only. The shared .reveal handles the
+     entrance itself; this only offsets each step's window. */
+  @media (prefers-reduced-motion: no-preference) {
+    @supports (animation-timeline: view()) {
+      .wf-step:nth-child(1) {
+        animation-range: entry 5% cover 22%;
+      }
+      .wf-step:nth-child(2) {
+        animation-range: entry 6% cover 24%;
+      }
+      .wf-step:nth-child(3) {
+        animation-range: entry 7% cover 26%;
+      }
+      .wf-step:nth-child(4) {
+        animation-range: entry 8% cover 28%;
+      }
+      .wf-step:nth-child(5) {
+        animation-range: entry 9% cover 30%;
+      }
+    }
+  }
+</style>

@@ -1,8 +1,9 @@
 //! Password hashing and browser-session token generation for console users.
 
-use crate::sha2::{sha256_bytes, Sha256State};
+use crate::sha2::{Sha256State, sha256_bytes};
 use crate::token::{constant_time_eq, mint};
 use shinu_core::Result;
+use std::fmt::Write as _;
 use std::io::Read;
 
 const PASSWORD_ITERATIONS: u32 = 210_000;
@@ -18,24 +19,22 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn encode_hex(bytes: &[u8]) -> String {
+fn append_hex(output: &mut String, bytes: &[u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {
         output.push(HEX[(byte >> 4) as usize] as char);
         output.push(HEX[(byte & 0x0f) as usize] as char);
     }
-    output
 }
 
-fn decode_hex(value: &str) -> Option<Vec<u8>> {
+fn decode_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
     let bytes = value.as_bytes();
-    if !bytes.len().is_multiple_of(2) {
+    if bytes.len() != N * 2 {
         return None;
     }
-    let mut decoded = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
-        decoded.push((hex_value(pair[0])? << 4) | hex_value(pair[1])?);
+    let mut decoded = [0_u8; N];
+    for (index, pair) in bytes.chunks_exact(2).enumerate() {
+        decoded[index] = (hex_value(pair[0])? << 4) | hex_value(pair[1])?;
     }
     Some(decoded)
 }
@@ -71,6 +70,17 @@ impl HmacSha256 {
     fn digest(&self, message: &[u8]) -> [u8; 32] {
         let mut inner = self.inner.clone();
         inner.update(message);
+        self.finish_inner(inner)
+    }
+
+    fn digest_parts(&self, first: &[u8], second: &[u8]) -> [u8; 32] {
+        let mut inner = self.inner.clone();
+        inner.update(first);
+        inner.update(second);
+        self.finish_inner(inner)
+    }
+
+    fn finish_inner(&self, inner: Sha256State) -> [u8; 32] {
         let inner_hash = inner.finish();
         let mut outer = self.outer.clone();
         outer.update(&inner_hash);
@@ -78,24 +88,20 @@ impl HmacSha256 {
     }
 }
 
-fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    HmacSha256::new(key).digest(message)
-}
-
 fn pbkdf2_sha256(password: &[u8], salt: &[u8], iterations: u32, out: &mut [u8]) {
     if iterations == 0 || out.is_empty() {
         return;
     }
     let block_count = out.len() / 32 + usize::from(!out.len().is_multiple_of(32));
-    assert!(block_count <= u32::MAX as usize);
+    assert!(u32::try_from(block_count).is_ok());
     let hmac = HmacSha256::new(password);
     for block_index in 1..=block_count {
-        let mut salt_block = Vec::with_capacity(salt.len() + 4);
-        salt_block.extend_from_slice(salt);
-        salt_block.extend_from_slice(&(block_index as u32).to_be_bytes());
-
-        let mut u = hmac_sha256(password, &salt_block);
+        let block_number = u32::try_from(block_index)
+            .expect("PBKDF2 block index fits in a 32-bit block number")
+            .to_be_bytes();
+        let mut u = hmac.digest_parts(salt, &block_number);
         let mut block = u;
+
         for _ in 1..iterations {
             u = hmac.digest(&u);
             for (accumulator, next) in block.iter_mut().zip(u) {
@@ -113,17 +119,15 @@ pub fn hash_password(plain: &str) -> Result<String> {
     let mut salt = [0_u8; PASSWORD_SALT_BYTES];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut salt)?;
     let mut derived = [0_u8; PASSWORD_HASH_BYTES];
-    pbkdf2_sha256(
-        plain.as_bytes(),
-        &salt,
-        PASSWORD_ITERATIONS,
-        &mut derived,
+    pbkdf2_sha256(plain.as_bytes(), &salt, PASSWORD_ITERATIONS, &mut derived);
+    let mut record = String::with_capacity(
+        "pbkdf2$".len() + 10 + 1 + PASSWORD_SALT_BYTES * 2 + 1 + PASSWORD_HASH_BYTES * 2,
     );
-    Ok(format!(
-        "pbkdf2${PASSWORD_ITERATIONS}${}${}",
-        encode_hex(&salt),
-        encode_hex(&derived)
-    ))
+    let _ = write!(record, "pbkdf2${PASSWORD_ITERATIONS}$");
+    append_hex(&mut record, &salt);
+    record.push('$');
+    append_hex(&mut record, &derived);
+    Ok(record)
 }
 
 /// Verifies a password using the iteration count encoded in its record.
@@ -141,31 +145,22 @@ pub fn verify_password(plain: &str, stored: &str) -> bool {
     let Some(hash_hex) = fields.next() else {
         return false;
     };
-    if fields.next().is_some()
-        || iterations == 0
-        || salt_hex.len() != PASSWORD_SALT_BYTES * 2
-        || hash_hex.len() != PASSWORD_HASH_BYTES * 2
-    {
+    if fields.next().is_some() || iterations == 0 {
         return false;
     }
-    let Some(salt) = decode_hex(salt_hex) else {
+    let Some(salt) = decode_hex::<PASSWORD_SALT_BYTES>(salt_hex) else {
         return false;
     };
-    let Some(expected) = decode_hex(hash_hex) else {
+    let Some(expected) = decode_hex::<PASSWORD_HASH_BYTES>(hash_hex) else {
         return false;
     };
-    if salt.len() != PASSWORD_SALT_BYTES || expected.len() != PASSWORD_HASH_BYTES {
-        return false;
-    }
 
     let mut derived = [0_u8; PASSWORD_HASH_BYTES];
     pbkdf2_sha256(plain.as_bytes(), &salt, iterations, &mut derived);
-    let derived_hex = encode_hex(&derived);
-    let expected_hex = encode_hex(&expected);
-    constant_time_eq(&derived_hex, &expected_hex)
+    constant_time_eq(&derived, &expected)
 }
 
-/// Creates a bearer-like random value for the browser session cookie.
+/// Creates a cryptographically random value for a browser session cookie.
 pub fn new_session_token() -> Result<String> {
     // Keep session randomness identical to project-token randomness: both
     // are 256-bit values read directly from the kernel CSPRNG.
@@ -175,22 +170,24 @@ pub fn new_session_token() -> Result<String> {
 #[cfg(test)]
 mod auth_tests {
     use super::{
-        hash_password, hmac_sha256, new_session_token, pbkdf2_sha256, verify_password,
-        PASSWORD_HASH_BYTES, PASSWORD_SALT_BYTES,
+        HmacSha256, PASSWORD_HASH_BYTES, PASSWORD_SALT_BYTES, hash_password, new_session_token,
+        pbkdf2_sha256, verify_password,
     };
+    use std::fmt::Write as _;
     use std::time::{Duration, Instant};
 
     fn hex(bytes: &[u8]) -> String {
-        bytes
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
+        let mut output = String::with_capacity(bytes.len() * 2);
+        for &byte in bytes {
+            let _ = write!(&mut output, "{byte:02x}");
+        }
+        output
     }
 
     #[test]
     fn hmac_matches_rfc_4231_short_key_vector() {
         let key = [0x0b_u8; 20];
-        let digest = hmac_sha256(&key, b"Hi There");
+        let digest = HmacSha256::new(&key).digest(b"Hi There");
         assert_eq!(
             hex(&digest),
             "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
@@ -200,10 +197,8 @@ mod auth_tests {
     #[test]
     fn hmac_matches_rfc_4231_long_key_vector() {
         let key = [0xaa_u8; 131];
-        let digest = hmac_sha256(
-            &key,
-            b"Test Using Larger Than Block-Size Key - Hash Key First",
-        );
+        let digest =
+            HmacSha256::new(&key).digest(b"Test Using Larger Than Block-Size Key - Hash Key First");
         assert_eq!(
             hex(&digest),
             "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
@@ -245,10 +240,14 @@ mod auth_tests {
         assert!(verify_password("correct horse battery staple", &stored));
         assert!(!verify_password("wrong password", &stored));
 
-        let mut tampered = stored.clone();
+        let mut tampered = stored;
         let index = tampered.rfind('$').expect("hash separator") + 1;
-        let replacement = if tampered.as_bytes()[index] == b'0' { '1' } else { '0' };
-        tampered.replace_range(index..index + 1, &replacement.to_string());
+        let replacement = if tampered.as_bytes()[index] == b'0' {
+            '1'
+        } else {
+            '0'
+        };
+        tampered.replace_range(index..=index, &replacement.to_string());
         assert!(!verify_password("correct horse battery staple", &tampered));
     }
 

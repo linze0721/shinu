@@ -1,13 +1,13 @@
 use std::path::Path;
 
-use shinu_core::{base_path, env_u32, migrate_base, Error, Image, Result};
+use shinu_core::{Error, Image, Result, base_path, env_u32, migrate_base};
 
 use super::configure::{
     chroot_run, configure_image, filter_guest_nameservers, guest_dns_fallback,
     guest_resolv_needs_repair, install_payload,
 };
 use super::extract::{extract_rootfs, mount_image, umount};
-use super::fetch::{fetch_tarball, BaseConfig};
+use super::fetch::{BaseConfig, fetch_tarball};
 
 fn build_base(root: &Path, base: &Path, image: Image, cfg: &BaseConfig) -> Result<()> {
     let tarball = fetch_tarball(root, image, cfg)?;
@@ -38,7 +38,10 @@ fn build_base(root: &Path, base: &Path, image: Image, cfg: &BaseConfig) -> Resul
         }
 
         let mnt = root.join(format!("build-{image}.mnt"));
-        mount_image(&staging, &mnt)?;
+        if let Err(error) = mount_image(&staging, &mnt) {
+            let _ = std::fs::remove_dir(&mnt);
+            return Err(error);
+        }
         let mounted_result = (|| -> Result<()> {
             extract_rootfs(root, image, &tarball, &mnt)?;
             // This first pass must seed DNS before any package-manager command.
@@ -53,7 +56,10 @@ fn build_base(root: &Path, base: &Path, image: Image, cfg: &BaseConfig) -> Resul
                     chroot_run(&mnt, "xbps-install -Syu")?;
                     // xbps may replace itself during the first pass before all upgrades apply.
                     chroot_run(&mnt, "xbps-install -yu")?;
-                    chroot_run(&mnt, "xbps-install -y -S socat openssh iproute2 git tmux xorg-server-xvfb x11vnc openbox xdotool scrot")?;
+                    chroot_run(
+                        &mnt,
+                        "xbps-install -y -S socat openssh iproute2 git tmux xorg-server-xvfb x11vnc openbox xdotool scrot",
+                    )?;
                 }
                 // ca-certificates is not pulled in by --no-install-recommends, and
                 // without it every HTTPS clone or download in the guest fails with
@@ -64,7 +70,10 @@ fn build_base(root: &Path, base: &Path, image: Image, cfg: &BaseConfig) -> Resul
                 )?,
                 Image::Arch => {
                     chroot_run(&mnt, "pacman-key --init && pacman-key --populate archlinux")?;
-                    chroot_run(&mnt, "pacman -Sy --noconfirm socat openssh tmux xorg-server-xvfb x11vnc openbox xdotool scrot")?;
+                    chroot_run(
+                        &mnt,
+                        "pacman -Sy --noconfirm socat openssh tmux xorg-server-xvfb x11vnc openbox xdotool scrot",
+                    )?;
                 }
                 Image::Rocky => chroot_run(
                     &mnt,
@@ -108,6 +117,12 @@ fn build_base(root: &Path, base: &Path, image: Image, cfg: &BaseConfig) -> Resul
 }
 
 pub fn ensure_base(root: &Path, image: Image, cfg: &BaseConfig) -> Result<()> {
+    // Match Registry::space_lock: each image gets its own lock, while two
+    // requests for one image share the same guard across the full build.
+    static BASE_LOCKS: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<Image, std::sync::Arc<std::sync::Mutex<()>>>>,
+    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
     // Migration is shared by all image requests. Serialize it separately so
     // two first-use requests cannot both race on the legacy filename.
     static MIGRATION_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
@@ -118,14 +133,6 @@ pub fn ensure_base(root: &Path, image: Image, cfg: &BaseConfig) -> Result<()> {
         .unwrap_or_else(|error| error.into_inner());
     migrate_base(root)?;
     drop(migration_guard);
-
-    // Match Registry::space_lock: each image gets its own lock, while two
-    // requests for one image share the same guard across the full build.
-    static BASE_LOCKS: std::sync::LazyLock<
-        std::sync::Mutex<
-            std::collections::HashMap<Image, std::sync::Arc<std::sync::Mutex<()>>>,
-        >,
-    > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let locks = &*BASE_LOCKS;
     let build_lock = {
         let mut locks = locks.lock().unwrap_or_else(|error| error.into_inner());
@@ -179,12 +186,19 @@ fn repair_one_base_resolv(root: &Path, image: Image) -> Result<bool> {
     }
     let result = (|| -> Result<bool> {
         let path = mnt.join("etc/resolv.conf");
-        let resolv = match std::fs::read_to_string(&path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(error) => return Err(error.into()),
+        let is_symlink = std::fs::symlink_metadata(&path)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false);
+        let resolv = if is_symlink {
+            String::new()
+        } else {
+            match std::fs::read_to_string(&path) {
+                Ok(contents) => contents,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(error) => return Err(error.into()),
+            }
         };
-        if !guest_resolv_needs_repair(&resolv) {
+        if !is_symlink && !guest_resolv_needs_repair(&resolv) {
             return Ok(false);
         }
         let fallback = guest_dns_fallback();
@@ -193,10 +207,7 @@ fn repair_one_base_resolv(root: &Path, image: Image) -> Result<bool> {
         // directory that does not exist in a cold image. Writing through it
         // would create the link target and leave the resolver unfixed, so the
         // link is replaced by a regular file.
-        if std::fs::symlink_metadata(&path)
-            .map(|meta| meta.file_type().is_symlink())
-            .unwrap_or(false)
-        {
+        if is_symlink {
             std::fs::remove_file(&path)?;
         }
         std::fs::write(path, filtered)?;

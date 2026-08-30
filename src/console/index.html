@@ -4,12 +4,12 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>shinu console</title>
-<link rel="icon" href="data:,">
+<meta name="theme-color" content="#f7f8f9">
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2032%2032%22%3E%3Crect%20width%3D%2232%22%20height%3D%2232%22%20rx%3D%227%22%20fill%3D%22%23f7f8f9%22%2F%3E%3Cpath%20d%3D%22M10%209v14M10%2016h8%22%20stroke%3D%22%23d6dbe0%22%20stroke-width%3D%221.75%22%20stroke-linecap%3D%22round%22%2F%3E%3Ccircle%20cx%3D%2210%22%20cy%3D%229%22%20r%3D%222.75%22%20fill%3D%22%231f7d5b%22%2F%3E%3Ccircle%20cx%3D%2210%22%20cy%3D%2223%22%20r%3D%222.75%22%20fill%3D%22%237fc9a8%22%2F%3E%3Ccircle%20cx%3D%2221%22%20cy%3D%2216%22%20r%3D%222.75%22%20fill%3D%22%231f7d5b%22%2F%3E%3C%2Fsvg%3E">
 <link rel="stylesheet" href="/assets/app.css">
 <script>
-/* Served by shinud from /assets/…. When the file is opened straight from
-   disk (file://) those absolute paths miss; fall back to the sibling files
-   so the page still renders for local preview. */
+/* Absolute /assets/… paths only resolve when shinud serves the page; a
+   file:// preview falls back to the sibling files. */
 if (location.protocol === 'file:') {
   var fallbackCss = document.createElement('link');
   fallbackCss.rel = 'stylesheet';
@@ -22,16 +22,17 @@ if (location.protocol === 'file:') {
 }
 </script>
 </head>
-<body data-page="console">
+<body class="page-console" data-page="console">
 <div class="container">
+  <a class="skip-link sr-only" href="#console-content">Skip to content</a>
   <header class="masthead">
     <h1 class="brand">shinu<span class="brand-accent">.</span></h1>
-
+    <span class="brand-sub">console</span>
   </header>
 
   <nav class="navbar" aria-label="Session">
     <span class="nav-item mono" id="project-badge"></span>
-    <span class="grow"></span>
+    <span class="nav-spacer"></span>
     <span class="nav-item" id="user-email"></span>
     <button class="nav-item" id="logout-btn" type="button">Log out</button>
   </nav>
@@ -41,10 +42,10 @@ if (location.protocol === 'file:') {
       <button type="button" class="menu-item active" data-view="spaces" aria-pressed="true">Spaces</button>
       <button type="button" class="menu-item" data-view="commits" aria-pressed="false">Commits</button>
       <button type="button" class="menu-item" data-view="tokens" aria-pressed="false">Tokens</button>
-      <button type="button" class="menu-item" data-view="quota" aria-pressed="false">Quota &amp; Usage</button>
+      <button type="button" class="menu-item" data-view="quota" aria-pressed="false">Quota &amp; usage</button>
     </nav>
 
-    <div class="content">
+    <div class="content" id="console-content">
       <div id="notice-area" aria-live="polite"></div>
 
       <section class="panel" id="spaces-panel" aria-label="Spaces">
@@ -53,7 +54,7 @@ if (location.protocol === 'file:') {
           <button class="btn small" id="refresh-btn" type="button">Refresh</button>
         </div>
         <div id="spaces-list">
-          <div class="state"><span class="spin"></span>Loading&hellip;</div>
+          <div class="state"><span class="spin"></span>Loading…</div>
         </div>
       </section>
 
@@ -71,7 +72,7 @@ if (location.protocol === 'file:') {
             <button type="button" id="tab-reflog" role="tab" aria-selected="false">Archive</button>
           </div>
           <div id="commit-list">
-            <div class="state"><span class="spin"></span>Loading&hellip;</div>
+            <div class="state"><span class="spin"></span>Loading…</div>
           </div>
         </div>
       </section>
@@ -90,7 +91,7 @@ if (location.protocol === 'file:') {
           </div>
         </div>
         <div id="tokens-list">
-          <div class="state"><span class="spin"></span>Loading&hellip;</div>
+          <div class="state"><span class="spin"></span>Loading…</div>
         </div>
         <div class="cli-setup" id="cli-setup"></div>
         <p class="panel-foot"><span class="mono">Authorization: Bearer &lt;token&gt;</span></p>
@@ -99,7 +100,7 @@ if (location.protocol === 'file:') {
       <section class="panel" id="quota-panel" aria-label="Quota and usage" hidden>
         <div class="panel-head"><h2>Quota &amp; usage</h2></div>
         <div id="meters">
-          <div class="state"><span class="spin"></span>Loading&hellip;</div>
+          <div class="state"><span class="spin"></span>Loading…</div>
         </div>
         <p class="usage-line" id="usage-line"></p>
       </section>

@@ -1,18 +1,22 @@
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use shinu::proto::SnapshotMode;
 use shinu::token::{self, Token};
+use shinu_image::DEFAULT_DIFF_LIMIT;
+use std::borrow::Cow;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process;
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
-use shinu_image::DEFAULT_DIFF_LIMIT;
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:7878";
 
@@ -135,7 +139,10 @@ enum Command {
     Diff {
         source: String,
         target: Option<String>,
-        #[arg(long, help = "include all paths; by default exclude /dev, /proc, /run, /sys, /tmp, /var/log, /etc/machine-id, and /etc/ssh/ssh_host_*")]
+        #[arg(
+            long,
+            help = "include all paths; by default exclude /dev, /proc, /run, /sys, /tmp, /var/log, /etc/machine-id, and /etc/ssh/ssh_host_*"
+        )]
         all: bool,
         #[arg(long, default_value_t = DEFAULT_DIFF_LIMIT, help = "maximum reported entries (default 10000; larger values are capped by the daemon)")]
         limit: usize,
@@ -237,6 +244,12 @@ impl Endpoint {
         let (authority, path) = remainder
             .split_once('/')
             .map_or((remainder, ""), |(authority, path)| (authority, path));
+        if path
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        {
+            return Err("endpoint must not contain whitespace or control characters".to_string());
+        }
         if authority.is_empty()
             || authority
                 .bytes()
@@ -264,7 +277,10 @@ impl Endpoint {
             };
             (host.to_string(), port)
         } else if authority.matches(':').count() > 1 {
-            return Err("IPv6 endpoints must use bracket notation, for example http://[::1]:7878".to_string());
+            return Err(
+                "IPv6 endpoints must use bracket notation, for example http://[::1]:7878"
+                    .to_string(),
+            );
         } else if let Some((host, port)) = authority.rsplit_once(':') {
             if host.is_empty() {
                 return Err("endpoint host must not be empty".to_string());
@@ -287,17 +303,17 @@ impl Endpoint {
         })
     }
 
-    fn target(&self, path: &str) -> String {
-        let path = if path.starts_with('/') {
-            path.to_string()
-        } else {
-            format!("/{path}")
-        };
-        if self.base_path.is_empty() {
-            path
-        } else {
-            format!("{}{}", self.base_path, path)
+    fn target<'a>(&self, path: &'a str) -> Cow<'a, str> {
+        if self.base_path.is_empty() && path.starts_with('/') {
+            return Cow::Borrowed(path);
         }
+        let mut target = String::with_capacity(self.base_path.len() + path.len() + 1);
+        target.push_str(&self.base_path);
+        if !path.starts_with('/') {
+            target.push('/');
+        }
+        target.push_str(path);
+        Cow::Owned(target)
     }
 
     fn connect_address(&self) -> String {
@@ -370,12 +386,7 @@ impl HttpClient {
         body: Option<&[u8]>,
     ) -> Result<(BufReader<TcpStream>, ResponseHead), String> {
         let content_length = body.map_or(0, |body| body.len() as u64);
-        let mut stream = self.start_request(
-            method,
-            path,
-            content_length,
-            body.map(|_| "application/json"),
-        )?;
+        let mut stream = self.start_request(method, path, content_length, body.is_some())?;
         if let Some(body) = body {
             stream.write_all(body).map_err(|error| error.to_string())?;
         }
@@ -388,14 +399,17 @@ impl HttpClient {
         method: &str,
         path: &str,
         content_length: u64,
-        content_type: Option<&str>,
+        json_body: bool,
     ) -> Result<TcpStream, String> {
-        let mut stream = TcpStream::connect(self.endpoint.connect_address())
-            .map_err(|error| format!("could not connect to {}: {error}", self.endpoint.authority))?;
+        let mut stream = TcpStream::connect(self.endpoint.connect_address()).map_err(|error| {
+            format!("could not connect to {}: {error}", self.endpoint.authority)
+        })?;
         let target = self.endpoint.target(path);
-        let content_type = content_type
-            .map(|value| format!("Content-Type: {value}\r\n"))
-            .unwrap_or_default();
+        let content_type = if json_body {
+            "Content-Type: application/json\r\n"
+        } else {
+            ""
+        };
         let request = format!(
             "{method} {target} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n{content_type}Content-Length: {content_length}\r\n\r\n",
             self.endpoint.authority, self.token
@@ -416,7 +430,7 @@ impl HttpClient {
         method: &str,
         path: &str,
     ) -> Result<(TcpStream, ResponseHead), String> {
-        let mut stream = self.start_request(method, path, 0, None)?;
+        let mut stream = self.start_request(method, path, 0, false)?;
         let mut head_bytes = Vec::new();
         let mut byte = [0u8; 1];
         while head_bytes.len() < 64 * 1024 {
@@ -460,12 +474,7 @@ impl HttpClient {
         }
         let mut stdout = io::stdout();
         let mut stderr = io::stderr();
-        stream_ndjson(
-            &mut reader,
-            &head.headers,
-            &mut stdout,
-            &mut stderr,
-        )
+        stream_ndjson(&mut reader, &head.headers, &mut stdout, &mut stderr)
     }
 
     fn push_file(&self, space: &str, local_path: &str, guest_path: &str) -> Result<u64, String> {
@@ -475,7 +484,7 @@ impl HttpClient {
             encode_path_segment(space),
             encode_query_value(guest_path)
         );
-        let mut stream = self.start_request("POST", &target, source.length, None)?;
+        let mut stream = self.start_request("POST", &target, source.length, false)?;
         copy_upload(&mut source.file, &mut stream, source.length)?;
         stream.flush().map_err(|error| error.to_string())?;
         let (mut reader, head) = Self::read_response(stream)?;
@@ -520,7 +529,9 @@ impl HttpClient {
                 .bytes()
                 .any(|byte| byte.is_ascii_control() || byte == b' ')
         {
-            return Err("proxy path must start with / and contain no control characters".to_string());
+            return Err(
+                "proxy path must start with / and contain no control characters".to_string(),
+            );
         }
         let target = format!(
             "/v1/spaces/{}/proxy/{port}{path}",
@@ -534,10 +545,12 @@ impl HttpClient {
         for (name, value) in &head.headers {
             writeln!(output, "{name}: {value}").map_err(|error| error.to_string())?;
         }
-        output.write_all(b"\r\n").map_err(|error| error.to_string())?;
+        output
+            .write_all(b"\r\n")
+            .map_err(|error| error.to_string())?;
         output.write_all(&body).map_err(|error| error.to_string())?;
         output.flush().map_err(|error| error.to_string())?;
-        Ok(if (200..300).contains(&head.status) { 0 } else { 1 })
+        Ok(i32::from(!(200..300).contains(&head.status)))
     }
 
     fn proxy_vnc(&self, space: &str, port: u16) -> Result<i32, String> {
@@ -548,7 +561,8 @@ impl HttpClient {
             .map_err(|error| format!("could not inspect VNC listener address: {error}"))?;
         println!("VNC proxy listening on {address}");
         for incoming in listener.incoming() {
-            let local = incoming.map_err(|error| format!("could not accept VNC client: {error}"))?;
+            let local =
+                incoming.map_err(|error| format!("could not accept VNC client: {error}"))?;
             let client = self.clone();
             let space = space.to_owned();
             thread::spawn(move || {
@@ -599,11 +613,12 @@ impl HttpClient {
                         if matches!(
                             error.kind(),
                             std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                        ) => {
-                            if stop_client_reader_thread.load(Ordering::Acquire) {
-                                break;
-                            }
+                        ) =>
+                    {
+                        if stop_client_reader_thread.load(Ordering::Acquire) {
+                            break;
                         }
+                    }
                     Err(_) => break,
                 }
             }
@@ -642,7 +657,7 @@ impl Drop for UploadSource {
 
 fn upload_source(path: &str) -> Result<UploadSource, String> {
     if path == "-" {
-        // Content-Length is mandatory on push; disk spooling keeps stdin streaming without a memory-sized buffer.
+        // Push requires Content-Length; spool stdin to disk instead of buffering it in memory.
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|error| format!("could not generate temporary upload name: {error}"))?
@@ -671,20 +686,26 @@ fn upload_source(path: &str) -> Result<UploadSource, String> {
                 }
             }
         }
-        let mut file = file.ok_or_else(|| "could not create a unique temporary upload file".to_string())?;
+        let file =
+            file.ok_or_else(|| "could not create a unique temporary upload file".to_string())?;
+        let mut source = UploadSource {
+            file,
+            length: 0,
+            temporary_path,
+        };
         let stdin = io::stdin();
         let mut input = stdin.lock();
-        let length = io::copy(&mut input, &mut file)
+        source.length = io::copy(&mut input, &mut source.file)
             .map_err(|error| format!("could not read stdin: {error}"))?;
-        file.flush()
+        source
+            .file
+            .flush()
             .map_err(|error| format!("could not flush temporary upload file: {error}"))?;
-        file.seek(SeekFrom::Start(0))
+        source
+            .file
+            .seek(SeekFrom::Start(0))
             .map_err(|error| format!("could not rewind temporary upload file: {error}"))?;
-        return Ok(UploadSource {
-            file,
-            length,
-            temporary_path,
-        });
+        return Ok(source);
     }
 
     let file = File::open(path).map_err(|error| format!("could not open {path:?}: {error}"))?;
@@ -703,7 +724,7 @@ fn copy_upload(source: &mut File, target: &mut TcpStream, length: u64) -> Result
     let mut remaining = length;
     let mut buffer = [0u8; 8192];
     while remaining > 0 {
-        let amount = remaining.min(buffer.len() as u64) as usize;
+        let amount = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
         let count = source
             .read(&mut buffer[..amount])
             .map_err(|error| format!("could not read upload source: {error}"))?;
@@ -774,26 +795,24 @@ fn create_space_body(
     disk_mib: Option<u64>,
     network: Option<String>,
 ) -> Value {
-    let mut body = json!({"name": name});
-    let object = body
-        .as_object_mut()
-        .expect("create space body starts as a JSON object");
+    let mut object = serde_json::Map::new();
+    object.insert("name".to_owned(), Value::String(name.to_owned()));
     if let Some(image) = image {
-        object.insert("image".to_string(), Value::String(image));
+        object.insert("image".to_owned(), Value::String(image));
     }
     if let Some(vcpus) = vcpus {
-        object.insert("vcpus".to_string(), Value::from(vcpus));
+        object.insert("vcpus".to_owned(), Value::from(vcpus));
     }
     if let Some(mem_mib) = mem_mib {
-        object.insert("mem_mib".to_string(), Value::from(mem_mib));
+        object.insert("mem_mib".to_owned(), Value::from(mem_mib));
     }
     if let Some(disk_mib) = disk_mib {
-        object.insert("disk_mib".to_string(), Value::from(disk_mib));
+        object.insert("disk_mib".to_owned(), Value::from(disk_mib));
     }
     if let Some(network) = network {
-        object.insert("network".to_string(), Value::String(network));
+        object.insert("network".to_owned(), Value::String(network));
     }
-    body
+    Value::Object(object)
 }
 
 fn resize_space_body(
@@ -804,20 +823,17 @@ fn resize_space_body(
     if vcpus.is_none() && mem_mib.is_none() && disk_mib.is_none() {
         return Err("resize requires at least one of --vcpus, --mem, or --disk".to_string());
     }
-    let mut body = Value::Object(serde_json::Map::new());
-    let object = body
-        .as_object_mut()
-        .expect("resize space body starts as a JSON object");
+    let mut object = serde_json::Map::new();
     if let Some(vcpus) = vcpus {
-        object.insert("vcpus".to_string(), Value::from(vcpus));
+        object.insert("vcpus".to_owned(), Value::from(vcpus));
     }
     if let Some(mem_mib) = mem_mib {
-        object.insert("mem_mib".to_string(), Value::from(mem_mib));
+        object.insert("mem_mib".to_owned(), Value::from(mem_mib));
     }
     if let Some(disk_mib) = disk_mib {
-        object.insert("disk_mib".to_string(), Value::from(disk_mib));
+        object.insert("disk_mib".to_owned(), Value::from(disk_mib));
     }
-    Ok(body)
+    Ok(Value::Object(object))
 }
 
 fn parse_limit_u32(raw: &str, field: &str) -> Result<u32, String> {
@@ -872,10 +888,7 @@ fn limits_set_body(
     let disk_inherit = inherit_requested(inherit, "disk-mib")?;
     let running_inherit = inherit_requested(inherit, "running")?;
     let api_inherit = inherit_requested(inherit, "api-per-min")?;
-    let mut body = Value::Object(serde_json::Map::new());
-    let object = body
-        .as_object_mut()
-        .expect("limits body starts as a JSON object");
+    let mut object = serde_json::Map::new();
     let mut fields = 0;
 
     if let Some(raw) = spaces {
@@ -937,7 +950,7 @@ fn limits_set_body(
     if fields == 0 {
         return Err("limits set requires at least one limit flag or --inherit field".to_string());
     }
-    Ok(body)
+    Ok(Value::Object(object))
 }
 
 fn run_command(client: &HttpClient, command: Command) -> Result<i32, String> {
@@ -1048,7 +1061,7 @@ else
     echo "unsupported guest init; expected runit or systemd" >&2
     exit 1
 fi"#
-                    .to_owned(),
+                .to_owned(),
             ];
             let status = client.stream_exec(&space, &command, None, None)?;
             if status == 0 {
@@ -1085,7 +1098,7 @@ fi"#
             } else {
                 println!("pulled {bytes} bytes to {local_file}");
             }
-         }
+        }
         Command::Commit {
             space,
             note,
@@ -1104,7 +1117,11 @@ fi"#
                 &format!("/v1/spaces/{}/commits", encode_path_segment(&space)),
                 Some(json!({ "note": note, "hot": hot, "snapshot": snapshot })),
             )?)?;
-            println!("{}  {}", short_id_value(data.get("id")), field_text(&data, "note"));
+            println!(
+                "{}  {}",
+                short_id_value(data.get("id")),
+                field_text(&data, "note")
+            );
         }
         Command::Log { space, json } => {
             let response = client.request(
@@ -1138,10 +1155,7 @@ fi"#
             all,
             limit,
         } => {
-            let mut path = format!(
-                "/v1/spaces/{}/diff",
-                encode_path_segment(&source)
-            );
+            let mut path = format!("/v1/spaces/{}/diff", encode_path_segment(&source));
             let mut query = Vec::new();
             if let Some(target) = target {
                 if source.parse::<Uuid>().is_ok() && target.parse::<Uuid>().is_ok() {
@@ -1238,20 +1252,18 @@ fi"#
             }
         }
         Command::Limits {
-            command: Some(LimitsCommand::Set {
-                project,
-                spaces,
-                disk_mib,
-                running,
-                api_per_min,
-                inherit,
-            }),
+            command:
+                Some(LimitsCommand::Set {
+                    project,
+                    spaces,
+                    disk_mib,
+                    running,
+                    api_per_min,
+                    inherit,
+                }),
             json,
         } => {
-            let path = format!(
-                "/v1/projects/{}/limits",
-                encode_path_segment(&project)
-            );
+            let path = format!("/v1/projects/{}/limits", encode_path_segment(&project));
             let response = client.request(
                 "PATCH",
                 &path,
@@ -1274,10 +1286,7 @@ fi"#
             command: Some(LimitsCommand::Clear { project }),
             json,
         } => {
-            let path = format!(
-                "/v1/projects/{}/limits",
-                encode_path_segment(&project)
-            );
+            let path = format!("/v1/projects/{}/limits", encode_path_segment(&project));
             let response = client.request("DELETE", &path, None)?;
             let body = successful_body(response)?;
             if json {
@@ -1294,17 +1303,11 @@ fi"#
 }
 
 fn usage_path(from: Option<i64>, to: Option<i64>) -> String {
-    let mut query = Vec::new();
-    if let Some(from) = from {
-        query.push(format!("from={from}"));
-    }
-    if let Some(to) = to {
-        query.push(format!("to={to}"));
-    }
-    if query.is_empty() {
-        "/v1/usage".to_string()
-    } else {
-        format!("/v1/usage?{}", query.join("&"))
+    match (from, to) {
+        (None, None) => "/v1/usage".to_owned(),
+        (Some(from), None) => format!("/v1/usage?from={from}"),
+        (None, Some(to)) => format!("/v1/usage?to={to}"),
+        (Some(from), Some(to)) => format!("/v1/usage?from={from}&to={to}"),
     }
 }
 
@@ -1331,15 +1334,17 @@ fn print_usage(data: &Value) {
         "vm_seconds: {}",
         vm_time(value_u64(data.get("vm_seconds")).unwrap_or(0))
     );
-    // A MiB-hour integral is fractional for short-lived spaces, so reading it
-    // as an integer would report zero for anything under two minutes.
+    // MiB-hour usage is fractional for short-lived spaces; preserve the fraction.
     println!(
         "disk_mib_hour: {:.2}",
         data.get("disk_mib_hour")
             .and_then(Value::as_f64)
             .unwrap_or(0.0)
     );
-    println!("api_calls: {}", value_u64(data.get("api_calls")).unwrap_or(0));
+    println!(
+        "api_calls: {}",
+        value_u64(data.get("api_calls")).unwrap_or(0)
+    );
 }
 
 fn print_limits(data: &Value) {
@@ -1353,10 +1358,7 @@ fn print_limits(data: &Value) {
         "max_vcpus: {}",
         value_u64(data.get("max_vcpus")).unwrap_or(0)
     );
-    println!(
-        "max_mem_mib: {}",
-        human_mib(data.get("max_mem_mib"))
-    );
+    println!("max_mem_mib: {}", human_mib(data.get("max_mem_mib")));
     println!(
         "disk_mib: {}/{}",
         value_u64(used.get("disk_mib")).unwrap_or(0),
@@ -1367,7 +1369,10 @@ fn print_limits(data: &Value) {
         value_u64(used.get("running")).unwrap_or(0),
         value_u64(data.get("max_running")).unwrap_or(0)
     );
-    println!("api_per_min: {}", value_u64(data.get("api_per_min")).unwrap_or(0));
+    println!(
+        "api_per_min: {}",
+        value_u64(data.get("api_per_min")).unwrap_or(0)
+    );
 }
 
 fn run_token(root: Option<PathBuf>, command: TokenCommand) -> Result<i32, String> {
@@ -1396,7 +1401,9 @@ fn run_token(root: Option<PathBuf>, command: TokenCommand) -> Result<i32, String
                     vec![
                         record.project.clone(),
                         record.hash.chars().take(12).collect(),
-                        seconds(&record.created_at.to_rfc3339()),
+                        record
+                            .created_at
+                            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                     ]
                 })
                 .collect::<Vec<_>>();
@@ -1439,7 +1446,8 @@ fn http_error(status: u16, body: &[u8]) -> String {
     {
         return format!("HTTP {status}: {message}");
     }
-    let detail = String::from_utf8_lossy(body).trim().to_string();
+    let detail = String::from_utf8_lossy(body);
+    let detail = detail.trim();
     if detail.is_empty() {
         format!("HTTP {status}")
     } else {
@@ -1448,7 +1456,8 @@ fn http_error(status: u16, body: &[u8]) -> String {
 }
 
 fn print_raw_json(body: &[u8]) -> Result<(), String> {
-    let text = std::str::from_utf8(body).map_err(|error| format!("invalid UTF-8 response: {error}"))?;
+    let text =
+        std::str::from_utf8(body).map_err(|error| format!("invalid UTF-8 response: {error}"))?;
     print!("{text}");
     if !text.ends_with('\n') {
         println!();
@@ -1469,11 +1478,7 @@ fn print_images(data: &Value) {
                 .map(|image| {
                     vec![
                         field_text(image, "image"),
-                        if image
-                            .get("built")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false)
-                        {
+                        if image.get("built").and_then(Value::as_bool).unwrap_or(false) {
                             "yes".to_string()
                         } else {
                             "no".to_string()
@@ -1558,8 +1563,17 @@ fn print_spaces(data: &Value) {
         .unwrap_or_default();
     table(
         &[
-            "NAME", "NETWORK", "PROJECT", "STATE", "HEAD", "EXCLUSIVE", "CREATED", "IMAGE", "VCPU",
-            "MEM", "DISK",
+            "NAME",
+            "NETWORK",
+            "PROJECT",
+            "STATE",
+            "HEAD",
+            "EXCLUSIVE",
+            "CREATED",
+            "IMAGE",
+            "VCPU",
+            "MEM",
+            "DISK",
         ],
         &rows,
     );
@@ -1569,11 +1583,7 @@ fn print_spaces(data: &Value) {
             .iter()
             .map(|ckpt| {
                 let note = field_text(ckpt, "note");
-                let note = if ckpt
-                    .get("auto")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                {
+                let note = if ckpt.get("auto").and_then(Value::as_bool).unwrap_or(false) {
                     format!("(auto) {note}")
                 } else {
                     note
@@ -1600,7 +1610,11 @@ fn print_reflog(data: &Value) {
 fn print_diff(data: &Value) {
     if let Some(entries) = data.get("entries").and_then(Value::as_array) {
         for entry in entries {
-            println!("{} {}", field_text(entry, "status"), field_text(entry, "path"));
+            println!(
+                "{} {}",
+                field_text(entry, "status"),
+                field_text(entry, "path")
+            );
         }
     }
     let summary = data.get("summary");
@@ -1619,16 +1633,11 @@ fn print_diff(data: &Value) {
     }
 }
 
-
 fn print_checkpoint_list(data: &Value, key: &str) {
     if let Some(commits) = data.get(key).and_then(Value::as_array) {
         for commit in commits {
             let note = field_text(commit, "note");
-            let note = if commit
-                .get("auto")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-            {
+            let note = if commit.get("auto").and_then(Value::as_bool).unwrap_or(false) {
                 format!("(auto) {note}")
             } else {
                 note
@@ -1660,14 +1669,15 @@ fn value_text(value: &Value) -> String {
 }
 
 fn short_id_value(value: Option<&Value>) -> String {
-    value.map_or_else(|| "-".to_string(), |value| short_id(&value_text(value)))
+    match value {
+        None | Some(Value::Null) => "-".to_owned(),
+        Some(Value::String(value)) => short_id(value),
+        Some(value) => short_id(&value_text(value)),
+    }
 }
 
 fn short_optional_value(value: Option<&Value>) -> String {
-    match value {
-        None | Some(Value::Null) => "-".to_string(),
-        Some(value) => short_id(&value_text(value)),
-    }
+    short_id_value(value)
 }
 
 fn short_id(value: &str) -> String {
@@ -1682,6 +1692,10 @@ fn value_u64(value: Option<&Value>) -> Option<u64> {
     }
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "Human-readable byte formatting intentionally rounds through f64 to preserve existing output."
+)]
 fn human(n: u64) -> String {
     if n < 1024 {
         format!("{n} B")
@@ -1739,18 +1753,7 @@ fn table(headers: &[&str], rows: &[Vec<String>]) {
 }
 
 fn encode_path_segment(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            encoded.push(byte as char);
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    encoded
-}
-fn encode_query_value(value: &str) -> String {
-    let mut encoded = String::new();
+    let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
             encoded.push(byte as char);
@@ -1761,6 +1764,17 @@ fn encode_query_value(value: &str) -> String {
     encoded
 }
 
+fn encode_query_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
 
 fn read_response_head<R: BufRead>(reader: &mut R) -> Result<ResponseHead, String> {
     let mut status_line = String::new();
@@ -1773,8 +1787,9 @@ fn read_response_head<R: BufRead>(reader: &mut R) -> Result<ResponseHead, String
     }
     let status = parse_status_line(&status_line)?;
     let mut headers = Vec::new();
+    let mut line = String::new();
     loop {
-        let mut line = String::new();
+        line.clear();
         if reader
             .read_line(&mut line)
             .map_err(|error| error.to_string())?
@@ -1788,10 +1803,7 @@ fn read_response_head<R: BufRead>(reader: &mut R) -> Result<ResponseHead, String
         let (name, value) = line
             .split_once(':')
             .ok_or_else(|| "malformed HTTP response header".to_string())?;
-        headers.push((
-            name.trim().to_ascii_lowercase(),
-            value.trim().to_string(),
-        ));
+        headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
     }
     Ok(ResponseHead { status, headers })
 }
@@ -1853,7 +1865,9 @@ fn read_body<R: BufRead>(reader: &mut R, headers: &[(String, String)]) -> Result
     }
     if let Some(length) = content_length(headers)? {
         let mut body = vec![0u8; length];
-        reader.read_exact(&mut body).map_err(|error| error.to_string())?;
+        reader
+            .read_exact(&mut body)
+            .map_err(|error| error.to_string())?;
         return Ok(body);
     }
     let mut body = Vec::new();
@@ -1896,32 +1910,36 @@ fn stream_body<R: BufRead, W: Write>(
     } else {
         let mut buffer = [0u8; 8192];
         loop {
-            let count = reader.read(&mut buffer).map_err(|error| error.to_string())?;
+            let count = reader
+                .read(&mut buffer)
+                .map_err(|error| error.to_string())?;
             if count == 0 {
                 break;
             }
             write_fragment(&buffer[..count])?;
         }
     }
-    output.flush().map_err(|error| format!("could not flush pull output: {error}"))?;
+    output
+        .flush()
+        .map_err(|error| format!("could not flush pull output: {error}"))?;
     Ok(total)
 }
-
 
 fn read_chunked<R: BufRead, F>(reader: &mut R, mut on_chunk: F) -> Result<(), String>
 where
     F: FnMut(&[u8]) -> Result<(), String>,
 {
+    let mut line = String::new();
     loop {
-        let mut size_line = String::new();
+        line.clear();
         if reader
-            .read_line(&mut size_line)
+            .read_line(&mut line)
             .map_err(|error| error.to_string())?
             == 0
         {
             return Err("chunked HTTP body ended before a chunk size".to_string());
         }
-        let size_text = size_line
+        let size_text = line
             .trim_end_matches(&['\r', '\n'][..])
             .split(';')
             .next()
@@ -1931,15 +1949,15 @@ where
             .map_err(|error| format!("invalid chunk size {size_text:?}: {error}"))?;
         if size == 0 {
             loop {
-                let mut trailer = String::new();
+                line.clear();
                 if reader
-                    .read_line(&mut trailer)
+                    .read_line(&mut line)
                     .map_err(|error| error.to_string())?
                     == 0
                 {
                     return Err("chunked HTTP body ended before trailers".to_string());
                 }
-                if trailer == "\r\n" || trailer == "\n" {
+                if line == "\r\n" || line == "\n" {
                     return Ok(());
                 }
             }
@@ -1972,15 +1990,8 @@ fn stream_ndjson<R: BufRead>(
 ) -> Result<i32, String> {
     let mut pending = Vec::new();
     let mut exit_code = None;
-    let mut feed = |fragment: &[u8]| {
-        feed_ndjson(
-            fragment,
-            &mut pending,
-            &mut exit_code,
-            stdout,
-            stderr,
-        )
-    };
+    let mut feed =
+        |fragment: &[u8]| feed_ndjson(fragment, &mut pending, &mut exit_code, stdout, stderr);
 
     if is_chunked(headers) {
         read_chunked(reader, &mut feed)?;
@@ -2001,7 +2012,9 @@ fn stream_ndjson<R: BufRead>(
     } else {
         let mut buffer = [0u8; 8192];
         loop {
-            let count = reader.read(&mut buffer).map_err(|error| error.to_string())?;
+            let count = reader
+                .read(&mut buffer)
+                .map_err(|error| error.to_string())?;
             if count == 0 {
                 break;
             }
@@ -2031,18 +2044,16 @@ fn feed_ndjson(
 ) -> Result<(), String> {
     pending.extend_from_slice(fragment);
     while let Some(position) = pending.iter().position(|byte| *byte == b'\n') {
-        let line = pending.drain(..=position).collect::<Vec<_>>();
-        let line = std::str::from_utf8(&line[..line.len() - 1])
+        let line = std::str::from_utf8(&pending[..position])
             .map_err(|error| format!("invalid UTF-8 in exec response: {error}"))?
             .trim_end_matches('\r');
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Some(code) = dispatch_ndjson_line(line, stdout, stderr)?
+        if !line.trim().is_empty()
+            && let Some(code) = dispatch_ndjson_line(line, stdout, stderr)?
             && exit_code.replace(code).is_some()
         {
             return Err("exec response contained multiple exit statuses".to_string());
         }
+        pending.drain(..=position);
     }
     Ok(())
 }
@@ -2052,7 +2063,8 @@ fn dispatch_ndjson_line<'a>(
     stdout: &'a mut dyn Write,
     stderr: &'a mut dyn Write,
 ) -> Result<Option<i32>, String> {
-    let value: Value = serde_json::from_str(line).map_err(|error| format!("invalid NDJSON line: {error}"))?;
+    let value: Value =
+        serde_json::from_str(line).map_err(|error| format!("invalid NDJSON line: {error}"))?;
     let object = value
         .as_object()
         .ok_or_else(|| "exec NDJSON line must be a JSON object".to_string())?;
@@ -2079,10 +2091,12 @@ fn dispatch_ndjson_line<'a>(
         let exit = exit
             .as_i64()
             .ok_or_else(|| "exec exit status must be an integer".to_string())?;
-        if !(i32::MIN as i64..=i32::MAX as i64).contains(&exit) {
+        if !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&exit) {
             return Err(format!("exec exit status is out of range: {exit}"));
         }
-        return Ok(Some(exit as i32));
+        let exit_code =
+            i32::try_from(exit).map_err(|_| format!("exec exit status is out of range: {exit}"))?;
+        return Ok(Some(exit_code));
     }
     Err("exec NDJSON line must contain stream or exit".to_string())
 }
@@ -2091,19 +2105,19 @@ fn find_token_index(tokens: &[Token], prefix: &str) -> Result<usize, String> {
     if prefix.is_empty() {
         return Err("hash prefix must not be empty".to_string());
     }
-    let matches = tokens
-        .iter()
-        .enumerate()
-        .filter(|(_, token)| token.hash.starts_with(prefix))
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [] => Err(format!("no token matches hash prefix {prefix:?}")),
-        [index] => Ok(*index),
-        _ => Err(format!(
-            "hash prefix {prefix:?} matches multiple tokens; provide a longer prefix"
-        )),
+    let mut match_index = None;
+    for (index, token) in tokens.iter().enumerate() {
+        if !token.hash.starts_with(prefix) {
+            continue;
+        }
+        if match_index.is_some() {
+            return Err(format!(
+                "hash prefix {prefix:?} matches multiple tokens; provide a longer prefix"
+            ));
+        }
+        match_index = Some(index);
     }
+    match_index.ok_or_else(|| format!("no token matches hash prefix {prefix:?}"))
 }
 
 fn main() {
@@ -2127,6 +2141,11 @@ mod tests {
     #[test]
     fn parses_http_status_code() {
         assert_eq!(parse_status_line("HTTP/1.1 201 Created\r\n").unwrap(), 201);
+    }
+
+    #[test]
+    fn rejects_control_characters_in_endpoint_base_path() {
+        assert!(Endpoint::parse("http://127.0.0.1:7878/base\r\nX-Injected: yes").is_err());
     }
     #[test]
     fn encodes_query_values_without_leaking_reserved_path_bytes() {
@@ -2163,7 +2182,6 @@ mod tests {
         assert_eq!(body, json!({"vcpus": 2, "disk_mib": 4096}));
         assert!(body.get("mem_mib").is_none());
     }
-
 
     #[test]
     fn limits_set_body_maps_unlimited_and_inherit() {
@@ -2208,13 +2226,14 @@ mod tests {
         .expect("parse limits set command");
         match cli.command {
             Command::Limits {
-                command: Some(LimitsCommand::Set {
-                    project,
-                    spaces,
-                    disk_mib,
-                    inherit,
-                    ..
-                }),
+                command:
+                    Some(LimitsCommand::Set {
+                        project,
+                        spaces,
+                        disk_mib,
+                        inherit,
+                        ..
+                    }),
                 json,
             } => {
                 assert_eq!(project, "project-a");

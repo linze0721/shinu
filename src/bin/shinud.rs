@@ -7,23 +7,26 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, MutexGuard, mpsc};
+use std::sync::{
+    Arc, Mutex, MutexGuard,
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use rusqlite::Connection;
-use shinu_image::{
-    diff_images, DiffEntry, DiffOptions, DiffResult, DiffStatus, DEFAULT_DIFF_LIMIT,
-    DEFAULT_EXCLUSIONS, MAX_DIFF_LIMIT,
-};
 use shinu::{
-    http,
+    Image, http,
     proto::{Req, SnapshotMode},
     quota::{self, Limits, RateLimiter},
     registry::Registry,
     state::{self, Ckpt, Space, State},
-    Image,
+};
+use shinu_image::{
+    DEFAULT_DIFF_LIMIT, DEFAULT_EXCLUSIONS, DiffEntry, DiffOptions, DiffResult, DiffStatus,
+    MAX_DIFF_LIMIT, diff_images,
 };
 
 const AUTH_HTML: &str = include_str!("../console/auth.html");
@@ -35,8 +38,7 @@ const SESSION_DEFAULT_DAYS: i64 = 7;
 const SESSION_MAX_AGE_SECONDS: u64 = 7 * 24 * 60 * 60;
 const REGISTER_REQUESTS_PER_HOUR: usize = 5;
 const LOGIN_FAILURE_MESSAGE: &str = "invalid email or password";
-const DUMMY_PASSWORD_HASH: &str =
-    "pbkdf2$210000$0000000000000000000000000000000000000000000000000000000000000000$0000000000000000000000000000000000000000000000000000000000000000";
+const DUMMY_PASSWORD_HASH: &str = "pbkdf2$210000$0000000000000000000000000000000000000000000000000000000000000000$0000000000000000000000000000000000000000000000000000000000000000";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 // Normal requests complete in milliseconds; fifteen seconds leaves room for a
 // slow client without letting an incomplete request retain a worker. This
@@ -45,9 +47,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// full snapshot is captured. `SHINU_FULL_EVERY` overrides this value; zero
 /// disables automatic degradation.
 const DEFAULT_FULL_EVERY: usize = 8;
-
-
-
 
 #[derive(Parser)]
 #[command(name = "shinud")]
@@ -59,7 +58,7 @@ struct Cli {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let root = shinu::resolve_root(cli.root.as_deref());
-    shinu::init_layout(&root)?;
+    shinu::init_daemon_layout(&root)?;
     let connection = state::open(&root)?;
     if state::migrate_from_json(&root, &connection)? {
         eprintln!("imported state.json into shinu.db (renamed to state.json.migrated)");
@@ -86,11 +85,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let net_cfg = shinu::NetConfig::from_env()?;
     let limits = Limits::from_env();
     // Only the deployment admin may mutate quotas; an unset secret fails closed.
-    let admin_token = Arc::new(
-        std::env::var("SHINU_ADMIN_TOKEN")
-            .ok()
-            .filter(|value| !value.trim().is_empty()),
-    );
+    let admin_token = std::env::var("SHINU_ADMIN_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
     let rate = RateLimiter::new();
     // Registration has its own IP-keyed limiter so API traffic cannot consume
     // the account-creation allowance (and vice versa).
@@ -116,42 +113,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sweep_net_cfg = Arc::clone(&net_cfg);
     let sweep_db = Arc::clone(&db);
     let sweep_registry = Arc::clone(&registry);
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(shinu::USAGE_SAMPLE_SECS));
-        match shinu::vm::sweep_idle(
-            sweep_root.as_path(),
-            sweep_vm_cfg.idle_secs,
-            sweep_net_cfg.as_ref(),
-        ) {
-            Ok(stopped) => {
-                for dir in &stopped {
-                    eprintln!("idle sweep stopped {}", dir.display());
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_secs(shinu::USAGE_SAMPLE_SECS));
+            match shinu::vm::sweep_idle(
+                sweep_root.as_path(),
+                sweep_vm_cfg.idle_secs,
+                sweep_net_cfg.as_ref(),
+            ) {
+                Ok(stopped) => {
+                    for dir in &stopped {
+                        eprintln!("idle sweep stopped {}", dir.display());
+                    }
+                    if let Err(error) = refresh_idle_networks(
+                        sweep_root.as_path(),
+                        &sweep_db,
+                        &sweep_registry,
+                        sweep_net_cfg.as_ref(),
+                        &stopped,
+                    ) {
+                        eprintln!("idle network refresh: {error}");
+                    }
                 }
-                if let Err(error) = refresh_idle_networks(
-                    sweep_root.as_path(),
-                    &sweep_db,
-                    &sweep_registry,
-                    sweep_net_cfg.as_ref(),
-                    &stopped,
-                ) {
-                    eprintln!("idle network refresh: {error}");
+                Err(error) => eprintln!("idle sweep: {error}"),
+            }
+            if let Err(error) = record_sweep_usage(sweep_root.as_path(), &sweep_db, &sweep_registry)
+            {
+                eprintln!("usage sweep: {error}");
+            }
+            let purge_result = {
+                let connection = lock_db(&sweep_db);
+                state::purge_expired_sessions(&connection)
+            };
+            match purge_result {
+                Ok(removed) if removed > 0 => {
+                    eprintln!("session sweep removed {removed} expired sessions");
                 }
+                Ok(_) => {}
+                Err(error) => eprintln!("session sweep: {error}"),
             }
-            Err(error) => eprintln!("idle sweep: {error}"),
-        }
-        if let Err(error) = record_sweep_usage(
-            sweep_root.as_path(),
-            &sweep_db,
-            &sweep_registry,
-        ) {
-            eprintln!("usage sweep: {error}");
-        }
-        match state::purge_expired_sessions(&lock_db(&sweep_db)) {
-            Ok(removed) if removed > 0 => {
-                eprintln!("session sweep removed {removed} expired sessions");
-            }
-            Ok(_) => {}
-            Err(error) => eprintln!("session sweep: {error}"),
         }
     });
 
@@ -160,7 +160,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok((stream, _)) => {
                 let timeout_setup = stream
                     .set_read_timeout(Some(REQUEST_TIMEOUT))
-                    .and_then(|_| stream.set_write_timeout(Some(REQUEST_TIMEOUT)));
+                    .and_then(|()| stream.set_write_timeout(Some(REQUEST_TIMEOUT)));
                 if let Err(error) = timeout_setup {
                     eprintln!("connection timeout setup: {error}");
                     continue;
@@ -237,7 +237,6 @@ impl<'a> RequestReader<'a> {
     fn clear_socket_timeouts(&mut self) -> shinu::Result<()> {
         clear_stream_timeouts(&**self.inner.get_mut())
     }
-
 }
 
 impl Read for RequestReader<'_> {
@@ -256,13 +255,14 @@ impl BufRead for RequestReader<'_> {
     }
 
     fn consume(&mut self, amount: usize) {
-        if self.capture && let Ok(buffer) = self.inner.fill_buf() {
+        if self.capture
+            && let Ok(buffer) = self.inner.fill_buf()
+        {
             self.captured.extend_from_slice(&buffer[..amount]);
         }
         self.inner.consume(amount);
     }
 }
-
 
 struct RegistrationLimiter {
     // quota::RateLimiter is a 60-second per-project limiter; registration is
@@ -278,7 +278,7 @@ impl RegistrationLimiter {
     }
 
     fn check(&self, ip: &str) -> shinu::Result<()> {
-        const WINDOW: Duration = Duration::from_secs(60 * 60);
+        const WINDOW: Duration = Duration::from_hours(1);
         let now = Instant::now();
         let mut requests = self
             .requests
@@ -293,15 +293,16 @@ impl RegistrationLimiter {
             }
         }
         requests.retain(|_, timestamps| !timestamps.is_empty());
-        let mut timestamps = requests.remove(ip).unwrap_or_default();
-        if timestamps.len() >= REGISTER_REQUESTS_PER_HOUR {
-            requests.insert(ip.to_owned(), timestamps);
-            return Err(shinu::Error::Quota(
-                "registration rate limit exceeded: 5 registrations per hour".into(),
-            ));
+        if let Some(timestamps) = requests.get_mut(ip) {
+            if timestamps.len() >= REGISTER_REQUESTS_PER_HOUR {
+                return Err(shinu::Error::Quota(
+                    "registration rate limit exceeded: 5 registrations per hour".into(),
+                ));
+            }
+            timestamps.push_back(now);
+            return Ok(());
         }
-        timestamps.push_back(now);
-        requests.insert(ip.to_owned(), timestamps);
+        requests.insert(ip.to_owned(), VecDeque::from([now]));
         Ok(())
     }
 }
@@ -353,20 +354,17 @@ fn update_state_with_quota<T>(
     Ok(value)
 }
 
+const BYTES_PER_MIB: u64 = 1024 * 1024;
+
+fn bytes_to_mib(bytes: u64) -> u64 {
+    bytes.saturating_add(BYTES_PER_MIB - 1) / BYTES_PER_MIB
+}
+
 fn image_size_mib(path: &Path) -> u64 {
-    path.metadata()
-        .map(|metadata| {
-            metadata
-                .len()
-                .saturating_add(1024 * 1024 - 1)
-                / (1024 * 1024)
-        })
-        .unwrap_or_else(|_| {
-            shinu::btrfs::exclusive(path)
-                .unwrap_or(0)
-                .saturating_add(1024 * 1024 - 1)
-                / (1024 * 1024)
-        })
+    path.metadata().map_or_else(
+        |_| shinu::btrfs::exclusive(path).map_or(0, bytes_to_mib),
+        |metadata| bytes_to_mib(metadata.len()),
+    )
 }
 fn space_snapshot_mem(root: &Path, id: Uuid) -> PathBuf {
     shinu::space_image(root, id).with_extension("mem")
@@ -398,9 +396,7 @@ fn network_members(state: &State, project: &str, network: Option<&str>) -> Vec<S
     state
         .spaces
         .iter()
-        .filter(|space| {
-            space.project == project && space.network.as_deref() == Some(network)
-        })
+        .filter(|space| space.project == project && space.network.as_deref() == Some(network))
         .cloned()
         .collect()
 }
@@ -427,9 +423,18 @@ fn running_network_members(
     project: &str,
     network: Option<&str>,
 ) -> Vec<Space> {
-    network_members(state, project, network)
-        .into_iter()
-        .filter(|space| shinu::vm::is_running(&shinu::vm_dir(root, space.id)))
+    let Some(network) = network else {
+        return Vec::new();
+    };
+    state
+        .spaces
+        .iter()
+        .filter(|space| {
+            space.project == project
+                && space.network.as_deref() == Some(network)
+                && shinu::vm::is_running(&shinu::vm_dir(root, space.id))
+        })
+        .cloned()
         .collect()
 }
 
@@ -473,9 +478,9 @@ fn refresh_network_rules(
     )
 }
 
-fn network_hosts_command(
+fn network_hosts_command<'a>(
     member: &Space,
-    members: &[Space],
+    members: impl Iterator<Item = &'a Space>,
     cfg: &shinu::NetConfig,
 ) -> Option<Vec<String>> {
     let mut script = format!(
@@ -493,7 +498,7 @@ printf '%s\n' {}
         NETWORK_HOSTS_END,
         shinu::shell_quote_word(NETWORK_HOSTS_BEGIN),
     );
-    for peer in members.iter().filter(|peer| peer.id != member.id) {
+    for peer in members.filter(|peer| peer.id != member.id) {
         let ip = guest_ip(peer.id, cfg)?;
         script.push_str(&format!(
             "printf '%s %s\\n' {} {}\n",
@@ -518,12 +523,13 @@ fn sync_network_hosts_with(
         let Some(network) = member.network.as_deref() else {
             continue;
         };
-        let network_members = all_members
-            .iter()
-            .filter(|peer| peer.network.as_deref() == Some(network))
-            .cloned()
-            .collect::<Vec<_>>();
-        let Some(command) = network_hosts_command(member, &network_members, cfg) else {
+        let Some(command) = network_hosts_command(
+            member,
+            all_members
+                .iter()
+                .filter(|peer| peer.network.as_deref() == Some(network)),
+            cfg,
+        ) else {
             continue;
         };
         match shinu::exec_in_vm(
@@ -582,12 +588,7 @@ fn refresh_idle_networks(
     }
     for (project, network) in groups {
         let all_members = network_members(&state, &project, Some(&network));
-        let mut previous_running = running_network_members(
-            root,
-            &state,
-            &project,
-            Some(&network),
-        );
+        let mut previous_running = running_network_members(root, &state, &project, Some(&network));
         for member in &all_members {
             if stopped_ids.contains(&member.id)
                 && !previous_running
@@ -622,7 +623,6 @@ fn checkpoint_exclusive(root: &Path, id: Uuid) -> shinu::Result<u64> {
     Ok(total)
 }
 
-
 fn space_size_mib(root: &Path, space: &Space) -> u64 {
     space
         .disk_mib
@@ -642,11 +642,8 @@ fn current_disk_mib(root: &Path, state: &State, project: &str) -> shinu::Result<
         .iter()
         .filter(|checkpoint| checkpoint.project == project)
     {
-        checkpoints = checkpoints.saturating_add(
-            checkpoint_exclusive(root, checkpoint.id)?
-                .saturating_add(1024 * 1024 - 1)
-                / (1024 * 1024),
-        );
+        checkpoints =
+            checkpoints.saturating_add(bytes_to_mib(checkpoint_exclusive(root, checkpoint.id)?));
     }
     Ok(spaces.saturating_add(checkpoints))
 }
@@ -669,29 +666,28 @@ fn check_space_quota(
 
 fn effective_limits(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Limits> {
     let connection = lock_db(ctx.db);
-    match state::project_limits(&connection, project)? {
-        Some((max_spaces, max_disk_mib, max_running, api_per_min)) => Ok(Limits {
-            max_spaces,
-            max_disk_mib,
-            max_vcpus: ctx.limits.max_vcpus,
-            max_mem_mib: ctx.limits.max_mem_mib,
-            max_running,
-            api_per_min,
-        }),
-        None => Ok(Limits {
-            max_spaces: ctx.limits.max_spaces,
-            max_disk_mib: ctx.limits.max_disk_mib,
-            max_vcpus: ctx.limits.max_vcpus,
-            max_mem_mib: ctx.limits.max_mem_mib,
-            max_running: ctx.limits.max_running,
-            api_per_min: ctx.limits.api_per_min,
-        }),
-    }
+    let (max_spaces, max_disk_mib, max_running, api_per_min) =
+        state::project_limits(&connection, project)?.unwrap_or((
+            ctx.limits.max_spaces,
+            ctx.limits.max_disk_mib,
+            ctx.limits.max_running,
+            ctx.limits.api_per_min,
+        ));
+    Ok(Limits {
+        max_spaces,
+        max_disk_mib,
+        max_vcpus: ctx.limits.max_vcpus,
+        max_mem_mib: ctx.limits.max_mem_mib,
+        max_running,
+        api_per_min,
+    })
 }
 
 fn ensure_positive_size(name: &str, value: Option<u64>) -> shinu::Result<()> {
     if value == Some(0) {
-        return Err(shinu::Error::Invalid(format!("{name} must be greater than zero")));
+        return Err(shinu::Error::Invalid(format!(
+            "{name} must be greater than zero"
+        )));
     }
     Ok(())
 }
@@ -709,13 +705,34 @@ fn check_vm_sizing(
 }
 
 fn count_running(root: &Path, state: &State, project: &str) -> u32 {
-    state
+    let count = state
         .spaces
         .iter()
         .filter(|space| {
             space.project == project && shinu::vm::is_running(&shinu::vm_dir(root, space.id))
         })
-        .count() as u32
+        .count();
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
+fn space_start_state(
+    ctx: &Ctx<'_>,
+    project: &str,
+    space: &Space,
+    limits: &Limits,
+) -> shinu::Result<(bool, State, Vec<Space>)> {
+    // Keep the running-slot check under the state lock, but release it before
+    // vm::start waits for the guest's SSH service.
+    let _state_guard = lock_state(ctx.registry);
+    let connection = lock_db(ctx.db);
+    let state = state::load(&connection)?;
+    let previous_running =
+        running_network_members(ctx.root, &state, project, space.network.as_deref());
+    let already_running = shinu::vm::is_running(&shinu::vm_dir(ctx.root, space.id));
+    if !already_running {
+        quota::check_running_limit(count_running(ctx.root, &state, project), limits)?;
+    }
+    Ok((already_running, state, previous_running))
 }
 
 fn record_sweep_usage(
@@ -728,11 +745,8 @@ fn record_sweep_usage(
     let state = state::load(&connection)?;
     for space in &state.spaces {
         let image = shinu::space_image(root, space.id);
-        // Billing time series: a du failure must not abort the 30-second sweep.
-        let disk_mib = shinu::btrfs::exclusive(&image)
-            .unwrap_or(0)
-            .saturating_add(1024 * 1024 - 1)
-            / (1024 * 1024);
+        // A disk-usage probe failure must not abort the 30-second sweep.
+        let disk_mib = bytes_to_mib(shinu::btrfs::exclusive(&image).unwrap_or(0));
         // `disk_mib_hour` stores one MiB snapshot per sweep, not a duration;
         // later pricing can multiply the sum by the 30-second sample period.
         state::record_usage(
@@ -902,8 +916,7 @@ fn resolve_snapshot_mode(
     match requested {
         SnapshotMode::None => Ok((SnapshotMode::None, None)),
         SnapshotMode::Full => {
-            let Some((base, diff_count)) = latest_usable_full_checkpoint(root, state, space)
-            else {
+            let Some((base, diff_count)) = latest_usable_full_checkpoint(root, state, space) else {
                 return Ok((SnapshotMode::Full, None));
             };
             if full_every > 0 && diff_count < full_every {
@@ -933,7 +946,6 @@ fn checkpoint_snapshot_mode(checkpoint: &Ckpt) -> &'static str {
         "full"
     }
 }
-
 
 fn materialize_checkpoint_memory(
     root: &Path,
@@ -1014,7 +1026,9 @@ fn resize_disk_image(image: &Path, disk_mib: u64) -> shinu::Result<()> {
             fsck.code().unwrap_or(-1)
         )));
     }
-    let resize = std::process::Command::new("resize2fs").arg(image).status()?;
+    let resize = std::process::Command::new("resize2fs")
+        .arg(image)
+        .status()?;
     if !resize.success() {
         return Err(shinu::Error::Invalid(format!(
             "resize2fs failed while growing {}",
@@ -1024,9 +1038,6 @@ fn resize_disk_image(image: &Path, disk_mib: u64) -> shinu::Result<()> {
     Ok(())
 }
 
-/// What a caller asks for when creating a space, as opposed to how the
-/// daemon satisfies it. Grouping these keeps `create_space` under the
-/// argument count where a positional call stops being readable.
 struct SpaceSpec {
     name: String,
     image: Option<Image>,
@@ -1122,12 +1133,7 @@ fn create_space(ctx: &Ctx<'_>, project: &str, spec: SpaceSpec) -> shinu::Result<
     result
 }
 
-fn fork_space(
-    ctx: &Ctx<'_>,
-    project: &str,
-    ckpt: Uuid,
-    name: String,
-) -> shinu::Result<Value> {
+fn fork_space(ctx: &Ctx<'_>, project: &str, ckpt: Uuid, name: String) -> shinu::Result<Value> {
     let limits = effective_limits(ctx, project)?;
     let (source_checkpoint, source_space) = {
         let _state_guard = lock_state(ctx.registry);
@@ -1193,12 +1199,7 @@ fn fork_space(
         }
         if source_full {
             materialize_checkpoint_memory(ctx.root, &source_checkpoint, &snapshot_mem)?;
-            shinu::btrfs::clone_for(
-                &shinu::ckpt_state(ctx.root, source),
-                &snapshot_state,
-                0,
-                0,
-            )?;
+            shinu::btrfs::clone_for(&shinu::ckpt_state(ctx.root, source), &snapshot_state, 0, 0)?;
         }
         let source_disk = source_space
             .disk_mib
@@ -1269,13 +1270,7 @@ fn commit_space(
                 .iter()
                 .find(|entry| entry.id == space_id && entry.project == project)
                 .ok_or_else(|| shinu::Error::NotFound(space_name.clone()))?;
-            resolve_snapshot_mode(
-                ctx.root,
-                &state,
-                current_space,
-                requested,
-                full_every(),
-            )?
+            resolve_snapshot_mode(ctx.root, &state, current_space, requested, full_every())?
         }
     };
     let running = shinu::vm::is_running(&vm_dir);
@@ -1311,7 +1306,9 @@ fn commit_space(
         }
     }
     let id = Uuid::new_v4();
-    let snapshot_limits = has_snapshot.then(|| effective_limits(ctx, project)).transpose()?;
+    let snapshot_limits = has_snapshot
+        .then(|| effective_limits(ctx, project))
+        .transpose()?;
     let image = shinu::ckpt_image(ctx.root, id);
     let jail_snapshot_mem = shinu::vm::jail_root(ctx.root, space_id).join("snap.mem");
     let jail_snapshot_state = shinu::vm::jail_root(ctx.root, space_id).join("snap.state");
@@ -1329,25 +1326,19 @@ fn commit_space(
         }
         let checkpoint = update_state(ctx.db, ctx.registry, |state| {
             if let Some(limits) = snapshot_limits.as_ref() {
-                let new_checkpoint_mib = checkpoint_exclusive(ctx.root, id)?
-                    .saturating_add(1024 * 1024 - 1)
-                    / (1024 * 1024);
+                let new_checkpoint_mib = bytes_to_mib(checkpoint_exclusive(ctx.root, id)?);
                 quota::check_disk_limit(
-                    current_disk_mib(ctx.root, state, project)?
-                        .saturating_add(new_checkpoint_mib),
+                    current_disk_mib(ctx.root, state, project)?.saturating_add(new_checkpoint_mib),
                     0,
                     limits,
                 )?;
             }
             if let Some(base) = diff_base.as_ref() {
-                let still_present = state
-                    .ckpts
-                    .iter()
-                    .any(|checkpoint| {
-                        checkpoint.id == base.id
-                            && checkpoint.space == space_id
-                            && checkpoint.project == project
-                    });
+                let still_present = state.ckpts.iter().any(|checkpoint| {
+                    checkpoint.id == base.id
+                        && checkpoint.space == space_id
+                        && checkpoint.project == project
+                });
                 if !still_present {
                     return Err(shinu::Error::Invalid(format!(
                         "diff checkpoint base {} was deleted before commit completed",
@@ -1389,7 +1380,13 @@ fn checkout_space(
 ) -> shinu::Result<Value> {
     let (space_id, space_name, image_kind, vcpus, mem_mib) = {
         let entry = find_space(ctx.db, &space, project)?;
-        (entry.id, entry.name, entry.image, entry.vcpus, entry.mem_mib)
+        (
+            entry.id,
+            entry.name,
+            entry.image,
+            entry.vcpus,
+            entry.mem_mib,
+        )
     };
     let space_guard = ctx.registry.space_lock(space_id);
     let _space_guard = space_guard
@@ -1411,12 +1408,7 @@ fn checkout_space(
 
     let auto_id = Uuid::new_v4();
     let auto_image = shinu::ckpt_image(ctx.root, auto_id);
-    shinu::btrfs::clone_for(
-        &shinu::space_image(ctx.root, space_id),
-        &auto_image,
-        0,
-        0,
-    )?;
+    shinu::btrfs::clone_for(&shinu::space_image(ctx.root, space_id), &auto_image, 0, 0)?;
     let short_id = commit.to_string().chars().take(8).collect::<String>();
     let auto_note = format!("auto before checkout {short_id}");
     let auto_checkpoint = update_state(ctx.db, ctx.registry, |state| {
@@ -1432,7 +1424,7 @@ fn checkout_space(
             auto: true,
             full: false,
             base: None,
-            note: auto_note.clone(),
+            note: auto_note,
             created_at: Utc::now(),
             snapshot_version: None,
         };
@@ -1450,8 +1442,8 @@ fn checkout_space(
     shinu::vm::authorize(&image, &public_key, &mount)?;
     let snapshot_mem = space_snapshot_mem(ctx.root, space_id);
     let snapshot_state = space_snapshot_state(ctx.root, space_id);
+    remove_space_snapshot_files(ctx.root, space_id)?;
     if target.full {
-        remove_space_snapshot_files(ctx.root, space_id)?;
         if let Some(base_id) = target.base {
             let base = find_checkpoint(ctx.db, base_id, project)?;
             ensure_snapshot_loadable(&base)?;
@@ -1475,8 +1467,6 @@ fn checkout_space(
             let _ = remove_space_snapshot_files(ctx.root, space_id);
             return Err(error);
         }
-    } else {
-        remove_space_snapshot_files(ctx.root, space_id)?;
     }
     update_state(ctx.db, ctx.registry, |state| {
         shinu::find_ckpt(state, target.id, project)?;
@@ -1491,12 +1481,8 @@ fn checkout_space(
                 .iter()
                 .find(|space| space.id == space_id && space.project == project)
                 .and_then(|space| space.network.clone());
-            let previous_running = running_network_members(
-                ctx.root,
-                &state,
-                project,
-                network.as_deref(),
-            );
+            let previous_running =
+                running_network_members(ctx.root, &state, project, network.as_deref());
             (network, previous_running)
         };
         let _ = start_vm_with_pending_restore(
@@ -1508,21 +1494,13 @@ fn checkout_space(
             Some(&target),
         )?;
         let state = snapshot(ctx.db, ctx.registry)?;
-        let current_running = refresh_network_rules(
-            ctx,
-            &state,
-            project,
-            network.as_deref(),
-            &previous_running,
-        )?;
+        let current_running =
+            refresh_network_rules(ctx, &state, project, network.as_deref(), &previous_running)?;
         let all_members = network_members(&state, project, network.as_deref());
         sync_network_hosts(ctx, &current_running, &all_members);
     }
     Ok(json!({ "head": target.id, "auto_commit": auto_checkpoint.id }))
 }
-
-
-
 
 fn remove_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value> {
     let (id, resolved_name, network) = {
@@ -1533,10 +1511,8 @@ fn remove_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Val
     let _space_guard = space_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // The record is claimed under the same lock that verifies it, before any
-    // file is unlinked: a later failure then leaves an orphan for gc rather
-    // than a space whose image is already gone. `previous_running` is taken
-    // before the removal because it is the "before" set the rule diff needs.
+    // Claim the record before unlinking; failures leave an orphan for gc.
+    // Capture previous_running before removal for the network rule diff.
     let (state, previous_running, peers) = {
         let _state_guard = lock_state(ctx.registry);
         let connection = lock_db(ctx.db);
@@ -1547,37 +1523,22 @@ fn remove_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Val
             .find(|space| space.id == id && space.project == project)
             .cloned()
             .ok_or_else(|| shinu::Error::NotFound(id.to_string()))?;
-        let previous_running = running_network_members(
-            ctx.root,
-            &state,
-            project,
-            network.as_deref(),
-        );
+        let previous_running =
+            running_network_members(ctx.root, &state, project, network.as_deref());
         let peers = peer_ips(&space, &previous_running, ctx.net_cfg);
         state.spaces.retain(|space| space.id != id);
         state::store(&connection, &state)?;
         (state, previous_running, peers)
     };
     shinu::vm::stop_with_peers(&shinu::vm_dir(ctx.root, id), ctx.net_cfg, &peers)?;
-    let current_running = refresh_network_rules(
-        ctx,
-        &state,
-        project,
-        network.as_deref(),
-        &previous_running,
-    )?;
-    // The claimed state no longer contains this space, so the peer set it
-    // yields is already the post-removal one.
+    let current_running =
+        refresh_network_rules(ctx, &state, project, network.as_deref(), &previous_running)?;
+    // The claimed state omits this space, so these are post-removal peers.
     let all_members = network_members(&state, project, network.as_deref());
     sync_network_hosts(ctx, &current_running, &all_members);
-    // The record is already gone, so a failure here leaves an orphaned file for
-    // gc rather than a space whose image has been deleted out from under it.
+    // Any deletion failure leaves an orphan for gc, not a dangling record.
     let image = shinu::space_image(ctx.root, id);
-    match std::fs::remove_file(&image) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
+    remove_file_if_missing(&image)?;
     remove_space_snapshot_files(ctx.root, id)?;
     match std::fs::remove_dir_all(shinu::vm_dir(ctx.root, id)) {
         Ok(()) => {}
@@ -1606,14 +1567,14 @@ fn remove_checkpoint(ctx: &Ctx<'_>, project: &str, id: Uuid) -> shinu::Result<Va
     Ok(json!({ "removed": id }))
 }
 
-
 fn list_spaces(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
     let state = snapshot(ctx.db, ctx.registry)?;
     let mut spaces = Vec::new();
     for space in state.spaces.iter().filter(|space| space.project == project) {
         let mut value = serde_json::to_value(space)?;
         if let Some(object) = value.as_object_mut() {
-            let size = shinu::btrfs::exclusive(&shinu::space_image(ctx.root, space.id)).unwrap_or(0);
+            let size =
+                shinu::btrfs::exclusive(&shinu::space_image(ctx.root, space.id)).unwrap_or(0);
             object.insert("exclusive".into(), Value::from(size));
             object.insert(
                 "running".into(),
@@ -1623,7 +1584,11 @@ fn list_spaces(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
         spaces.push(value);
     }
     let mut checkpoints = Vec::new();
-    for checkpoint in state.ckpts.iter().filter(|checkpoint| checkpoint.project == project) {
+    for checkpoint in state
+        .ckpts
+        .iter()
+        .filter(|checkpoint| checkpoint.project == project)
+    {
         let mut value = checkpoint_json(checkpoint)?;
         if let Some(object) = value.as_object_mut() {
             let size = checkpoint_exclusive(ctx.root, checkpoint.id).unwrap_or(0);
@@ -1633,7 +1598,7 @@ fn list_spaces(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
     }
     Ok(json!({ "spaces": spaces, "ckpts": checkpoints }))
 }
-fn list_images(ctx: &Ctx<'_>) -> shinu::Result<Value> {
+fn list_images(ctx: &Ctx<'_>) -> Value {
     let images = Image::all()
         .iter()
         .copied()
@@ -1644,7 +1609,7 @@ fn list_images(ctx: &Ctx<'_>) -> shinu::Result<Value> {
             })
         })
         .collect::<Vec<_>>();
-    Ok(Value::Array(images))
+    Value::Array(images)
 }
 
 fn start_vm_with_pending_restore(
@@ -1702,28 +1667,8 @@ fn start_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Valu
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let limits = effective_limits(ctx, project)?;
     check_vm_sizing(ctx, &limits, space.vcpus, space.mem_mib)?;
-    // The quota check must be serialised so concurrent callers cannot all
-    // observe the same free slot, but booting must not be: vm::start blocks
-    // until the guest's sshd answers, so holding the state lock across it
-    // serialised every concurrent boot behind one VM's readiness wait.
-    // vm::start writes the pid file before waiting, so a VM counts as running
-    // as soon as it is spawned and the next caller sees an accurate count.
-    let (already_running, state, previous_running) = {
-        let _state_guard = lock_state(ctx.registry);
-        let connection = lock_db(ctx.db);
-        let state = state::load(&connection)?;
-        let previous_running = running_network_members(
-            ctx.root,
-            &state,
-            project,
-            space.network.as_deref(),
-        );
-        let already_running = shinu::vm::is_running(&shinu::vm_dir(ctx.root, space.id));
-        if !already_running {
-            quota::check_running_limit(count_running(ctx.root, &state, project), &limits)?;
-        }
-        (already_running, state, previous_running)
-    };
+    let (already_running, state, previous_running) =
+        space_start_state(ctx, project, &space, &limits)?;
     let restore_checkpoint = space
         .head
         .and_then(|head| state.ckpts.iter().find(|checkpoint| checkpoint.id == head));
@@ -1751,7 +1696,6 @@ fn start_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Valu
     sync_network_hosts(ctx, &current_running, &all_members);
     Ok(json!({ "booted": booted }))
 }
-
 fn stop_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value> {
     let space = {
         let connection = lock_db(ctx.db);
@@ -1766,20 +1710,13 @@ fn stop_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value
         let _state_guard = lock_state(ctx.registry);
         let connection = lock_db(ctx.db);
         let state = state::load(&connection)?;
-        let previous_running = running_network_members(
-            ctx.root,
-            &state,
-            project,
-            space.network.as_deref(),
-        );
+        let previous_running =
+            running_network_members(ctx.root, &state, project, space.network.as_deref());
         let peers = peer_ips(&space, &previous_running, ctx.net_cfg);
         (state, previous_running, peers)
     };
-    let was_running = shinu::vm::stop_with_peers(
-        &shinu::vm_dir(ctx.root, space.id),
-        ctx.net_cfg,
-        &peers,
-    )?;
+    let was_running =
+        shinu::vm::stop_with_peers(&shinu::vm_dir(ctx.root, space.id), ctx.net_cfg, &peers)?;
     let current_running = refresh_network_rules(
         ctx,
         &state,
@@ -1867,8 +1804,8 @@ fn resize_space(
         };
         let grew = target_disk > current_disk;
         if grew {
-            let used_without_current = current_disk_mib(ctx.root, &state, project)?
-                .saturating_sub(current_disk);
+            let used_without_current =
+                current_disk_mib(ctx.root, &state, project)?.saturating_sub(current_disk);
             quota::check_disk_limit(used_without_current, target_disk, &limits)?;
         }
         (
@@ -1932,7 +1869,6 @@ fn touch_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Valu
     shinu::vm::touch(&shinu::vm_dir(ctx.root, id))?;
     Ok(json!({ "ok": true }))
 }
-
 
 fn gc(ctx: &Ctx<'_>, project: &str, free_below: u64, dry_run: bool) -> shinu::Result<Value> {
     let available = shinu::avail_bytes(ctx.root)?;
@@ -2067,13 +2003,13 @@ fn patch_project_limits(ctx: &Ctx<'_>, project: &str, body: &[u8]) -> shinu::Res
         ));
     }
 
-    let existing = {
-        let connection = lock_db(ctx.db);
-        state::project_limit_overrides(&connection, project)?
-    };
+    // Serialize the nullable read-modify-write with the same state-then-db
+    // order used by all other state mutations.
+    let state_guard = lock_state(ctx.registry);
+    let connection = lock_db(ctx.db);
+    let existing = state::project_limit_overrides(&connection, project)?;
     let (current_spaces, current_disk_mib, current_running, current_api_per_min) =
         existing.unwrap_or((None, None, None, None));
-    let connection = lock_db(ctx.db);
     state::set_project_limits(
         &connection,
         project,
@@ -2083,10 +2019,12 @@ fn patch_project_limits(ctx: &Ctx<'_>, project: &str, body: &[u8]) -> shinu::Res
         api_per_min.unwrap_or(current_api_per_min),
     )?;
     drop(connection);
+    drop(state_guard);
     limits_value(ctx, project)
 }
 
 fn clear_project_limits(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
+    let _state_guard = lock_state(ctx.registry);
     let connection = lock_db(ctx.db);
     state::clear_project_limits(&connection, project)?;
     Ok(json!({ "project": project, "cleared": true }))
@@ -2106,22 +2044,34 @@ fn diff_space(ctx: &Ctx<'_>, project: &str, spec: DiffSpec) -> shinu::Result<Val
         (Some(from), Some(to)) => {
             shinu::find_ckpt(&state, from, project)?;
             shinu::find_ckpt(&state, to, project)?;
-            (shinu::ckpt_image(ctx.root, from), shinu::ckpt_image(ctx.root, to))
+            (
+                shinu::ckpt_image(ctx.root, from),
+                shinu::ckpt_image(ctx.root, to),
+            )
         }
         (Some(from), None) => {
             let space = shinu::find(&state, &spec.space, project)?;
             shinu::find_ckpt(&state, from, project)?;
-            (shinu::ckpt_image(ctx.root, from), shinu::space_image(ctx.root, space.id))
+            (
+                shinu::ckpt_image(ctx.root, from),
+                shinu::space_image(ctx.root, space.id),
+            )
         }
         (None, Some(to)) => {
             if let Ok(from) = spec.space.parse::<Uuid>() {
                 shinu::find_ckpt(&state, from, project)?;
                 shinu::find_ckpt(&state, to, project)?;
-                (shinu::ckpt_image(ctx.root, from), shinu::ckpt_image(ctx.root, to))
+                (
+                    shinu::ckpt_image(ctx.root, from),
+                    shinu::ckpt_image(ctx.root, to),
+                )
             } else {
                 let space = shinu::find(&state, &spec.space, project)?;
                 shinu::find_ckpt(&state, to, project)?;
-                (shinu::space_image(ctx.root, space.id), shinu::ckpt_image(ctx.root, to))
+                (
+                    shinu::space_image(ctx.root, space.id),
+                    shinu::ckpt_image(ctx.root, to),
+                )
             }
         }
         (None, None) => {
@@ -2130,7 +2080,10 @@ fn diff_space(ctx: &Ctx<'_>, project: &str, spec: DiffSpec) -> shinu::Result<Val
                 shinu::Error::Invalid(format!("space {} has no HEAD checkpoint", space.name))
             })?;
             shinu::find_ckpt(&state, head, project)?;
-            (shinu::ckpt_image(ctx.root, head), shinu::space_image(ctx.root, space.id))
+            (
+                shinu::ckpt_image(ctx.root, head),
+                shinu::space_image(ctx.root, space.id),
+            )
         }
     };
     let limit = spec.limit.min(MAX_DIFF_LIMIT);
@@ -2192,7 +2145,6 @@ fn diff_status_marker(entry: &DiffEntry) -> &'static str {
     }
 }
 
-
 fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
     match req {
         Req::New {
@@ -2220,7 +2172,7 @@ fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
             mem_mib,
             disk_mib,
         } => resize_space(ctx, project, space, vcpus, mem_mib, disk_mib),
-        Req::Images => list_images(ctx),
+        Req::Images => Ok(list_images(ctx)),
         Req::Fork { ckpt, name } => fork_space(ctx, project, ckpt, name),
         Req::Commit {
             space,
@@ -2306,8 +2258,7 @@ fn validate_exec_session_id(session: &str) -> shinu::Result<()> {
     Ok(())
 }
 
-fn exec_session(body: &[u8]) -> shinu::Result<Option<String>> {
-    let value = parse_body(body)?;
+fn exec_session_value(value: &Value) -> shinu::Result<Option<String>> {
     match value.get("session") {
         None | Some(Value::Null) => Ok(None),
         Some(value) => {
@@ -2321,17 +2272,18 @@ fn exec_session(body: &[u8]) -> shinu::Result<Option<String>> {
 }
 
 fn exec_request(body: &[u8], space: String) -> shinu::Result<Req> {
-    let (cmd, stdin) = exec_command(body)?;
+    let value = parse_body(body)?;
+    let (cmd, stdin) = exec_command_value(&value)?;
+    let session = exec_session_value(&value)?;
     Ok(Req::Exec {
         space,
         cmd,
         stdin,
-        session: exec_session(body)?,
+        session,
     })
 }
 
-fn exec_command(body: &[u8]) -> shinu::Result<(Vec<String>, Option<String>)> {
-    let value = parse_body(body)?;
+fn exec_command_value(value: &Value) -> shinu::Result<(Vec<String>, Option<String>)> {
     let command = value
         .get("cmd")
         .and_then(Value::as_array)
@@ -2350,9 +2302,12 @@ fn exec_command(body: &[u8]) -> shinu::Result<(Vec<String>, Option<String>)> {
     }
     let stdin = match value.get("stdin") {
         None | Some(Value::Null) => None,
-        Some(value) => Some(value.as_str().ok_or_else(|| {
-            shinu::Error::Invalid("stdin must be a string".into())
-        })?.to_owned()),
+        Some(value) => Some(
+            value
+                .as_str()
+                .ok_or_else(|| shinu::Error::Invalid("stdin must be a string".into()))?
+                .to_owned(),
+        ),
     };
     Ok((command, stdin))
 }
@@ -2485,28 +2440,24 @@ fn route(path: &str) -> Option<Endpoint> {
 }
 
 fn proxy_route(path: &str, query: &str) -> Option<Endpoint> {
-    let raw = path.split('/').collect::<Vec<_>>();
-    if raw.len() < 6
-        || !raw[0].is_empty()
-        || raw[1] != "v1"
-        || raw[2] != "spaces"
-        || raw[4] != "proxy"
+    let mut segments = path.splitn(7, '/');
+    if segments.next() != Some("")
+        || segments.next() != Some("v1")
+        || segments.next() != Some("spaces")
     {
         return None;
     }
-    let space = decode_segment(raw[3])?;
-    if space.is_empty() {
+    let space = decode_segment(segments.next()?)?;
+    if space.is_empty() || segments.next() != Some("proxy") {
         return None;
     }
-    let port = decode_segment(raw[5])?.parse::<u16>().ok()?;
+    let port = decode_segment(segments.next()?)?.parse::<u16>().ok()?;
     if port == 0 {
         return None;
     }
-    let guest_path = if raw.len() == 6 {
-        "/".to_owned()
-    } else {
-        format!("/{}", raw[6..].join("/"))
-    };
+    let guest_path = segments
+        .next()
+        .map_or_else(|| "/".to_owned(), |suffix| format!("/{suffix}"));
     let path = if query.is_empty() {
         guest_path
     } else {
@@ -2526,6 +2477,9 @@ fn hex_digit(value: u8) -> Option<u8> {
 
 fn decode_segment(segment: &str) -> Option<String> {
     let bytes = segment.as_bytes();
+    if !bytes.contains(&b'%') {
+        return Some(segment.to_owned());
+    }
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
@@ -2544,8 +2498,6 @@ fn decode_segment(segment: &str) -> Option<String> {
     }
     String::from_utf8(decoded).ok()
 }
-
-
 fn usage_query(path: &str) -> shinu::Result<(Option<i64>, Option<i64>)> {
     let Some((_, query)) = path.split_once('?') else {
         return Ok((None, None));
@@ -2560,15 +2512,23 @@ fn usage_query(path: &str) -> shinu::Result<(Option<i64>, Option<i64>)> {
             .split_once('=')
             .ok_or_else(|| shinu::Error::Invalid("usage query must use key=value".into()))?;
         let parsed = value.parse::<i64>().map_err(|error| {
-            shinu::Error::Invalid(format!("usage query {key} must be a unix timestamp: {error}"))
+            shinu::Error::Invalid(format!(
+                "usage query {key} must be a unix timestamp: {error}"
+            ))
         })?;
         match key {
             "from" if from.is_none() => from = Some(parsed),
             "to" if to.is_none() => to = Some(parsed),
             "from" | "to" => {
-                return Err(shinu::Error::Invalid(format!("duplicate usage query key: {key}")))
+                return Err(shinu::Error::Invalid(format!(
+                    "duplicate usage query key: {key}"
+                )));
             }
-            _ => return Err(shinu::Error::Invalid(format!("unknown usage query key: {key}"))),
+            _ => {
+                return Err(shinu::Error::Invalid(format!(
+                    "unknown usage query key: {key}"
+                )));
+            }
         }
     }
     Ok((from, to))
@@ -2585,12 +2545,15 @@ fn diff_request(path: &str, space: String) -> shinu::Result<Req> {
                 .ok_or_else(|| shinu::Error::Invalid("diff query must use key=value".into()))?;
             let key = decode_segment(raw_key)
                 .ok_or_else(|| shinu::Error::Invalid("diff query key is not valid UTF-8".into()))?;
-            let value = decode_segment(raw_value)
-                .ok_or_else(|| shinu::Error::Invalid(format!("diff query value for {key} is invalid")))?;
+            let value = decode_segment(raw_value).ok_or_else(|| {
+                shinu::Error::Invalid(format!("diff query value for {key} is invalid"))
+            })?;
             match key.as_str() {
                 "from" | "commit" => {
                     if from.is_some() {
-                        return Err(shinu::Error::Invalid("duplicate diff query key: from".into()));
+                        return Err(shinu::Error::Invalid(
+                            "duplicate diff query key: from".into(),
+                        ));
                     }
                     from = Some(parse_diff_commit(&key, &value)?);
                 }
@@ -2617,7 +2580,11 @@ fn diff_request(path: &str, space: String) -> shinu::Result<Req> {
                     })?;
                     limit = parsed.min(MAX_DIFF_LIMIT);
                 }
-                _ => return Err(shinu::Error::Invalid(format!("unknown diff query key: {key}"))),
+                _ => {
+                    return Err(shinu::Error::Invalid(format!(
+                        "unknown diff query key: {key}"
+                    )));
+                }
             }
         }
     }
@@ -2631,11 +2598,10 @@ fn diff_request(path: &str, space: String) -> shinu::Result<Req> {
 }
 
 fn parse_diff_commit(key: &str, value: &str) -> shinu::Result<Uuid> {
-    Uuid::parse_str(value)
-        .map_err(|error| shinu::Error::Invalid(format!("diff query {key} is not a commit id: {error}")))
+    Uuid::parse_str(value).map_err(|error| {
+        shinu::Error::Invalid(format!("diff query {key} is not a commit id: {error}"))
+    })
 }
-
-
 
 fn method_allowed(endpoint: &Endpoint, method: &str) -> bool {
     match endpoint {
@@ -2669,7 +2635,9 @@ fn method_allowed(endpoint: &Endpoint, method: &str) -> bool {
         | Endpoint::Fork(_)
         | Endpoint::Gc => method == "POST",
         Endpoint::Pull(_) | Endpoint::Vnc(_) => method == "GET",
-        Endpoint::Proxy { .. } => matches!(method, "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD"),
+        Endpoint::Proxy { .. } => {
+            matches!(method, "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD")
+        }
     }
 }
 
@@ -2681,8 +2649,7 @@ fn parse_body(body: &[u8]) -> shinu::Result<Value> {
         .map_err(|error| shinu::Error::Invalid(format!("invalid JSON body: {error}")))
 }
 
-fn body_string(body: &[u8], field: &str) -> shinu::Result<String> {
-    let value = parse_body(body)?;
+fn value_string(value: &Value, field: &str) -> shinu::Result<String> {
     value
         .get(field)
         .and_then(Value::as_str)
@@ -2690,16 +2657,18 @@ fn body_string(body: &[u8], field: &str) -> shinu::Result<String> {
         .ok_or_else(|| shinu::Error::Invalid(format!("body field {field} must be a string")))
 }
 
-fn body_bool(body: &[u8], field: &str) -> shinu::Result<bool> {
-    let value = parse_body(body)?;
+fn body_string(body: &[u8], field: &str) -> shinu::Result<String> {
+    value_string(&parse_body(body)?, field)
+}
+
+fn value_bool(value: &Value, field: &str) -> shinu::Result<bool> {
     value
         .get(field)
         .and_then(Value::as_bool)
         .ok_or_else(|| shinu::Error::Invalid(format!("body field {field} must be a boolean")))
 }
 
-fn body_snapshot_mode(body: &[u8]) -> shinu::Result<SnapshotMode> {
-    let value = parse_body(body)?;
+fn value_snapshot_mode(value: &Value) -> shinu::Result<SnapshotMode> {
     match value.get("snapshot") {
         None => Ok(SnapshotMode::None),
         Some(Value::String(mode)) => match mode.as_str() {
@@ -2716,13 +2685,10 @@ fn body_snapshot_mode(body: &[u8]) -> shinu::Result<SnapshotMode> {
     }
 }
 
-
-fn body_u64(body: &[u8], field: &str) -> shinu::Result<u64> {
-    let value = parse_body(body)?;
-    value
-        .get(field)
-        .and_then(Value::as_u64)
-        .ok_or_else(|| shinu::Error::Invalid(format!("body field {field} must be an unsigned integer")))
+fn value_u64(value: &Value, field: &str) -> shinu::Result<u64> {
+    value.get(field).and_then(Value::as_u64).ok_or_else(|| {
+        shinu::Error::Invalid(format!("body field {field} must be an unsigned integer"))
+    })
 }
 
 fn value_optional_u32(value: &Value, field: &str) -> shinu::Result<Option<u32>> {
@@ -2731,7 +2697,11 @@ fn value_optional_u32(value: &Value, field: &str) -> shinu::Result<Option<u32>> 
         Some(raw) => raw
             .as_u64()
             .and_then(|number| u32::try_from(number).ok())
-            .ok_or_else(|| shinu::Error::Invalid(format!("body field {field} must be an unsigned 32-bit integer")))
+            .ok_or_else(|| {
+                shinu::Error::Invalid(format!(
+                    "body field {field} must be an unsigned 32-bit integer"
+                ))
+            })
             .map(Some),
     }
 }
@@ -2741,7 +2711,9 @@ fn value_optional_u64(value: &Value, field: &str) -> shinu::Result<Option<u64>> 
         None | Some(Value::Null) => Ok(None),
         Some(raw) => raw
             .as_u64()
-            .ok_or_else(|| shinu::Error::Invalid(format!("body field {field} must be an unsigned integer")))
+            .ok_or_else(|| {
+                shinu::Error::Invalid(format!("body field {field} must be an unsigned integer"))
+            })
             .map(Some),
     }
 }
@@ -2755,7 +2727,11 @@ fn value_patch_u32(value: &Value, field: &str) -> shinu::Result<Option<Option<u3
         Some(raw) => raw
             .as_u64()
             .and_then(|number| u32::try_from(number).ok())
-            .ok_or_else(|| shinu::Error::Invalid(format!("body field {field} must be an unsigned 32-bit integer or null")))
+            .ok_or_else(|| {
+                shinu::Error::Invalid(format!(
+                    "body field {field} must be an unsigned 32-bit integer or null"
+                ))
+            })
             .map(|number| Some(Some(number))),
     }
 }
@@ -2766,7 +2742,11 @@ fn value_patch_u64(value: &Value, field: &str) -> shinu::Result<Option<Option<u6
         Some(Value::Null) => Ok(Some(None)),
         Some(raw) => raw
             .as_u64()
-            .ok_or_else(|| shinu::Error::Invalid(format!("body field {field} must be an unsigned integer or null")))
+            .ok_or_else(|| {
+                shinu::Error::Invalid(format!(
+                    "body field {field} must be an unsigned integer or null"
+                ))
+            })
             .map(|number| Some(Some(number))),
     }
 }
@@ -2781,9 +2761,9 @@ fn new_request(body: &[u8]) -> shinu::Result<Req> {
     let image = match value.get("image") {
         None | Some(Value::Null) => None,
         Some(raw) => {
-            let id = raw.as_str().ok_or_else(|| {
-                shinu::Error::Invalid("body field image must be a string".into())
-            })?;
+            let id = raw
+                .as_str()
+                .ok_or_else(|| shinu::Error::Invalid("body field image must be a string".into()))?;
             Some(id.parse::<Image>().map_err(|error| {
                 shinu::Error::Invalid(format!("body field image is invalid: {error}"))
             })?)
@@ -2822,6 +2802,28 @@ fn resize_request(body: &[u8], space: String) -> shinu::Result<Req> {
         disk_mib: value_patch_u64(&value, "disk_mib")?,
     })
 }
+fn commit_request(body: &[u8], space: String) -> shinu::Result<Req> {
+    let value = parse_body(body)?;
+    let note = value_string(&value, "note")?;
+    let hot = value_bool(&value, "hot")?;
+    let snapshot = value_snapshot_mode(&value)?;
+    Ok(Req::Commit {
+        space,
+        note,
+        hot,
+        snapshot,
+    })
+}
+
+fn gc_request(body: &[u8]) -> shinu::Result<Req> {
+    let value = parse_body(body)?;
+    let free_below = value_u64(&value, "free_below")?;
+    let dry_run = value_bool(&value, "dry_run")?;
+    Ok(Req::Gc {
+        free_below,
+        dry_run,
+    })
+}
 
 fn request_for(
     endpoint: Endpoint,
@@ -2840,53 +2842,41 @@ fn request_for(
         Endpoint::Rm(space) => Ok((Req::Rm { space }, 200)),
         Endpoint::Start(space) => Ok((Req::Start { space }, 200)),
         Endpoint::Stop(space) => Ok((Req::Stop { space }, 200)),
-        Endpoint::Commit(space) => Ok((
-            Req::Commit {
-                space,
-                note: body_string(body, "note")?,
-                hot: body_bool(body, "hot")?,
-                snapshot: body_snapshot_mode(body)?,
-            },
-            201,
-        )),
+        Endpoint::Commit(space) => Ok((commit_request(body, space)?, 201)),
         Endpoint::Log(space) => Ok((Req::Log { space }, 200)),
         Endpoint::Reflog(space) => Ok((Req::Reflog { space }, 200)),
         Endpoint::Diff(space) => Ok((diff_request("", space)?, 200)),
         Endpoint::Checkout(space) => Ok((
             Req::Checkout {
                 space,
-                commit: Uuid::parse_str(&body_string(body, "commit")?)
-                    .map_err(|error| shinu::Error::Invalid(format!("invalid commit id: {error}")))?,
+                commit: Uuid::parse_str(&body_string(body, "commit")?).map_err(|error| {
+                    shinu::Error::Invalid(format!("invalid commit id: {error}"))
+                })?,
             },
             200,
         )),
         Endpoint::Fork(commit) => Ok((
             Req::Fork {
-                ckpt: Uuid::parse_str(&commit)
-                    .map_err(|error| shinu::Error::Invalid(format!("invalid commit id: {error}")))?,
+                ckpt: Uuid::parse_str(&commit).map_err(|error| {
+                    shinu::Error::Invalid(format!("invalid commit id: {error}"))
+                })?,
                 name: body_string(body, "name")?,
             },
             201,
         )),
         Endpoint::RmCkpt(commit) => Ok((
             Req::RmCkpt {
-                ckpt: Uuid::parse_str(&commit)
-                    .map_err(|error| shinu::Error::Invalid(format!("invalid commit id: {error}")))?,
+                ckpt: Uuid::parse_str(&commit).map_err(|error| {
+                    shinu::Error::Invalid(format!("invalid commit id: {error}"))
+                })?,
             },
             200,
         )),
-        Endpoint::Gc => Ok((
-            Req::Gc {
-                free_below: body_u64(body, "free_below")?,
-                dry_run: body_bool(body, "dry_run")?,
-            },
-            200,
-        )),
+        Endpoint::Gc => Ok((gc_request(body)?, 200)),
         Endpoint::Exec(space) => Ok((exec_request(body, space)?, 200)),
         _ => Err(shinu::Error::Invalid("endpoint is not an API route".into())),
     }
 }
-
 
 fn transfer_path(path: &str) -> shinu::Result<String> {
     let query = path
@@ -2908,7 +2898,9 @@ fn transfer_path(path: &str) -> shinu::Result<String> {
             )));
         }
         if guest_path.replace(value).is_some() {
-            return Err(shinu::Error::Invalid("duplicate transfer query key: path".into()));
+            return Err(shinu::Error::Invalid(
+                "duplicate transfer query key: path".into(),
+            ));
         }
     }
     let guest_path = guest_path
@@ -2930,7 +2922,6 @@ fn upload_length(content_length: Option<usize>) -> shinu::Result<usize> {
     }
 }
 
-
 struct SshTarget {
     vm_dir: PathBuf,
     proxy: String,
@@ -2945,28 +2936,8 @@ fn prepare_ssh(ctx: &Ctx<'_>, project: &str, space: &str) -> shinu::Result<SshTa
     let _space_guard = space_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // The quota check must be serialised so concurrent callers cannot all
-    // observe the same free slot, but booting must not be: vm::start blocks
-    // until the guest's sshd answers, so holding the state lock across it
-    // serialised every concurrent boot behind one VM's readiness wait.
-    // vm::start writes the pid file before waiting, so a VM counts as running
-    // as soon as it is spawned and the next caller sees an accurate count.
-    let (already_running, state, previous_running) = {
-        let _state_guard = lock_state(ctx.registry);
-        let connection = lock_db(ctx.db);
-        let state = state::load(&connection)?;
-        let previous_running = running_network_members(
-            ctx.root,
-            &state,
-            project,
-            entry.network.as_deref(),
-        );
-        let running = shinu::vm::is_running(&shinu::vm_dir(ctx.root, space_id));
-        if !running {
-            quota::check_running_limit(count_running(ctx.root, &state, project), &limits)?;
-        }
-        (running, state, previous_running)
-    };
+    let (already_running, state, previous_running) =
+        space_start_state(ctx, project, &entry, &limits)?;
     let restore_checkpoint = entry
         .head
         .and_then(|head| state.ckpts.iter().find(|checkpoint| checkpoint.id == head));
@@ -3023,11 +2994,7 @@ fn ssh_command(target: &SshTarget, remote: &[String]) -> Command {
     command
 }
 
-fn session_remote_command(
-    session: &str,
-    command: &[String],
-    has_stdin: bool,
-) -> Vec<String> {
+fn session_remote_command(session: &str, command: &[String], has_stdin: bool) -> Vec<String> {
     let session_dir = format!("/tmp/shinu-session-{session}");
     let request_id = Uuid::new_v4().to_string();
     let input_path = format!("{session_dir}/input");
@@ -3048,11 +3015,13 @@ fn session_remote_command(
     let command = shinu::shell_quote(command);
     let command_line = format!(
         "{command} < {stdin} > {stdout} 2> {stderr}",
-        stdin = if has_stdin { stdin.as_str() } else { "'/dev/null'" },
+        stdin = if has_stdin {
+            stdin.as_str()
+        } else {
+            "'/dev/null'"
+        },
     );
-    let exit_trap = format!(
-        "trap 'printf \"%s\\n\" \"$?\" > {status_path}' 0"
-    );
+    let exit_trap = format!("trap 'printf \"%s\\n\" \"$?\" > {status_path}' 0");
     let status_line = format!("status=$?\ntrap - 0\nprintf '%s\\n' \"$status\" > {status}");
     let command_payload = quote(&format!("{exit_trap}\n{command_line}\n{status_line}"));
 
@@ -3305,7 +3274,6 @@ fn abort_child(child: &mut Child) {
     let _ = child.wait();
 }
 
-
 enum PullFailure {
     BeforeResponse(shinu::Error),
     AfterResponse,
@@ -3436,11 +3404,12 @@ fn stream_vnc(stream: &mut TcpStream, mut vsock: UnixStream) -> shinu::Result<()
                     if matches!(
                         error.kind(),
                         std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                    ) => {
-                        if stop_client_reader_thread.load(Ordering::Acquire) {
-                            break;
-                        }
+                    ) =>
+                {
+                    if stop_client_reader_thread.load(Ordering::Acquire) {
+                        break;
                     }
+                }
                 Err(_) => break,
             }
         }
@@ -3513,17 +3482,14 @@ fn proxy_header(name: &str, value: &str) -> ProxyHeader {
 }
 
 fn is_proxy_hop_header(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "connection"
-            | "keep-alive"
-            | "transfer-encoding"
-            | "upgrade"
-            | "proxy-connection"
-            | "te"
-            | "trailer"
-            | "expect"
-    )
+    name.eq_ignore_ascii_case("connection")
+        || name.eq_ignore_ascii_case("keep-alive")
+        || name.eq_ignore_ascii_case("transfer-encoding")
+        || name.eq_ignore_ascii_case("upgrade")
+        || name.eq_ignore_ascii_case("proxy-connection")
+        || name.eq_ignore_ascii_case("te")
+        || name.eq_ignore_ascii_case("trailer")
+        || name.eq_ignore_ascii_case("expect")
 }
 
 fn proxy_connection_tokens(headers: &[ProxyHeader]) -> Vec<String> {
@@ -3541,6 +3507,26 @@ fn proxy_is_filtered(header: &ProxyHeader, connection_tokens: &[String]) -> bool
         || connection_tokens
             .iter()
             .any(|token| header.name.eq_ignore_ascii_case(token))
+}
+
+fn proxy_cookie_name(value: &str) -> Option<&str> {
+    value.split_once('=').map(|(name, _)| name.trim())
+}
+
+fn proxy_cookie_without_session(value: &str) -> Option<String> {
+    let cookies = value
+        .split(';')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .filter(|part| proxy_cookie_name(part) != Some(SESSION_COOKIE))
+        .collect::<Vec<_>>();
+    (!cookies.is_empty()).then(|| cookies.join("; "))
+}
+
+fn is_reserved_session_set_cookie(header: &ProxyHeader) -> bool {
+    header.name.eq_ignore_ascii_case("Set-Cookie")
+        && proxy_cookie_name(header.value.split(';').next().unwrap_or_default())
+            == Some(SESSION_COOKIE)
 }
 
 fn parse_proxy_request_head(
@@ -3590,10 +3576,10 @@ fn parse_proxy_request_head(
                 "proxy request has duplicate Transfer-Encoding".into(),
             ));
         } else if header.name.eq_ignore_ascii_case("Transfer-Encoding") {
-            transfer_encoding = Some(header.value.clone());
+            transfer_encoding = Some(header.value.as_str());
         }
     }
-    let chunked = transfer_encoding.as_ref().is_some_and(|value| {
+    let chunked = transfer_encoding.is_some_and(|value| {
         value
             .split(',')
             .all(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"))
@@ -3616,19 +3602,25 @@ fn parse_proxy_request_head(
         chunked,
     })
 }
-
 fn proxy_request_headers(request: &ProxyRequestHead, port: u16) -> Vec<ProxyHeader> {
     let connection_tokens = proxy_connection_tokens(&request.headers);
-    let mut headers = request
-        .headers
-        .iter()
-        .filter(|header| {
-            !proxy_is_filtered(header, &connection_tokens)
-                && !header.name.eq_ignore_ascii_case("Host")
-                && !header.name.eq_ignore_ascii_case("Content-Length")
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let mut headers = Vec::with_capacity(request.headers.len() + 3);
+    for header in &request.headers {
+        if proxy_is_filtered(header, &connection_tokens)
+            || header.name.eq_ignore_ascii_case("Host")
+            || header.name.eq_ignore_ascii_case("Content-Length")
+            || header.name.eq_ignore_ascii_case("Authorization")
+        {
+            continue;
+        }
+        if header.name.eq_ignore_ascii_case("Cookie") {
+            if let Some(value) = proxy_cookie_without_session(&header.value) {
+                headers.push(proxy_header("Cookie", &value));
+            }
+            continue;
+        }
+        headers.push(header.clone());
+    }
     headers.push(proxy_header("Host", &format!("127.0.0.1:{port}")));
     if request.chunked {
         headers.push(proxy_header("Transfer-Encoding", "chunked"));
@@ -3690,10 +3682,7 @@ fn read_proxy_line(reader: &mut impl BufRead) -> Result<Vec<u8>, String> {
 fn parse_proxy_chunk_size(line: &[u8]) -> Result<usize, String> {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
     let line = line.strip_suffix(b"\r").unwrap_or(line);
-    let size = line
-        .split(|byte| *byte == b';')
-        .next()
-        .unwrap_or_default();
+    let size = line.split(|byte| *byte == b';').next().unwrap_or_default();
     let size = std::str::from_utf8(size)
         .map_err(|_| "proxy chunk size is not ASCII".to_string())?
         .trim();
@@ -3810,20 +3799,30 @@ fn parse_proxy_response_head(reader: &mut impl BufRead) -> Result<ProxyResponseH
     let status_text = std::str::from_utf8(&status_line)
         .map_err(|_| "guest response status line is not UTF-8".to_string())?
         .trim_end_matches(&['\r', '\n'][..]);
-    if status_text.bytes().any(|byte| byte == b'\r' || byte == b'\n') {
+    if status_text
+        .bytes()
+        .any(|byte| byte == b'\r' || byte == b'\n')
+    {
         return Err("guest returned a status line with embedded line breaks".into());
     }
     let mut fields = status_text.splitn(3, ' ');
     let version = fields.next().unwrap_or_default();
     let code = fields.next().unwrap_or_default();
-    if !version.starts_with("HTTP/1.") || code.len() != 3 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err(format!("guest returned an invalid HTTP status line: {status_text:?}"));
+    if !version.starts_with("HTTP/1.")
+        || code.len() != 3
+        || !code.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(format!(
+            "guest returned an invalid HTTP status line: {status_text:?}"
+        ));
     }
     let status = code
         .parse::<u16>()
         .map_err(|error| format!("guest returned an invalid HTTP status code: {error}"))?;
     if !(100..=599).contains(&status) {
-        return Err(format!("guest returned an invalid HTTP status code: {status}"));
+        return Err(format!(
+            "guest returned an invalid HTTP status code: {status}"
+        ));
     }
     let mut headers = Vec::new();
     loop {
@@ -3858,11 +3857,11 @@ fn parse_proxy_response_head(reader: &mut impl BufRead) -> Result<ProxyResponseH
     })
 }
 
-fn proxy_response_body(
-    response: &ProxyResponseHead,
-    method: &str,
-) -> Result<ProxyBody, String> {
-    if method.eq_ignore_ascii_case("HEAD") || (100..200).contains(&response.status) || matches!(response.status, 204 | 304) {
+fn proxy_response_body(response: &ProxyResponseHead, method: &str) -> Result<ProxyBody, String> {
+    if method.eq_ignore_ascii_case("HEAD")
+        || (100..200).contains(&response.status)
+        || matches!(response.status, 204 | 304)
+    {
         return Ok(ProxyBody::None);
     }
     let mut content_length = None;
@@ -3872,15 +3871,16 @@ fn proxy_response_body(
             if content_length.is_some() {
                 return Err("guest response has duplicate Content-Length".into());
             }
-            content_length = Some(header.value.parse::<usize>().map_err(|error| {
-                format!("guest response has invalid Content-Length: {error}")
-            })?);
+            content_length =
+                Some(header.value.parse::<usize>().map_err(|error| {
+                    format!("guest response has invalid Content-Length: {error}")
+                })?);
         } else if header.name.eq_ignore_ascii_case("Transfer-Encoding")
             && transfer_encoding.is_some()
         {
             return Err("guest response has duplicate Transfer-Encoding".into());
         } else if header.name.eq_ignore_ascii_case("Transfer-Encoding") {
-            transfer_encoding = Some(header.value.clone());
+            transfer_encoding = Some(header.value.as_str());
         }
     }
     if transfer_encoding.is_some() && content_length.is_some() {
@@ -3897,6 +3897,15 @@ fn proxy_response_body(
     }
     Ok(content_length.map_or(ProxyBody::Close, ProxyBody::Length))
 }
+fn proxy_response_header_is_filtered(
+    header: &ProxyHeader,
+    connection_tokens: &[String],
+    body: &ProxyBody,
+) -> bool {
+    proxy_is_filtered(header, connection_tokens)
+        || is_reserved_session_set_cookie(header)
+        || header.name.eq_ignore_ascii_case("Content-Length") && matches!(body, ProxyBody::Close)
+}
 
 fn write_proxy_response_head(
     stream: &mut TcpStream,
@@ -3906,14 +3915,11 @@ fn write_proxy_response_head(
     write!(stream, "{}\r\n", response.status_line)?;
     let connection_tokens = proxy_connection_tokens(&response.headers);
     for header in &response.headers {
-        if proxy_is_filtered(header, &connection_tokens)
-            || header.name.eq_ignore_ascii_case("Content-Length") && matches!(body, ProxyBody::Close)
-        {
+        if proxy_response_header_is_filtered(header, &connection_tokens, body) {
             continue;
         }
         write!(stream, "{}: {}\r\n", header.name, header.value)?;
     }
-
     if matches!(body, ProxyBody::Chunked) {
         stream.write_all(b"Transfer-Encoding: chunked\r\n")?;
     }
@@ -3957,7 +3963,8 @@ fn relay_proxy_chunked(
             .map_err(|error| ProxyRelayFailure::Transport(error.to_string()))?;
         if size == 0 {
             loop {
-                let trailer = read_proxy_response_line(reader).map_err(ProxyRelayFailure::GuestClosed)?;
+                let trailer =
+                    read_proxy_response_line(reader).map_err(ProxyRelayFailure::GuestClosed)?;
                 stream
                     .write_all(&trailer)
                     .map_err(|error| ProxyRelayFailure::Transport(error.to_string()))?;
@@ -3993,7 +4000,10 @@ fn relay_proxy_chunked(
     }
 }
 
-fn relay_proxy_close(reader: &mut impl Read, stream: &mut TcpStream) -> Result<(), ProxyRelayFailure> {
+fn relay_proxy_close(
+    reader: &mut impl Read,
+    stream: &mut TcpStream,
+) -> Result<(), ProxyRelayFailure> {
     let mut buffer = [0u8; 64 * 1024];
     loop {
         let count = reader
@@ -4094,11 +4104,7 @@ fn relay_proxy_response(
     Ok(())
 }
 
-fn proxy_bridge_error(
-    space: &str,
-    port: u16,
-    failure: ProxyRelayFailure,
-) -> shinu::Error {
+fn proxy_bridge_error(space: &str, port: u16, failure: ProxyRelayFailure) -> shinu::Error {
     let (kind, detail) = match failure {
         ProxyRelayFailure::BeforeResponse(detail) => ("before response", detail),
         ProxyRelayFailure::GuestClosed(detail) => ("after the response started", detail),
@@ -4156,6 +4162,9 @@ fn admin_token_matches(ctx: &Ctx<'_>, request: &http::Request) -> bool {
 }
 
 fn require_admin_token(ctx: &Ctx<'_>, request: &http::Request) -> shinu::Result<()> {
+    if request.authorization_present && request.token.is_none() {
+        return Err(shinu::Error::Auth("invalid token".into()));
+    }
     if admin_token_matches(ctx, request) {
         Ok(())
     } else {
@@ -4185,7 +4194,11 @@ fn authenticate(ctx: &Ctx<'_>, request: &http::Request) -> shinu::Result<Caller>
     // A bearer token is deliberately authoritative when present. Falling back
     // to a cookie after an invalid bearer would let a malformed proxy header
     // silently change which project receives a request.
-    if let Some(plain) = request.token.as_deref() {
+    if request.authorization_present || request.token.is_some() {
+        let plain = request
+            .token
+            .as_deref()
+            .ok_or_else(|| shinu::Error::Auth("invalid token".into()))?;
         let tokens = shinu::token::load(ctx.root)?;
         let project = shinu::token::authenticate(&tokens, plain)?;
         return Ok(Caller::Api { project });
@@ -4204,7 +4217,10 @@ fn authenticate(ctx: &Ctx<'_>, request: &http::Request) -> shinu::Result<Caller>
 }
 
 fn authenticate_optional(ctx: &Ctx<'_>, request: &http::Request) -> Option<Caller> {
-    if request.token.is_none() && !request.cookies.contains_key(SESSION_COOKIE) {
+    if !request.authorization_present
+        && request.token.is_none()
+        && !request.cookies.contains_key(SESSION_COOKIE)
+    {
         return None;
     }
     authenticate(ctx, request).ok()
@@ -4212,13 +4228,13 @@ fn authenticate_optional(ctx: &Ctx<'_>, request: &http::Request) -> Option<Calle
 
 fn origin_host(origin: &str) -> Option<&str> {
     let (_, authority) = origin.split_once("://")?;
-    let end = authority
-        .find(['/', '?', '#'])
-        .unwrap_or(authority.len());
+    let end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
     let authority = &authority[..end];
     if authority.is_empty()
         || authority.contains('@')
-        || authority.chars().any(|character| character.is_ascii_whitespace())
+        || authority
+            .chars()
+            .any(|character| character.is_ascii_whitespace())
     {
         return None;
     }
@@ -4232,9 +4248,8 @@ fn check_console_csrf(request: &http::Request) -> shinu::Result<()> {
     let origin = request.origin.as_deref().ok_or_else(|| {
         shinu::Error::Invalid("origin header is required for this console request".into())
     })?;
-    let origin_host = origin_host(origin).ok_or_else(|| {
-        shinu::Error::Invalid("origin header is not a valid URL".into())
-    })?;
+    let origin_host = origin_host(origin)
+        .ok_or_else(|| shinu::Error::Invalid("origin header is not a valid URL".into()))?;
     let host = request
         .host
         .as_deref()
@@ -4349,11 +4364,7 @@ fn register_console(
     Ok((json!({ "user_id": user_id, "project": project }), cookie))
 }
 
-fn login_console(
-    ctx: &Ctx<'_>,
-    body: &[u8],
-    secure: bool,
-) -> shinu::Result<(Value, String)> {
+fn login_console(ctx: &Ctx<'_>, body: &[u8], secure: bool) -> shinu::Result<(Value, String)> {
     let (email, password) = parse_credentials(body, false)?;
     let user = state::find_user_by_email(&lock_db(ctx.db), &email)?;
     let (user_id, password_hash) = user
@@ -4402,10 +4413,12 @@ fn list_console_tokens(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
     let tokens = tokens
         .iter()
         .filter(|token| token.project == project)
-        .map(|token| json!({
-            "hash_prefix": token_hash_prefix(&token.hash),
-            "created_at": token.created_at,
-        }))
+        .map(|token| {
+            json!({
+                "hash_prefix": token_hash_prefix(&token.hash),
+                "created_at": token.created_at,
+            })
+        })
         .collect::<Vec<_>>();
     Ok(json!({ "tokens": tokens }))
 }
@@ -4424,7 +4437,10 @@ fn create_console_token(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
 }
 
 fn delete_console_token(ctx: &Ctx<'_>, project: &str, prefix: &str) -> shinu::Result<Value> {
-    if prefix.is_empty() || prefix.len() > 64 || !prefix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if prefix.is_empty()
+        || prefix.len() > 64
+        || !prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
         return Err(shinu::Error::NotFound("token not found".into()));
     }
     let _state_guard = lock_state(ctx.registry);
@@ -4443,7 +4459,6 @@ fn delete_console_token(ctx: &Ctx<'_>, project: &str, prefix: &str) -> shinu::Re
     shinu::token::store(ctx.root, &tokens)?;
     Ok(json!({}))
 }
-
 
 fn respond_error(stream: &mut impl Write, status: u16, error: &shinu::Error) -> shinu::Result<()> {
     let body = if status >= 500 {
@@ -4476,8 +4491,10 @@ fn respond_request_timeout(stream: &mut TcpStream) {
     // A request timeout is transport policy, not a domain error; avoid the
     // diagnostic path and close with the standard status for an incomplete request.
     let _ = stream
-        .write_all(b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-        .and_then(|_| stream.flush());
+        .write_all(
+            b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )
+        .and_then(|()| stream.flush());
 }
 
 fn clear_stream_timeouts(stream: &TcpStream) -> shinu::Result<()> {
@@ -4618,11 +4635,7 @@ fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
                 Err(shinu::Error::Auth(_)) => {
                     // Keep every login failure byte-for-byte equivalent so an
                     // observer cannot distinguish an unknown email.
-                    http::respond(
-                        &mut stream,
-                        401,
-                        &json!({ "error": LOGIN_FAILURE_MESSAGE }),
-                    )?;
+                    http::respond(&mut stream, 401, &json!({ "error": LOGIN_FAILURE_MESSAGE }))?;
                 }
                 Err(error) => respond_error(&mut stream, http::status_for(&error), &error)?,
             }
@@ -4678,16 +4691,14 @@ fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
             };
             let project = caller_project(&caller);
             match &endpoint {
-                Endpoint::ConsoleLogout => {
-                    match logout_console(ctx, &request) {
-                        Ok(cookie) => {
-                            http::respond_with_cookie(&mut stream, 200, &json!({}), &cookie)?;
-                        }
-                        Err(error) => {
-                            respond_error(&mut stream, http::status_for(&error), &error)?;
-                        }
+                Endpoint::ConsoleLogout => match logout_console(ctx, &request) {
+                    Ok(cookie) => {
+                        http::respond_with_cookie(&mut stream, 200, &json!({}), &cookie)?;
                     }
-                }
+                    Err(error) => {
+                        respond_error(&mut stream, http::status_for(&error), &error)?;
+                    }
+                },
                 Endpoint::ConsoleMe => match me_console(ctx, &caller) {
                     Ok(body) => http::respond(&mut stream, 200, &body)?,
                     Err(error) => respond_error(&mut stream, http::status_for(&error), &error)?,
@@ -4996,7 +5007,6 @@ fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
     Ok(())
 }
 
-
 struct StreamLine {
     stream: &'static str,
     data: String,
@@ -5039,6 +5049,56 @@ fn write_stream_line(stream: &mut impl Write, line: StreamLine) -> shinu::Result
     http::respond_chunk(stream, &json!({ "stream": line.stream, "data": line.data }))?;
     Ok(())
 }
+struct StreamingChildCleanup {
+    child: Child,
+    stdout_reader: Option<thread::JoinHandle<()>>,
+    stderr_reader: Option<thread::JoinHandle<()>>,
+    kill_on_drop: bool,
+}
+
+impl StreamingChildCleanup {
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            stdout_reader: None,
+            stderr_reader: None,
+            kill_on_drop: true,
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    fn set_readers(
+        &mut self,
+        stdout_reader: thread::JoinHandle<()>,
+        stderr_reader: thread::JoinHandle<()>,
+    ) {
+        self.stdout_reader = Some(stdout_reader);
+        self.stderr_reader = Some(stderr_reader);
+    }
+
+    fn disarm(&mut self) {
+        // `try_wait` has reaped the child; avoid signaling a PID that may be
+        // reused before this guard is dropped.
+        self.kill_on_drop = false;
+    }
+}
+impl Drop for StreamingChildCleanup {
+    fn drop(&mut self) {
+        if self.kill_on_drop {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+        if let Some(reader) = self.stdout_reader.take() {
+            let _ = reader.join();
+        }
+        if let Some(reader) = self.stderr_reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
 
 fn execute_streaming(
     stream: &mut TcpStream,
@@ -5049,49 +5109,54 @@ fn execute_streaming(
     stdin_data: Option<String>,
     session: Option<String>,
 ) -> shinu::Result<()> {
+    // A VM with an exec in flight is not idle, but nothing else refreshes
+    // `last_used` while a command runs: `touch` fires only inside vm::start,
+    // so a single long-running agent command would cross the idle window and
+    // get reaped mid-command by sweep_idle, killing the SSH channel from under
+    // the guest. Refresh it here for the lifetime of the child; the warm-VM
+    // case (start already running, no touch at all) is covered by the first
+    // refresh below.
+    const TOUCH_EVERY: Duration = Duration::from_secs(30);
     let target = prepare_ssh(ctx, project, &space)?;
     let session_command = session
         .as_deref()
         .map(|session| session_remote_command(session, &command, stdin_data.is_some()));
-    let remote = session_command
-        .as_deref()
-        .unwrap_or(command.as_slice());
+    let remote = session_command.as_deref().unwrap_or(command.as_slice());
     let stdin_mode = if stdin_data.is_some() {
         Stdio::piped()
     } else {
         Stdio::null()
     };
-    let mut child = spawn_ssh(
+    let mut cleanup = StreamingChildCleanup::new(spawn_ssh(
         &target,
         remote,
         stdin_mode,
         Stdio::piped(),
         Stdio::piped(),
-    )?;
-    let stdout = child
+    )?);
+    let stdout = cleanup
+        .child_mut()
         .stdout
         .take()
         .ok_or_else(|| shinu::Error::Invalid("ssh stdout pipe unavailable".into()))?;
-    let stderr = child
+    let stderr = cleanup
+        .child_mut()
         .stderr
         .take()
         .ok_or_else(|| shinu::Error::Invalid("ssh stderr pipe unavailable".into()))?;
     let (sender, receiver) = mpsc::channel();
     let stdout_reader = read_stream("stdout", stdout, sender.clone());
     let stderr_reader = read_stream("stderr", stderr, sender);
+    cleanup.set_readers(stdout_reader, stderr_reader);
     if let Some(stdin_data) = stdin_data {
-        let mut child_stdin = child
+        let mut child_stdin = cleanup
+            .child_mut()
             .stdin
             .take()
             .ok_or_else(|| shinu::Error::Invalid("ssh stdin pipe unavailable".into()))?;
         // Exec JSON is capped at 1 MiB, so this write can block only for a
         // bounded amount of input while the reader threads drain SSH output.
         if let Err(error) = child_stdin.write_all(stdin_data.as_bytes()) {
-            drop(child_stdin);
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_reader.join();
-            let _ = stderr_reader.join();
             return Err(error.into());
         }
         // EOF tells commands such as `cat` that the complete stdin payload has
@@ -5103,14 +5168,6 @@ fn execute_streaming(
     let mut readers = 2;
     let mut child_status = None;
     let mut stream_broken = false;
-    // A VM with an exec in flight is not idle, but nothing else refreshes
-    // `last_used` while a command runs: `touch` fires only inside vm::start,
-    // so a single long exec (a keigetsu agent run) would cross the idle
-    // window and get reaped mid-command by sweep_idle, killing the ssh
-    // channel from under the guest. Refresh it here for the lifetime of the
-    // child; the warm-VM case (start already running, no touch at all) is
-    // covered by the first refresh below.
-    const TOUCH_EVERY: Duration = Duration::from_secs(30);
     let mut last_touch = Instant::now();
     let _ = shinu::vm::touch(&target.vm_dir);
 
@@ -5131,8 +5188,13 @@ fn execute_streaming(
         }
 
         if child_status.is_none() {
-            match child.try_wait() {
-                Ok(status) => child_status = status,
+            match cleanup.child_mut().try_wait() {
+                Ok(status) => {
+                    if status.is_some() {
+                        cleanup.disarm();
+                    }
+                    child_status = status;
+                }
                 Err(_) => {
                     stream_broken = true;
                     break;
@@ -5149,19 +5211,12 @@ fn execute_streaming(
         }
     }
     if stream_broken {
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = stdout_reader.join();
-        let _ = stderr_reader.join();
         return Ok(());
     }
-    let exit = child_status
-        .and_then(|status| status.code())
-        .unwrap_or(255);
+    let exit = child_status.and_then(|status| status.code()).unwrap_or(255);
     let _ = http::respond_chunk(stream, &json!({ "exit": exit }));
     let _ = http::respond_chunked_end(stream);
-    let _ = stdout_reader.join();
-    let _ = stderr_reader.join();
+    cleanup.disarm();
     Ok(())
 }
 
@@ -5177,10 +5232,10 @@ mod tests {
         state::{self, Ckpt, Space, State},
         vm,
     };
-    use std::os::unix::fs::symlink;
     use std::collections::HashMap;
     use std::io::{Read as IoRead, Write as IoWrite};
     use std::net::{TcpListener, TcpStream};
+    use std::os::unix::fs::symlink;
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
     use std::sync::{Arc, LazyLock, Mutex};
@@ -5249,12 +5304,17 @@ mod tests {
         };
         let members = super::network_members(&state, "project-a", Some("blue"));
         assert_eq!(
-            members.iter().map(|space| space.name.as_str()).collect::<Vec<_>>(),
+            members
+                .iter()
+                .map(|space| space.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["web", "db"]
         );
-        assert!(super::network_members(&state, "project-b", Some("blue"))
-            .iter()
-            .all(|space| space.name == "other-project"));
+        assert!(
+            super::network_members(&state, "project-b", Some("blue"))
+                .iter()
+                .all(|space| space.name == "other-project")
+        );
         assert!(super::network_members(&state, "project-a", None).is_empty());
     }
 
@@ -5343,10 +5403,8 @@ mod tests {
 
     fn write_snapshot_test_files(root: &std::path::Path, id: Uuid) {
         std::fs::create_dir_all(root.join("ckpts")).expect("create checkpoint directory");
-        std::fs::write(shinu::ckpt_mem(root, id), b"memory")
-            .expect("write memory snapshot");
-        std::fs::write(shinu::ckpt_state(root, id), b"state")
-            .expect("write snapshot state");
+        std::fs::write(shinu::ckpt_mem(root, id), b"memory").expect("write memory snapshot");
+        std::fs::write(shinu::ckpt_state(root, id), b"state").expect("write snapshot state");
     }
 
     fn snapshot_test_chain(root: &std::path::Path, diff_count: usize) -> (State, Uuid) {
@@ -5393,14 +5451,9 @@ mod tests {
             ckpts: Vec::new(),
         };
 
-        let (mode, base) = super::resolve_snapshot_mode(
-            &root,
-            &state,
-            &space,
-            SnapshotMode::Full,
-            8,
-        )
-        .expect("resolve first full snapshot");
+        let (mode, base) =
+            super::resolve_snapshot_mode(&root, &state, &space, SnapshotMode::Full, 8)
+                .expect("resolve first full snapshot");
         assert_eq!(mode, SnapshotMode::Full);
         assert!(base.is_none());
         std::fs::remove_dir_all(root).expect("remove test root");
@@ -5425,16 +5478,14 @@ mod tests {
             ckpts: vec![base],
         };
 
-        let (mode, selected) = super::resolve_snapshot_mode(
-            &root,
-            &state,
-            &space,
-            SnapshotMode::Full,
-            8,
-        )
-        .expect("resolve second full snapshot");
+        let (mode, selected) =
+            super::resolve_snapshot_mode(&root, &state, &space, SnapshotMode::Full, 8)
+                .expect("resolve second full snapshot");
         assert_eq!(mode, SnapshotMode::Diff);
-        assert_eq!(selected.as_ref().map(|checkpoint| checkpoint.id), Some(base_id));
+        assert_eq!(
+            selected.as_ref().map(|checkpoint| checkpoint.id),
+            Some(base_id)
+        );
         std::fs::remove_dir_all(root).expect("remove test root");
     }
 
@@ -5444,17 +5495,15 @@ mod tests {
             let root = test_root("full-frequency");
             let (state, base_id) = snapshot_test_chain(&root, diff_count);
             let space = &state.spaces[0];
-            let (mode, selected) = super::resolve_snapshot_mode(
-                &root,
-                &state,
-                space,
-                SnapshotMode::Full,
-                8,
-            )
-            .expect("resolve frequency-bounded full snapshot");
+            let (mode, selected) =
+                super::resolve_snapshot_mode(&root, &state, space, SnapshotMode::Full, 8)
+                    .expect("resolve frequency-bounded full snapshot");
             assert_eq!(mode, expected_mode);
             if expected_mode == SnapshotMode::Diff {
-                assert_eq!(selected.as_ref().map(|checkpoint| checkpoint.id), Some(base_id));
+                assert_eq!(
+                    selected.as_ref().map(|checkpoint| checkpoint.id),
+                    Some(base_id)
+                );
             } else {
                 assert!(selected.is_none());
             }
@@ -5475,14 +5524,9 @@ mod tests {
             ckpts: vec![base],
         };
 
-        let (mode, selected) = super::resolve_snapshot_mode(
-            &root,
-            &state,
-            &space,
-            SnapshotMode::Full,
-            8,
-        )
-        .expect("resolve stale full snapshot");
+        let (mode, selected) =
+            super::resolve_snapshot_mode(&root, &state, &space, SnapshotMode::Full, 8)
+                .expect("resolve stale full snapshot");
         assert_eq!(mode, SnapshotMode::Full);
         assert!(selected.is_none());
         std::fs::remove_dir_all(root).expect("remove test root");
@@ -5502,21 +5546,15 @@ mod tests {
             Some(shinu::FC_SNAPSHOT_VERSION),
         );
         write_snapshot_test_files(&root, base_id);
-        std::fs::remove_file(shinu::ckpt_mem(&root, base_id))
-            .expect("remove base memory snapshot");
+        std::fs::remove_file(shinu::ckpt_mem(&root, base_id)).expect("remove base memory snapshot");
         let state = State {
             spaces: vec![space.clone()],
             ckpts: vec![base],
         };
 
-        let (mode, selected) = super::resolve_snapshot_mode(
-            &root,
-            &state,
-            &space,
-            SnapshotMode::Full,
-            8,
-        )
-        .expect("resolve missing base snapshot");
+        let (mode, selected) =
+            super::resolve_snapshot_mode(&root, &state, &space, SnapshotMode::Full, 8)
+                .expect("resolve missing base snapshot");
         assert_eq!(mode, SnapshotMode::Full);
         assert!(selected.is_none());
         std::fs::remove_dir_all(root).expect("remove test root");
@@ -5529,14 +5567,9 @@ mod tests {
         let (state, _) = snapshot_test_chain(&root, 0);
         let space = &state.spaces[0];
 
-        let (mode, selected) = super::resolve_snapshot_mode(
-            &root,
-            &state,
-            space,
-            SnapshotMode::Full,
-            0,
-        )
-        .expect("resolve zero frequency full snapshot");
+        let (mode, selected) =
+            super::resolve_snapshot_mode(&root, &state, space, SnapshotMode::Full, 0)
+                .expect("resolve zero frequency full snapshot");
         assert_eq!(mode, SnapshotMode::Full);
         assert!(selected.is_none());
         std::fs::remove_dir_all(root).expect("remove test root");
@@ -5551,13 +5584,7 @@ mod tests {
             ckpts: Vec::new(),
         };
 
-        let result = super::resolve_snapshot_mode(
-            &root,
-            &state,
-            &space,
-            SnapshotMode::Diff,
-            8,
-        );
+        let result = super::resolve_snapshot_mode(&root, &state, &space, SnapshotMode::Diff, 8);
         assert!(matches!(
             result,
             Err(shinu::Error::Invalid(message)) if message.contains("existing full checkpoint")
@@ -5593,16 +5620,14 @@ mod tests {
             ckpts: vec![old_base, stale_base],
         };
 
-        let (mode, selected) = super::resolve_snapshot_mode(
-            &root,
-            &state,
-            &space,
-            SnapshotMode::Full,
-            8,
-        )
-        .expect("resolve full snapshot past stale ancestor");
+        let (mode, selected) =
+            super::resolve_snapshot_mode(&root, &state, &space, SnapshotMode::Full, 8)
+                .expect("resolve full snapshot past stale ancestor");
         assert_eq!(mode, SnapshotMode::Diff);
-        assert_eq!(selected.as_ref().map(|checkpoint| checkpoint.id), Some(old_base_id));
+        assert_eq!(
+            selected.as_ref().map(|checkpoint| checkpoint.id),
+            Some(old_base_id)
+        );
         std::fs::remove_dir_all(root).expect("remove test root");
     }
 
@@ -5680,9 +5705,18 @@ mod tests {
             snapshot_version: None,
             ..diff.clone()
         };
-        assert_eq!(super::checkpoint_json(&diff).expect("diff response")["snapshot"], "diff");
-        assert_eq!(super::checkpoint_json(&full).expect("full response")["snapshot"], "full");
-        assert_eq!(super::checkpoint_json(&disk).expect("disk response")["snapshot"], "none");
+        assert_eq!(
+            super::checkpoint_json(&diff).expect("diff response")["snapshot"],
+            "diff"
+        );
+        assert_eq!(
+            super::checkpoint_json(&full).expect("full response")["snapshot"],
+            "full"
+        );
+        assert_eq!(
+            super::checkpoint_json(&disk).expect("disk response")["snapshot"],
+            "none"
+        );
     }
 
     fn checkpoint_for_snapshot_gate(full: bool, snapshot_version: Option<&str>) -> Ckpt {
@@ -5708,8 +5742,7 @@ mod tests {
 
     #[test]
     fn snapshot_load_gate_accepts_matching_version() {
-        let checkpoint =
-            checkpoint_for_snapshot_gate(true, Some(shinu::FC_SNAPSHOT_VERSION));
+        let checkpoint = checkpoint_for_snapshot_gate(true, Some(shinu::FC_SNAPSHOT_VERSION));
         assert!(super::ensure_snapshot_loadable(&checkpoint).is_ok());
     }
 
@@ -5745,22 +5778,26 @@ mod tests {
 
     #[test]
     fn exec_command_accepts_absent_and_present_stdin() {
-        let (command, stdin) = super::exec_command(br#"{"cmd":["sh","-c","cat"]}"#)
-            .expect("exec without stdin");
+        let value =
+            super::parse_body(br#"{"cmd":["sh","-c","cat"]}"#).expect("parse exec without stdin");
+        let (command, stdin) = super::exec_command_value(&value).expect("exec without stdin");
         assert_eq!(command, vec!["sh", "-c", "cat"]);
         assert_eq!(stdin, None);
-        let (_, stdin) = super::exec_command(br#"{"cmd":["cat"],"stdin":"payload"}"#)
-            .expect("exec with stdin");
+        let value = super::parse_body(br#"{"cmd":["cat"],"stdin":"payload"}"#)
+            .expect("parse exec with stdin");
+        let (_, stdin) = super::exec_command_value(&value).expect("exec with stdin");
         assert_eq!(stdin.as_deref(), Some("payload"));
-        let (_, stdin) = super::exec_command(br#"{"cmd":["cat"],"stdin":null}"#)
-            .expect("exec with null stdin");
+        let value = super::parse_body(br#"{"cmd":["cat"],"stdin":null}"#)
+            .expect("parse exec with null stdin");
+        let (_, stdin) = super::exec_command_value(&value).expect("exec with null stdin");
         assert_eq!(stdin, None);
     }
 
     #[test]
     fn exec_command_rejects_non_string_stdin() {
+        let value = super::parse_body(br#"{"cmd":["cat"],"stdin":7}"#).expect("parse exec body");
         assert!(matches!(
-            super::exec_command(br#"{"cmd":["cat"],"stdin":7}"#),
+            super::exec_command_value(&value),
             Err(shinu::Error::Invalid(message)) if message == "stdin must be a string"
         ));
     }
@@ -5802,10 +5839,10 @@ mod tests {
         ));
 
         for session in ["agent;rm", "agent/name"] {
-            let error = super::exec_session(
-                format!(r#"{{"session":"{session}"}}"#).as_bytes(),
-            )
-            .expect_err("unsafe session id should be rejected");
+            let body = format!(r#"{{"session":"{session}"}}"#);
+            let value = super::parse_body(body.as_bytes()).expect("parse session body");
+            let error = super::exec_session_value(&value)
+                .expect_err("unsafe session id should be rejected");
             assert!(
                 error.to_string().contains("session id"),
                 "unexpected error: {error}"
@@ -5826,11 +5863,7 @@ mod tests {
                 .output()
                 .expect("run guest session wrapper")
         }
-        fn run_with_stdin(
-            session: &str,
-            command: &[&str],
-            input: &[u8],
-        ) -> std::process::Output {
+        fn run_with_stdin(session: &str, command: &[&str], input: &[u8]) -> std::process::Output {
             let command = command
                 .iter()
                 .map(|part| (*part).to_owned())
@@ -5868,10 +5901,7 @@ mod tests {
                     .map(|status| status.success())
                     .unwrap_or(false);
                 if alive {
-                    let _ = Command::new("kill")
-                        .arg(pid)
-                        .stderr(Stdio::null())
-                        .status();
+                    let _ = Command::new("kill").arg(pid).stderr(Stdio::null()).status();
                 }
             }
             let _ = std::fs::remove_dir_all(&session_dir);
@@ -5892,30 +5922,23 @@ mod tests {
         assert_eq!(env.stdout, b"ok\n");
         let child_exported = run(&session, &["sh", "-c", "export SHINU_CHILD_TEST=child"]);
         assert_eq!(child_exported.status.code(), Some(0));
-        let child_env = run(
-            &session,
-            &["sh", "-c", "printf '%s' \"$SHINU_CHILD_TEST\""],
-        );
+        let child_env = run(&session, &["sh", "-c", "printf '%s' \"$SHINU_CHILD_TEST\""]);
         assert_eq!(child_env.status.code(), Some(0));
         assert!(child_env.stdout.is_empty());
         let echoed = run_with_stdin(&session, &["cat"], b"session input\n");
         assert_eq!(echoed.status.code(), Some(0));
         assert_eq!(echoed.stdout, b"session input\n");
-        let streams = run(
-            &session,
-            &["sh", "-c", "printf stdout; printf stderr >&2"],
-        );
+        let streams = run(&session, &["sh", "-c", "printf stdout; printf stderr >&2"]);
         assert_eq!(streams.status.code(), Some(0));
         assert_eq!(streams.stdout, b"stdout");
         assert_eq!(streams.stderr, b"stderr");
 
-
         // The wrapper has no sentinel in the command output protocol. A value
         // that looks like a framing delimiter therefore remains ordinary output.
         let marker = "__SHINU_EXEC_FRAME_MARKER__";
-        let marked = run(&session, &["printf", "%s\\n", marker]);
-        assert_eq!(marked.status.code(), Some(0));
-        assert_eq!(marked.stdout, format!("{marker}\n").into_bytes());
+        let marked_output = run(&session, &["printf", "%s\\n", marker]);
+        assert_eq!(marked_output.status.code(), Some(0));
+        assert_eq!(marked_output.stdout, format!("{marker}\n").into_bytes());
 
         let failed = run(&session, &["sh", "-c", "exit 3"]);
         assert_eq!(failed.status.code(), Some(3));
@@ -5943,10 +5966,8 @@ mod tests {
 
     #[test]
     fn transfer_routes_and_methods_are_explicit() {
-        let push = super::route("/v1/spaces/demo/push?path=%2Ftmp%2Ffile")
-            .expect("push route");
-        let pull = super::route("/v1/spaces/demo/pull?path=%2Ftmp%2Ffile")
-            .expect("pull route");
+        let push = super::route("/v1/spaces/demo/push?path=%2Ftmp%2Ffile").expect("push route");
+        let pull = super::route("/v1/spaces/demo/pull?path=%2Ftmp%2Ffile").expect("pull route");
         let vnc = super::route("/v1/spaces/demo/vnc").expect("vnc route");
         let diff = super::route("/v1/spaces/demo/diff").expect("diff route");
         let exec = super::route("/v1/spaces/demo/exec").expect("exec route");
@@ -6005,7 +6026,9 @@ mod tests {
         .expect("store project token");
 
         let endpoint = super::route("/v1/projects/project-a/limits").expect("limits route");
-        assert!(matches!(&endpoint, super::Endpoint::ProjectLimits(project) if project == "project-a"));
+        assert!(
+            matches!(&endpoint, super::Endpoint::ProjectLimits(project) if project == "project-a")
+        );
         assert!(super::method_allowed(&endpoint, "GET"));
         assert!(super::method_allowed(&endpoint, "PATCH"));
         assert!(super::method_allowed(&endpoint, "DELETE"));
@@ -6019,9 +6042,11 @@ mod tests {
             ),
         );
         assert!(denied.starts_with("HTTP/1.1 401"), "response: {denied}");
-        assert!(state::project_limits(&super::lock_db(&db), "project-a")
-            .expect("read denied limits")
-            .is_none());
+        assert!(
+            state::project_limits(&super::lock_db(&db), "project-a")
+                .expect("read denied limits")
+                .is_none()
+        );
 
         let granted = serve_raw(
             &ctx,
@@ -6042,9 +6067,11 @@ mod tests {
             "DELETE /v1/projects/project-a/limits HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer admin-secret\r\nContent-Length: 0\r\n\r\n",
         );
         assert!(cleared.starts_with("HTTP/1.1 200"), "response: {cleared}");
-        assert!(state::project_limits(&super::lock_db(&db), "project-a")
-            .expect("read cleared limits")
-            .is_none());
+        assert!(
+            state::project_limits(&super::lock_db(&db), "project-a")
+                .expect("read cleared limits")
+                .is_none()
+        );
         std::fs::remove_dir_all(root).expect("remove test root");
     }
 
@@ -6066,8 +6093,8 @@ mod tests {
     #[test]
     fn proxy_header_filter_rewrites_host_and_framing() {
         let raw = b"POST /v1/spaces/demo/proxy/8080/ HTTP/1.1\r\nHost: control\r\nConnection: X-Trace\r\nX-Trace: hidden\r\nX-Request: kept\r\nContent-Length: 4\r\n\r\n";
-        let request = super::parse_proxy_request_head(raw, "POST", "/")
-            .expect("parse proxy request");
+        let request =
+            super::parse_proxy_request_head(raw, "POST", "/").expect("parse proxy request");
         let headers = super::proxy_request_headers(&request, 8080);
         assert!(headers.iter().any(|header| {
             header.name.eq_ignore_ascii_case("Host") && header.value == "127.0.0.1:8080"
@@ -6088,6 +6115,29 @@ mod tests {
     }
 
     #[test]
+    fn proxy_request_headers_strip_control_credentials_and_reserved_cookie() {
+        let raw = b"GET /v1/spaces/demo/proxy/8080/ HTTP/1.1\r\nAuthorization: Bearer secret\r\nCookie: shinu_session=secret\r\nCookie: guest=kept; shinu_session=other; preference=dark\r\n\r\n";
+        let request =
+            super::parse_proxy_request_head(raw, "GET", "/").expect("parse proxy request");
+        let headers = super::proxy_request_headers(&request, 8080);
+        assert!(
+            !headers
+                .iter()
+                .any(|header| header.name.eq_ignore_ascii_case("Authorization"))
+        );
+        let cookies = headers
+            .iter()
+            .filter(|header| header.name.eq_ignore_ascii_case("Cookie"))
+            .map(|header| header.value.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(cookies, vec!["guest=kept; preference=dark"]);
+        assert_eq!(
+            super::proxy_cookie_without_session("shinu_session=secret"),
+            None
+        );
+    }
+
+    #[test]
     fn proxy_chunked_body_preserves_chunks_and_trailers() {
         let mut reader = std::io::Cursor::new(b"4\r\ntest\r\n0\r\nX-Trailer: yes\r\n\r\n");
         let mut output = Vec::new();
@@ -6102,17 +6152,21 @@ mod tests {
             8080,
             super::ProxyRelayFailure::BeforeResponse("Connection refused".into()),
         );
-        assert!(refused
-            .to_string()
-            .contains("guest port 8080 in space demo has nothing listening"));
+        assert!(
+            refused
+                .to_string()
+                .contains("guest port 8080 in space demo has nothing listening")
+        );
         let closed = super::proxy_bridge_error(
             "demo",
             8080,
             super::ProxyRelayFailure::GuestClosed("response ended before Content-Length".into()),
         );
-        assert!(closed
-            .to_string()
-            .contains("guest in space demo closed port 8080 before completing its response"));
+        assert!(
+            closed
+                .to_string()
+                .contains("guest in space demo closed port 8080 before completing its response")
+        );
     }
 
     #[test]
@@ -6123,13 +6177,51 @@ mod tests {
             super::proxy_response_body(&response, "GET"),
             Ok(super::ProxyBody::Length(4))
         ));
-        let mut chunked = std::io::Cursor::new(
-            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
-        );
+        let mut chunked =
+            std::io::Cursor::new(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n");
         let response = super::parse_proxy_response_head(&mut chunked).expect("chunked response");
         assert!(matches!(
             super::proxy_response_body(&response, "GET"),
             Ok(super::ProxyBody::Chunked)
+        ));
+    }
+
+    #[test]
+    fn proxy_response_headers_suppress_only_reserved_session_cookie() {
+        let response = super::ProxyResponseHead {
+            status_line: "HTTP/1.1 200 OK".into(),
+            status: 200,
+            headers: vec![
+                super::ProxyHeader {
+                    name: "Set-Cookie".into(),
+                    value: "shinu_session=guest-secret; Path=/".into(),
+                },
+                super::ProxyHeader {
+                    name: "Set-Cookie".into(),
+                    value: "guest_preference=dark; Path=/".into(),
+                },
+                super::ProxyHeader {
+                    name: "X-Guest".into(),
+                    value: "kept".into(),
+                },
+            ],
+        };
+        let body = super::ProxyBody::Length(0);
+        let connection_tokens: Vec<String> = Vec::new();
+        assert!(super::proxy_response_header_is_filtered(
+            &response.headers[0],
+            &connection_tokens,
+            &body,
+        ));
+        assert!(!super::proxy_response_header_is_filtered(
+            &response.headers[1],
+            &connection_tokens,
+            &body,
+        ));
+        assert!(!super::proxy_response_header_is_filtered(
+            &response.headers[2],
+            &connection_tokens,
+            &body,
         ));
     }
 
@@ -6153,7 +6245,14 @@ mod tests {
         )
         .expect("parse resize request");
         assert_eq!(status, 200);
-        assert!(matches!(request, Req::Resize { vcpus: Some(Some(4)), mem_mib: Some(None), .. }));
+        assert!(matches!(
+            request,
+            Req::Resize {
+                vcpus: Some(Some(4)),
+                mem_mib: Some(None),
+                ..
+            }
+        ));
         assert!(matches!(
             super::resize_request(br#"{"image":"arch"}"#, "demo".into()),
             Err(shinu::Error::Invalid(message)) if message.contains("immutable")
@@ -6284,16 +6383,13 @@ mod tests {
             max_running: 2,
             api_per_min: 120,
         };
-        let result = super::update_state_with_quota(
-            &root,
-            &db,
-            &registry,
-            "project-a",
-            &limits,
-            0,
-            |_| Ok(()),
+        let result =
+            super::update_state_with_quota(&root, &db, &registry, "project-a", &limits, 0, |_| {
+                Ok(())
+            });
+        assert!(
+            matches!(result, Err(shinu::Error::Quota(message)) if message.contains("space limit"))
         );
-        assert!(matches!(result, Err(shinu::Error::Quota(message)) if message.contains("space limit")));
         std::fs::remove_dir_all(root).expect("remove test root");
     }
 
@@ -6302,7 +6398,9 @@ mod tests {
         let rate = RateLimiter::new();
         assert!(rate.check("project-a", 1).is_ok());
         let result = rate.check("project-a", 1);
-        assert!(matches!(result, Err(shinu::Error::Quota(message)) if message.contains("rate limit")));
+        assert!(
+            matches!(result, Err(shinu::Error::Quota(message)) if message.contains("rate limit"))
+        );
     }
 
     #[test]
@@ -6370,9 +6468,11 @@ mod tests {
         assert!(shinu::quota::check_space_limit(7, &unlimited_limits).is_ok());
         assert!(shinu::quota::check_disk_limit(u64::MAX, u64::MAX, &unlimited_limits).is_ok());
         assert!(shinu::quota::check_running_limit(3, &unlimited_limits).is_ok());
-        assert!(RateLimiter::new()
-            .check("project-unlimited", unlimited_limits.api_per_min)
-            .is_ok());
+        assert!(
+            RateLimiter::new()
+                .check("project-unlimited", unlimited_limits.api_per_min)
+                .is_ok()
+        );
         std::fs::remove_dir_all(root).expect("remove test root");
     }
 
@@ -6678,9 +6778,18 @@ mod tests {
         let registry = registry();
         let db = test_db(&root);
         let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
-        let result = handle(&ctx, Req::Rm { space: "doomed".into() }, project);
+        let result = handle(
+            &ctx,
+            Req::Rm {
+                space: "doomed".into(),
+            },
+            project,
+        );
 
-        assert!(result.is_err(), "the delete phase must fail, got {result:?}");
+        assert!(
+            result.is_err(),
+            "the delete phase must fail, got {result:?}"
+        );
         let state = super::snapshot(&db, &registry).expect("read state after failed rm");
         assert!(
             state.spaces.iter().all(|space| space.id != id),
@@ -6757,7 +6866,13 @@ mod tests {
         let registry = registry();
         let db = test_db(&root);
         let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
-        let result = handle(&ctx, Req::RmCkpt { ckpt: checkpoint_id }, project);
+        let result = handle(
+            &ctx,
+            Req::RmCkpt {
+                ckpt: checkpoint_id,
+            },
+            project,
+        );
         assert!(matches!(
             result,
             Err(shinu::Error::Invalid(message)) if message.contains("child-space")
@@ -6792,7 +6907,9 @@ mod tests {
         let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
         let result = handle(
             &ctx,
-            Req::RmCkpt { ckpt: checkpoint_id },
+            Req::RmCkpt {
+                ckpt: checkpoint_id,
+            },
             "project-a",
         );
         assert!(matches!(
@@ -6881,8 +6998,12 @@ mod tests {
         assert_eq!(second.parent, Some(first.id));
         assert_eq!(state.spaces[0].head, Some(second.id));
         let log = shinu::log_chain(&state, &state.spaces[0]);
-        assert_eq!(log.iter().map(|checkpoint| checkpoint.id).collect::<Vec<_>>(),
-                   vec![second.id, first.id]);
+        assert_eq!(
+            log.iter()
+                .map(|checkpoint| checkpoint.id)
+                .collect::<Vec<_>>(),
+            vec![second.id, first.id]
+        );
     }
 
     #[test]
@@ -7086,9 +7207,16 @@ mod tests {
             state.ckpts.retain(|checkpoint| checkpoint.id != id);
             claimed.push(id);
         }
-        assert_eq!(claimed, vec![stale_id], "raced commit must survive the claim");
+        assert_eq!(
+            claimed,
+            vec![stale_id],
+            "raced commit must survive the claim"
+        );
         assert!(
-            state.ckpts.iter().any(|checkpoint| checkpoint.id == raced_id),
+            state
+                .ckpts
+                .iter()
+                .any(|checkpoint| checkpoint.id == raced_id),
             "raced commit must stay in the state so its image is never unlinked"
         );
         assert_eq!(state.spaces[0].head, Some(raced_id));
@@ -7167,6 +7295,7 @@ mod tests {
             method: "POST".into(),
             path: "/v1/spaces".into(),
             token: None,
+            authorization_present: false,
             body: br"{}".to_vec(),
             cookies: HashMap::new(),
             origin: origin.map(str::to_owned),
@@ -7196,9 +7325,8 @@ mod tests {
     }
     #[test]
     fn error_responses_hide_server_details_but_preserve_client_details() {
-        let infrastructure = shinu::Error::Internal(
-            "sql: no such column host_cidr in /srv/shinu/shinu.db".into(),
-        );
+        let infrastructure =
+            shinu::Error::Internal("sql: no such column host_cidr in /srv/shinu/shinu.db".into());
         let mut server_response = Vec::new();
         super::respond_error(&mut server_response, 500, &infrastructure)
             .expect("write server error response");
@@ -7216,7 +7344,6 @@ mod tests {
         assert!(client_response.contains("missing-space"));
     }
 
-
     #[test]
     fn console_register_then_login_creates_sessions() {
         let root = test_root("console-register-login");
@@ -7231,17 +7358,15 @@ mod tests {
         assert!(registered["project"].as_str().is_some());
         assert!(register_cookie.contains("shinu_session="));
 
-        let (logged_in, login_cookie) = super::login_console(
-            &ctx,
-            body.as_bytes(),
-            false,
-        )
-        .expect("login user");
+        let (logged_in, login_cookie) =
+            super::login_console(&ctx, body.as_bytes(), false).expect("login user");
         assert_eq!(logged_in["user_id"], registered["user_id"]);
         assert!(login_cookie.contains("shinu_session="));
-        assert!(state::find_user_by_email(&super::lock_db(&db), &email)
-            .expect("find registered user")
-            .is_some());
+        assert!(
+            state::find_user_by_email(&super::lock_db(&db), &email)
+                .expect("find registered user")
+                .is_some()
+        );
         std::fs::remove_dir_all(root).expect("remove test root");
     }
 
@@ -7252,11 +7377,14 @@ mod tests {
         let registry = registry();
         let ctx = console_ctx(&root, &db, &registry);
         let email = format!("user-{}@example.com", Uuid::new_v4());
-        let registered = format!(
-            "{{\"email\":\"{email}\",\"password\":\"correct horse\"}}"
-        );
-        super::register_console(&ctx, registered.as_bytes(), &Uuid::new_v4().to_string(), false)
-            .expect("register user");
+        let registered = format!("{{\"email\":\"{email}\",\"password\":\"correct horse\"}}");
+        super::register_console(
+            &ctx,
+            registered.as_bytes(),
+            &Uuid::new_v4().to_string(),
+            false,
+        )
+        .expect("register user");
         let wrong = format!("{{\"email\":\"{email}\",\"password\":\"wrong secret\"}}");
         let unknown = format!(
             "{{\"email\":\"unknown-{}@example.com\",\"password\":\"wrong secret\"}}",
@@ -7284,7 +7412,8 @@ mod tests {
             "{{\"email\":\"short-{}@example.com\",\"password\":\"too short\"}}",
             Uuid::new_v4()
         );
-        let result = super::register_console(&ctx, body.as_bytes(), &Uuid::new_v4().to_string(), false);
+        let result =
+            super::register_console(&ctx, body.as_bytes(), &Uuid::new_v4().to_string(), false);
         assert!(matches!(
             result,
             Err(shinu::Error::Invalid(message)) if message.contains("12 characters")
@@ -7307,18 +7436,47 @@ mod tests {
     }
 
     #[test]
+    fn malformed_authorization_never_falls_back_to_session_cookie() {
+        let root = test_root("mixed-auth");
+        let db = console_db();
+        let registry = registry();
+        let ctx = console_ctx(&root, &db, &registry);
+        let email = format!("mixed-auth-{}@example.com", Uuid::new_v4());
+        let (user_id, _) =
+            state::create_user(&super::lock_db(&db), &email, super::DUMMY_PASSWORD_HASH)
+                .expect("create mixed-auth user");
+        let session = format!("session-{}", Uuid::new_v4());
+        let session_hash = shinu::sha256_hex(session.as_bytes());
+        state::create_session(&super::lock_db(&db), &session_hash, &user_id, 7)
+            .expect("create mixed-auth session");
+
+        let mut request = console_request(None, Some("console.example"));
+        request
+            .cookies
+            .insert(super::SESSION_COOKIE.into(), session);
+        assert!(matches!(
+            super::authenticate(&ctx, &request),
+            Ok(super::Caller::Console { .. })
+        ));
+        request.authorization_present = true;
+        assert!(matches!(
+            super::authenticate(&ctx, &request),
+            Err(shinu::Error::Auth(message)) if message == "invalid token"
+        ));
+        assert!(super::authenticate_optional(&ctx, &request).is_none());
+        std::fs::remove_dir_all(root).expect("remove mixed-auth root");
+    }
+
+    #[test]
     fn expired_console_session_is_rejected() {
         let root = test_root("console-expired-session");
         let db = console_db();
         let registry = registry();
         let ctx = console_ctx(&root, &db, &registry);
         let email = format!("expired-{}@example.com", Uuid::new_v4());
-        let (user_id, _) = state::create_user(
-            &super::lock_db(&db),
-            &email,
-            super::DUMMY_PASSWORD_HASH,
-        )
-        .expect("create expired-session user");
+        let (user_id, _) =
+            state::create_user(&super::lock_db(&db), &email, super::DUMMY_PASSWORD_HASH)
+                .expect("create expired-session user");
         let token = format!("expired-{}", Uuid::new_v4());
         let token_hash = shinu::sha256_hex(token.as_bytes());
         state::create_session(&super::lock_db(&db), &token_hash, &user_id, -1)
@@ -7363,6 +7521,40 @@ mod tests {
         );
         assert!(response.starts_with("HTTP/1.1 403"), "response: {response}");
         std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn streaming_cleanup_joins_output_readers() {
+        let mut child = Command::new("printf")
+            .arg("output")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn cleanup test child");
+        let stdout = child.stdout.take().expect("cleanup test stdout");
+        let stderr = child.stderr.take().expect("cleanup test stderr");
+        let stdout_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stderr_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stdout_done_reader = Arc::clone(&stdout_done);
+        let stderr_done_reader = Arc::clone(&stderr_done);
+        let stdout_reader = thread::spawn(move || {
+            let mut stdout = stdout;
+            let mut output = Vec::new();
+            let _ = stdout.read_to_end(&mut output);
+            stdout_done_reader.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let stderr_reader = thread::spawn(move || {
+            let mut stderr = stderr;
+            let mut output = Vec::new();
+            let _ = stderr.read_to_end(&mut output);
+            stderr_done_reader.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let mut cleanup = super::StreamingChildCleanup::new(child);
+        cleanup.set_readers(stdout_reader, stderr_reader);
+        drop(cleanup);
+        assert!(stdout_done.load(std::sync::atomic::Ordering::Acquire));
+        assert!(stderr_done.load(std::sync::atomic::Ordering::Acquire));
     }
 
     /// Guest output is arbitrary bytes, and a line-oriented UTF-8 read used to

@@ -90,7 +90,6 @@ name = "shinu-mcp"
 path = "src/bin/shinu-mcp.rs"
 
 [dependencies]
-serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
 uuid.workspace = true

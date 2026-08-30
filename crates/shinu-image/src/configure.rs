@@ -1,14 +1,17 @@
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use shinu_core::{
-    is_blocked_guest_destination, parse_ipv4, Error, Image, Result, VSOCK_SSH_PORT, VSOCK_VNC_PORT,
+    Error, Image, Result, VSOCK_SSH_PORT, VSOCK_VNC_PORT, is_blocked_guest_destination, parse_ipv4,
 };
 
 pub(super) fn guest_dns_fallback() -> String {
     std::env::var("SHINU_GUEST_DNS")
         .ok()
-        .filter(|value| !value.trim().is_empty())
+        .and_then(|value| {
+            let value = value.trim();
+            guest_can_reach_resolver(value).then(|| value.to_owned())
+        })
         .unwrap_or_else(|| "1.1.1.1".to_owned())
 }
 
@@ -17,38 +20,35 @@ pub(super) fn guest_dns_fallback() -> String {
 /// so a v6 resolver is as unreachable as a private or loopback v4 one, and
 /// keeping either would suppress the fallback and leave the guest without DNS.
 fn guest_can_reach_resolver(address: &str) -> bool {
-    parse_ipv4(address).is_some()
-        && !is_blocked_guest_destination(address)
-        && !address.starts_with("127.")
+    parse_ipv4(address).is_some() && !is_blocked_guest_destination(address)
 }
 
 /// Filters host resolver entries before baking them into the guest image.
 /// Private and link-local host resolvers cannot be reached after guest egress
 /// filtering, so copying one would make xbps unable to resolve package mirrors.
+/// An unusable fallback is replaced with the public default resolver.
 pub fn filter_guest_nameservers(resolv: &str, fallback: &str) -> String {
-    let fallback = if fallback.trim().is_empty() {
-        "1.1.1.1"
+    let fallback = fallback.trim();
+    let fallback = if guest_can_reach_resolver(fallback) {
+        fallback
     } else {
-        fallback.trim()
+        "1.1.1.1"
     };
+    let mut has_nameserver = false;
     let filtered = resolv
         .lines()
         .filter(|line| {
             let mut fields = line.split_whitespace();
             match (fields.next(), fields.next()) {
-                (Some("nameserver"), Some(address)) => guest_can_reach_resolver(address),
-                (Some("nameserver"), None) => false,
+                (Some("nameserver"), Some(address)) if guest_can_reach_resolver(address) => {
+                    has_nameserver = true;
+                    true
+                }
+                (Some("nameserver"), _) => false,
                 _ => true,
             }
         })
         .collect::<Vec<_>>();
-    let has_nameserver = filtered.iter().any(|line| {
-        let mut fields = line.split_whitespace();
-        matches!(
-            (fields.next(), fields.next()),
-            (Some("nameserver"), Some(address)) if guest_can_reach_resolver(address)
-        )
-    });
     if has_nameserver {
         format!("{}\n", filtered.join("\n"))
     } else {
@@ -79,10 +79,10 @@ pub fn guest_resolv_needs_repair(resolv: &str) -> bool {
 
 pub fn seed_resolv(mnt: &Path) -> Result<()> {
     let fallback = guest_dns_fallback();
-    let contents = match std::fs::read("/etc/resolv.conf") {
-        Ok(resolv) => filter_guest_nameservers(&String::from_utf8_lossy(&resolv), &fallback),
-        Err(_) => format!("nameserver {fallback}\n"),
-    };
+    let contents = std::fs::read("/etc/resolv.conf").map_or_else(
+        |_| format!("nameserver {fallback}\n"),
+        |resolv| filter_guest_nameservers(&String::from_utf8_lossy(&resolv), &fallback),
+    );
     let path = mnt.join("etc/resolv.conf");
     if std::fs::symlink_metadata(&path)
         .map(|metadata| metadata.file_type().is_symlink())
@@ -127,8 +127,8 @@ pub(super) fn chroot_run(mnt: &Path, command: &str) -> Result<()> {
 }
 
 /// Turns the extracted rootfs into a bootable cloud image: root login, serial
-/// console, sshd, and the vsock bridge sshd cannot provide itself (OpenSSH
-/// has no AF_VSOCK listener, so socat forwards the guest vsock port to it).
+/// console, sshd, and the vsock bridge. OpenSSH cannot provide an `AF_VSOCK`
+/// listener itself, so socat forwards the guest vsock port to it.
 pub(super) fn configure_image(mnt: &Path, image: Image) -> Result<()> {
     // Package managers resolve mirrors during this build, before a guest has
     // a runtime network interface; a baked public resolver is the only DNS
@@ -141,12 +141,14 @@ pub(super) fn configure_image(mnt: &Path, image: Image) -> Result<()> {
     if let Ok(contents) = std::fs::read_to_string(&shadow) {
         let patched = contents
             .lines()
-            .map(|line| match line.strip_prefix("root:") {
-                Some(rest) => match rest.split_once(':') {
-                    Some((_, tail)) => format!("root::{tail}"),
-                    None => line.to_owned(),
-                },
-                None => line.to_owned(),
+            .map(|line| {
+                line.strip_prefix("root:").map_or_else(
+                    || line.to_owned(),
+                    |rest| match rest.split_once(':') {
+                        Some((_, tail)) => format!("root::{tail}"),
+                        None => line.to_owned(),
+                    },
+                )
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -179,18 +181,19 @@ pub(super) fn configure_image(mnt: &Path, image: Image) -> Result<()> {
     let network_script = "#!/bin/sh\nexec 2>&1\nIP=$(sed -n 's/.*shinu\\.ip=\\([^ ]*\\).*/\\1/p' /proc/cmdline)\nGW=$(sed -n 's/.*shinu\\.gw=\\([^ ]*\\).*/\\1/p' /proc/cmdline)\n[ -n \"$IP\" ] || { echo \"no shinu.ip on cmdline\"; exec sleep infinity; }\nip addr add \"$IP\" dev eth0 2>/dev/null\nip link set eth0 up\n[ -n \"$GW\" ] && ip route add default via \"$GW\" 2>/dev/null\necho \"configured $IP via $GW\"\nexec sleep infinity\n";
     // Keep callers independent of the capture utility baked into each distro.
     let screenshot_script = match image {
-        Image::Rocky => "#!/bin/sh\nif [ \"$#\" -ne 1 ]; then\n    echo \"usage: shinu-screenshot OUTPUT\" >&2\n    exit 2\nfi\nDISPLAY=${DISPLAY:-:0}\nexport DISPLAY\nexec import -window root \"$1\"\n",
-        Image::Void | Image::Ubuntu | Image::Arch => "#!/bin/sh\nif [ \"$#\" -ne 1 ]; then\n    echo \"usage: shinu-screenshot OUTPUT\" >&2\n    exit 2\nfi\nDISPLAY=${DISPLAY:-:0}\nexport DISPLAY\nexec scrot -o \"$1\"\n",
+        Image::Rocky => {
+            "#!/bin/sh\nif [ \"$#\" -ne 1 ]; then\n    echo \"usage: shinu-screenshot OUTPUT\" >&2\n    exit 2\nfi\nDISPLAY=${DISPLAY:-:0}\nexport DISPLAY\nexec import -window root \"$1\"\n"
+        }
+        Image::Void | Image::Ubuntu | Image::Arch => {
+            "#!/bin/sh\nif [ \"$#\" -ne 1 ]; then\n    echo \"usage: shinu-screenshot OUTPUT\" >&2\n    exit 2\nfi\nDISPLAY=${DISPLAY:-:0}\nexport DISPLAY\nexec scrot -o \"$1\"\n"
+        }
     };
     let screenshot_path = mnt.join("usr/local/bin/shinu-screenshot");
     if let Some(parent) = screenshot_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&screenshot_path, screenshot_script)?;
-    std::fs::set_permissions(
-        &screenshot_path,
-        std::fs::Permissions::from_mode(0o755),
-    )?;
+    std::fs::set_permissions(&screenshot_path, std::fs::Permissions::from_mode(0o755))?;
 
     let desktop_script = "#!/bin/sh\nexec 2>&1\nXvfb :0 -screen 0 1280x800x24 &\nsleep 1\nDISPLAY=:0 openbox &\nexec x11vnc -display :0 -rfbport 5900 -nopw -forever -shared -localhost\n";
     let desktop_command = "exec 2>&1; Xvfb :0 -screen 0 1280x800x24 & sleep 1; DISPLAY=:0 openbox & exec x11vnc -display :0 -rfbport 5900 -nopw -forever -shared -localhost";
@@ -286,17 +289,11 @@ pub(super) fn configure_image(mnt: &Path, image: Image) -> Result<()> {
             let desktop = mnt.join("etc/sv/shinu-desktop");
             std::fs::create_dir_all(&desktop)?;
             std::fs::write(desktop.join("run"), desktop_script)?;
-            std::fs::set_permissions(
-                desktop.join("run"),
-                std::fs::Permissions::from_mode(0o755),
-            )?;
+            std::fs::set_permissions(desktop.join("run"), std::fs::Permissions::from_mode(0o755))?;
             let vnc = mnt.join("etc/sv/shinu-vsock-vnc");
             std::fs::create_dir_all(&vnc)?;
             std::fs::write(vnc.join("run"), &vsock_vnc_script)?;
-            std::fs::set_permissions(
-                vnc.join("run"),
-                std::fs::Permissions::from_mode(0o755),
-            )?;
+            std::fs::set_permissions(vnc.join("run"), std::fs::Permissions::from_mode(0o755))?;
             for service in ["shinu-desktop", "shinu-vsock-vnc"] {
                 let _ = std::fs::remove_file(default.join(service));
             }
@@ -392,10 +389,7 @@ pub(super) fn configure_image(mnt: &Path, image: Image) -> Result<()> {
             }
             let serial = getty.join("serial-getty@ttyS0.service");
             let _ = std::fs::remove_file(&serial);
-            std::os::unix::fs::symlink(
-                "/usr/lib/systemd/system/serial-getty@.service",
-                serial,
-            )?;
+            std::os::unix::fs::symlink("/usr/lib/systemd/system/serial-getty@.service", serial)?;
         }
     }
 
@@ -407,6 +401,45 @@ pub(super) fn configure_image(mnt: &Path, image: Image) -> Result<()> {
     Ok(())
 }
 
+fn payload_target(mnt: &Path, destination: &str) -> Result<PathBuf> {
+    let relative = destination.trim_start_matches('/');
+    if Path::new(relative)
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(Error::Invalid(format!(
+            "payload destination escapes guest image: {destination}"
+        )));
+    }
+    let target = mnt.join(relative);
+    let root = mnt.canonicalize()?;
+    let mut ancestor = target.as_path();
+    let metadata = loop {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) => break metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    Error::Invalid(format!(
+                        "payload destination has no guest root: {destination}"
+                    ))
+                })?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    if ancestor == target.as_path() && metadata.file_type().is_symlink() {
+        return Err(Error::Invalid(format!(
+            "payload destination is a symlink: {destination}"
+        )));
+    }
+    if !ancestor.canonicalize()?.starts_with(&root) {
+        return Err(Error::Invalid(format!(
+            "payload destination escapes guest image: {destination}"
+        )));
+    }
+    Ok(target)
+}
+
 /// Bakes caller-supplied files into the base image.
 ///
 /// The base build is the only moment shared guest files are baked into every
@@ -415,7 +448,7 @@ pub(super) fn configure_image(mnt: &Path, image: Image) -> Result<()> {
 ///
 /// Baking it into the base rather than pushing it per space also means every
 /// space starts identical and pays nothing at clone time, since the payload is
-/// shared CoW extents like the rest of the image.
+/// shared `CoW` extents like the rest of the image.
 ///
 /// `SHINU_PAYLOAD` is a comma-separated list of `<src>` or `<src>=<dst>`. A
 /// bare `<src>` lands in `/usr/local/bin/<basename>`. `SHINU_PAYLOAD_SERVICE`
@@ -446,9 +479,9 @@ pub(super) fn install_payload(mnt: &Path, image: Image) -> Result<()> {
                 src.display()
             )));
         }
-        // Destinations are absolute guest paths; strip the leading slash so
-        // they join under the mount instead of escaping to the host root.
-        let target = mnt.join(dst.trim_start_matches('/'));
+        // Reject parent components and symlinked ancestors before joining so a payload
+        // cannot escape the guest image or overwrite a host file through a symlink.
+        let target = payload_target(mnt, &dst)?;
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -464,8 +497,20 @@ pub(super) fn install_payload(mnt: &Path, image: Image) -> Result<()> {
     if service.is_empty() {
         return Ok(());
     }
-    let run = mnt.join(format!("etc/sv/{service}/run"));
-    if !run.exists() {
+    if service == "."
+        || service == ".."
+        || service.contains('/')
+        || service.chars().any(char::is_control)
+    {
+        return Err(Error::Invalid(format!(
+            "invalid SHINU_PAYLOAD_SERVICE={service}: service name must be one safe path component"
+        )));
+    }
+    let run = payload_target(mnt, &format!("/etc/sv/{service}/run"))?;
+    if !std::fs::symlink_metadata(&run)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+    {
         return Err(Error::Invalid(format!(
             "SHINU_PAYLOAD_SERVICE={service} but the payload did not provide /etc/sv/{service}/run"
         )));
@@ -499,6 +544,25 @@ pub(super) fn install_payload(mnt: &Path, image: Image) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod payload_tests {
+    use super::payload_target;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::path::Path;
+
+    #[test]
+    fn rejects_parent_components_and_escaping_ancestors() {
+        let mnt = std::env::temp_dir().join(format!("shinu-payload-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(mnt.join("etc")).expect("create test mount");
+        symlink("/tmp", mnt.join("etc/redirect")).expect("create redirect symlink");
+
+        assert!(payload_target(Path::new("/mnt"), "../outside").is_err());
+        assert!(payload_target(&mnt, "/etc/redirect/file").is_err());
+
+        fs::remove_dir_all(mnt).expect("remove test mount");
+    }
+}
 
 #[cfg(test)]
 mod resolver_tests {
@@ -518,6 +582,18 @@ mod resolver_tests {
         let resolv = "nameserver 10.0.0.2\nnameserver 169.254.169.254\n";
         assert_eq!(
             filter_guest_nameservers(resolv, "1.1.1.1"),
+            "nameserver 1.1.1.1\n"
+        );
+    }
+
+    #[test]
+    fn resolver_filter_replaces_unreachable_fallback() {
+        assert_eq!(
+            filter_guest_nameservers("", "192.168.5.123"),
+            "nameserver 1.1.1.1\n"
+        );
+        assert_eq!(
+            filter_guest_nameservers("", "2001:db8::1"),
             "nameserver 1.1.1.1\n"
         );
     }
@@ -547,7 +623,9 @@ mod resolver_tests {
     #[test]
     fn detects_only_unusable_guest_resolvers_for_repair() {
         assert!(!guest_resolv_needs_repair("# comment\nnameserver 8.8.8.8"));
-        assert!(guest_resolv_needs_repair("nameserver 192.168.5.123\nnameserver 8.8.8.8"));
+        assert!(guest_resolv_needs_repair(
+            "nameserver 192.168.5.123\nnameserver 8.8.8.8"
+        ));
         assert!(guest_resolv_needs_repair(""));
     }
 }

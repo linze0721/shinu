@@ -1,0 +1,57 @@
+---
+import { isolation } from "../content/facts";
+
+/**
+ * The section is an acrostic: the initial of every line, set in a fixed-width
+ * rail down the left edge, spells the heading's word. The rail is what makes
+ * the device readable, so it is the one element that never collapses. On
+ * narrow screens it shrinks but stays in the same column.
+ *
+ * Each line already starts with its own letter, so the rail is decoration for
+ * sighted readers and is hidden from assistive tech, which reads the line once.
+ */
+const { heading, lede, points } = isolation;
+---
+
+<section id="isolation" class="shell py-20 md:py-24" aria-labelledby="isolation-heading">
+  <header class="reveal max-w-[60ch]">
+    <h2 id="isolation-heading" class="text-3xl font-medium tracking-tight text-ink md:text-5xl">
+      {heading}
+    </h2>
+    <p class="mt-5 leading-relaxed text-ink-soft">{lede}</p>
+  </header>
+
+  <ol class="mt-10 md:mt-14">
+    {
+      points.map((p) => (
+        <li class="reveal rule-t grid grid-cols-[2.5rem_1fr] gap-x-4 gap-y-3 py-8 md:grid-cols-[5.5rem_1fr] md:gap-x-10 md:py-10 lg:grid-cols-[5.5rem_minmax(0,26rem)_minmax(0,1fr)] lg:gap-x-12">
+          <span
+            aria-hidden="true"
+            class="acrostic select-none font-mono text-3xl leading-none font-semibold lowercase text-jade-600 md:text-5xl"
+          >
+            {p.letter}
+          </span>
+          <h3 class="text-xl font-normal tracking-tight text-ink md:text-2xl lg:text-[1.75rem]">
+            {p.line}
+          </h3>
+          <p class="col-start-2 max-w-[60ch] leading-relaxed text-ink-soft lg:col-start-3 lg:mt-0">
+            {p.body}
+          </p>
+        </li>
+      ))
+    }
+    <li class="rule-t" aria-hidden="true"></li>
+  </ol>
+</section>
+
+<style>
+  /* The rail is the whole device, so its letters must sit on one optical
+     axis regardless of glyph width: the column is fixed by the grid track
+     and the glyph is centered in it. It is set lowercase mono to match the
+     wordmark, because the word it spells is the product name. */
+  .acrostic {
+    display: block;
+    text-align: center;
+    font-variant-ligatures: none;
+  }
+</style>

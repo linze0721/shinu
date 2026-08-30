@@ -1,0 +1,26 @@
+---
+import Base from "../layouts/Base.astro";
+import Nav from "../components/Nav.astro";
+import Hero from "../components/Hero.astro";
+import Primitives from "../components/Primitives.astro";
+import Workflow from "../components/Workflow.astro";
+import Isolation from "../components/Isolation.astro";
+import Numbers from "../components/Numbers.astro";
+import Start from "../components/Start.astro";
+import Footer from "../components/Footer.astro";
+import { meta } from "../content/facts";
+import "../styles/global.css";
+---
+
+<Base title={meta.title} description={meta.description}>
+  <Nav />
+  <main id="main">
+    <Hero />
+    <Primitives />
+    <Workflow />
+    <Isolation />
+    <Numbers />
+    <Start />
+  </main>
+  <Footer />
+</Base>

@@ -1,0 +1,33 @@
+---
+import { Icon } from "astro-icon/components";
+import { brand, start } from "../content/facts";
+---
+
+<section
+  id="start"
+  class="shell flex min-h-[52dvh] flex-col justify-center py-20 md:py-24"
+  aria-labelledby="start-heading"
+>
+  <div class="rule-t pt-14 md:pt-16">
+    <h2
+      id="start-heading"
+      class="reveal max-w-[16ch] text-4xl font-medium tracking-tight text-ink md:text-6xl"
+    >
+      {start.heading}
+    </h2>
+    <p class="reveal mt-6 max-w-[52ch] text-lg leading-relaxed text-ink-soft">
+      {start.lede}
+    </p>
+
+    <div class="reveal mt-10 md:mt-12">
+      <a
+        href={`mailto:${brand.contact}`}
+        class="press inline-flex items-center gap-3 rounded-full bg-jade-600 px-8 py-4 text-lg font-medium text-white shadow-[0_1px_2px_rgba(25,29,35,0.04)] transition-colors hover:bg-jade-700"
+      >
+        {start.cta}
+        <Icon name="ph:arrow-right" class="size-5" />
+      </a>
+      <p class="machine mt-6">{start.aside}</p>
+    </div>
+  </div>
+</section>

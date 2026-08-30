@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use std::process;
 use std::thread;
 
+const BUFFER_SIZE: usize = 64 * 1024;
+
 fn usage() -> ! {
     eprintln!("usage: shinu-vsock <uds_path> <port>");
     process::exit(2);
@@ -28,17 +30,12 @@ fn main() {
     let mut stream = shinu::vsock_connect(&uds, port).unwrap_or_else(|error| fail(error));
 
     let mut to_socket = stream.try_clone().unwrap_or_else(|error| fail(error));
-    // No `shutdown(Write)` on stdin EOF, and no exit from this thread.
-    //
-    // Firecracker's vsock multiplexer has no half-close: shutting one
-    // direction down tears the whole connection apart. SSH signals
-    // end-of-input inside its own protocol, so the transport never has to
-    // carry that signal. Errors are non-fatal for the same reason: when the
-    // guest closes first this copy fails with EPIPE while the reverse
-    // direction may still hold unread output, and exiting would truncate it.
+    // Do not half-close stdin: Firecracker's vsock multiplexer tears down both
+    // directions. SSH carries end-of-input in its protocol, and ignoring copy
+    // errors keeps unread guest output from being truncated.
     let _stdin_thread = thread::spawn(move || {
         let mut stdin = io::stdin().lock();
-        let mut buf = [0u8; 65536];
+        let mut buf = [0u8; BUFFER_SIZE];
         loop {
             match stdin.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -51,16 +48,10 @@ fn main() {
         }
     });
 
-    // Explicit read/write/flush rather than `io::copy` into `io::stdout()`.
-    //
-    // `io::stdout()` is a `LineWriter`: it holds bytes until it sees a newline.
-    // SSH's post-handshake traffic is encrypted binary that can contain no
-    // newline for an entire session, so the reply to the client's very first
-    // encrypted packet stayed in this buffer and both ends waited on each
-    // other forever — key exchange completed, then the session hung (measured
-    // on this host). Flushing every chunk is what makes the stream a stream.
+    // Flush each chunk: stdout is a LineWriter and encrypted SSH traffic can
+    // lack newlines long enough for buffering to deadlock key exchange.
     let mut stdout = io::stdout().lock();
-    let mut buf = [0u8; 65536];
+    let mut buf = [0u8; BUFFER_SIZE];
     loop {
         match stream.read(&mut buf) {
             Ok(0) => break,

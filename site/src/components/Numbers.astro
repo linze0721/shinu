@@ -1,0 +1,42 @@
+---
+import { measurements } from "../content/facts";
+---
+
+<section id="numbers" class="shell py-20 md:py-24" aria-labelledby="numbers-heading">
+  <header class="reveal max-w-[60ch]">
+    <h2
+      id="numbers-heading"
+      class="text-3xl font-medium tracking-tight text-ink md:text-5xl"
+    >
+      Counted, not promised.
+    </h2>
+    <p class="mt-5 leading-relaxed text-ink-soft">
+      Read off a running host.
+    </p>
+  </header>
+
+  <div class="mt-12 grid grid-cols-1 gap-x-8 md:mt-14 md:grid-cols-2 lg:grid-cols-4">
+    {
+      measurements.map((m, i) => (
+        <div
+          class:list={[
+            "reveal py-8 lg:py-0",
+            i > 0 ? "rule-t lg:rule-l lg:border-t-0 lg:pl-8" : "",
+            i === 1 ? "md:border-t-0" : "",
+            i % 2 === 1 ? "md:rule-l md:border-t-0 md:pl-8" : "",
+          ]}
+        >
+          <p class="font-mono text-4xl leading-none tracking-tight tabular-nums text-ink md:text-5xl">
+            {m.figure}
+          </p>
+          <p class="mt-5 font-mono text-xs tracking-wide text-jade-700">
+            {m.label}
+          </p>
+          <p class="mt-4 max-w-[38ch] text-sm leading-relaxed text-ink-soft">
+            {m.body}
+          </p>
+        </div>
+      ))
+    }
+  </div>
+</section>

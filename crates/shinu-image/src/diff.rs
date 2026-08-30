@@ -131,8 +131,12 @@ fn combine_mount_results(
 pub fn compare_trees(old_root: &Path, new_root: &Path, options: DiffOptions) -> Result<DiffResult> {
     let old = collect_tree(old_root, options.all)?;
     let new = collect_tree(new_root, options.all)?;
-    let mut paths = old.keys().cloned().collect::<Vec<_>>();
-    paths.extend(new.keys().filter(|path| !old.contains_key(*path)).cloned());
+    let limit = options.limit.min(MAX_DIFF_LIMIT);
+    let mut paths = old
+        .keys()
+        .chain(new.keys().filter(|path| !old.contains_key(*path)))
+        .cloned()
+        .collect::<Vec<_>>();
     paths.sort();
 
     let mut result = DiffResult {
@@ -157,7 +161,7 @@ pub fn compare_trees(old_root: &Path, new_root: &Path, options: DiffOptions) -> 
             DiffStatus::Removed => result.removed += 1,
             DiffStatus::Modified => result.modified += 1,
         }
-        if result.entries.len() < options.limit {
+        if result.entries.len() < limit {
             result.entries.push(DiffEntry { path, status });
         } else {
             result.truncated = true;
@@ -180,7 +184,10 @@ fn nodes_differ(left: &Node, right: &Node) -> bool {
 
 fn collect_tree(root: &Path, all: bool) -> Result<BTreeMap<String, Node>> {
     if !root.is_dir() {
-        return Err(Error::Invalid(format!("diff root is not a directory: {}", root.display())));
+        return Err(Error::Invalid(format!(
+            "diff root is not a directory: {}",
+            root.display()
+        )));
     }
     let mut nodes = BTreeMap::new();
     collect_dir(root, Path::new(""), all, &mut nodes)?;
@@ -202,7 +209,7 @@ fn collect_dir(
             continue;
         }
         let metadata = fs::symlink_metadata(entry.path())?;
-        let kind = node_kind(&metadata, entry.file_type()?);
+        let kind = node_kind(&metadata);
         let path = display_path(&child);
         nodes.insert(
             path,
@@ -219,12 +226,12 @@ fn collect_dir(
     Ok(())
 }
 
-fn node_kind(metadata: &Metadata, file_type: fs::FileType) -> NodeKind {
+fn node_kind(metadata: &Metadata) -> NodeKind {
     if metadata.is_dir() {
         NodeKind::Directory
     } else if metadata.is_file() {
         NodeKind::File
-    } else if file_type.is_symlink() {
+    } else if metadata.file_type().is_symlink() {
         NodeKind::Symlink
     } else {
         NodeKind::Other
@@ -256,10 +263,10 @@ pub fn is_excluded(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{compare_trees, is_excluded, DiffOptions, DiffStatus};
+    use super::{DiffOptions, DiffStatus, compare_trees, is_excluded};
     use std::fs;
-    use std::time::Duration;
     use std::path::Path;
+    use std::time::Duration;
 
     fn temp_tree(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("shinu-diff-{name}-{}", std::process::id()));
@@ -314,10 +321,30 @@ mod tests {
         assert_eq!(result.removed, 1);
         assert_eq!(result.modified, 2);
         assert!(!result.truncated);
-        assert!(result.entries.iter().any(|entry| entry.path == "/added" && entry.status == DiffStatus::Added));
-        assert!(result.entries.iter().any(|entry| entry.path == "/removed" && entry.status == DiffStatus::Removed));
-        assert!(result.entries.iter().any(|entry| entry.path == "/changed" && entry.status == DiffStatus::Modified));
-        assert!(!result.entries.iter().any(|entry| entry.path == "/etc/machine-id"));
+        assert!(
+            result
+                .entries
+                .iter()
+                .any(|entry| entry.path == "/added" && entry.status == DiffStatus::Added)
+        );
+        assert!(
+            result
+                .entries
+                .iter()
+                .any(|entry| entry.path == "/removed" && entry.status == DiffStatus::Removed)
+        );
+        assert!(
+            result
+                .entries
+                .iter()
+                .any(|entry| entry.path == "/changed" && entry.status == DiffStatus::Modified)
+        );
+        assert!(
+            !result
+                .entries
+                .iter()
+                .any(|entry| entry.path == "/etc/machine-id")
+        );
         let _ = fs::remove_dir_all(old);
         let _ = fs::remove_dir_all(new);
     }

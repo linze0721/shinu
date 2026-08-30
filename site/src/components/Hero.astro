@@ -1,0 +1,167 @@
+---
+import { Icon } from "astro-icon/components";
+import { brand, hero, repo } from "../content/facts";
+
+const ctaPrimary =
+  "press inline-flex items-center gap-2 rounded-full bg-jade-600 px-6 py-3 text-sm font-medium text-white shadow-[0_1px_2px_rgba(25,29,35,0.04)] hover:bg-jade-700";
+const ctaSecondary =
+  "press inline-flex items-center gap-2 rounded-full border border-edge-strong bg-surface px-6 py-3 text-sm font-medium text-ink-soft hover:border-jade-300 hover:text-ink";
+---
+
+<section id="top" class="shell">
+  <div
+    class="grid grid-cols-1 content-start items-center gap-12 pt-16 pb-4 lg:grid-cols-12 lg:gap-10 lg:pt-20 lg:pb-6"
+  >
+    <div class="max-w-[65ch] lg:col-span-7">
+      <p class="hero-in font-mono text-xs uppercase tracking-widest text-jade-700">
+        {hero.eyebrow}
+      </p>
+      <h1
+        class="hero-in mt-6 text-5xl leading-[1.15] font-normal tracking-tight text-ink md:text-6xl"
+      >
+        <span class="block md:whitespace-nowrap">{hero.headlineTop}</span>
+        <span class="block pb-1 leading-[1.1]">
+          <em>{hero.headlineEmphasis}</em>
+        </span>
+      </h1>
+      <p class="hero-in mt-6 max-w-[60ch] text-lg leading-relaxed text-ink-soft">
+        {hero.subtext}
+      </p>
+      <div class="hero-in mt-8 flex flex-wrap items-center gap-4 [&_a]:whitespace-nowrap">
+        <a href={`mailto:${brand.contact}`} class={ctaPrimary}>
+          {hero.ctaPrimary}
+          <Icon name="ph:arrow-right" class="size-4" />
+        </a>
+        {
+          repo ? (
+            <a href={repo} target="_blank" rel="noopener noreferrer" class={ctaSecondary}>
+              <Icon name="ph:git-branch" class="size-4" />
+              View source
+            </a>
+          ) : (
+            <a href="#primitives" class={ctaSecondary}>
+              <Icon name="ph:arrow-down" class="size-4" />
+              {hero.ctaSecondary}
+            </a>
+          )
+        }
+      </div>
+    </div>
+
+    <div class="hero-in lg:col-span-5">
+      <figure class="surface w-full max-w-[460px] px-6 py-8 lg:max-w-none">
+        <figcaption class="sr-only">
+          A line of moments that forks into parallel paths, one node marked as the moment you
+          returned to.
+        </figcaption>
+        <svg
+          viewBox="0 28 400 184"
+          class="h-auto w-full"
+          role="img"
+          aria-label="A line of moments forking into parallel paths"
+        >
+          <!-- hairline frame ticks, archive-plot furniture -->
+          <g stroke="var(--color-edge-strong)" stroke-width="1">
+            <line x1="0.5" y1="28" x2="0.5" y2="212" />
+            <line x1="399.5" y1="28" x2="399.5" y2="212" />
+          </g>
+
+          <!-- the line of moments -->
+          <polyline
+            points="40,120 100,120 160,120"
+            fill="none"
+            stroke="var(--color-edge-strong)"
+            stroke-width="1.5"></polyline>
+
+          <!-- branch carried forward from the fork -->
+          <path
+            d="M 160 120 C 200 120 200 60 240 60 L 360 60"
+            fill="none"
+            stroke="var(--color-edge-strong)"
+            stroke-width="1.5"></path>
+          <!-- branch left behind -->
+          <path
+            d="M 160 120 C 200 120 200 180 240 180 L 360 180"
+            fill="none"
+            stroke="var(--color-edge-strong)"
+            stroke-width="1.5"
+            stroke-dasharray="3 5"
+            opacity="0.6"></path>
+          <!-- the path you are on, after the return -->
+          <line
+            x1="160"
+            y1="120"
+            x2="360"
+            y2="120"
+            stroke="var(--color-jade-600)"
+            stroke-width="1.5"></line>
+
+          <!-- moments -->
+          <g fill="var(--color-surface)" stroke="var(--color-edge-strong)" stroke-width="1.5">
+            <circle cx="40" cy="120" r="3.5"></circle>
+            <circle cx="100" cy="120" r="3.5"></circle>
+            <circle cx="300" cy="60" r="3.5"></circle>
+            <circle cx="360" cy="60" r="3.5"></circle>
+            <circle cx="300" cy="180" r="3.5"></circle>
+            <circle cx="360" cy="180" r="3.5"></circle>
+          </g>
+
+          <!-- the moment you returned to -->
+          <circle
+            cx="160"
+            cy="120"
+            r="9"
+            fill="none"
+            stroke="var(--color-jade-600)"
+            stroke-width="1"
+            opacity="0.5"></circle>
+          <circle cx="160" cy="120" r="4" fill="var(--color-jade-600)"></circle>
+
+          <!-- now -->
+          <circle cx="360" cy="120" r="4" fill="var(--color-ink)"></circle>
+
+          <!-- labels: three short mono words, nothing more -->
+          <g
+            font-family="var(--font-mono)"
+            font-size="11"
+            letter-spacing="0.08em"
+            fill="var(--color-ink-muted)"
+          >
+            <text x="40" y="148">frozen</text>
+            <text x="160" y="148" text-anchor="middle" fill="var(--color-jade-700)">rewound</text>
+            <text x="360" y="148" text-anchor="end">now</text>
+          </g>
+        </svg>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<style>
+  @media (prefers-reduced-motion: no-preference) {
+    .hero-in {
+      opacity: 0;
+      animation: hero-in 720ms var(--ease-soft) forwards;
+    }
+    .hero-in:nth-child(2) {
+      animation-delay: 45ms;
+    }
+    .hero-in:nth-child(3) {
+      animation-delay: 90ms;
+    }
+    .hero-in:nth-child(4) {
+      animation-delay: 135ms;
+    }
+  }
+
+  @keyframes hero-in {
+    from {
+      opacity: 0;
+      transform: translateY(6px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+</style>

@@ -1,7 +1,9 @@
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use shinu::shell_quote_word;
+use std::borrow::Cow;
 use std::env;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::fmt::Write as _;
+use std::io::{self, BufRead, BufReader, Write};
 use std::net::TcpStream;
 
 const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:7878";
@@ -25,7 +27,7 @@ impl Server {
         Self { endpoint, token }
     }
 
-    fn client(&self) -> Result<HttpClient, String> {
+    fn client(&self) -> Result<HttpClient<'_>, String> {
         let token = self.token.as_deref().ok_or_else(|| {
             "SHINU_TOKEN is not configured; set SHINU_TOKEN to a Shinu API bearer token before calling a tool"
                 .to_string()
@@ -35,7 +37,7 @@ impl Server {
         }
         Ok(HttpClient {
             endpoint: Endpoint::parse(&self.endpoint)?,
-            token: token.to_string(),
+            token,
         })
     }
 
@@ -51,18 +53,18 @@ impl Server {
             }
             "shinu_resize_space" => {
                 let space = required_string(arguments, "space")?;
-                let path = format!("/v1/spaces/{}", encode_path_segment(&space));
+                let path = format!("/v1/spaces/{}", encode_path_segment(space));
                 let body = resize_space_body(arguments)?;
                 client.request_text("PATCH", &path, Some(body))
             }
             "shinu_start" => {
                 let space = required_string(arguments, "space")?;
-                let path = format!("/v1/spaces/{}/start", encode_path_segment(&space));
+                let path = format!("/v1/spaces/{}/start", encode_path_segment(space));
                 client.request_text("POST", &path, None)
             }
             "shinu_stop" => {
                 let space = required_string(arguments, "space")?;
-                let path = format!("/v1/spaces/{}/stop", encode_path_segment(&space));
+                let path = format!("/v1/spaces/{}/stop", encode_path_segment(space));
                 client.request_text("POST", &path, None)
             }
             "shinu_write_file" => {
@@ -72,51 +74,34 @@ impl Server {
                 let command = vec![
                     "sh".to_string(),
                     "-c".to_string(),
-                    format!("cat > {}", shell_quote_word(&path)),
+                    format!("cat > {}", shell_quote_word(path)),
                 ];
-                let request_path = format!(
-                    "/v1/spaces/{}/exec",
-                    encode_path_segment(&space)
-                );
-                let response = client.request(
+                let request_path = format!("/v1/spaces/{}/exec", encode_path_segment(space));
+                let response = client.request_checked(
                     "POST",
                     &request_path,
                     Some(json!({ "cmd": command, "stdin": content })),
                 )?;
-                if !(200..300).contains(&response.status) {
-                    return Err(http_error(response.status, &response.body));
-                }
                 aggregate_exec(&response.body)
             }
             "shinu_read_file" => {
                 let space = required_string(arguments, "space")?;
                 let path = required_string(arguments, "path")?;
-                let command = vec!["cat".to_string(), path];
-                let request_path = format!(
-                    "/v1/spaces/{}/exec",
-                    encode_path_segment(&space)
-                );
-                let response = client.request(
+                let command = vec!["cat".to_string(), path.to_owned()];
+                let request_path = format!("/v1/spaces/{}/exec", encode_path_segment(space));
+                let response = client.request_checked(
                     "POST",
                     &request_path,
                     Some(json!({ "cmd": command })),
                 )?;
-                if !(200..300).contains(&response.status) {
-                    return Err(http_error(response.status, &response.body));
-                }
                 aggregate_stdout(&response.body)
             }
             "shinu_exec" => {
                 let space = required_string(arguments, "space")?;
                 let command = required_command(arguments)?;
-                let path = format!(
-                    "/v1/spaces/{}/exec",
-                    encode_path_segment(&space)
-                );
-                let response = client.request("POST", &path, Some(json!({ "cmd": command })))?;
-                if !(200..300).contains(&response.status) {
-                    return Err(http_error(response.status, &response.body));
-                }
+                let path = format!("/v1/spaces/{}/exec", encode_path_segment(space));
+                let response =
+                    client.request_checked("POST", &path, Some(json!({ "cmd": command })))?;
                 aggregate_exec(&response.body)
             }
             "shinu_commit" => {
@@ -124,10 +109,7 @@ impl Server {
                 let note = required_string(arguments, "note")?;
                 let hot = required_bool(arguments, "hot")?;
                 let snapshot = required_snapshot_mode(arguments, "snapshot")?;
-                let path = format!(
-                    "/v1/spaces/{}/commits",
-                    encode_path_segment(&space)
-                );
+                let path = format!("/v1/spaces/{}/commits", encode_path_segment(space));
                 client.request_text(
                     "POST",
                     &path,
@@ -136,39 +118,29 @@ impl Server {
             }
             "shinu_log" => {
                 let space = required_string(arguments, "space")?;
-                let path = format!("/v1/spaces/{}/log", encode_path_segment(&space));
+                let path = format!("/v1/spaces/{}/log", encode_path_segment(space));
                 client.request_text("GET", &path, None)
             }
             "shinu_reflog" => {
                 let space = required_string(arguments, "space")?;
-                let path = format!("/v1/spaces/{}/reflog", encode_path_segment(&space));
+                let path = format!("/v1/spaces/{}/reflog", encode_path_segment(space));
                 client.request_text("GET", &path, None)
             }
             "shinu_checkout" => {
                 let space = required_string(arguments, "space")?;
                 let commit = required_string(arguments, "commit")?;
-                let path = format!(
-                    "/v1/spaces/{}/checkout",
-                    encode_path_segment(&space)
-                );
-                client.request_text(
-                    "POST",
-                    &path,
-                    Some(json!({ "commit": commit })),
-                )
+                let path = format!("/v1/spaces/{}/checkout", encode_path_segment(space));
+                client.request_text("POST", &path, Some(json!({ "commit": commit })))
             }
             "shinu_fork" => {
                 let commit = required_string(arguments, "commit")?;
                 let name = required_string(arguments, "name")?;
-                let path = format!(
-                    "/v1/commits/{}/fork",
-                    encode_path_segment(&commit)
-                );
+                let path = format!("/v1/commits/{}/fork", encode_path_segment(commit));
                 client.request_text("POST", &path, Some(json!({ "name": name })))
             }
             "shinu_delete_space" => {
                 let space = required_string(arguments, "space")?;
-                let path = format!("/v1/spaces/{}", encode_path_segment(&space));
+                let path = format!("/v1/spaces/{}", encode_path_segment(space));
                 client.request_text("DELETE", &path, None)
             }
             _ => Err(format!("unknown Shinu tool {name}")),
@@ -176,7 +148,6 @@ impl Server {
     }
 }
 
-#[derive(Clone)]
 struct Endpoint {
     host: String,
     authority: String,
@@ -194,7 +165,9 @@ impl Endpoint {
             .bytes()
             .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
         {
-            return Err("SHINU_ENDPOINT must not contain whitespace or control characters".to_string());
+            return Err(
+                "SHINU_ENDPOINT must not contain whitespace or control characters".to_string(),
+            );
         }
         let remainder = if let Some(value) = input.strip_prefix("http://") {
             value
@@ -258,25 +231,17 @@ impl Endpoint {
         })
     }
 
-    fn target(&self, path: &str) -> String {
-        let path = if path.starts_with('/') {
-            path.to_string()
-        } else {
-            format!("/{path}")
-        };
-        if self.base_path.is_empty() {
-            path
-        } else {
-            format!("{}{}", self.base_path, path)
+    fn target<'a>(&self, path: &'a str) -> Cow<'a, str> {
+        if self.base_path.is_empty() && path.starts_with('/') {
+            return Cow::Borrowed(path);
         }
-    }
-
-    fn connect_address(&self) -> String {
-        if self.host.contains(':') {
-            format!("[{}]:{}", self.host, self.port)
-        } else {
-            format!("{}:{}", self.host, self.port)
+        let mut target = String::with_capacity(self.base_path.len() + path.len() + 1);
+        target.push_str(&self.base_path);
+        if !path.starts_with('/') {
+            target.push('/');
         }
+        target.push_str(path);
+        Cow::Owned(target)
     }
 }
 
@@ -290,9 +255,9 @@ fn parse_port(value: &str) -> Result<u16, String> {
     Ok(port)
 }
 
-struct HttpClient {
+struct HttpClient<'a> {
     endpoint: Endpoint,
-    token: String,
+    token: &'a str,
 }
 
 struct HttpResponse {
@@ -305,7 +270,7 @@ struct ResponseHead {
     headers: Vec<(String, String)>,
 }
 
-impl HttpClient {
+impl HttpClient<'_> {
     fn request(
         &self,
         method: &str,
@@ -323,16 +288,26 @@ impl HttpClient {
         })
     }
 
+    fn request_checked(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<HttpResponse, String> {
+        let response = self.request(method, path, body)?;
+        if !(200..300).contains(&response.status) {
+            return Err(http_error(response.status, &response.body));
+        }
+        Ok(response)
+    }
+
     fn request_text(
         &self,
         method: &str,
         path: &str,
         body: Option<Value>,
     ) -> Result<String, String> {
-        let response = self.request(method, path, body)?;
-        if !(200..300).contains(&response.status) {
-            return Err(http_error(response.status, &response.body));
-        }
+        let response = self.request_checked(method, path, body)?;
         body_text(&response.body)
     }
 
@@ -342,8 +317,10 @@ impl HttpClient {
         path: &str,
         body: Option<&[u8]>,
     ) -> Result<(BufReader<TcpStream>, ResponseHead), String> {
-        let mut stream = TcpStream::connect(self.endpoint.connect_address())
-            .map_err(|error| format!("could not connect to {}: {error}", self.endpoint.authority))?;
+        let mut stream = TcpStream::connect((self.endpoint.host.as_str(), self.endpoint.port))
+            .map_err(|error| {
+                format!("could not connect to {}: {error}", self.endpoint.authority)
+            })?;
         let target = self.endpoint.target(path);
         let content_length = body.map_or(0, <[u8]>::len);
         let content_type = if body.is_some() {
@@ -352,16 +329,16 @@ impl HttpClient {
             ""
         };
         let request = format!(
-            "{method} {target} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n{content_type}Content-Length: {content_length}\r\n\r\n",
-            self.endpoint.authority, self.token
+            "{method} {} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n{content_type}Content-Length: {content_length}\r\n\r\n",
+            target.as_ref(),
+            self.endpoint.authority,
+            self.token
         );
         stream
             .write_all(request.as_bytes())
             .map_err(|error| error.to_string())?;
         if let Some(body) = body {
-            stream
-                .write_all(body)
-                .map_err(|error| error.to_string())?;
+            stream.write_all(body).map_err(|error| error.to_string())?;
         }
         stream.flush().map_err(|error| error.to_string())?;
         let mut reader = BufReader::new(stream);
@@ -370,49 +347,50 @@ impl HttpClient {
     }
 }
 
-fn required_string(arguments: &Map<String, Value>, field: &str) -> Result<String, String> {
-    match arguments.get(field) {
-        Some(Value::String(value)) if !value.trim().is_empty() => Ok(value.clone()),
-        Some(Value::String(_)) => Err(format!("argument {field} must not be empty")),
-        Some(_) => Err(format!("argument {field} must be a string")),
-        None => Err(format!("missing required argument {field}")),
-    }
-}
-fn required_text(arguments: &Map<String, Value>, field: &str) -> Result<String, String> {
-    match arguments.get(field) {
-        Some(Value::String(value)) => Ok(value.clone()),
-        Some(_) => Err(format!("argument {field} must be a string")),
-        None => Err(format!("missing required argument {field}")),
+fn required_string<'a>(arguments: &'a Map<String, Value>, field: &str) -> Result<&'a str, String> {
+    let value = required_text(arguments, field)?;
+    if value.trim().is_empty() {
+        Err(format!("argument {field} must not be empty"))
+    } else {
+        Ok(value)
     }
 }
 
+fn required_text<'a>(arguments: &'a Map<String, Value>, field: &str) -> Result<&'a str, String> {
+    match arguments.get(field) {
+        Some(Value::String(value)) => Ok(value),
+        Some(_) => Err(format!("argument {field} must be a string")),
+        None => Err(format!("missing required argument {field}")),
+    }
+}
 
 fn required_bool(arguments: &Map<String, Value>, field: &str) -> Result<bool, String> {
-    arguments
-        .get(field)
-        .and_then(Value::as_bool)
-        .ok_or_else(|| match arguments.get(field) {
-            Some(_) => format!("argument {field} must be a boolean"),
-            None => format!("missing required argument {field}"),
-        })
+    match arguments.get(field) {
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err(format!("argument {field} must be a boolean")),
+        None => Err(format!("missing required argument {field}")),
+    }
 }
 
-fn required_snapshot_mode(
-    arguments: &Map<String, Value>,
+fn required_snapshot_mode<'a>(
+    arguments: &'a Map<String, Value>,
     field: &str,
-) -> Result<String, String> {
+) -> Result<&'a str, String> {
     let value = required_string(arguments, field)?;
-    if matches!(value.as_str(), "none" | "full" | "diff") {
+    if matches!(value, "none" | "full" | "diff") {
         Ok(value)
     } else {
         Err(format!("argument {field} must be one of: none, full, diff"))
     }
 }
 
-fn optional_string(arguments: &Map<String, Value>, field: &str) -> Result<Option<String>, String> {
+fn optional_string<'a>(
+    arguments: &'a Map<String, Value>,
+    field: &str,
+) -> Result<Option<&'a str>, String> {
     match arguments.get(field) {
         None => Ok(None),
-        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.clone())),
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value)),
         Some(Value::String(_)) => Err(format!("argument {field} must not be empty")),
         Some(_) => Err(format!("argument {field} must be a string")),
     }
@@ -429,16 +407,11 @@ fn optional_u64(arguments: &Map<String, Value>, field: &str) -> Result<Option<u6
     }
 }
 
-fn create_space_body(
-    name: String,
-    arguments: &Map<String, Value>,
-) -> Result<Value, String> {
-    let mut body = json!({"name": name});
-    let object = body
-        .as_object_mut()
-        .expect("create space body starts as a JSON object");
+fn create_space_body(name: &str, arguments: &Map<String, Value>) -> Result<Value, String> {
+    let mut object = Map::new();
+    object.insert("name".to_string(), Value::String(name.to_owned()));
     if let Some(image) = optional_string(arguments, "image")? {
-        object.insert("image".to_string(), Value::String(image));
+        object.insert("image".to_string(), Value::String(image.to_owned()));
     }
     if let Some(vcpus) = optional_u64(arguments, "vcpus")? {
         object.insert("vcpus".to_string(), Value::from(vcpus));
@@ -450,9 +423,9 @@ fn create_space_body(
         object.insert("disk_mib".to_string(), Value::from(disk_mib));
     }
     if let Some(network) = optional_string(arguments, "network")? {
-        object.insert("network".to_string(), Value::String(network));
+        object.insert("network".to_string(), Value::String(network.to_owned()));
     }
-    Ok(body)
+    Ok(Value::Object(object))
 }
 
 fn resize_space_body(arguments: &Map<String, Value>) -> Result<Value, String> {
@@ -462,10 +435,7 @@ fn resize_space_body(arguments: &Map<String, Value>) -> Result<Value, String> {
     if vcpus.is_none() && mem_mib.is_none() && disk_mib.is_none() {
         return Err("resize requires at least one of vcpus, mem_mib, or disk_mib".to_string());
     }
-    let mut body = Value::Object(Map::new());
-    let object = body
-        .as_object_mut()
-        .expect("resize space body starts as a JSON object");
+    let mut object = Map::new();
     if let Some(vcpus) = vcpus {
         object.insert("vcpus".to_string(), Value::from(vcpus));
     }
@@ -475,11 +445,10 @@ fn resize_space_body(arguments: &Map<String, Value>) -> Result<Value, String> {
     if let Some(disk_mib) = disk_mib {
         object.insert("disk_mib".to_string(), Value::from(disk_mib));
     }
-    Ok(body)
+    Ok(Value::Object(object))
 }
 
-
-fn required_command(arguments: &Map<String, Value>) -> Result<Vec<String>, String> {
+fn required_command(arguments: &Map<String, Value>) -> Result<&[Value], String> {
     let value = arguments
         .get("cmd")
         .ok_or_else(|| "missing required argument cmd".to_string())?;
@@ -489,16 +458,12 @@ fn required_command(arguments: &Map<String, Value>) -> Result<Vec<String>, Strin
     if values.is_empty() {
         return Err("argument cmd must contain at least one command argument".to_string());
     }
-    values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            value
-                .as_str()
-                .map(str::to_owned)
-                .ok_or_else(|| format!("argument cmd[{index}] must be a string"))
-        })
-        .collect()
+    for (index, value) in values.iter().enumerate() {
+        if value.as_str().is_none() {
+            return Err(format!("argument cmd[{index}] must be a string"));
+        }
+    }
+    Ok(values)
 }
 
 fn validate_arguments(name: &str, arguments: &Map<String, Value>) -> Result<(), String> {
@@ -568,12 +533,15 @@ fn validate_arguments(name: &str, arguments: &Map<String, Value>) -> Result<(), 
 }
 
 fn encode_path_segment(value: &str) -> String {
-    let mut encoded = String::new();
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
             encoded.push(byte as char);
         } else {
-            encoded.push_str(&format!("%{byte:02X}"));
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
         }
     }
     encoded
@@ -591,7 +559,8 @@ fn http_error(status: u16, body: &[u8]) -> String {
     {
         return format!("HTTP {status}: {message}");
     }
-    let detail = String::from_utf8_lossy(body).trim().to_string();
+    let detail = String::from_utf8_lossy(body);
+    let detail = detail.trim();
     if detail.is_empty() {
         format!("HTTP {status}")
     } else {
@@ -599,8 +568,15 @@ fn http_error(status: u16, body: &[u8]) -> String {
     }
 }
 
-fn aggregate_exec(body: &[u8]) -> Result<String, String> {
-    let text = body_text(body)?;
+struct ExecOutput {
+    stdout: String,
+    stderr: String,
+    exit: i64,
+}
+
+fn parse_exec_output(body: &[u8]) -> Result<ExecOutput, String> {
+    let text = std::str::from_utf8(body)
+        .map_err(|error| format!("HTTP response was not valid UTF-8: {error}"))?;
     let mut stdout = String::new();
     let mut stderr = String::new();
     let mut exit = None;
@@ -618,21 +594,21 @@ fn aggregate_exec(body: &[u8]) -> Result<String, String> {
             let stream = stream.as_str().ok_or_else(|| {
                 format!("exec stream on NDJSON line {} must be a string", index + 1)
             })?;
-            let data = object
-                .get("data")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    format!("exec stream on NDJSON line {} is missing string data", index + 1)
-                })?;
+            let data = object.get("data").and_then(Value::as_str).ok_or_else(|| {
+                format!(
+                    "exec stream on NDJSON line {} is missing string data",
+                    index + 1
+                )
+            })?;
             match stream {
                 "stdout" => stdout.push_str(data),
                 "stderr" => stderr.push_str(data),
                 _ => return Err(format!("unknown exec stream {stream:?}")),
             }
         } else if let Some(value) = object.get("exit") {
-            let code = value
-                .as_i64()
-                .ok_or_else(|| format!("exec exit on NDJSON line {} must be an integer", index + 1))?;
+            let code = value.as_i64().ok_or_else(|| {
+                format!("exec exit on NDJSON line {} must be an integer", index + 1)
+            })?;
             if exit.replace(code).is_some() {
                 return Err("exec response contained multiple exit statuses".to_string());
             }
@@ -644,6 +620,19 @@ fn aggregate_exec(body: &[u8]) -> Result<String, String> {
         }
     }
     let exit = exit.ok_or_else(|| "exec response did not include an exit status".to_string())?;
+    Ok(ExecOutput {
+        stdout,
+        stderr,
+        exit,
+    })
+}
+
+fn aggregate_exec(body: &[u8]) -> Result<String, String> {
+    let ExecOutput {
+        stdout,
+        stderr,
+        exit,
+    } = parse_exec_output(body)?;
     let mut result = String::from("stdout:\n");
     result.push_str(&stdout);
     if !stdout.ends_with('\n') {
@@ -654,54 +643,17 @@ fn aggregate_exec(body: &[u8]) -> Result<String, String> {
     if !stderr.ends_with('\n') {
         result.push('\n');
     }
-    result.push_str(&format!("exit: {exit}"));
+    result.push_str("exit: ");
+    let _ = write!(&mut result, "{exit}");
     Ok(result)
 }
+
 fn aggregate_stdout(body: &[u8]) -> Result<String, String> {
-    let text = body_text(body)?;
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    let mut exit = None;
-    for (index, raw_line) in text.split('\n').enumerate() {
-        let line = raw_line.trim_end_matches('\r');
-        if line.trim().is_empty() {
-            continue;
-        }
-        let value: Value = serde_json::from_str(line)
-            .map_err(|error| format!("invalid exec NDJSON line {}: {error}", index + 1))?;
-        let object = value
-            .as_object()
-            .ok_or_else(|| format!("exec NDJSON line {} must be a JSON object", index + 1))?;
-        if let Some(stream) = object.get("stream") {
-            let stream = stream.as_str().ok_or_else(|| {
-                format!("exec stream on NDJSON line {} must be a string", index + 1)
-            })?;
-            let data = object
-                .get("data")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    format!("exec stream on NDJSON line {} is missing string data", index + 1)
-                })?;
-            match stream {
-                "stdout" => stdout.push_str(data),
-                "stderr" => stderr.push_str(data),
-                _ => return Err(format!("unknown exec stream {stream:?}")),
-            }
-        } else if let Some(value) = object.get("exit") {
-            let code = value
-                .as_i64()
-                .ok_or_else(|| format!("exec exit on NDJSON line {} must be an integer", index + 1))?;
-            if exit.replace(code).is_some() {
-                return Err("exec response contained multiple exit statuses".to_string());
-            }
-        } else {
-            return Err(format!(
-                "exec NDJSON line {} must contain stream or exit",
-                index + 1
-            ));
-        }
-    }
-    let exit = exit.ok_or_else(|| "exec response did not include an exit status".to_string())?;
+    let ExecOutput {
+        stdout,
+        stderr,
+        exit,
+    } = parse_exec_output(body)?;
     if exit != 0 {
         if stderr.is_empty() {
             return Err(format!("guest command exited with status {exit}"));
@@ -740,8 +692,9 @@ fn read_response_head<R: BufRead>(reader: &mut R) -> Result<ResponseHead, String
     }
     let status = parse_port_status(&status_line)?;
     let mut headers = Vec::new();
+    let mut line = String::new();
     loop {
-        let mut line = String::new();
+        line.clear();
         if reader
             .read_line(&mut line)
             .map_err(|error| error.to_string())?
@@ -755,10 +708,7 @@ fn read_response_head<R: BufRead>(reader: &mut R) -> Result<ResponseHead, String
         let (name, value) = line
             .split_once(':')
             .ok_or_else(|| "malformed HTTP response header".to_string())?;
-        headers.push((
-            name.trim().to_ascii_lowercase(),
-            value.trim().to_string(),
-        ));
+        headers.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
     }
     Ok(ResponseHead { status, headers })
 }
@@ -790,12 +740,7 @@ fn content_length(headers: &[(String, String)]) -> Result<Option<usize>, String>
 
 fn read_body<R: BufRead>(reader: &mut R, headers: &[(String, String)]) -> Result<Vec<u8>, String> {
     if is_chunked(headers) {
-        let mut body = Vec::new();
-        read_chunked(reader, |chunk| {
-            body.extend_from_slice(chunk);
-            Ok(())
-        })?;
-        return Ok(body);
+        return read_chunked(reader);
     }
     if let Some(length) = content_length(headers)? {
         let mut body = vec![0u8; length];
@@ -811,12 +756,12 @@ fn read_body<R: BufRead>(reader: &mut R, headers: &[(String, String)]) -> Result
     Ok(body)
 }
 
-fn read_chunked<R: BufRead, F>(reader: &mut R, mut on_chunk: F) -> Result<(), String>
-where
-    F: FnMut(&[u8]) -> Result<(), String>,
-{
+fn read_chunked<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    let mut size_line = String::new();
+    let mut trailer = String::new();
     loop {
-        let mut size_line = String::new();
+        size_line.clear();
         if reader
             .read_line(&mut size_line)
             .map_err(|error| error.to_string())?
@@ -834,7 +779,7 @@ where
             .map_err(|error| format!("invalid chunk size {size_text:?}: {error}"))?;
         if size == 0 {
             loop {
-                let mut trailer = String::new();
+                trailer.clear();
                 if reader
                     .read_line(&mut trailer)
                     .map_err(|error| error.to_string())?
@@ -843,13 +788,14 @@ where
                     return Err("chunked HTTP body ended before trailers".to_string());
                 }
                 if trailer == "\r\n" || trailer == "\n" {
-                    return Ok(());
+                    return Ok(body);
                 }
             }
         }
-        let mut chunk = vec![0u8; size];
+        let chunk_start = body.len();
+        body.resize(chunk_start + size, 0);
         reader
-            .read_exact(&mut chunk)
+            .read_exact(&mut body[chunk_start..])
             .map_err(|error| error.to_string())?;
         let mut line_end = [0u8; 2];
         reader
@@ -858,7 +804,6 @@ where
         if line_end != *b"\r\n" {
             return Err("chunked HTTP body is missing its CRLF".to_string());
         }
-        on_chunk(&chunk)?;
     }
 }
 
@@ -1058,7 +1003,11 @@ fn dispatch(server: &Server, request: &Map<String, Value>, id: Value) -> Value {
             if let Some(params) = request.get("params")
                 && !params.is_object()
             {
-                return rpc_error(id, -32602, "Invalid params: initialize params must be an object");
+                return rpc_error(
+                    id,
+                    -32602,
+                    "Invalid params: initialize params must be an object",
+                );
             }
             rpc_result(
                 id,
@@ -1073,23 +1022,36 @@ fn dispatch(server: &Server, request: &Map<String, Value>, id: Value) -> Value {
             if let Some(params) = request.get("params")
                 && !params.is_object()
             {
-                return rpc_error(id, -32602, "Invalid params: tools/list params must be an object");
+                return rpc_error(
+                    id,
+                    -32602,
+                    "Invalid params: tools/list params must be an object",
+                );
             }
             rpc_result(id, json!({"tools": tool_definitions()}))
         }
         "tools/call" => {
             let Some(params) = request.get("params").and_then(Value::as_object) else {
-                return rpc_error(id, -32602, "Invalid params: tools/call params must be an object");
+                return rpc_error(
+                    id,
+                    -32602,
+                    "Invalid params: tools/call params must be an object",
+                );
             };
             let Some(name) = params.get("name").and_then(Value::as_str) else {
-                return rpc_error(id, -32602, "Invalid params: tools/call requires a string name");
+                return rpc_error(
+                    id,
+                    -32602,
+                    "Invalid params: tools/call requires a string name",
+                );
             };
             if !is_known_tool(name) {
                 return rpc_error(id, -32602, format!("Invalid params: unknown tool {name}"));
             }
+            let empty_arguments = Map::new();
             let arguments = match params.get("arguments") {
-                None => Map::new(),
-                Some(Value::Object(arguments)) => arguments.clone(),
+                None => &empty_arguments,
+                Some(Value::Object(arguments)) => arguments,
                 Some(_) => {
                     return rpc_error(
                         id,
@@ -1098,10 +1060,10 @@ fn dispatch(server: &Server, request: &Map<String, Value>, id: Value) -> Value {
                     );
                 }
             };
-            if let Err(error) = validate_arguments(name, &arguments) {
+            if let Err(error) = validate_arguments(name, arguments) {
                 return rpc_error(id, -32602, format!("Invalid params: {error}"));
             }
-            match server.execute_tool(name, &arguments) {
+            match server.execute_tool(name, arguments) {
                 Ok(text) => rpc_result(id, tool_result(text, false)),
                 Err(error) => rpc_result(id, tool_result(error, true)),
             }
@@ -1111,8 +1073,7 @@ fn dispatch(server: &Server, request: &Map<String, Value>, id: Value) -> Value {
 }
 
 fn write_response(output: &mut impl Write, response: &Value) -> io::Result<()> {
-    serde_json::to_writer(&mut *output, response)
-        .map_err(|error| io::Error::other(error.to_string()))?;
+    serde_json::to_writer(&mut *output, response).map_err(io::Error::other)?;
     output.write_all(b"\n")?;
     output.flush()
 }
@@ -1143,19 +1104,19 @@ fn handle_line(server: &Server, line: &str, output: &mut impl Write) -> io::Resu
 fn main() {
     let server = Server::from_env();
     let stdin = io::stdin();
-    let mut input = BufReader::new(stdin.lock());
+    let input = BufReader::new(stdin.lock());
     let stdout = io::stdout();
     let mut output = stdout.lock();
-    // stdout is the JSON-RPC protocol channel; diagnostics on it would corrupt framing, so logs stay on stderr.
-    for line in input.by_ref().lines() {
+    // Keep stdout protocol-only; diagnostics belong on stderr.
+    for line in input.lines() {
         match line {
-            Ok(line) if line.trim().is_empty() => continue,
-            Ok(line) => {
+            Ok(line) if !line.trim().is_empty() => {
                 if let Err(error) = handle_line(&server, &line, &mut output) {
                     eprintln!("shinu-mcp: could not write JSON-RPC response: {error}");
                     break;
                 }
             }
+            Ok(_) => {}
             Err(error) => {
                 eprintln!("shinu-mcp: could not read JSON-RPC request: {error}");
                 break;
@@ -1179,48 +1140,58 @@ mod tests {
     fn validates_lifecycle_and_file_tools() {
         assert!(validate_arguments("shinu_start", &arguments(json!({"space": "dev"}))).is_ok());
         assert!(validate_arguments("shinu_stop", &arguments(json!({"space": "dev"}))).is_ok());
-        assert!(validate_arguments(
-            "shinu_write_file",
-            &arguments(json!({"space": "dev", "path": "/tmp/note", "content": ""}))
-        )
-        .is_ok());
-        assert!(validate_arguments(
-            "shinu_read_file",
-            &arguments(json!({"space": "dev", "path": "/tmp/note"}))
-        )
-        .is_ok());
+        assert!(
+            validate_arguments(
+                "shinu_write_file",
+                &arguments(json!({"space": "dev", "path": "/tmp/note", "content": ""}))
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_arguments(
+                "shinu_read_file",
+                &arguments(json!({"space": "dev", "path": "/tmp/note"}))
+            )
+            .is_ok()
+        );
 
         assert!(validate_arguments("shinu_start", &Map::new()).is_err());
-        assert!(validate_arguments(
-            "shinu_write_file",
-            &arguments(json!({"space": "dev", "path": "/tmp/note"}))
-        )
-        .is_err());
-        assert!(validate_arguments(
-            "shinu_read_file",
-            &arguments(json!({"space": "dev", "path": 7}))
-        )
-        .is_err());
+        assert!(
+            validate_arguments(
+                "shinu_write_file",
+                &arguments(json!({"space": "dev", "path": "/tmp/note"}))
+            )
+            .is_err()
+        );
+        assert!(
+            validate_arguments(
+                "shinu_read_file",
+                &arguments(json!({"space": "dev", "path": 7}))
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn validates_image_and_resize_tools() {
         assert!(validate_arguments("shinu_list_images", &Map::new()).is_ok());
-        assert!(validate_arguments(
-            "shinu_resize_space",
-            &arguments(json!({"space": "dev", "mem_mib": 2048}))
-        )
-        .is_ok());
-        assert!(validate_arguments(
-            "shinu_resize_space",
-            &arguments(json!({"space": "dev"}))
-        )
-        .is_err());
-        assert!(validate_arguments(
-            "shinu_resize_space",
-            &arguments(json!({"space": "dev", "disk_mib": "2048"}))
-        )
-        .is_err());
+        assert!(
+            validate_arguments(
+                "shinu_resize_space",
+                &arguments(json!({"space": "dev", "mem_mib": 2048}))
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_arguments("shinu_resize_space", &arguments(json!({"space": "dev"}))).is_err()
+        );
+        assert!(
+            validate_arguments(
+                "shinu_resize_space",
+                &arguments(json!({"space": "dev", "disk_mib": "2048"}))
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1253,7 +1224,10 @@ mod tests {
                 .get("name")
                 .and_then(Value::as_str)
                 .expect("tool definition name");
-            assert!(is_known_tool(name), "tool {name} missing from known-tool match");
+            assert!(
+                is_known_tool(name),
+                "tool {name} missing from known-tool match"
+            );
         }
     }
 }

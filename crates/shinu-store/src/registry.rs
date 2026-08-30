@@ -26,7 +26,10 @@ impl Registry {
     }
 
     pub fn space_lock(&self, id: Uuid) -> Arc<Mutex<()>> {
-        let mut spaces = self.spaces.lock().unwrap_or_else(|error| error.into_inner());
+        let mut spaces = self
+            .spaces
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         spaces.retain(|_, lock| Arc::strong_count(lock) > 1);
         spaces
             .entry(id)
@@ -68,6 +71,6 @@ mod tests {
         }
 
         let count = registry.space_lock_count();
-        assert!(count <= 1, "space lock map grew to {} entries", count);
+        assert!(count <= 1, "space lock map grew to {count} entries");
     }
 }

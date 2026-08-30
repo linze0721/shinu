@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use shinu_core::{cache_dir, Error, Image, Result};
+use shinu_core::{Error, Image, Result, cache_dir};
 
 use super::fetch::{oci_layer_member, oci_manifest_member, tar_member};
 
@@ -72,7 +72,12 @@ fn extract_archive<const N: usize>(
     strip_root: bool,
 ) -> Result<()> {
     let mut command = std::process::Command::new("tar");
-    command.args(flags).arg(archive).arg("-C").arg(mnt).arg("--numeric-owner");
+    command
+        .args(flags)
+        .arg(archive)
+        .arg("-C")
+        .arg(mnt)
+        .arg("--numeric-owner");
     if strip_root {
         command.arg("--strip-components=1");
     }
@@ -101,22 +106,23 @@ fn extract_oci_rootfs(root: &Path, archive: &Path, mnt: &Path) -> Result<()> {
     // stream. Stage it in cache so extraction never buffers a rootfs in RAM.
     let stage = cache_dir(root).join("rocky-layer.tar.part");
     let _ = std::fs::remove_file(&stage);
-    let file = std::fs::File::create(&stage)?;
-    let output = std::process::Command::new("tar")
-        .args(["-xJOf"])
-        .arg(archive)
-        .arg(&layer_member)
-        .stdout(std::process::Stdio::from(file))
-        .output()?;
-    if !output.status.success() {
-        let _ = std::fs::remove_file(&stage);
-        return Err(Error::Invalid(format!(
-            "extracting OCI layer {} failed: {}",
-            layer_member,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    let result = extract_archive(&stage, mnt, ["-xpf"], false);
+    let result = (|| -> Result<()> {
+        let file = std::fs::File::create(&stage)?;
+        let output = std::process::Command::new("tar")
+            .args(["-xJOf"])
+            .arg(archive)
+            .arg(&layer_member)
+            .stdout(std::process::Stdio::from(file))
+            .output()?;
+        if !output.status.success() {
+            return Err(Error::Invalid(format!(
+                "extracting OCI layer {} failed: {}",
+                layer_member,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        extract_archive(&stage, mnt, ["-xpf"], false)
+    })();
     let _ = std::fs::remove_file(&stage);
     result
 }

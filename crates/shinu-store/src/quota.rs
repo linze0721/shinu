@@ -1,4 +1,4 @@
-//! Per-project resource ceilings and request throttling for the hosted demo.
+//! Per-project resource ceilings and request throttling.
 use shinu_core::{Error, Result};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -12,8 +12,9 @@ const DEFAULT_API_PER_MIN: u32 = 120;
 // defaults while keeping one tenant from exhausting a host by accident.
 const DEFAULT_MAX_VCPUS: u32 = 16;
 const DEFAULT_MAX_MEM_MIB: u32 = 32 * 1024;
+const WINDOW: Duration = Duration::from_mins(1);
 
-/// Resource ceilings applied to a project. The global environment provides SaaS
+/// Resource ceilings applied to a project. The global environment provides `SaaS`
 /// defaults and rejects zero; a zero is unlimited only when an individual
 /// project row explicitly grants it, never through the environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,7 +32,6 @@ impl Limits {
         Self::from_lookup(|key| std::env::var(key).ok())
     }
 
-    // A reader seam keeps parser tests deterministic without mutating the process environment.
     fn from_lookup<F>(lookup: F) -> Self
     where
         F: Fn(&str) -> Option<String>,
@@ -87,14 +87,11 @@ impl RateLimiter {
             return Ok(());
         }
 
-        const WINDOW: Duration = Duration::from_secs(60);
-
         let mut requests = self
             .requests
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        // Sweep every tenant on each request: otherwise a tenant that stops
-        // sending calls would leave its timestamp and map key forever.
+        // Sweep all queues so inactive projects do not retain stale entries.
         for timestamps in requests.values_mut() {
             while timestamps.front().is_some_and(|at| {
                 now.checked_duration_since(*at)
@@ -105,19 +102,14 @@ impl RateLimiter {
         }
         requests.retain(|_, timestamps| !timestamps.is_empty());
 
-        let mut timestamps = requests.remove(project).unwrap_or_default();
-
+        let timestamps = requests.entry(project.to_owned()).or_default();
         if timestamps.len() >= per_min as usize {
-            if !timestamps.is_empty() {
-                requests.insert(project.to_owned(), timestamps);
-            }
             return Err(Error::Quota(format!(
                 "rate limit exceeded: {per_min} requests per minute"
             )));
         }
 
         timestamps.push_back(now);
-        requests.insert(project.to_owned(), timestamps);
         Ok(())
     }
 }
@@ -158,11 +150,7 @@ pub fn check_mem_limit(requested: u32, limits: &Limits) -> Result<()> {
     Ok(())
 }
 
-pub fn check_disk_limit(
-    current_mib: u64,
-    adding_mib: u64,
-    limits: &Limits,
-) -> Result<()> {
+pub fn check_disk_limit(current_mib: u64, adding_mib: u64, limits: &Limits) -> Result<()> {
     if limits.max_disk_mib == 0 {
         return Ok(());
     }
@@ -205,16 +193,18 @@ mod quota_tests {
     #[test]
     fn limits_environment_values_override_defaults() {
         let limits = Limits::from_lookup(|key| {
-            Some(match key {
-                "SHINU_LIMIT_SPACES" => "9",
-                "SHINU_LIMIT_DISK_MIB" => "20480",
-                "SHINU_LIMIT_VCPUS" => "8",
-                "SHINU_LIMIT_MEM_MIB" => "16384",
-                "SHINU_LIMIT_RUNNING" => "4",
-                "SHINU_LIMIT_API_PER_MIN" => "600",
-                _ => return None,
-            }
-            .to_owned())
+            Some(
+                match key {
+                    "SHINU_LIMIT_SPACES" => "9",
+                    "SHINU_LIMIT_DISK_MIB" => "20480",
+                    "SHINU_LIMIT_VCPUS" => "8",
+                    "SHINU_LIMIT_MEM_MIB" => "16384",
+                    "SHINU_LIMIT_RUNNING" => "4",
+                    "SHINU_LIMIT_API_PER_MIN" => "600",
+                    _ => return None,
+                }
+                .to_owned(),
+            )
         });
         assert_eq!(limits.max_spaces, 9);
         assert_eq!(limits.max_disk_mib, 20_480);
@@ -227,16 +217,18 @@ mod quota_tests {
     #[test]
     fn invalid_or_empty_environment_values_use_defaults() {
         let limits = Limits::from_lookup(|key| {
-            Some(match key {
-                "SHINU_LIMIT_SPACES" => "not-a-number",
-                "SHINU_LIMIT_DISK_MIB" => " ",
-                "SHINU_LIMIT_RUNNING" => "-1",
-                "SHINU_LIMIT_API_PER_MIN" => "-1",
-                "SHINU_LIMIT_VCPUS" => "0",
-                "SHINU_LIMIT_MEM_MIB" => " ",
-                _ => return None,
-            }
-            .to_owned())
+            Some(
+                match key {
+                    "SHINU_LIMIT_SPACES" => "not-a-number",
+                    "SHINU_LIMIT_DISK_MIB" => " ",
+                    "SHINU_LIMIT_RUNNING" => "-1",
+                    "SHINU_LIMIT_API_PER_MIN" => "-1",
+                    "SHINU_LIMIT_VCPUS" => "0",
+                    "SHINU_LIMIT_MEM_MIB" => " ",
+                    _ => return None,
+                }
+                .to_owned(),
+            )
         });
         assert_eq!(limits, Limits::from_lookup(|_| None));
     }
@@ -244,14 +236,16 @@ mod quota_tests {
     #[test]
     fn zero_environment_values_use_saas_defaults() {
         let limits = Limits::from_lookup(|key| {
-            Some(match key {
-                "SHINU_LIMIT_SPACES"
-                | "SHINU_LIMIT_DISK_MIB"
-                | "SHINU_LIMIT_RUNNING"
-                | "SHINU_LIMIT_API_PER_MIN" => "0",
-                _ => return None,
-            }
-            .to_owned())
+            Some(
+                match key {
+                    "SHINU_LIMIT_SPACES"
+                    | "SHINU_LIMIT_DISK_MIB"
+                    | "SHINU_LIMIT_RUNNING"
+                    | "SHINU_LIMIT_API_PER_MIN" => "0",
+                    _ => return None,
+                }
+                .to_owned(),
+            )
         });
         assert_eq!(limits.max_spaces, 5);
         assert_eq!(limits.max_disk_mib, 10_240);
@@ -369,12 +363,16 @@ mod quota_tests {
         let limiter = RateLimiter::new();
         let first = Instant::now();
         assert!(limiter.check_at("demo", 1, first).is_ok());
-        assert!(limiter
-            .check_at("demo", 1, first + Duration::from_secs(59))
-            .is_err());
-        assert!(limiter
-            .check_at("demo", 1, first + Duration::from_secs(60))
-            .is_ok());
+        assert!(
+            limiter
+                .check_at("demo", 1, first + Duration::from_secs(59))
+                .is_err()
+        );
+        assert!(
+            limiter
+                .check_at("demo", 1, first + Duration::from_mins(1))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -382,9 +380,11 @@ mod quota_tests {
         let limiter = RateLimiter::new();
         let first = Instant::now();
         assert!(limiter.check_at("stale", 1, first).is_ok());
-        assert!(limiter
-            .check_at("active", 1, first + Duration::from_secs(61))
-            .is_ok());
+        assert!(
+            limiter
+                .check_at("active", 1, first + Duration::from_secs(61))
+                .is_ok()
+        );
         let requests = limiter
             .requests
             .lock()

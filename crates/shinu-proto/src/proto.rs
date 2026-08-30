@@ -1,5 +1,5 @@
-use shinu_core::Image;
 use serde::{Deserialize, Serialize};
+use shinu_core::Image;
 use uuid::Uuid;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -75,9 +75,7 @@ pub enum Req {
         ckpt: Uuid,
     },
     Ls,
-    /// Boots the space's VM if it is not already running and returns
-    /// everything the caller needs to reach it: vsock socket, private
-    /// key, port.
+    /// Starts the space's VM if it is not running and reports whether it booted.
     Start {
         space: String,
     },
@@ -110,11 +108,4 @@ pub enum Req {
         free_below: u64,
         dry_run: bool,
     },
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum Resp {
-    Ok { data: serde_json::Value },
-    Error { message: String },
 }

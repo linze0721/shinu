@@ -6,8 +6,8 @@
 (function () {
   /* ================= shared helpers ================= */
 
-  function $(selector, root) {
-    return (root || document).querySelector(selector);
+  function $(selector) {
+    return document.querySelector(selector);
   }
 
   function esc(value) {
@@ -29,8 +29,8 @@
   }
   ApiError.prototype = Object.create(Error.prototype);
 
-  /* All console traffic goes through here. credentials:'same-origin' is what
-     carries the shinu_session cookie the browser got at login. */
+  /* credentials:'same-origin' is what carries the shinu_session cookie the
+     browser got at login. */
   function api(method, path, body) {
     return fetch(path, {
       method: method,
@@ -126,7 +126,7 @@
   function copyText(text, btn) {
     var label = btn.textContent;
     function done(ok) {
-      btn.textContent = ok ? 'Copied' : 'Copy failed — select the text manually';
+      btn.textContent = ok ? 'Copied' : 'Copy failed, select the text manually';
       setTimeout(function () {
         btn.textContent = label;
       }, 1600);
@@ -164,11 +164,11 @@
     var area = $('#notice-area');
     if (!area) return;
     for (var i = 0; i < area.children.length; i += 1) {
-      if (area.children[i].getAttribute('data-sig') === message) return;
+      if (area.children[i].getAttribute('data-msg') === message) return;
     }
     var div = document.createElement('div');
     div.className = 'notice error';
-    div.setAttribute('data-sig', message);
+    div.setAttribute('data-msg', message);
     var span = document.createElement('span');
     span.className = 'notice-msg';
     span.textContent = message;
@@ -206,18 +206,14 @@
       mode = next;
       var registering = mode === 'register';
       Object.keys(tabs).forEach(function (key) {
-        var active = key === mode;
-        tabs[key].classList.toggle('active', active);
-        tabs[key].setAttribute('aria-selected', String(active));
+        tabs[key].classList.toggle('active', key === mode);
+        tabs[key].setAttribute('aria-selected', String(key === mode));
       });
       submit.textContent = registering ? 'Create account' : 'Log in';
-      password.setAttribute(
-        'autocomplete',
-        registering ? 'new-password' : 'current-password'
-      );
+      password.autocomplete = registering ? 'new-password' : 'current-password';
       hint.hidden = !registering;
       errBox.hidden = true;
-      document.title = registering ? 'shinu — register' : 'shinu — log in';
+      document.title = registering ? 'shinu: register' : 'shinu: log in';
       /* Keep the URL in sync so a refresh keeps the mode. The History API
          throws on file:// previews, hence the protocol guard. */
       if (location.protocol.indexOf('http') === 0) {
@@ -242,7 +238,7 @@
       },
       function (err) {
         if (err.status === 0) {
-          showError('Cannot reach the shinu daemon — is it running?');
+          showError('Cannot reach the shinu daemon. Is it running?');
         }
       }
     );
@@ -333,6 +329,11 @@
       );
     }
 
+    function showLoading(selector) {
+      $(selector).innerHTML =
+        '<div class="state"><span class="spin"></span>Loading&hellip;</div>';
+    }
+
     /* ---------- rendering ---------- */
 
     function renderSpaces() {
@@ -366,7 +367,7 @@
               '</button></td><td>' +
               (s.running ? '<span class="green">running</span>' : 'stopped') +
               '</td><td class="mono">' +
-              (s.head ? esc(shortId(s.head)) : '&mdash;') +
+              (s.head ? esc(shortId(s.head)) : 'none') +
               '</td><td class="mono nobr">' +
               esc(fmtBytes(s.exclusive || 0)) +
               '</td><td class="space-created nobr" title="' +
@@ -429,25 +430,23 @@
     function renderCommitList() {
       var s = selectedSpace();
       if (!s) return;
-      var list = $('#commit-list');
       if (state.historyError) {
-        list.innerHTML = errorState(state.historyError, 'retry-history');
+        $('#commit-list').innerHTML = errorState(state.historyError, 'retry-history');
         return;
       }
       var rows = state.tab === 'log' ? state.log : state.reflog;
       if (!rows) {
-        list.innerHTML =
-          '<div class="state"><span class="spin"></span>Loading&hellip;</div>';
+        showLoading('#commit-list');
         return;
       }
       if (rows.length === 0) {
-        list.innerHTML =
+        $('#commit-list').innerHTML =
           state.tab === 'log'
             ? '<div class="state"><p>No commits yet.</p></div>'
             : '<div class="state"><p>The archive is empty.</p></div>';
         return;
       }
-      list.innerHTML =
+      $('#commit-list').innerHTML =
         '<table class="data-table"><thead><tr><th>Id</th><th>When</th>' +
         '<th>Note</th><th>Checkout from the CLI</th></tr></thead><tbody>' +
         rows
@@ -512,14 +511,13 @@
         meterRow('Spaces', L.used.spaces, L.max_spaces, String) +
         meterRow('Disk', L.used.disk_mib, L.max_disk_mib, fmtMib) +
         meterRow('Running VMs', L.used.running, L.max_running, String) +
-        '<tr><td>API rate</td><td class="mono nobr">' +
+        '<tr><td>API rate</td><td class="mono nobr quota-num">' +
         esc(String(L.api_per_min)) +
         ' / min</td><td></td></tr>' +
         '</tbody></table>';
       var U = state.usage;
       if (U) {
         $('#usage-line').textContent =
-          '' +
           U.spaces_created +
           ' spaces created · ' +
           fmtDuration(U.vm_seconds) +
@@ -684,10 +682,17 @@
         views[key].hidden = key !== name;
       });
       for (var i = 0; i < menuItems.length; i += 1) {
-        var active = menuItems[i].getAttribute('data-view') === name;
+        var active = menuItems[i].dataset.view === name;
         menuItems[i].classList.toggle('active', active);
         menuItems[i].setAttribute('aria-pressed', String(active));
       }
+    }
+
+    function setHistoryTab(tab) {
+      $('#tab-log').classList.toggle('active', tab === 'log');
+      $('#tab-log').setAttribute('aria-selected', String(tab === 'log'));
+      $('#tab-reflog').classList.toggle('active', tab === 'reflog');
+      $('#tab-reflog').setAttribute('aria-selected', String(tab === 'reflog'));
     }
 
     function selectSpace(name) {
@@ -696,10 +701,7 @@
       state.tab = 'log';
       state.log = state.reflog = null;
       state.historyError = null;
-      $('#tab-log').classList.add('active');
-      $('#tab-log').setAttribute('aria-selected', 'true');
-      $('#tab-reflog').classList.remove('active');
-      $('#tab-reflog').setAttribute('aria-selected', 'false');
+      setHistoryTab('log');
       renderSpaces();
       renderDetail();
       /* selecting a space jumps to its save points, mirroring the old
@@ -712,18 +714,15 @@
       if (state.tab === tab) return;
       state.tab = tab;
       state.historyError = null;
-      $('#tab-log').classList.toggle('active', tab === 'log');
-      $('#tab-log').setAttribute('aria-selected', String(tab === 'log'));
-      $('#tab-reflog').classList.toggle('active', tab === 'reflog');
-      $('#tab-reflog').setAttribute('aria-selected', String(tab === 'reflog'));
+      setHistoryTab(tab);
       renderCommitList();
       if (tab === 'log' && !state.log) loadHistory('log');
       if (tab === 'reflog' && !state.reflog) loadHistory('reflog');
     }
 
     function onNewToken() {
-      var btn = $('#new-token-btn');
-      btn.disabled = true;
+      var tokenBtn = $('#new-token-btn');
+      tokenBtn.disabled = true;
       capi('POST', '/console/tokens', {}).then(
         function (data) {
           if (data && data.token) {
@@ -737,7 +736,7 @@
           notify(err.message);
         }
       ).then(function () {
-        btn.disabled = false;
+        tokenBtn.disabled = false;
       });
     }
 
@@ -764,18 +763,15 @@
         copyText(el.getAttribute('data-copy'), el);
       },
       'retry-spaces': function () {
-        $('#spaces-list').innerHTML =
-          '<div class="state"><span class="spin"></span>Loading&hellip;</div>';
+        showLoading('#spaces-list');
         refreshSpaces(false);
       },
       'retry-quota': function () {
-        $('#meters').innerHTML =
-          '<div class="state"><span class="spin"></span>Loading&hellip;</div>';
+        showLoading('#meters');
         refreshQuota(false);
       },
       'retry-tokens': function () {
-        $('#tokens-list').innerHTML =
-          '<div class="state"><span class="spin"></span>Loading&hellip;</div>';
+        showLoading('#tokens-list');
         refreshTokens(false);
       },
       'retry-history': function () {
@@ -799,7 +795,7 @@
 
     for (var mi = 0; mi < menuItems.length; mi += 1) {
       menuItems[mi].addEventListener('click', function () {
-        setView(this.getAttribute('data-view'));
+        setView(this.dataset.view);
       });
     }
 
@@ -828,7 +824,7 @@
         $('#user-email').textContent = state.me.email || '';
         $('#project-badge').textContent = state.me.project || '';
         if (state.me.project) {
-          document.title = 'shinu console — ' + state.me.project;
+          document.title = 'shinu console: ' + state.me.project;
         }
         refreshAll();
         setInterval(function () {

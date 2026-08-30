@@ -3,7 +3,7 @@ pub use crate::net::{egress_rules, peer_rules};
 use crate::config::VmConfig;
 use crate::net::NetConfig;
 use shinu_core::{Error, Image, Result};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -81,10 +81,14 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 fn command_failure(program: &str, args: &[&str], output: &std::process::Output) -> Error {
-    let command = std::iter::once(program)
-        .chain(args.iter().copied())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let mut command = String::with_capacity(args.iter().fold(program.len(), |length, arg| {
+        length.saturating_add(arg.len()).saturating_add(1)
+    }));
+    command.push_str(program);
+    for arg in args {
+        command.push(' ');
+        command.push_str(arg);
+    }
     Error::Internal(format!(
         "{command} failed: {}",
         String::from_utf8_lossy(&output.stderr).trim()
@@ -102,6 +106,40 @@ fn run_command(program: &str, args: &[&str]) -> Result<std::process::Output> {
     Ok(std::process::Command::new(program).args(args).output()?)
 }
 
+/// Whether an asset's no-follow metadata satisfies the root-executed trust
+/// boundary. Keep this scalar seam testable without impersonating uid 0.
+fn trusted_asset_attributes(regular: bool, uid: u32, mode: u32, expected_uid: u32) -> bool {
+    regular && uid == expected_uid && mode & 0o111 != 0 && mode & 0o022 == 0
+}
+
+fn validate_vm_asset(path: &Path, label: &str) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| {
+        Error::Invalid(format!(
+            "cannot validate {label} asset {}: {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink()
+        || !trusted_asset_attributes(
+            metadata.file_type().is_file(),
+            metadata.uid(),
+            metadata.mode(),
+            0,
+        )
+    {
+        return Err(Error::Invalid(format!(
+            "unsafe {label} asset: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_vm_assets(jailer: &Path, firecracker: &Path) -> Result<()> {
+    validate_vm_asset(jailer, "jailer")?;
+    validate_vm_asset(firecracker, "firecracker")
+}
+
 fn require_success(program: &str, args: &[&str]) -> Result<()> {
     let output = run_command(program, args)?;
     if output.status.success() {
@@ -113,9 +151,7 @@ fn require_success(program: &str, args: &[&str]) -> Result<()> {
 
 fn allow_file_exists(program: &str, args: &[&str]) -> Result<()> {
     let output = run_command(program, args)?;
-    if output.status.success()
-        || String::from_utf8_lossy(&output.stderr).contains("File exists")
-    {
+    if output.status.success() || String::from_utf8_lossy(&output.stderr).contains("File exists") {
         Ok(())
     } else {
         Err(command_failure(program, args, &output))
@@ -156,6 +192,16 @@ const SHINU_INPUT_CHAIN: &str = "SHINU-INPUT";
 // iptables serialises each command, not the check-plus-append sequence. Keep
 // concurrent VM starts from placing a tap DROP between shared ACCEPT updates.
 static INPUT_CHAIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// FORWARD rules use absolute insertion positions. Hold one process-wide lock
+// across each complete batch so concurrent VM lifecycle operations cannot
+// interleave a broad allow ahead of another tap's isolation fence.
+static FORWARD_CHAIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_forward_chain() -> std::sync::MutexGuard<'static, ()> {
+    FORWARD_CHAIN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Runs an iptables check, then the add if the rule is absent.
 ///
@@ -220,7 +266,12 @@ fn ensure_input_rule(rule: &[String]) -> Result<()> {
 }
 
 fn delete_iptables_rule(chain: &str, rule: &[String]) {
-    let mut args = vec!["-w".to_owned(), "5".to_owned(), "-D".to_owned(), chain.to_owned()];
+    let mut args = vec![
+        "-w".to_owned(),
+        "5".to_owned(),
+        "-D".to_owned(),
+        chain.to_owned(),
+    ];
     args.extend(rule.iter().cloned());
     let args = args.iter().map(String::as_str).collect::<Vec<_>>();
     let _ = run_command("iptables", &args);
@@ -230,11 +281,7 @@ fn ensure_forward_rule(rule: &[String], position: usize) -> Result<()> {
     let mut check = vec!["-C".to_owned(), "FORWARD".to_owned()];
     check.extend(rule.iter().cloned());
     let check = check.iter().map(String::as_str).collect::<Vec<_>>();
-    let mut add = vec![
-        "-I".to_owned(),
-        "FORWARD".to_owned(),
-        position.to_string(),
-    ];
+    let mut add = vec!["-I".to_owned(), "FORWARD".to_owned(), position.to_string()];
     add.extend(rule.iter().cloned());
     let add = add.iter().map(String::as_str).collect::<Vec<_>>();
     ensure_iptables_rule(&check, &add)
@@ -253,13 +300,13 @@ pub fn tap_up_with_peers(id: Uuid, cfg: &NetConfig, peers: &[String]) -> Result<
     }
     let tap = crate::net::tap_name(id);
     let (third, fourth_base) = crate::net::net_slot(id);
-    let network = format!(
-        "{}.{}.{}.{}",
-        cfg.base[0], cfg.base[1], third, fourth_base
-    );
+    let network = format!("{}.{}.{}.{}", cfg.base[0], cfg.base[1], third, fourth_base);
     let host = format!(
         "{}.{}.{}.{}",
-        cfg.base[0], cfg.base[1], third, fourth_base + 1
+        cfg.base[0],
+        cfg.base[1],
+        third,
+        fourth_base + 1
     );
     let host_cidr = format!("{host}/30");
     let network_cidr = format!("{network}/30");
@@ -297,66 +344,69 @@ pub fn tap_up_with_peers(id: Uuid, cfg: &NetConfig, peers: &[String]) -> Result<
     ];
     ensure_iptables_rule(&nat_check, &nat_add)?;
 
-    let forward_out_check = [
-        "-C",
-        "FORWARD",
-        "-i",
-        &tap,
-        "-o",
-        &cfg.uplink,
-        "-j",
-        "ACCEPT",
-    ];
-    let forward_out_add = [
-        "-I",
-        "FORWARD",
-        "1",
-        "-i",
-        &tap,
-        "-o",
-        &cfg.uplink,
-        "-j",
-        "ACCEPT",
-    ];
-    ensure_iptables_rule(&forward_out_check, &forward_out_add)?;
-
-    let forward_in_check = [
-        "-C",
-        "FORWARD",
-        "-i",
-        &cfg.uplink,
-        "-o",
-        &tap,
-        "-m",
-        "state",
-        "--state",
-        "RELATED,ESTABLISHED",
-        "-j",
-        "ACCEPT",
-    ];
-    let forward_in_add = [
-        "-I",
-        "FORWARD",
-        "1",
-        "-i",
-        &cfg.uplink,
-        "-o",
-        &tap,
-        "-m",
-        "state",
-        "--state",
-        "RELATED,ESTABLISHED",
-        "-j",
-        "ACCEPT",
-    ];
-    ensure_iptables_rule(&forward_in_check, &forward_in_add)?;
-    // Insert after the broad forwarding rules so these entries end up
-    // ahead of the unconditional tap-to-uplink ACCEPT.
-    for (position, rule) in crate::net::egress_rules_with_peers(&tap, &host, &cfg.allow, peers)
-        .iter()
-        .enumerate()
     {
-        ensure_forward_rule(rule, position + 1)?;
+        let _forward_chain_guard = lock_forward_chain();
+        let forward_out_check = [
+            "-C",
+            "FORWARD",
+            "-i",
+            &tap,
+            "-o",
+            &cfg.uplink,
+            "-j",
+            "ACCEPT",
+        ];
+        let forward_out_add = [
+            "-I",
+            "FORWARD",
+            "1",
+            "-i",
+            &tap,
+            "-o",
+            &cfg.uplink,
+            "-j",
+            "ACCEPT",
+        ];
+        ensure_iptables_rule(&forward_out_check, &forward_out_add)?;
+
+        let forward_in_check = [
+            "-C",
+            "FORWARD",
+            "-i",
+            &cfg.uplink,
+            "-o",
+            &tap,
+            "-m",
+            "state",
+            "--state",
+            "RELATED,ESTABLISHED",
+            "-j",
+            "ACCEPT",
+        ];
+        let forward_in_add = [
+            "-I",
+            "FORWARD",
+            "1",
+            "-i",
+            &cfg.uplink,
+            "-o",
+            &tap,
+            "-m",
+            "state",
+            "--state",
+            "RELATED,ESTABLISHED",
+            "-j",
+            "ACCEPT",
+        ];
+        ensure_iptables_rule(&forward_in_check, &forward_in_add)?;
+        // Insert after the broad forwarding rules so these entries end up
+        // ahead of the unconditional tap-to-uplink ACCEPT.
+        for (position, rule) in crate::net::egress_rules_with_peers(&tap, &host, &cfg.allow, peers)
+            .iter()
+            .enumerate()
+        {
+            ensure_forward_rule(rule, position + 1)?;
+        }
     }
     let _input_chain_guard = INPUT_CHAIN_LOCK
         .lock()
@@ -376,18 +426,20 @@ pub fn tap_up_with_peers(id: Uuid, cfg: &NetConfig, peers: &[String]) -> Result<
 }
 /// Adds the current named-network peer exceptions to an existing tap.
 ///
-/// This uses the same fixed positions as `tap_up`: gateway and explicit LAN
-/// allowances occupy the prefix, peer /32s follow, and the private-address
-/// drops remain after them. `ensure_forward_rule` makes repeated refreshes
+/// This uses the same fixed positions as `tap_up`: the gateway occupies the
+/// first slot, peer /32s follow, and the inter-tap fence and operator/private
+/// rules remain after them. `ensure_forward_rule` makes repeated refreshes
 /// idempotent instead of growing FORWARD on every start.
 pub fn refresh_peer_rules(id: Uuid, cfg: &NetConfig, peers: &[String]) -> Result<()> {
     if !cfg.enabled || peers.is_empty() {
         return Ok(());
     }
     let tap = crate::net::tap_name(id);
-    let prefix = 1 + cfg.allow.len();
-    for (position, rule) in crate::net::peer_rules(&tap, peers).iter().enumerate() {
-        ensure_forward_rule(rule, prefix + position + 1)?;
+    let _forward_chain_guard = lock_forward_chain();
+    let prefix = 1;
+    for (position, peer) in peers.iter().enumerate() {
+        let rule = crate::net::peer_rule(&tap, peer);
+        ensure_forward_rule(&rule, prefix + position + 1)?;
     }
     Ok(())
 }
@@ -401,7 +453,9 @@ pub fn remove_peer_rules(id: Uuid, cfg: &NetConfig, peers: &[String]) {
         return;
     }
     let tap = crate::net::tap_name(id);
-    for rule in crate::net::peer_rules(&tap, peers) {
+    let _forward_chain_guard = lock_forward_chain();
+    for peer in peers {
+        let rule = crate::net::peer_rule(&tap, peer);
         let mut args = vec![
             "-w".to_owned(),
             "5".to_owned(),
@@ -417,7 +471,7 @@ pub fn remove_peer_rules(id: Uuid, cfg: &NetConfig, peers: &[String]) {
 /// Removes this VM's rules and tap. Cleanup is deliberately best effort:
 /// a stopped VM with a missing tap is already in the desired state.
 pub fn tap_down(id: Uuid, cfg: &NetConfig) {
-    tap_down_with_peers(id, cfg, &[])
+    tap_down_with_peers(id, cfg, &[]);
 }
 
 pub fn tap_down_with_peers(id: Uuid, cfg: &NetConfig, peers: &[String]) {
@@ -426,17 +480,19 @@ pub fn tap_down_with_peers(id: Uuid, cfg: &NetConfig, peers: &[String]) {
     }
     let tap = crate::net::tap_name(id);
     let (third, fourth_base) = crate::net::net_slot(id);
-    let network = format!(
-        "{}.{}.{}.{}",
-        cfg.base[0], cfg.base[1], third, fourth_base
-    );
+    let network = format!("{}.{}.{}.{}", cfg.base[0], cfg.base[1], third, fourth_base);
     let network_cidr = format!("{network}/30");
     let gateway = format!(
         "{}.{}.{}.{}",
-        cfg.base[0], cfg.base[1], third, fourth_base + 1
+        cfg.base[0],
+        cfg.base[1],
+        third,
+        fourth_base + 1
     );
     let _ = std::process::Command::new("iptables")
         .args([
+            "-w",
+            "5",
             "-t",
             "nat",
             "-D",
@@ -449,41 +505,51 @@ pub fn tap_down_with_peers(id: Uuid, cfg: &NetConfig, peers: &[String]) {
             "MASQUERADE",
         ])
         .output();
-    let _ = std::process::Command::new("iptables")
-        .args([
-            "-D",
-            "FORWARD",
-            "-i",
-            &tap,
-            "-o",
-            &cfg.uplink,
-            "-j",
-            "ACCEPT",
-        ])
-        .output();
-    let _ = std::process::Command::new("iptables")
-        .args([
-            "-D",
-            "FORWARD",
-            "-i",
-            &cfg.uplink,
-            "-o",
-            &tap,
-            "-m",
-            "state",
-            "--state",
-            "RELATED,ESTABLISHED",
-            "-j",
-            "ACCEPT",
-        ])
-        .output();
-    for rule in crate::net::egress_rules_with_peers(&tap, &gateway, &cfg.allow, peers) {
-        let mut args = vec!["-D".to_owned(), "FORWARD".to_owned()];
-        args.extend(rule);
-        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    {
+        let _forward_chain_guard = lock_forward_chain();
         let _ = std::process::Command::new("iptables")
-            .args(args)
+            .args([
+                "-w",
+                "5",
+                "-D",
+                "FORWARD",
+                "-i",
+                &tap,
+                "-o",
+                &cfg.uplink,
+                "-j",
+                "ACCEPT",
+            ])
             .output();
+        let _ = std::process::Command::new("iptables")
+            .args([
+                "-w",
+                "5",
+                "-D",
+                "FORWARD",
+                "-i",
+                &cfg.uplink,
+                "-o",
+                &tap,
+                "-m",
+                "state",
+                "--state",
+                "RELATED,ESTABLISHED",
+                "-j",
+                "ACCEPT",
+            ])
+            .output();
+        for rule in crate::net::egress_rules_with_peers(&tap, &gateway, &cfg.allow, peers) {
+            let mut args = vec![
+                "-w".to_owned(),
+                "5".to_owned(),
+                "-D".to_owned(),
+                "FORWARD".to_owned(),
+            ];
+            args.extend(rule);
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let _ = std::process::Command::new("iptables").args(args).output();
+        }
     }
     let input_drop = crate::net::input_drop_rule(&tap);
     delete_iptables_rule(SHINU_INPUT_CHAIN, &input_drop);
@@ -509,7 +575,9 @@ pub fn prepare(dir: &Path, uid: u32, gid: u32) -> Result<String> {
             .arg(&key)
             .status()?;
         if !status.success() {
-            return Err(Error::Internal("ssh-keygen failed for space key".to_owned()));
+            return Err(Error::Internal(
+                "ssh-keygen failed for space key".to_owned(),
+            ));
         }
     }
     let public = std::fs::read_to_string(key.with_extension("pub"))?;
@@ -589,12 +657,11 @@ fn is_vm_process(pid: u32, config: &Path, id: Uuid) -> bool {
     };
     let config_needle = config.as_os_str().as_encoded_bytes();
     let id_text = id.to_string();
-    let id_with_equals = format!("--id={id_text}");
     let mut id_matches = false;
     let mut config_matches = false;
     let mut previous_was_id_flag = false;
     for arg in cmdline.split(|byte| *byte == 0) {
-        if arg == id_with_equals.as_bytes()
+        if (arg.strip_prefix(b"--id=") == Some(id_text.as_bytes()))
             || (previous_was_id_flag && arg == id_text.as_bytes())
         {
             id_matches = true;
@@ -624,31 +691,23 @@ pub fn touch(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Control-plane requests answer promptly; anything slower is a wedged VMM,
-/// so five seconds is a deadline rather than a guess.
+/// Control-plane calls need a short deadline; a slow response indicates a
+/// wedged VMM.
 const API_TIMEOUT_SECS: u32 = 5;
 
-/// Snapshot creation is bounded by how fast guest RAM reaches the disk, not
-/// by VMM responsiveness. Measured at 5.4s for a 1 GiB guest on local flash,
-/// which sits right on the control-plane deadline; a large guest on slower
-/// storage is minutes away. Cutting the request off does not stop Firecracker,
-/// it just abandons a snapshot that is still being written, so allow room for
-/// the write to finish and let the VM-level wedge detection catch real hangs.
+/// Snapshot writes scale with guest memory and storage speed, so they use a
+/// separate generous deadline rather than the control-plane timeout.
 const SNAPSHOT_TIMEOUT_SECS: u32 = 900;
 
-/// One request against a VM's control API. `curl` is already this crate's
-/// HTTP client (see `fetch_tarball`), and it speaks unix sockets, so no
-/// hand-rolled HTTP and no new dependency.
-///
-/// `None` means the transfer failed or Firecracker refused the request:
-/// without `--fail`, curl exits 0 on a completed HTTP 4xx/5xx and callers
-/// would treat a `fault_message` body as success.
+/// Sends one request to Firecracker's Unix-socket control API.
+/// `None` means transport failure or Firecracker rejection. The curl
+/// `--fail` flag makes HTTP 4xx/5xx responses failures instead of bodies.
 fn api(dir: &Path, method: &str, path: &str, body: Option<&str>) -> Option<String> {
     api_with_timeout(dir, method, path, body, API_TIMEOUT_SECS)
 }
 
-/// `api` with an explicit deadline, for requests whose duration scales with
-/// guest size rather than VMM latency.
+/// Uses a caller-supplied deadline for requests whose duration scales with
+/// guest size.
 fn api_with_timeout(
     dir: &Path,
     method: &str,
@@ -680,34 +739,22 @@ fn api_with_timeout(
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Pulls one unsigned field out of the balloon statistics object.
-///
-/// A hand-rolled scan rather than a `serde_json::Value`: the reply is a
-/// flat object of numbers, and this avoids allocating a parse tree in the
-/// daemon's poll loop every 30 seconds.
+/// Reads an unsigned numeric field from Firecracker's flat statistics object.
 fn stat_field(stats: &str, key: &str) -> Option<u64> {
     let needle = format!("\"{key}\":");
     let rest = &stats[stats.find(&needle)? + needle.len()..];
-    let digits: String = rest
-        .trim_start()
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
-    digits.parse().ok()
+    let digits = rest.trim_start();
+    let end = digits
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(digits.len());
+    digits[..end].parse().ok()
 }
 
-/// Hands the guest's unused memory back to the host.
-///
-/// Cold boot enables the balloon's free page reporting, which already returns
-/// pages the guest kernel has on its free list (measured: RSS 102.7 MiB → 596.9
-/// MiB → 105.0 MiB within 5s of the guest freeing 500 MiB, no inflate issued).
-/// Reporting cannot see memory the guest is still using, so an idle guest
-/// holding hundreds of MiB of page cache stays resident on the host; inflating
-/// the balloon makes the guest drop that cache and return it.
-///
-/// The target comes from the guest's own `available_memory` rather than a
-/// guess, less `keep_mib` so the page cache and a working margin survive.
-/// Returns the MiB actually asked for.
+/// Hands guest-unused memory back to the host through Firecracker's balloon.
+/// Free-page reporting returns pages the guest kernel marks free, but explicit
+/// inflation remains necessary for page cache. `keep_mib` leaves a working
+/// margin available to the guest.
+/// Returns the MiB actually requested.
 pub fn reclaim(dir: &Path, keep_mib: u64) -> Option<u64> {
     let stats = api(dir, "GET", "/balloon/statistics", None)?;
     let available = stat_field(&stats, "available_memory")? / (1024 * 1024);
@@ -757,14 +804,7 @@ impl SnapshotKind {
 /// land in the jail and must be moved out by the caller.
 pub fn snapshot(dir: &Path, kind: SnapshotKind) -> Result<(PathBuf, PathBuf)> {
     release(dir);
-    if api(
-        dir,
-        "PATCH",
-        "/vm",
-        Some("{\"state\": \"Paused\"}"),
-    )
-    .is_none()
-    {
+    if api(dir, "PATCH", "/vm", Some("{\"state\": \"Paused\"}")).is_none() {
         return Err(Error::Internal(
             "failed to pause VM for snapshot".to_owned(),
         ));
@@ -784,24 +824,10 @@ pub fn snapshot(dir: &Path, kind: SnapshotKind) -> Result<(PathBuf, PathBuf)> {
     {
         // A failed create leaves Firecracker paused, so always make the best
         // effort to restore normal VM operation before reporting the error.
-        let _ = api(
-            dir,
-            "PATCH",
-            "/vm",
-            Some("{\"state\": \"Resumed\"}"),
-        );
-        return Err(Error::Internal(
-            "failed to create VM snapshot".to_owned(),
-        ));
+        let _ = api(dir, "PATCH", "/vm", Some("{\"state\": \"Resumed\"}"));
+        return Err(Error::Internal("failed to create VM snapshot".to_owned()));
     }
-    if api(
-        dir,
-        "PATCH",
-        "/vm",
-        Some("{\"state\": \"Resumed\"}"),
-    )
-    .is_none()
-    {
+    if api(dir, "PATCH", "/vm", Some("{\"state\": \"Resumed\"}")).is_none() {
         return Err(Error::Internal(
             "failed to resume VM after snapshot".to_owned(),
         ));
@@ -812,16 +838,11 @@ pub fn snapshot(dir: &Path, kind: SnapshotKind) -> Result<(PathBuf, PathBuf)> {
     ))
 }
 
-/// Byte ranges the diff actually wrote, found with `SEEK_DATA`/`SEEK_HOLE`.
-///
-/// Firecracker writes a diff as a sparse file: holes are pages the guest never
-/// touched, and allocated ranges are the dirty pages. That distinction cannot
-/// be recovered from the bytes themselves, because a dirty page whose new
-/// contents are all zero looks exactly like a hole to any content-based scan.
-/// The kernel knows which is which, so ask it.
+/// Firecracker diff snapshots are sparse: allocated extents are dirty pages
+/// and holes are untouched. The kernel's extent view is required because a
+/// dirty page filled with zeroes is indistinguishable from a hole by content.
 fn written_extents(file: &std::fs::File, size: u64) -> Result<Vec<(u64, u64)>> {
-    // Declared rather than taken from a crate: this is the only syscall in the
-    // codebase std does not expose, and one extern beats a dependency.
+    // `lseek` with SEEK_DATA/SEEK_HOLE is the kernel's sparse extent view.
     unsafe extern "C" {
         fn lseek(fd: i32, offset: i64, whence: i32) -> i64;
     }
@@ -830,7 +851,9 @@ fn written_extents(file: &std::fs::File, size: u64) -> Result<Vec<(u64, u64)>> {
     let fd = std::os::fd::AsRawFd::as_raw_fd(file);
     let mut extents = Vec::new();
     let mut offset = 0i64;
-    while (offset as u64) < size {
+    while offset >= 0 && offset.cast_unsigned() < size {
+        // SAFETY: `fd` comes from the open `File`, and the constants match
+        // Linux's `SEEK_DATA`/`SEEK_HOLE` ABI.
         let start = unsafe { lseek(fd, offset, SEEK_DATA) };
         if start < 0 {
             let error = std::io::Error::last_os_error();
@@ -845,6 +868,8 @@ fn written_extents(file: &std::fs::File, size: u64) -> Result<Vec<(u64, u64)>> {
                 "cannot map written extents of a diff snapshot: {error}"
             )));
         }
+        // SAFETY: `fd` remains the open snapshot descriptor and `SEEK_HOLE`
+        // is the Linux ABI constant declared above.
         let end = unsafe { lseek(fd, start, SEEK_HOLE) };
         if end < 0 {
             return Err(Error::Internal(format!(
@@ -852,23 +877,21 @@ fn written_extents(file: &std::fs::File, size: u64) -> Result<Vec<(u64, u64)>> {
                 std::io::Error::last_os_error()
             )));
         }
-        extents.push((start as u64, (end - start) as u64));
+        if end < start {
+            return Err(Error::Internal(
+                "diff snapshot extent ended before it started".to_owned(),
+            ));
+        }
+        extents.push((start.cast_unsigned(), (end - start).cast_unsigned()));
         offset = end;
     }
     Ok(extents)
 }
 
 /// Builds a loadable memory image from a full base and a Firecracker diff.
-///
-/// The reflink keeps every untouched page shared with the base, then only the
-/// diff's written extents are copied over it. Both halves matter:
-///
-/// Copying the whole diff instead (`dd conv=notrunc`) would write its holes as
-/// zeros, which both destroys the base's untouched pages and allocates the
-/// full 1 GiB, defeating the reflink. Skipping zeros instead (`conv=sparse`)
-/// would drop pages the guest deliberately zeroed and leave the base's stale
-/// bytes there. Measured, both produced a wrong image; extents are what
-/// distinguish "never written" from "written as zero".
+/// Reflinking keeps untouched pages shared with the base; only allocated diff
+/// extents are copied over it. Holes must not be copied as zeroes, while
+/// zero-filled dirty extents must not be skipped.
 pub fn merge_snapshot_memory(base: &Path, diff: &Path, merged: &Path) -> Result<()> {
     if merged.exists() {
         std::fs::remove_file(merged)?;
@@ -879,10 +902,20 @@ pub fn merge_snapshot_memory(base: &Path, diff: &Path, merged: &Path) -> Result<
     let extents = written_extents(&source, size)?;
     let target = std::fs::OpenOptions::new().write(true).open(merged)?;
     let mut buffer = vec![0u8; 1024 * 1024];
+    let buffer_len = u64::try_from(buffer.len()).map_err(|error| {
+        Error::Internal(format!(
+            "snapshot merge buffer length does not fit u64: {error}"
+        ))
+    })?;
     for (offset, length) in extents {
         let mut copied = 0u64;
         while copied < length {
-            let chunk = std::cmp::min(buffer.len() as u64, length - copied) as usize;
+            let chunk =
+                usize::try_from(std::cmp::min(buffer_len, length - copied)).map_err(|error| {
+                    Error::Internal(format!(
+                        "snapshot merge chunk length does not fit usize: {error}"
+                    ))
+                })?;
             let at = offset + copied;
             std::os::unix::fs::FileExt::read_exact_at(&source, &mut buffer[..chunk], at)?;
             std::os::unix::fs::FileExt::write_all_at(&target, &buffer[..chunk], at)?;
@@ -904,16 +937,9 @@ fn signal(pid: u32, sig: &str) -> bool {
 
 /// True once the guest's sshd is ready to serve on `port`.
 ///
-/// Firecracker's host vsock is not a transparent pipe: a client sends
-/// `CONNECT <port>\n` and gets `OK <assigned>` back only if something in
-/// the guest accepts.
-///
-/// A successful handshake alone is not enough, though. The bridge inside
-/// the guest starts accepting before sshd is serving, so a VM could pass
-/// that check and still refuse the very next connection — which is how a
-/// first exec failed with 255 while two VMs were booting at once. Waiting
-/// for the SSH identification string means readiness is decided by the
-/// thing exec actually depends on.
+/// A successful vsock CONNECT only proves that the bridge accepts a socket.
+/// Requiring the SSH identification line makes readiness match the service
+/// that execution actually uses.
 fn probe(uds: &Path, port: u16) -> bool {
     use std::io::{Read, Write};
     let Ok(mut stream) = std::os::unix::net::UnixStream::connect(uds) else {
@@ -928,8 +954,7 @@ fn probe(uds: &Path, port: u16) -> bool {
     {
         return false;
     }
-    // One byte at a time: a buffered reader would swallow the banner that
-    // follows the handshake line, and both lines are read here.
+    // Read one byte at a time so the handshake read cannot consume the SSH banner.
     let line = |stream: &mut std::os::unix::net::UnixStream| -> Option<Vec<u8>> {
         let mut out = Vec::new();
         let mut byte = [0u8; 1];
@@ -954,9 +979,8 @@ fn link_resource(src: &Path, dst: &Path) -> Result<()> {
     if dst.exists() {
         std::fs::remove_file(dst)?;
     }
-    // A 2 GiB image must stay on the same filesystem as its source: a
-    // hardlink is O(1) and preserves CoW accounting, while copying would
-    // consume the whole image and silently destroy that invariant.
+    // Hardlinks preserve zero-copy CoW accounting; copying the image would
+    // consume its full size and violate the jail layout invariant.
     std::fs::hard_link(src, dst).map_err(|error| {
         Error::Internal(format!(
             "hard-link {} -> {} failed (cross-device links are not supported): {error}",
@@ -1019,25 +1043,18 @@ pub struct RestoreFiles<'a> {
 
 /// Builds the `PUT /snapshot/load` request body.
 ///
-/// `track_dirty_pages` does not survive a restore: Firecracker rebuilds the
-/// bitmap from this request and does not inherit it from the snapshot. Omitting
-/// it leaves a restored VM with no dirty tracking, so every later diff degrades
-/// to a full memory dump (measured: three successive diffs of an idle restored
-/// guest were 268 MiB each, against 8 MiB once the flag was sent). Cold boot
-/// sets the same flag in `fc.json`; a restore has to ask for it again.
-///
-/// `tap` repoints the interface when restoring into a different space. A
-/// snapshot records the tap it was captured on, so a fork or any re-derived tap
-/// must override it or Firecracker reopens the source's tap and fails with
-/// EBUSY while that VM still owns it.
+/// Firecracker rebuilds dirty-page tracking from the load request rather than
+/// inheriting it from the snapshot, so restores must set `track_dirty_pages`.
+/// A snapshot's interface belongs to its source space; `tap` overrides it so
+/// a fork does not reopen the source tap.
 fn snapshot_load_body(tap: Option<&str>) -> String {
     let base = "\"snapshot_path\":\"snap.state\",\"mem_backend\":{\"backend_path\":\"snap.mem\",\"backend_type\":\"File\"},\"track_dirty_pages\":true,\"resume_vm\":true";
-    match tap {
-        Some(tap) => format!(
+    tap.map_or_else(
+        || format!("{{{base}}}"),
+        |tap| format!(
             "{{{base},\"network_overrides\":[{{\"iface_id\":\"eth0\",\"host_dev_name\":\"{tap}\"}}]}}"
         ),
-        None => format!("{{{base}}}"),
-    }
+    )
 }
 
 /// Boots the VM unless it is already up. Returns whether a boot happened.
@@ -1068,7 +1085,10 @@ pub fn start(
     }
     let kernel = shinu_core::kernel_path(root);
     if !kernel.exists() {
-        return Err(Error::NotFound(format!("kernel image: {}", kernel.display())));
+        return Err(Error::NotFound(format!(
+            "kernel image: {}",
+            kernel.display()
+        )));
     }
 
     // A stale socket or jail from a dead VM must not make the next jailer
@@ -1131,14 +1151,16 @@ pub fn start(
         // Firecracker process we identify below.
         let log = std::fs::File::create(dir.join("console.log"))?;
         let memory_limit = format!("memory.max={mem_mib}M");
+        let jailer = shinu_core::jailer_bin(root);
+        let firecracker = shinu_core::firecracker_bin(root);
         let mut command = std::process::Command::new("setsid");
         command
             .arg("--fork")
-            .arg(shinu_core::jailer_bin(root))
+            .arg(&jailer)
             .arg("--id")
             .arg(id.to_string())
             .arg("--exec-file")
-            .arg(shinu_core::firecracker_bin(root))
+            .arg(&firecracker)
             .arg("--uid")
             .arg(cfg.jail_uid.to_string())
             .arg("--gid")
@@ -1157,6 +1179,10 @@ pub fn start(
         if restore.is_none() {
             command.arg("--config-file").arg("fc.json");
         }
+        // The assets cross from the daemon's root privilege into the jailer
+        // boundary. Re-read no-follow metadata immediately before execution;
+        // an unsafe replacement must fail closed rather than reach `setsid`.
+        validate_vm_assets(&jailer, &firecracker)?;
         let status = command
             .stdin(std::process::Stdio::null())
             .stderr(log.try_clone()?)
@@ -1226,9 +1252,7 @@ pub fn start(
                 let _ = stop(&dir, net_cfg);
                 let _ = std::fs::remove_file(jail.join(JAIL_SNAP_MEM));
                 let _ = std::fs::remove_file(jail.join(JAIL_SNAP_STATE));
-                return Err(Error::Internal(
-                    "failed to load VM snapshot".to_owned(),
-                ));
+                return Err(Error::Internal("failed to load VM snapshot".to_owned()));
             }
         }
 
@@ -1264,7 +1288,7 @@ pub fn start(
                     "failed to correct restored guest clock for {id}: exit status {status}"
                 ),
                 Err(error) => {
-                    eprintln!("failed to correct restored guest clock for {id}: {error}")
+                    eprintln!("failed to correct restored guest clock for {id}: {error}");
                 }
             }
             // The snapshot also carries the source space's address. Each space
@@ -1288,7 +1312,7 @@ pub fn start(
                         "failed to reconfigure restored guest network for {id}: exit status {status}"
                     ),
                     Err(error) => {
-                        eprintln!("failed to reconfigure restored guest network for {id}: {error}")
+                        eprintln!("failed to reconfigure restored guest network for {id}: {error}");
                     }
                 }
             }
@@ -1317,7 +1341,10 @@ fn dir_id(dir: &Path) -> Result<Uuid> {
         .and_then(|name| name.to_str())
         .ok_or_else(|| Error::Internal(format!("VM directory has no UUID: {}", dir.display())))?;
     Uuid::parse_str(name).map_err(|error| {
-        Error::Internal(format!("VM directory is not a UUID ({}): {error}", dir.display()))
+        Error::Internal(format!(
+            "VM directory is not a UUID ({}): {error}",
+            dir.display()
+        ))
     })
 }
 /// Whether an `e2fsck` exit status means the image is usable.
@@ -1339,7 +1366,10 @@ pub fn reclaim_image(image: &Path) -> Result<u64> {
 
     let before = shinu_core::btrfs::exclusive(image)?;
     let image_arg = image.to_str().ok_or_else(|| {
-        Error::Internal(format!("image path is not valid UTF-8: {}", image.display()))
+        Error::Internal(format!(
+            "image path is not valid UTF-8: {}",
+            image.display()
+        ))
     })?;
     let args = ["-E", "discard", "-fp", image_arg];
     let output = std::process::Command::new("e2fsck").args(args).output()?;
@@ -1353,19 +1383,17 @@ pub fn reclaim_image(image: &Path) -> Result<u64> {
 const RECLAIM_GROWTH_BYTES: u64 = 8 * 1024 * 1024;
 
 fn reclaim_due(current: u64, baseline: Option<u64>) -> bool {
-    baseline.is_none_or(|baseline| {
-        current.saturating_sub(baseline) >= RECLAIM_GROWTH_BYTES
-    })
+    baseline.is_none_or(|baseline| current.saturating_sub(baseline) >= RECLAIM_GROWTH_BYTES)
 }
-const RECLAIM_DELAY: Duration = Duration::from_secs(60);
+const RECLAIM_DELAY: Duration = Duration::from_mins(1);
 
 fn stopped_at_path(dir: &Path) -> PathBuf {
     dir.join("stopped_at")
 }
 
 fn stopped_long_enough(dir: &Path) -> bool {
-    let Ok(stopped_at) = std::fs::metadata(stopped_at_path(dir))
-        .and_then(|metadata| metadata.modified())
+    let Ok(stopped_at) =
+        std::fs::metadata(stopped_at_path(dir)).and_then(|metadata| metadata.modified())
     else {
         // VMs stopped before this marker existed have already had an
         // unbounded amount of time for their dirty pages to settle.
@@ -1416,11 +1444,8 @@ fn reclaim_stopped_image(root: &Path, dir: &Path, id: Uuid) {
         }
         return;
     }
-    // e2fsck can take seconds to tens of seconds on a large image. The
-    // sweep pays that cost in the background for bounded host usage,
-    // which is the premise that makes SaaS disk billing viable. Space
-    // images are btrfs reflink clones: discard releases only unshared
-    // extents, while shared checkpoint blocks remain protected by COW.
+    // Run e2fsck off the request path. Reflinked checkpoint extents remain
+    // protected by CoW, while discard releases only unshared blocks.
     match reclaim_image(&image) {
         Ok(bytes) => {
             if bytes > 0 {
@@ -1435,9 +1460,14 @@ fn reclaim_stopped_image(root: &Path, dir: &Path, id: Uuid) {
                         image.display()
                     ),
                 }
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "Reclaim bytes are converted to f64 solely for a human-readable MiB display metric."
+                )]
+                let reclaimed_mib = bytes as f64 / (1024.0 * 1024.0);
                 eprintln!(
                     "reclaimed {:.1} MiB from {}",
-                    bytes as f64 / (1024.0 * 1024.0),
+                    reclaimed_mib,
                     image.display()
                 );
             } else {
@@ -1450,31 +1480,27 @@ fn reclaim_stopped_image(root: &Path, dir: &Path, id: Uuid) {
         Err(error) => eprintln!("failed to reclaim {}: {error}", image.display()),
     }
 }
-/// Graceful guest shutdown first, signals only as a fallback.
-///
-/// The API socket could send CtrlAltDel, but SIGTERM kills the VMM
-/// outright either way: the guest never runs its shutdown path, so
-/// everything still in its page cache is lost. Writes from the previous
-/// command would silently vanish (measured: a file written and read back
-/// fine within one session came back empty after a stop). So flush the
-/// guest first, and keep SIGTERM/SIGKILL for one that is wedged or gone.
+/// Flushes guest writes before stopping the VMM; signals are only a fallback
+/// for a wedged or already-unresponsive process.
 pub fn stop(dir: &Path, cfg: &NetConfig) -> Result<bool> {
     stop_with_peers(dir, cfg, &[])
 }
 
 pub fn stop_with_peers(dir: &Path, cfg: &NetConfig, peers: &[String]) -> Result<bool> {
     let id = dir_id(dir)?;
+    let vsock = vsock_path(dir);
+    let api_socket = api_path(dir);
+    let pid_file = pid_path(dir);
     let Some(pid) = running_pid(dir) else {
-        let _ = std::fs::remove_file(vsock_path(dir));
-        let _ = std::fs::remove_file(api_path(dir));
-        let _ = std::fs::remove_file(pid_path(dir));
+        let _ = std::fs::remove_file(&vsock);
+        let _ = std::fs::remove_file(&api_socket);
+        let _ = std::fs::remove_file(&pid_file);
         tap_down_with_peers(id, cfg, peers);
         clean_jail(dir)?;
         mark_stopped(dir);
         return Ok(false);
     };
 
-    let vsock = vsock_path(dir);
     if vsock.exists() {
         // Durability needs exactly one thing: the guest's dirty pages on
         // the image before the VMM dies. `sync` plus a read-only remount
@@ -1516,35 +1542,23 @@ pub fn stop_with_peers(dir: &Path, cfg: &NetConfig, peers: &[String]) -> Result<
             "firecracker pid {pid} did not stop"
         )));
     }
-    let _ = std::fs::remove_file(vsock_path(dir));
-    let _ = std::fs::remove_file(api_path(dir));
-    let _ = std::fs::remove_file(pid_path(dir));
+    let _ = std::fs::remove_file(&vsock);
+    let _ = std::fs::remove_file(&api_socket);
+    let _ = std::fs::remove_file(&pid_file);
     tap_down_with_peers(id, cfg, peers);
     clean_jail(dir)?;
     mark_stopped(dir);
     Ok(true)
 }
 
-/// Idle housekeeping, in two stages.
-///
-/// A VM that has been unused for a *tenth* of the idle window first has
-/// its unused memory handed back to the host; one that passes the full
-/// window is shut down. Reclaiming first means a VM the user comes back
-/// to is still warm — the balloon deflates in `start` — while the host
-/// stops paying for memory nobody is using. Without this stage a VM's
-/// host footprint only ever grows, because Firecracker has no free-page
-/// reporting to return pages on its own.
-///
-/// A stopped image is compacted here instead of inside `stop`: the VM's
-/// dirty pages can still be written back asynchronously after Firecracker
-/// exits, so running e2fsck immediately can miss blocks that are about to
-/// land in the image. The `reclaimed` marker avoids rescanning unchanged
-/// images on every sweep while keeping the work off the request path.
-///
-/// A missing `last_used` counts as "just used" rather than "ancient": a
-/// VM that booted a moment ago must not be reaped before its first
-/// command.
+/// Idle housekeeping reclaims memory before shutting down a VM at the full
+/// idle deadline. Stopped images are compacted on a later sweep so kernel
+/// writeback has settled; the reclaim marker avoids rescanning unchanged
+/// images. A missing `last_used` is treated as just used so a fresh VM is not
+/// reaped before its first command.
 pub fn sweep_idle(root: &Path, idle_secs: u64, cfg: &NetConfig) -> Result<Vec<PathBuf>> {
+    // Leave page-cache and working-set headroom for the next guest command.
+    const KEEP_MIB: u64 = 128;
     let mut stopped = Vec::new();
     let vm_root = root.join("vm");
     let entries = match std::fs::read_dir(&vm_root) {
@@ -1553,10 +1567,6 @@ pub fn sweep_idle(root: &Path, idle_secs: u64, cfg: &NetConfig) -> Result<Vec<Pa
         Err(error) => return Err(error.into()),
     };
     let now = now_secs();
-    // Enough headroom for the guest's page cache and a working margin;
-    // reclaiming every last free page would make the next command swap
-    // its own working set back in.
-    const KEEP_MIB: u64 = 128;
     for entry in entries.flatten() {
         let dir = entry.path();
         if !is_running(&dir) {
@@ -1584,7 +1594,7 @@ pub fn sweep_idle(root: &Path, idle_secs: u64, cfg: &NetConfig) -> Result<Vec<Pa
 }
 #[cfg(test)]
 mod jail_tests {
-    use super::{jail_root, jail_socket, VmConfig};
+    use super::{VmConfig, jail_root, jail_socket};
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
@@ -1626,9 +1636,7 @@ mod jail_tests {
         let id = Uuid::from_u128(1);
         assert_eq!(
             jail_root(Path::new("/var/lib/shinu"), id),
-            PathBuf::from(format!(
-                "/var/lib/shinu/jail/firecracker/{id}/root"
-            ))
+            PathBuf::from(format!("/var/lib/shinu/jail/firecracker/{id}/root"))
         );
     }
 
@@ -1638,7 +1646,10 @@ mod jail_tests {
         let root = jail_root(Path::new("/srv/shinu"), id);
         let socket = jail_socket(Path::new("/srv/shinu"), id);
         assert!(socket.starts_with(&root));
-        assert_eq!(socket.strip_prefix(root).expect("socket relative"), Path::new("fc.sock"));
+        assert_eq!(
+            socket.strip_prefix(root).expect("socket relative"),
+            Path::new("fc.sock")
+        );
     }
 
     #[test]
@@ -1677,10 +1688,40 @@ mod jail_tests {
     }
 }
 #[cfg(test)]
+mod asset_validation_tests {
+    use super::{trusted_asset_attributes, validate_vm_asset};
+    use std::os::unix::fs::symlink;
+    use uuid::Uuid;
+
+    #[test]
+    fn execution_asset_attributes_require_root_owned_nonwritable_executable() {
+        assert!(trusted_asset_attributes(true, 0, 0o755, 0));
+        assert!(!trusted_asset_attributes(false, 0, 0o755, 0));
+        assert!(!trusted_asset_attributes(true, 1000, 0o755, 0));
+        assert!(!trusted_asset_attributes(true, 0, 0o775, 0));
+        assert!(!trusted_asset_attributes(true, 0, 0o644, 0));
+    }
+
+    #[test]
+    fn execution_rejects_a_symlinked_asset() {
+        let parent = std::env::temp_dir().join(format!("shinu-vm-assets-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&parent).expect("create fixture parent");
+        let target = parent.join("target");
+        let link = parent.join("jailer");
+        std::fs::write(&target, b"not a trusted binary").expect("write fixture target");
+        symlink(&target, &link).expect("create asset symlink");
+
+        let result = validate_vm_asset(&link, "jailer");
+
+        assert!(matches!(result, Err(super::Error::Invalid(_))));
+        std::fs::remove_dir_all(parent).expect("remove fixture");
+    }
+}
+#[cfg(test)]
 mod reclaim_tests {
     use super::{e2fsck_ok, reclaim_due, reclaim_image, sweep_idle};
     use crate::NetConfig;
-        use shinu_core::{space_image, vm_dir};
+    use shinu_core::{space_image, vm_dir};
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
     use uuid::Uuid;
@@ -1712,13 +1753,9 @@ mod reclaim_tests {
         assert!(!reclaim_due(0, Some(1)));
     }
 
-
     #[test]
     fn sweep_ignores_reclaim_failure_for_stopped_space() {
-        let mut component = OsString::from(format!(
-            "shinu-sweep-reclaim-{}",
-            std::process::id()
-        ));
+        let mut component = OsString::from(format!("shinu-sweep-reclaim-{}", std::process::id()));
         component.push(OsString::from_vec(vec![0xff]));
         let root = std::env::temp_dir().join(component);
         let id = Uuid::from_u128(0x1234);
@@ -1745,14 +1782,17 @@ mod reclaim_tests {
 #[cfg(test)]
 mod input_chain_tests {
     use super::{
-        input_chain_create_args, input_chain_jump_add_args, input_chain_jump_check_args,
-        input_rule_args, SHINU_INPUT_CHAIN,
+        SHINU_INPUT_CHAIN, input_chain_create_args, input_chain_jump_add_args,
+        input_chain_jump_check_args, input_rule_args,
     };
 
     #[test]
     fn chain_creation_and_input_jump_are_idempotent_argv() {
         assert_eq!(input_chain_create_args(), ["-N", "SHINU-INPUT"]);
-        assert_eq!(input_chain_jump_check_args(), ["-C", "INPUT", "-j", "SHINU-INPUT"]);
+        assert_eq!(
+            input_chain_jump_check_args(),
+            ["-C", "INPUT", "-j", "SHINU-INPUT"]
+        );
         assert_eq!(
             input_chain_jump_add_args(),
             ["-I", "INPUT", "1", "-j", "SHINU-INPUT"]
@@ -1841,11 +1881,8 @@ pub fn exec_in_vm(vsock_uds: &Path, key: &Path, port: u16, cmd: &[String]) -> Re
 mod snapshot_load_tests {
     use super::snapshot_load_body;
 
-    // Firecracker rebuilds the dirty-page bitmap from the load request rather
-    // than inheriting it from the snapshot, and silently accepts a body that
-    // omits the flag. The failure is invisible until diffs of an idle restored
-    // guest come back at 268 MiB instead of 8 MiB, so pin the flag on both
-    // branches rather than relying on a live re-measurement to catch it.
+    // Firecracker rebuilds dirty-page tracking from the load request, so the
+    // restore body must keep this flag on every branch.
     #[test]
     fn every_restore_requests_dirty_page_tracking() {
         assert!(snapshot_load_body(None).contains("\"track_dirty_pages\":true"));

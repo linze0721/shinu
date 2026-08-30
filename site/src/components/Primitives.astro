@@ -1,0 +1,36 @@
+---
+import { primitives } from "../content/facts";
+---
+
+<section id="primitives" class="shell py-20 md:py-24" aria-labelledby="primitives-heading">
+  <header class="reveal max-w-[60ch]">
+    <h2
+      id="primitives-heading"
+      class="text-3xl font-medium tracking-tight text-balance text-ink md:text-5xl"
+    >
+      Four powers. Nothing else to learn.
+    </h2>
+  </header>
+
+  <div class="mt-10 md:mt-14">
+    {
+      primitives.map((p) => (
+        <article class="reveal rule-t grid grid-cols-1 gap-6 py-10 md:grid-cols-12 md:gap-8 md:py-12">
+          <div class="md:col-span-4">
+            <p class="font-mono text-3xl tracking-tight text-jade-600 md:text-4xl">{p.verb}</p>
+            <p class="mt-5">
+              <code class="inline-block rounded-[10px] bg-sunken px-2.5 py-1 font-mono text-xs text-ink-muted">
+                {p.signature}
+              </code>
+            </p>
+          </div>
+          <div class="md:col-span-8">
+            <h3 class="text-2xl font-normal tracking-tight text-ink md:text-3xl">{p.title}</h3>
+            <p class="mt-4 max-w-[65ch] leading-relaxed text-ink-soft">{p.body}</p>
+          </div>
+        </article>
+      ))
+    }
+    <div class="rule-t" aria-hidden="true"></div>
+  </div>
+</section>

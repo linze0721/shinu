@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 use rusqlite::types::Type;
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -54,7 +54,7 @@ pub struct Ckpt {
     /// True when memory and vCPU state files accompany the disk image.
     #[serde(default)]
     pub full: bool,
-    /// Memory state this checkpoint overlays; `None` means a standalone full snapshot.
+    /// Memory state this checkpoint overlays; `None` means no memory base is required.
     #[serde(default)]
     pub base: Option<Uuid>,
     /// Firecracker snapshot data format version the memory state was captured
@@ -141,8 +141,7 @@ const SCHEMA: &str = r#"
 "#;
 
 fn migrate_space_columns(conn: &Connection) -> Result<()> {
-    // ALTER TABLE is conditional because older installs may already have
-    // rows; SQLite has no portable IF NOT EXISTS for columns.
+    // SQLite has no IF NOT EXISTS for columns, so inspect before each ALTER.
     for (name, definition) in [
         ("image", "TEXT NOT NULL DEFAULT 'void'"),
         ("vcpus", "INTEGER"),
@@ -156,7 +155,9 @@ fn migrate_space_columns(conn: &Connection) -> Result<()> {
             |row| row.get(0),
         )?;
         if present == 0 {
-            conn.execute_batch(&format!("ALTER TABLE spaces ADD COLUMN {name} {definition}"))?;
+            conn.execute_batch(&format!(
+                "ALTER TABLE spaces ADD COLUMN {name} {definition}"
+            ))?;
         }
     }
     Ok(())
@@ -177,8 +178,7 @@ pub fn validate_network_name(network: Option<&str>) -> Result<()> {
             .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'))
     {
         return Err(Error::Invalid(
-            "network name must be non-empty, at most 32 bytes, and contain only [a-z0-9-]"
-                .into(),
+            "network name must be non-empty, at most 32 bytes, and contain only [a-z0-9-]".into(),
         ));
     }
     Ok(())
@@ -229,10 +229,11 @@ fn restrict_sqlite_sidecars(root: &Path) -> Result<()> {
     // WAL/SHM are created at umask mode and hold committed pages, so
     // 0600 on shinu.db is meaningless unless the sidecars match.
     for name in ["shinu.db-wal", "shinu.db-shm"] {
-        match std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o600)) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+        if let Err(error) =
+            std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o600))
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(error.into());
         }
     }
     Ok(())
@@ -261,7 +262,9 @@ fn parse_image(value: String) -> rusqlite::Result<Image> {
         rusqlite::Error::FromSqlConversionFailure(
             3,
             Type::Text,
-            Box::new(std::io::Error::other(format!("invalid image {value}: {error}"))),
+            Box::new(std::io::Error::other(format!(
+                "invalid image {value}: {error}"
+            ))),
         )
     })
 }
@@ -296,19 +299,41 @@ fn ckpt_from_row(row: &Row<'_>) -> rusqlite::Result<Ckpt> {
     })
 }
 
-fn ckpt_params(ckpt: &Ckpt) -> [String; 10] {
-    [
-        ckpt.id.to_string(),
-        ckpt.space.to_string(),
-        ckpt.project.clone(),
-        ckpt.parent.map(|id| id.to_string()).unwrap_or_default(),
-        if ckpt.auto { "1".to_owned() } else { "0".to_owned() },
-        if ckpt.full { "1".to_owned() } else { "0".to_owned() },
-        ckpt.base.map(|id| id.to_string()).unwrap_or_default(),
-        ckpt.snapshot_version.clone().unwrap_or_default(),
-        ckpt.note.clone(),
-        ckpt.created_at.to_rfc3339(),
-    ]
+fn insert_space(tx: &Transaction<'_>, space: &Space) -> rusqlite::Result<usize> {
+    tx.execute(
+        "INSERT INTO spaces (id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            space.id.to_string(),
+            space.name,
+            space.project,
+            space.image.to_string(),
+            space.parent.map(|id| id.to_string()),
+            space.head.map(|id| id.to_string()),
+            space.vcpus,
+            space.mem_mib,
+            space.disk_mib,
+            space.network,
+            space.created_at.to_rfc3339(),
+        ],
+    )
+}
+
+fn insert_ckpt(tx: &Transaction<'_>, ckpt: &Ckpt) -> rusqlite::Result<usize> {
+    tx.execute(
+        "INSERT INTO ckpts (id, space, project, parent, auto, full, base, snapshot_version, note, created_at) VALUES (?1, ?2, ?3, NULLIF(?4, ''), ?5, ?6, NULLIF(?7, ''), NULLIF(?8, ''), ?9, ?10)",
+        params![
+            ckpt.id.to_string(),
+            ckpt.space.to_string(),
+            ckpt.project.as_str(),
+            ckpt.parent.map(|id| id.to_string()).unwrap_or_default(),
+            if ckpt.auto { "1" } else { "0" },
+            if ckpt.full { "1" } else { "0" },
+            ckpt.base.map(|id| id.to_string()).unwrap_or_default(),
+            ckpt.snapshot_version.as_deref().unwrap_or_default(),
+            ckpt.note.as_str(),
+            ckpt.created_at.to_rfc3339(),
+        ],
+    )
 }
 
 impl State {
@@ -345,36 +370,17 @@ pub fn migrate_from_json(root: &Path, conn: &Connection) -> Result<bool> {
     }
     let tx = conn.unchecked_transaction()?;
     for space in &state.spaces {
-        tx.execute(
-            "INSERT INTO spaces (id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                space.id.to_string(),
-                space.name,
-                space.project,
-                space.image.to_string(),
-                space.parent.map(|id| id.to_string()),
-                space.head.map(|id| id.to_string()),
-                space.vcpus,
-                space.mem_mib,
-                space.disk_mib,
-                space.network,
-                space.created_at.to_rfc3339(),
-            ],
-        )?;
+        insert_space(&tx, space)?;
     }
     for ckpt in &state.ckpts {
-        let values = ckpt_params(ckpt);
-        tx.execute(
-            "INSERT INTO ckpts (id, space, project, parent, auto, full, base, snapshot_version, note, created_at) VALUES (?1, ?2, ?3, NULLIF(?4, ''), ?5, ?6, NULLIF(?7, ''), NULLIF(?8, ''), ?9, ?10)",
-            params![values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[9]],
-        )?;
+        insert_ckpt(&tx, ckpt)?;
     }
     tx.commit()?;
     std::fs::rename(path, root.join("state.json.migrated"))?;
     Ok(true)
 }
 
-/// Loads the complete in-memory view for listing and history operations.
+/// Loads the complete in-memory snapshot for listing and history operations.
 pub fn load(conn: &Connection) -> Result<State> {
     let spaces = {
         let mut statement = conn.prepare(
@@ -395,7 +401,7 @@ pub fn load(conn: &Connection) -> Result<State> {
     Ok(State { spaces, ckpts })
 }
 
-/// Replaces the space and checkpoint portions of the in-memory view in one transaction.
+/// Replaces persisted space and checkpoint rows atomically.
 pub fn store(conn: &Connection, state: &State) -> Result<()> {
     for space in &state.spaces {
         validate_network_name(space.network.as_deref())?;
@@ -404,39 +410,16 @@ pub fn store(conn: &Connection, state: &State) -> Result<()> {
     tx.execute("DELETE FROM ckpts", [])?;
     tx.execute("DELETE FROM spaces", [])?;
     for space in &state.spaces {
-        tx.execute(
-            "INSERT INTO spaces (id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                space.id.to_string(),
-                space.name,
-                space.project,
-                space.image.to_string(),
-                space.parent.map(|id| id.to_string()),
-                space.head.map(|id| id.to_string()),
-                space.vcpus,
-                space.mem_mib,
-                space.disk_mib,
-                space.network,
-                space.created_at.to_rfc3339(),
-            ],
-        )?;
+        insert_space(&tx, space)?;
     }
     for ckpt in &state.ckpts {
-        let values = ckpt_params(ckpt);
-        tx.execute(
-            "INSERT INTO ckpts (id, space, project, parent, auto, full, base, snapshot_version, note, created_at) VALUES (?1, ?2, ?3, NULLIF(?4, ''), ?5, ?6, NULLIF(?7, ''), NULLIF(?8, ''), ?9, ?10)",
-            params![values[0], values[1], values[2], values[3], values[4], values[5], values[6], values[7], values[8], values[9]],
-        )?;
+        insert_ckpt(&tx, ckpt)?;
     }
     tx.commit()?;
     Ok(())
 }
 
-pub fn find_space(
-    conn: &Connection,
-    name: &str,
-    project: &str,
-) -> Result<Option<Space>> {
+pub fn find_space(conn: &Connection, name: &str, project: &str) -> Result<Option<Space>> {
     let by_name = conn
         .query_row(
             "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, created_at FROM spaces WHERE project = ?1 AND name = ?2 LIMIT 1",
@@ -459,11 +442,7 @@ pub fn find_space(
     .map_err(Into::into)
 }
 
-pub fn find_ckpt(
-    conn: &Connection,
-    id: Uuid,
-    project: &str,
-) -> Result<Option<Ckpt>> {
+pub fn find_ckpt(conn: &Connection, id: Uuid, project: &str) -> Result<Option<Ckpt>> {
     conn.query_row(
         "SELECT id, space, project, parent, auto, full, base, snapshot_version, note, created_at FROM ckpts WHERE project = ?1 AND id = ?2 LIMIT 1",
         params![project, id.to_string()],
@@ -487,18 +466,17 @@ fn normalize_email(email: &str) -> String {
     email.trim().to_lowercase()
 }
 
-
 pub fn create_user(
     conn: &Connection,
     email: &str,
     password_hash: &str,
 ) -> Result<(String, String)> {
     let email = normalize_email(email);
-    let user_id = Uuid::new_v4().to_string();
+    let user_uuid = Uuid::new_v4();
+    let user_id = user_uuid.to_string();
     // A random UUID-derived project keeps email identity and user-controlled
     // characters out of project paths.
-    let compact_id = user_id.replace('-', "");
-    let project = compact_id[..12].to_owned();
+    let project = user_uuid.simple().to_string()[..12].to_owned();
     let created_at = Utc::now().to_rfc3339();
     let tx = conn.unchecked_transaction()?;
 
@@ -521,10 +499,7 @@ pub fn create_user(
     Ok((user_id, project))
 }
 
-pub fn find_user_by_email(
-    conn: &Connection,
-    email: &str,
-) -> Result<Option<(String, String)>> {
+pub fn find_user_by_email(conn: &Connection, email: &str) -> Result<Option<(String, String)>> {
     let email = normalize_email(email);
     conn.query_row(
         "SELECT id, password_hash FROM users WHERE email = ?1 LIMIT 1",
@@ -555,12 +530,7 @@ pub fn user_email(conn: &Connection, user_id: &str) -> Result<Option<String>> {
     .map_err(Into::into)
 }
 
-pub fn create_session(
-    conn: &Connection,
-    token_hash: &str,
-    user_id: &str,
-    days: i64,
-) -> Result<()> {
+pub fn create_session(conn: &Connection, token_hash: &str, user_id: &str, days: i64) -> Result<()> {
     let created_at = Utc::now();
     let expires_at = created_at + chrono::Duration::days(days);
     conn.execute(
@@ -575,10 +545,7 @@ pub fn create_session(
     Ok(())
 }
 
-pub fn lookup_session(
-    conn: &Connection,
-    token_hash: &str,
-) -> Result<Option<String>> {
+pub fn lookup_session(conn: &Connection, token_hash: &str) -> Result<Option<String>> {
     // Both timestamps use UTC's RFC3339 representation, whose fields are
     // ordered from most to least significant, so lexical order is time order.
     let now = Utc::now().to_rfc3339();
@@ -598,12 +565,8 @@ pub fn delete_session(conn: &Connection, token_hash: &str) -> Result<()> {
 
 pub fn purge_expired_sessions(conn: &Connection) -> Result<usize> {
     let now = Utc::now().to_rfc3339();
-    Ok(conn.execute(
-        "DELETE FROM sessions WHERE expires_at <= ?1",
-        params![now],
-    )?)
+    Ok(conn.execute("DELETE FROM sessions WHERE expires_at <= ?1", params![now])?)
 }
-
 
 pub fn record_usage(
     conn: &Connection,
@@ -647,8 +610,11 @@ pub fn usage_summary(
     // The sweep records one MiB reading per pass rather than a duration,
     // so the raw sum is a sample count scaled by size. Billing wants an
     // integral, so convert here: each sample stands for one sweep period.
-    let disk_mib_hour =
-        disk_mib_samples as f64 * (shinu_core::USAGE_SAMPLE_SECS as f64 / 3600.0);
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "Billing converts integer samples to fractional MiB-hours."
+    )]
+    let disk_mib_hour = disk_mib_samples as f64 * (shinu_core::USAGE_SAMPLE_SECS as f64 / 3600.0);
     Ok(serde_json::json!({
         "project": project,
         "spaces_created": spaces_created,
@@ -666,9 +632,8 @@ pub type ProjectLimitOverrides = (Option<u32>, Option<u64>, Option<u32>, Option<
 fn project_optional_u32(value: Option<i64>, field: &str) -> Result<Option<u32>> {
     value
         .map(|value| {
-            u32::try_from(value).map_err(|error| {
-                Error::Invalid(format!("{field} limit out of range: {error}"))
-            })
+            u32::try_from(value)
+                .map_err(|error| Error::Invalid(format!("{field} limit out of range: {error}")))
         })
         .transpose()
 }
@@ -676,25 +641,21 @@ fn project_optional_u32(value: Option<i64>, field: &str) -> Result<Option<u32>> 
 fn project_optional_u64(value: Option<i64>, field: &str) -> Result<Option<u64>> {
     value
         .map(|value| {
-            u64::try_from(value).map_err(|error| {
-                Error::Invalid(format!("{field} limit out of range: {error}"))
-            })
+            u64::try_from(value)
+                .map_err(|error| Error::Invalid(format!("{field} limit out of range: {error}")))
         })
         .transpose()
 }
 
 fn project_u32(value: Option<i64>, fallback: u32, field: &str) -> Result<u32> {
-    project_optional_u32(value, field)?.map_or(Ok(fallback), Ok)
+    Ok(project_optional_u32(value, field)?.unwrap_or(fallback))
 }
 
 fn project_u64(value: Option<i64>, fallback: u64, field: &str) -> Result<u64> {
-    project_optional_u64(value, field)?.map_or(Ok(fallback), Ok)
+    Ok(project_optional_u64(value, field)?.unwrap_or(fallback))
 }
 
-fn project_limit_row(
-    conn: &Connection,
-    project: &str,
-) -> Result<Option<ProjectLimitRow>> {
+fn project_limit_row(conn: &Connection, project: &str) -> Result<Option<ProjectLimitRow>> {
     Ok(conn
         .query_row(
             "SELECT max_spaces, max_disk_mib, max_running, api_per_min FROM projects WHERE project = ?1",
@@ -770,10 +731,7 @@ pub fn clear_project_limits(conn: &Connection, project: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn project_limits(
-    conn: &Connection,
-    project: &str,
-) -> Result<Option<(u32, u64, u32, u32)>> {
+pub fn project_limits(conn: &Connection, project: &str) -> Result<Option<(u32, u64, u32, u32)>> {
     let Some((max_spaces, max_disk_mib, max_running, api_per_min)) =
         project_limit_row(conn, project)?
     else {
@@ -865,7 +823,14 @@ mod db_tests {
         for accepted in ["web", "web-01", "a", "a".repeat(32).as_str()] {
             validate_network_name(Some(accepted)).expect("accepted network name");
         }
-        for rejected in ["", "A", "web_name", "web name", "a".repeat(33).as_str(), "é"] {
+        for rejected in [
+            "",
+            "A",
+            "web_name",
+            "web name",
+            "a".repeat(33).as_str(),
+            "é",
+        ] {
             assert!(matches!(
                 validate_network_name(Some(rejected)),
                 Err(Error::Invalid(message))
@@ -889,11 +854,25 @@ mod db_tests {
         .expect("insert legacy space");
 
         migrate_space_columns(&conn).expect("apply sizing migration");
-        let row: (String, Option<i64>, Option<i64>, Option<i64>, Option<String>) = conn
+        let row: (
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        ) = conn
             .query_row(
                 "SELECT image, vcpus, mem_mib, disk_mib, network FROM spaces",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .expect("read migrated space");
         assert_eq!(row, ("void".into(), None, None, None, None));
@@ -933,10 +912,16 @@ mod db_tests {
     #[test]
     fn create_user_round_trips_identity_and_membership() {
         let conn = db();
-        let (user_id, project) = create_user(&conn, "  Alice@Example.COM ", "password-hash")
-            .expect("create user");
-        assert_eq!(user_email(&conn, &user_id).unwrap().as_deref(), Some("alice@example.com"));
-        assert_eq!(user_project(&conn, &user_id).unwrap(), Some(project.clone()));
+        let (user_id, project) =
+            create_user(&conn, "  Alice@Example.COM ", "password-hash").expect("create user");
+        assert_eq!(
+            user_email(&conn, &user_id).unwrap().as_deref(),
+            Some("alice@example.com")
+        );
+        assert_eq!(
+            user_project(&conn, &user_id).unwrap(),
+            Some(project.clone())
+        );
         assert_eq!(
             find_user_by_email(&conn, "alice@example.com").unwrap(),
             Some((user_id.clone(), "password-hash".into()))
@@ -975,8 +960,8 @@ mod db_tests {
     #[test]
     fn find_user_by_email_is_case_insensitive() {
         let conn = db();
-        let (user_id, _) = create_user(&conn, "Find@Example.com", "password-hash")
-            .expect("create user");
+        let (user_id, _) =
+            create_user(&conn, "Find@Example.com", "password-hash").expect("create user");
         let found = find_user_by_email(&conn, "  fInD@eXAMPLE.COM ")
             .expect("find user")
             .expect("user exists");
@@ -986,8 +971,8 @@ mod db_tests {
     #[test]
     fn lookup_session_returns_user_for_active_session() {
         let conn = db();
-        let (user_id, _) = create_user(&conn, "session@example.com", "password-hash")
-            .expect("create user");
+        let (user_id, _) =
+            create_user(&conn, "session@example.com", "password-hash").expect("create user");
         create_session(&conn, "active-session", &user_id, 7).expect("create session");
         assert_eq!(
             lookup_session(&conn, "active-session").unwrap(),
@@ -1000,8 +985,8 @@ mod db_tests {
     #[test]
     fn lookup_session_rejects_expired_session() {
         let conn = db();
-        let (user_id, _) = create_user(&conn, "expired@example.com", "password-hash")
-            .expect("create user");
+        let (user_id, _) =
+            create_user(&conn, "expired@example.com", "password-hash").expect("create user");
         let past = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
         conn.execute(
             "INSERT INTO sessions (id, user_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
@@ -1014,8 +999,8 @@ mod db_tests {
     #[test]
     fn purge_expired_sessions_keeps_active_sessions() {
         let conn = db();
-        let (user_id, _) = create_user(&conn, "purge@example.com", "password-hash")
-            .expect("create user");
+        let (user_id, _) =
+            create_user(&conn, "purge@example.com", "password-hash").expect("create user");
         let now = Utc::now();
         let past = (now - chrono::Duration::days(1)).to_rfc3339();
         let future = (now + chrono::Duration::days(1)).to_rfc3339();
@@ -1052,7 +1037,6 @@ mod db_tests {
         assert_eq!(memberships, 0);
     }
 
-
     #[test]
     fn open_is_idempotent_and_restricts_database_permissions() {
         let root = root();
@@ -1085,11 +1069,7 @@ mod db_tests {
             if !sidecar_path.exists() {
                 continue;
             }
-            let sidecar_mode = fs::metadata(&sidecar_path)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777;
+            let sidecar_mode = fs::metadata(&sidecar_path).unwrap().permissions().mode() & 0o777;
             assert_eq!(sidecar_mode, 0o600, "{sidecar}");
         }
         drop(conn);
@@ -1144,9 +1124,11 @@ mod db_tests {
         let (state, _, ckpt) = sample_state("alpha");
         store(&conn, &state).unwrap();
         assert!(find_space(&conn, "demo", "other").unwrap().is_none());
-        assert!(find_space(&conn, &state.spaces[0].id.to_string(), "other")
-            .unwrap()
-            .is_none());
+        assert!(
+            find_space(&conn, &state.spaces[0].id.to_string(), "other")
+                .unwrap()
+                .is_none()
+        );
         assert!(find_ckpt(&conn, ckpt.id, "other").unwrap().is_none());
     }
 
@@ -1177,6 +1159,10 @@ mod db_tests {
         // 120 samples of 64 MiB at a 30-second period is exactly 64 MiB-hours.
         assert_eq!(usage["disk_mib_samples"], 64);
         let hours = usage["disk_mib_hour"].as_f64().expect("mib-hours");
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "The assertion mirrors billing's fractional MiB-hour conversion."
+        )]
         let expected = 64.0 * (shinu_core::USAGE_SAMPLE_SECS as f64 / 3600.0);
         assert!((hours - expected).abs() < 1e-9, "got {hours}");
         assert_eq!(usage["api_calls"], 5);
@@ -1200,9 +1186,18 @@ mod db_tests {
             params!["alpha", "vm_seconds", 30, 30],
         )
         .unwrap();
-        assert_eq!(usage_summary(&conn, "alpha", Some(20), Some(20)).unwrap()["vm_seconds"], 20);
-        assert_eq!(usage_summary(&conn, "alpha", Some(20), Some(30)).unwrap()["vm_seconds"], 50);
-        assert_eq!(usage_summary(&conn, "alpha", Some(31), None).unwrap()["vm_seconds"], 0);
+        assert_eq!(
+            usage_summary(&conn, "alpha", Some(20), Some(20)).unwrap()["vm_seconds"],
+            20
+        );
+        assert_eq!(
+            usage_summary(&conn, "alpha", Some(20), Some(30)).unwrap()["vm_seconds"],
+            50
+        );
+        assert_eq!(
+            usage_summary(&conn, "alpha", Some(31), None).unwrap()["vm_seconds"],
+            0
+        );
     }
 
     #[test]
@@ -1223,7 +1218,11 @@ mod db_tests {
         let root = root();
         let (existing, _, _) = sample_state("alpha");
         let (incoming, _, _) = sample_state("other");
-        fs::write(root.join("state.json"), serde_json::to_vec(&incoming).unwrap()).unwrap();
+        fs::write(
+            root.join("state.json"),
+            serde_json::to_vec(&incoming).unwrap(),
+        )
+        .unwrap();
         let conn = db();
         store(&conn, &existing).unwrap();
         assert!(!migrate_from_json(&root, &conn).unwrap());
@@ -1281,13 +1280,11 @@ mod db_tests {
         assert_eq!(state.ckpts.len(), 1);
         assert_eq!(state.ckpts[0].project, "default");
         assert_eq!(state.ckpts[0].snapshot_version, None);
-        assert!(find_space(
-            &conn,
-            "05d48e52-e935-4009-ba1d-ece1aa240034",
-            "default"
-        )
-        .unwrap()
-        .is_some());
+        assert!(
+            find_space(&conn, "05d48e52-e935-4009-ba1d-ece1aa240034", "default")
+                .unwrap()
+                .is_some()
+        );
         assert!(!root.join("state.json").exists());
         assert!(root.join("state.json.migrated").exists());
         fs::remove_dir_all(root).unwrap();
@@ -1301,7 +1298,10 @@ mod db_tests {
             [],
         )
         .unwrap();
-        assert_eq!(project_limits(&conn, "alpha").unwrap(), Some((3, 2048, 1, 60)));
+        assert_eq!(
+            project_limits(&conn, "alpha").unwrap(),
+            Some((3, 2048, 1, 60))
+        );
         assert!(project_limits(&conn, "missing").unwrap().is_none());
     }
     #[test]
@@ -1349,5 +1349,4 @@ mod db_tests {
         assert!(project_limit_overrides(&conn, "alpha").unwrap().is_none());
         assert!(project_limits(&conn, "alpha").unwrap().is_none());
     }
-
 }

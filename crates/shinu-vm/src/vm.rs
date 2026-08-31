@@ -5,8 +5,9 @@ use crate::net::NetConfig;
 use shinu_core::{Error, Image, Result};
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 /// `<root>/jail/firecracker/<id>/root` is the host-visible chroot root.
@@ -105,6 +106,108 @@ fn console_tail(dir: &Path) -> String {
 
 fn run_command(program: &str, args: &[&str]) -> Result<std::process::Output> {
     Ok(std::process::Command::new(program).args(args).output()?)
+}
+
+// Guest sync cost scales with dirty disk pages; bound a wedged guest without
+// applying the five-second control-plane deadline to a durability operation.
+const GUEST_FLUSH_TIMEOUT: Duration = Duration::from_mins(1);
+const PROCESS_GROUP_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+fn ssh_command(
+    helper: &Path,
+    vsock_uds: &Path,
+    key: &Path,
+    port: u16,
+    cmd: &[String],
+) -> std::process::Command {
+    let mut command = std::process::Command::new("ssh");
+    command
+        .args([
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "LogLevel=ERROR",
+            "-o",
+            "IdentitiesOnly=yes",
+        ])
+        .arg("-o")
+        .arg(format!(
+            "ProxyCommand={} {} {port}",
+            helper.display(),
+            vsock_uds.display()
+        ))
+        .arg("-i")
+        .arg(key)
+        // The hostname is a placeholder: ProxyCommand decides the real peer.
+        .arg("root@shinu")
+        .arg("--")
+        .arg(shinu_core::shell_quote(cmd));
+    command
+}
+
+fn kill_process_group(pgid: u32) {
+    let _ = std::process::Command::new("kill")
+        .args(["-KILL", "--"])
+        .arg(format!("-{pgid}"))
+        .status();
+}
+
+fn run_process_group(
+    mut command: std::process::Command,
+    timeout: Duration,
+) -> Option<std::process::ExitStatus> {
+    // A zero process group asks the kernel to use the new process's pid. The
+    // SSH child and its ProxyCommand descendants inherit this group.
+    command.process_group(0);
+    let Ok(mut child) = command.spawn() else {
+        return None;
+    };
+    let pgid = child.id();
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Some(status),
+            Ok(Some(status)) => {
+                kill_process_group(pgid);
+                let _ = child.wait();
+                return Some(status);
+            }
+            Ok(None) => {}
+            Err(_) => {
+                kill_process_group(pgid);
+                let _ = child.wait();
+                return None;
+            }
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            kill_process_group(pgid);
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(PROCESS_GROUP_POLL_INTERVAL.min(deadline.duration_since(now)));
+    }
+}
+
+fn run_guest_flush(vsock_uds: &Path, key: &Path) -> Option<std::process::ExitStatus> {
+    let helper = shinu_core::vsock_helper().ok()?;
+    let command = [
+        "sh".to_owned(),
+        "-c".to_owned(),
+        "sync; mount -o remount,ro / 2>/dev/null; sync".to_owned(),
+    ];
+    let ssh = ssh_command(
+        &helper,
+        vsock_uds,
+        key,
+        shinu_core::VSOCK_SSH_PORT,
+        &command,
+    );
+    run_process_group(ssh, GUEST_FLUSH_TIMEOUT)
 }
 
 /// Whether an asset's no-follow metadata satisfies the root-executed trust
@@ -1519,16 +1622,7 @@ pub fn stop_with_peers(dir: &Path, cfg: &NetConfig, peers: &[String]) -> Result<
         // Durability needs exactly one thing: the guest's dirty pages on
         // the image before the VMM dies. `sync` plus a read-only remount
         // does that and returns normally, leaving the connection intact.
-        let _ = exec_in_vm(
-            &vsock,
-            &key_path(dir),
-            shinu_core::VSOCK_SSH_PORT,
-            &[
-                "sh".to_owned(),
-                "-c".to_owned(),
-                "sync; mount -o remount,ro / 2>/dev/null; sync".to_owned(),
-            ],
-        );
+        let _ = run_guest_flush(&vsock, &key_path(dir));
     }
 
     signal(pid, "TERM");
@@ -1848,6 +1942,92 @@ mod input_chain_tests {
     }
 }
 
+#[cfg(test)]
+mod process_group_tests {
+    use super::{run_process_group, ssh_command};
+    use std::ffi::OsStr;
+    use std::path::Path;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+    use uuid::Uuid;
+
+    #[test]
+    fn process_group_runner_places_the_child_in_its_own_group() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("test \"$(ps -o pgid= -p $$ | tr -d ' ')\" = \"$$\"");
+
+        let status = run_process_group(command, Duration::from_secs(1));
+
+        assert_eq!(status.and_then(|status| status.code()), Some(0));
+    }
+
+    #[test]
+    fn process_group_runner_kills_descendants_at_the_deadline() {
+        let marker = std::env::temp_dir().join(format!(
+            "shinu-process-group-{}-{}.marker",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        let marker_word = shinu_core::shell_quote_word(&marker.to_string_lossy());
+        let script = format!("(sleep 0.3; printf leaked > {marker_word}) & wait");
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(&script);
+
+        let started = Instant::now();
+        let status = run_process_group(command, Duration::from_millis(50));
+
+        assert!(status.is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!marker.exists());
+        let _ = std::fs::remove_file(marker);
+    }
+
+    #[test]
+    fn ssh_command_keeps_exec_transport_and_flush_argv_unchanged() {
+        let flush = [
+            "sh".to_owned(),
+            "-c".to_owned(),
+            "sync; mount -o remount,ro / 2>/dev/null; sync".to_owned(),
+        ];
+        let command = ssh_command(
+            Path::new("/opt/shinu/shinu-vsock"),
+            Path::new("/tmp/shinu-vsock.sock"),
+            Path::new("/tmp/id_ed25519"),
+            2222,
+            &flush,
+        );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(command.get_program(), OsStr::new("ssh"));
+        assert_eq!(
+            args,
+            vec![
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "LogLevel=ERROR",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "ProxyCommand=/opt/shinu/shinu-vsock /tmp/shinu-vsock.sock 2222",
+                "-i",
+                "/tmp/id_ed25519",
+                "root@shinu",
+                "--",
+                "'sh' '-c' 'sync; mount -o remount,ro / 2>/dev/null; sync'",
+            ]
+        );
+    }
+}
+
 /// The one library function an unprivileged process may call. Everything else
 /// here (`btrfs::delete`, `btrfs::exclusive`, base building, starting VMs)
 /// needs privileges the CLI does not have and must stay inside the daemon.
@@ -1864,30 +2044,7 @@ pub fn exec_in_vm(vsock_uds: &Path, key: &Path, port: u16, cmd: &[String]) -> Re
     // base image and therefore shared by every clone of it, and the transport
     // is a host-kernel vsock socket that never touches a network, so there is
     // no party in the middle to authenticate against.
-    let status = std::process::Command::new("ssh")
-        .args([
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
-            "-o",
-            "LogLevel=ERROR",
-            "-o",
-            "IdentitiesOnly=yes",
-        ])
-        .arg("-o")
-        .arg(format!(
-            "ProxyCommand={} {} {port}",
-            helper.display(),
-            vsock_uds.display()
-        ))
-        .arg("-i")
-        .arg(key)
-        // The hostname is a placeholder: ProxyCommand decides the real peer.
-        .arg("root@shinu")
-        .arg("--")
-        .arg(shinu_core::shell_quote(cmd))
-        .status()?;
+    let status = ssh_command(&helper, vsock_uds, key, port, cmd).status()?;
     Ok(status.code().unwrap_or(255))
 }
 

@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -58,6 +58,7 @@ const JOB_MAX_ARGS: usize = 256;
 const JOB_MAX_ARG_BYTES: usize = 8 * 1024;
 const JOB_LIST_LIMIT: usize = 64;
 const DEFAULT_FULL_EVERY: usize = 8;
+const LEASE_GRACE_DEFAULT_SECS: u64 = 300;
 const DIFF_TMP_DIR: &str = "diff-tmp";
 
 #[derive(Parser)]
@@ -158,6 +159,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &stopped,
             ) {
                 eprintln!("idle network refresh: {error}");
+            }
+            if let Err(error) = sweep_expired_leases(
+                sweep_root.as_path(),
+                &sweep_db,
+                &sweep_registry,
+                sweep_net_cfg.as_ref(),
+                Utc::now(),
+            ) {
+                eprintln!("lease sweep: {error}");
             }
             if let Err(error) = record_sweep_usage(sweep_root.as_path(), &sweep_db, &sweep_registry)
             {
@@ -1219,6 +1229,215 @@ fn refresh_idle_networks(
     Ok(())
 }
 
+fn ensure_lease_active(space: &Space, now: DateTime<Utc>) -> shinu::Result<()> {
+    if space.expires_at.is_some_and(|expires_at| expires_at <= now) {
+        return Err(shinu::Error::Invalid(format!(
+            "space lease has expired: {}",
+            space.name
+        )));
+    }
+    Ok(())
+}
+
+fn validate_ttl_seconds(ttl_seconds: Option<u64>) -> shinu::Result<()> {
+    state::lease_expiry(Utc::now(), ttl_seconds).map(|_| ())
+}
+
+fn lease_grace_secs_from(value: Option<&str>) -> u64 {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(LEASE_GRACE_DEFAULT_SECS)
+}
+
+fn lease_grace_secs() -> u64 {
+    lease_grace_secs_from(std::env::var("SHINU_LEASE_GRACE_SECS").ok().as_deref())
+}
+
+fn lease_after_grace(expires_at: DateTime<Utc>, now: DateTime<Utc>, grace_secs: u64) -> bool {
+    let Ok(grace_secs) = i64::try_from(grace_secs) else {
+        // An unrepresentable grace interval is safer when treated as an
+        // indefinitely long grace period than as immediate deletion.
+        return false;
+    };
+    let Some(duration) = chrono::Duration::try_seconds(grace_secs) else {
+        return false;
+    };
+    expires_at
+        .checked_add_signed(duration)
+        .is_some_and(|deadline| now >= deadline)
+}
+
+/// Stops one VM while the caller owns its space lock, without taking any
+/// state/DB lock across the VM or firewall operations.
+fn stop_space_runtime(
+    root: &Path,
+    cfg: &shinu::NetConfig,
+    space: &Space,
+    previous_running: &[Space],
+) -> shinu::Result<bool> {
+    let peers = peer_ips(space, previous_running, cfg);
+    shinu::vm::stop_with_peers(&shinu::vm_dir(root, space.id), cfg, &peers)
+}
+
+/// Removes only mutable files owned by a Space. Checkpoint files deliberately
+/// do not appear here: they are project-scoped history and may outlive a Space.
+fn remove_space_files(root: &Path, id: Uuid) -> shinu::Result<()> {
+    remove_file_if_missing(&shinu::space_image(root, id))?;
+    remove_space_snapshot_files(root, id)?;
+    match std::fs::remove_dir_all(shinu::vm_dir(root, id)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+struct LeaseSweepContext<'a> {
+    root: &'a Path,
+    db: &'a Mutex<Connection>,
+    registry: &'a Registry,
+    cfg: &'a shinu::NetConfig,
+    now: DateTime<Utc>,
+    grace_secs: u64,
+}
+
+fn sweep_lease_candidates(
+    registry: &Registry,
+    candidates: impl IntoIterator<Item = (Uuid, String, DateTime<Utc>)>,
+    mut process: impl FnMut(Uuid, &str, DateTime<Utc>) -> shinu::Result<()>,
+) {
+    for (id, project, expected_expires_at) in candidates {
+        let space_guard = registry.space_lock(id);
+        let _space_guard = match space_guard.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => continue,
+        };
+        if let Err(error) = process(id, &project, expected_expires_at) {
+            eprintln!("expired lease sweep for {id}: {error}");
+        }
+    }
+}
+
+fn sweep_expired_leases(
+    root: &Path,
+    db: &Mutex<Connection>,
+    registry: &Registry,
+    cfg: &shinu::NetConfig,
+    now: DateTime<Utc>,
+) -> shinu::Result<()> {
+    // Candidate identity is advisory. Every item is re-read after acquiring
+    // its single Space lock so a renewal or deletion cannot be acted on using
+    // a stale snapshot.
+    let candidates = snapshot(db, registry)?
+        .spaces
+        .into_iter()
+        .filter_map(|space| {
+            space
+                .expires_at
+                .filter(|expires_at| *expires_at <= now)
+                .map(|expires_at| (space.id, space.project, expires_at))
+        })
+        .collect::<Vec<_>>();
+    let sweep = LeaseSweepContext {
+        root,
+        db,
+        registry,
+        cfg,
+        now,
+        grace_secs: lease_grace_secs(),
+    };
+    sweep_lease_candidates(registry, candidates, |id, project, expected_expires_at| {
+        sweep_expired_lease(&sweep, project, id, expected_expires_at)
+    });
+    Ok(())
+}
+
+fn sweep_expired_lease(
+    sweep: &LeaseSweepContext<'_>,
+    project: &str,
+    id: Uuid,
+    expected_expires_at: DateTime<Utc>,
+) -> shinu::Result<()> {
+    let (space, state_before) = {
+        let _state_guard = lock_state(sweep.registry);
+        let connection = lock_db(sweep.db);
+        let state = state::load(&connection)?;
+        let Some(space) = state
+            .spaces
+            .iter()
+            .find(|space| space.id == id && space.project == project)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        if space.expires_at != Some(expected_expires_at)
+            || space
+                .expires_at
+                .is_none_or(|expires_at| expires_at > sweep.now)
+        {
+            return Ok(());
+        }
+        if !state::active_jobs_by_space(&connection, id, project)?.is_empty() {
+            // Active jobs pin the VM and the Space until their terminal rows
+            // are durable; the next sweep gets a fresh advisory candidate.
+            return Ok(());
+        }
+        (space, state)
+    };
+
+    // VM discovery and all firewall/guest operations happen after the state
+    // and DB guards have been released. Holding the Space lock still excludes
+    // start/submit/renew/remove for this identity.
+    let previous_running =
+        running_network_members(sweep.root, &state_before, project, space.network.as_deref());
+    if !lease_after_grace(expected_expires_at, sweep.now, sweep.grace_secs) {
+        let was_running = stop_space_runtime(sweep.root, sweep.cfg, &space, &previous_running)?;
+        if was_running {
+            let current_running = refresh_network_rules_with(
+                sweep.root,
+                sweep.cfg,
+                &state_before,
+                project,
+                space.network.as_deref(),
+                &previous_running,
+            )?;
+            let all_members = network_members(&state_before, project, space.network.as_deref());
+            sync_network_hosts_with(sweep.root, sweep.cfg, &current_running, &all_members);
+        }
+        return Ok(());
+    }
+
+    // Claim the row before any destructive I/O. A renewal that won the Space
+    // lock before this point changes the expected timestamp and returns None;
+    // active jobs are checked again transactionally by the claim helper.
+    let (space, terminal_jobs, state_after) = {
+        let _state_guard = lock_state(sweep.registry);
+        let connection = lock_db(sweep.db);
+        let Some(space) =
+            state::claim_expired_space(&connection, id, project, expected_expires_at, sweep.now)?
+        else {
+            return Ok(());
+        };
+        let terminal_jobs = state::claim_terminal_jobs_by_space(&connection, id, project)?;
+        let state_after = state::load(&connection)?;
+        (space, terminal_jobs, state_after)
+    };
+    for job in terminal_jobs {
+        remove_file_if_missing(&shinu::job_log_path(sweep.root, job.id))?;
+    }
+    stop_space_runtime(sweep.root, sweep.cfg, &space, &previous_running)?;
+    let current_running = refresh_network_rules_with(
+        sweep.root,
+        sweep.cfg,
+        &state_after,
+        project,
+        space.network.as_deref(),
+        &previous_running,
+    )?;
+    let all_members = network_members(&state_after, project, space.network.as_deref());
+    sync_network_hosts_with(sweep.root, sweep.cfg, &current_running, &all_members);
+    remove_space_files(sweep.root, id)
+}
 fn checkpoint_exclusive(root: &Path, id: Uuid) -> shinu::Result<u64> {
     let mut total: u64 = 0;
     for path in [
@@ -1720,6 +1939,7 @@ struct SpaceSpec {
     mem_mib: Option<u32>,
     disk_mib: Option<u64>,
     network: Option<String>,
+    ttl_seconds: Option<u64>,
 }
 
 fn create_space(ctx: &Ctx<'_>, project: &str, spec: SpaceSpec) -> shinu::Result<Value> {
@@ -1730,11 +1950,13 @@ fn create_space(ctx: &Ctx<'_>, project: &str, spec: SpaceSpec) -> shinu::Result<
         mem_mib,
         disk_mib,
         network,
+        ttl_seconds,
     } = spec;
     state::validate_network_name(network.as_deref())?;
     ensure_positive_size("vcpus", vcpus.map(u64::from))?;
     ensure_positive_size("mem_mib", mem_mib.map(u64::from))?;
     ensure_positive_size("disk_mib", disk_mib)?;
+    validate_ttl_seconds(ttl_seconds)?;
     let limits = effective_limits(ctx, project)?;
     check_vm_sizing(ctx, &limits, vcpus, mem_mib)?;
     let image = image.unwrap_or(Image::Void);
@@ -1780,6 +2002,8 @@ fn create_space(ctx: &Ctx<'_>, project: &str, spec: SpaceSpec) -> shinu::Result<
             requested_disk,
             |state| {
                 check_name(state, &name, project)?;
+                let created_at = Utc::now();
+                let expires_at = state::lease_expiry(created_at, ttl_seconds)?;
                 let space = Space {
                     id,
                     name: name.clone(),
@@ -1791,9 +2015,8 @@ fn create_space(ctx: &Ctx<'_>, project: &str, spec: SpaceSpec) -> shinu::Result<
                     mem_mib,
                     disk_mib,
                     network: network.clone(),
-                    expires_at: None,
-
-                    created_at: Utc::now(),
+                    expires_at,
+                    created_at,
                 };
                 state.spaces.push(space.clone());
                 Ok(space)
@@ -1809,8 +2032,14 @@ fn create_space(ctx: &Ctx<'_>, project: &str, spec: SpaceSpec) -> shinu::Result<
     }
     result
 }
-
-fn fork_space(ctx: &Ctx<'_>, project: &str, ckpt: Uuid, name: String) -> shinu::Result<Value> {
+fn fork_space(
+    ctx: &Ctx<'_>,
+    project: &str,
+    ckpt: Uuid,
+    name: String,
+    ttl_seconds: Option<u64>,
+) -> shinu::Result<Value> {
+    validate_ttl_seconds(ttl_seconds)?;
     let limits = effective_limits(ctx, project)?;
     let id = Uuid::new_v4();
     let space_guard = ctx.registry.space_lock(id);
@@ -1902,6 +2131,8 @@ fn fork_space(ctx: &Ctx<'_>, project: &str, ckpt: Uuid, name: String) -> shinu::
             |state| {
                 check_name(state, &name, project)?;
                 shinu::find_ckpt(state, source, project)?;
+                let created_at = Utc::now();
+                let expires_at = state::lease_expiry(created_at, ttl_seconds)?;
                 let space = Space {
                     id,
                     name: name.clone(),
@@ -1913,9 +2144,8 @@ fn fork_space(ctx: &Ctx<'_>, project: &str, ckpt: Uuid, name: String) -> shinu::
                     mem_mib: source_space.mem_mib,
                     disk_mib: source_space.disk_mib,
                     network: source_space.network.clone(),
-                    expires_at: None,
-
-                    created_at: Utc::now(),
+                    expires_at,
+                    created_at,
                 };
                 state.spaces.push(space.clone());
                 Ok(space)
@@ -2091,6 +2321,7 @@ fn checkout_space(
             .iter()
             .find(|entry| entry.id == space_id && entry.project == project)
             .ok_or_else(|| shinu::Error::NotFound(space.clone()))?;
+        ensure_lease_active(entry, Utc::now())?;
         if vm_running {
             return Err(shinu::Error::Invalid(format!(
                 "stop the space before checking it out: {}",
@@ -2236,12 +2467,11 @@ fn remove_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Val
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let current = revalidate_space(ctx, project, id, &name)?;
-    let resolved_name = current.name;
-    let network = current.network;
-    // Capture previous_running before removal for the network rule diff.
+    let resolved_name = current.name.clone();
+    let network = current.network.clone();
     // Claiming the Space lock first makes this check race-free with submit:
     // a new Starting row cannot appear until removal has completed.
-    let (state, previous_running, peers, terminal_jobs) = {
+    let (state_before, state_after, terminal_jobs) = {
         let _state_guard = lock_state(ctx.registry);
         let connection = lock_db(ctx.db);
         let active = state::active_jobs_by_space(&connection, id, project)?;
@@ -2250,41 +2480,40 @@ fn remove_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Val
                 "space {name} has active detached jobs"
             )));
         }
-        let mut state = state::load(&connection)?;
-        let space = state
+        let state_before = state::load(&connection)?;
+        let mut state_after = state_before.clone();
+        if !state_after
             .spaces
             .iter()
-            .find(|space| space.id == id && space.project == project)
-            .cloned()
-            .ok_or_else(|| shinu::Error::NotFound(id.to_string()))?;
-        let previous_running =
-            running_network_members(ctx.root, &state, project, network.as_deref());
-        let peers = peer_ips(&space, &previous_running, ctx.net_cfg);
-        state.spaces.retain(|space| space.id != id);
-        state::store(&connection, &state)?;
+            .any(|space| space.id == id && space.project == project)
+        {
+            return Err(shinu::Error::NotFound(id.to_string()));
+        }
+        state_after.spaces.retain(|space| space.id != id);
+        state::store(&connection, &state_after)?;
         let terminal_jobs = state::claim_terminal_jobs_by_space(&connection, id, project)?;
-        (state, previous_running, peers, terminal_jobs)
+        (state_before, state_after, terminal_jobs)
     };
+    let previous_running =
+        running_network_members(ctx.root, &state_before, project, network.as_deref());
     // Host log unlinking follows the DB claim and is intentionally outside the
     // state/DB lock scope.
     for job in terminal_jobs {
         remove_file_if_missing(&shinu::job_log_path(ctx.root, job.id))?;
     }
-    shinu::vm::stop_with_peers(&shinu::vm_dir(ctx.root, id), ctx.net_cfg, &peers)?;
-    let current_running =
-        refresh_network_rules(ctx, &state, project, network.as_deref(), &previous_running)?;
+    stop_space_runtime(ctx.root, ctx.net_cfg, &current, &previous_running)?;
+    let current_running = refresh_network_rules(
+        ctx,
+        &state_after,
+        project,
+        network.as_deref(),
+        &previous_running,
+    )?;
     // The claimed state omits this space, so these are post-removal peers.
-    let all_members = network_members(&state, project, network.as_deref());
+    let all_members = network_members(&state_after, project, network.as_deref());
     sync_network_hosts(ctx, &current_running, &all_members);
     // Any deletion failure leaves an orphan for gc, not a dangling record.
-    let image = shinu::space_image(ctx.root, id);
-    remove_file_if_missing(&image)?;
-    remove_space_snapshot_files(ctx.root, id)?;
-    match std::fs::remove_dir_all(shinu::vm_dir(ctx.root, id)) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
+    remove_space_files(ctx.root, id)?;
     Ok(json!({ "removed": resolved_name, "id": id }))
 }
 fn remove_checkpoint(ctx: &Ctx<'_>, project: &str, id: Uuid) -> shinu::Result<Value> {
@@ -2420,6 +2649,7 @@ fn start_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Valu
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let space = revalidate_space(ctx, project, initial.id, &name)?;
+    ensure_lease_active(&space, Utc::now())?;
     let limits = effective_limits(ctx, project)?;
     check_vm_sizing(ctx, &limits, space.vcpus, space.mem_mib)?;
     let (already_running, state, previous_running) =
@@ -2471,17 +2701,10 @@ fn stop_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value
             )));
         }
     }
-    let (state, previous_running, peers) = {
-        let _state_guard = lock_state(ctx.registry);
-        let connection = lock_db(ctx.db);
-        let state = state::load(&connection)?;
-        let previous_running =
-            running_network_members(ctx.root, &state, project, space.network.as_deref());
-        let peers = peer_ips(&space, &previous_running, ctx.net_cfg);
-        (state, previous_running, peers)
-    };
-    let was_running =
-        shinu::vm::stop_with_peers(&shinu::vm_dir(ctx.root, space.id), ctx.net_cfg, &peers)?;
+    let state = snapshot(ctx.db, ctx.registry)?;
+    let previous_running =
+        running_network_members(ctx.root, &state, project, space.network.as_deref());
+    let was_running = stop_space_runtime(ctx.root, ctx.net_cfg, &space, &previous_running)?;
     let current_running = refresh_network_rules(
         ctx,
         &state,
@@ -2617,6 +2840,32 @@ fn resize_space(
         Ok((updated, exceeded))
     })?;
     exceeded?;
+    Ok(serde_json::to_value(updated)?)
+}
+
+fn set_space_lease(
+    ctx: &Ctx<'_>,
+    project: &str,
+    name: String,
+    ttl_seconds: Option<u64>,
+) -> shinu::Result<Value> {
+    validate_ttl_seconds(ttl_seconds)?;
+    let initial = find_space(ctx.db, &name, project)?;
+    let space_guard = ctx.registry.space_lock(initial.id);
+    let _space_guard = space_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let current = revalidate_space(ctx, project, initial.id, &name)?;
+    let updated = update_state(ctx.db, ctx.registry, |state| {
+        let space = state
+            .spaces
+            .iter_mut()
+            .find(|space| space.id == current.id && space.project == project)
+            .ok_or_else(|| shinu::Error::NotFound(name.clone()))?;
+        let now = Utc::now();
+        space.expires_at = state::lease_expiry(now, ttl_seconds)?;
+        Ok(space.clone())
+    })?;
     Ok(serde_json::to_value(updated)?)
 }
 
@@ -3001,6 +3250,7 @@ fn submit_job(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let entry = revalidate_space(ctx, project, initial.id, &space)?;
+    ensure_lease_active(&entry, Utc::now())?;
     let job = state::Job {
         id: Uuid::new_v4(),
         project: project.to_owned(),
@@ -3255,6 +3505,7 @@ fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
             mem_mib,
             disk_mib,
             network,
+            ttl_seconds,
         } => create_space(
             ctx,
             project,
@@ -3265,6 +3516,7 @@ fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
                 mem_mib,
                 disk_mib,
                 network,
+                ttl_seconds,
             },
         ),
         Req::Resize {
@@ -3274,7 +3526,12 @@ fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
             disk_mib,
         } => resize_space(ctx, project, space, vcpus, mem_mib, disk_mib),
         Req::Images => Ok(list_images(ctx)),
-        Req::Fork { ckpt, name } => fork_space(ctx, project, ckpt, name),
+        Req::Fork {
+            ckpt,
+            name,
+            ttl_seconds,
+        } => fork_space(ctx, project, ckpt, name, ttl_seconds),
+        Req::SetLease { space, ttl_seconds } => set_space_lease(ctx, project, space, ttl_seconds),
         Req::Commit {
             space,
             note,
@@ -3497,6 +3754,7 @@ enum Endpoint {
     Start(String),
     Stop(String),
     Exec(String),
+    Lease(String),
     Proxy {
         space: String,
         port: u16,
@@ -3597,6 +3855,7 @@ fn route(path: &str) -> Option<Endpoint> {
         return match segments[4].as_str() {
             "start" => Some(Endpoint::Start(name)),
             "stop" => Some(Endpoint::Stop(name)),
+            "lease" => Some(Endpoint::Lease(name)),
             "exec" => Some(Endpoint::Exec(name)),
             "push" => Some(Endpoint::Push(name)),
             "pull" => Some(Endpoint::Pull(name)),
@@ -3806,6 +4065,7 @@ fn method_allowed(endpoint: &Endpoint, method: &str) -> bool {
         | Endpoint::Diff(_) => method == "GET",
         Endpoint::ProjectLimits(_) => matches!(method, "GET" | "PATCH" | "DELETE"),
         Endpoint::Rm(_) => method == "DELETE" || method == "PATCH",
+        Endpoint::Lease(_) => method == "PATCH",
         Endpoint::RmCkpt(_) => method == "DELETE",
         Endpoint::Start(_)
         | Endpoint::Stop(_)
@@ -3899,6 +4159,25 @@ fn value_optional_u64(value: &Value, field: &str) -> shinu::Result<Option<u64>> 
     }
 }
 
+fn value_optional_ttl(value: &Value, field: &str) -> shinu::Result<Option<u64>> {
+    let ttl_seconds = value_optional_u64(value, field)?;
+    if ttl_seconds == Some(0) {
+        return Err(shinu::Error::Invalid(format!(
+            "body field {field} must be greater than zero"
+        )));
+    }
+    Ok(ttl_seconds)
+}
+
+fn value_required_ttl(value: &Value, field: &str) -> shinu::Result<Option<u64>> {
+    if value.get(field).is_none() {
+        return Err(shinu::Error::Invalid(format!(
+            "body field {field} is required"
+        )));
+    }
+    value_optional_ttl(value, field)
+}
+
 fn value_patch_u32(value: &Value, field: &str) -> shinu::Result<Option<Option<u32>>> {
     // Absent, null and a number are three distinct PATCH intents: leave alone,
     // reset to the daemon default, or set explicitly.
@@ -3966,6 +4245,7 @@ fn new_request(body: &[u8]) -> shinu::Result<Req> {
         mem_mib: value_optional_u32(&value, "mem_mib")?,
         disk_mib: value_optional_u64(&value, "disk_mib")?,
         network,
+        ttl_seconds: value_optional_ttl(&value, "ttl_seconds")?,
     })
 }
 
@@ -3993,6 +4273,23 @@ fn commit_request(body: &[u8], space: String) -> shinu::Result<Req> {
         note,
         hot,
         snapshot,
+    })
+}
+
+fn fork_request(body: &[u8], ckpt: Uuid) -> shinu::Result<Req> {
+    let value = parse_body(body)?;
+    Ok(Req::Fork {
+        ckpt,
+        name: value_string(&value, "name")?,
+        ttl_seconds: value_optional_ttl(&value, "ttl_seconds")?,
+    })
+}
+
+fn lease_request(body: &[u8], space: String) -> shinu::Result<Req> {
+    let value = parse_body(body)?;
+    Ok(Req::SetLease {
+        space,
+        ttl_seconds: value_required_ttl(&value, "ttl_seconds")?,
     })
 }
 
@@ -4062,14 +4359,15 @@ fn request_for(
             200,
         )),
         Endpoint::Fork(commit) => Ok((
-            Req::Fork {
-                ckpt: Uuid::parse_str(&commit).map_err(|error| {
+            fork_request(
+                body,
+                Uuid::parse_str(&commit).map_err(|error| {
                     shinu::Error::Invalid(format!("invalid commit id: {error}"))
                 })?,
-                name: body_string(body, "name")?,
-            },
+            )?,
             201,
         )),
+        Endpoint::Lease(space) => Ok((lease_request(body, space)?, 200)),
         Endpoint::RmCkpt(commit) => Ok((
             Req::RmCkpt {
                 ckpt: Uuid::parse_str(&commit).map_err(|error| {
@@ -4152,6 +4450,7 @@ fn job_ssh_target(root: &Path, space_id: Uuid) -> shinu::Result<SshTarget> {
 /// Prepares an SSH target while the caller owns the Space lock. No lock is
 /// acquired here so submit can keep the lock through VM start and tmux launch.
 fn prepare_ssh_entry(ctx: &Ctx<'_>, project: &str, entry: &Space) -> shinu::Result<SshTarget> {
+    ensure_lease_active(entry, Utc::now())?;
     let limits = effective_limits(ctx, project)?;
     check_vm_sizing(ctx, &limits, entry.vcpus, entry.mem_mib)?;
     let (already_running, state, previous_running) =
@@ -6802,7 +7101,7 @@ fn execute_streaming(
 #[cfg(test)]
 mod tests {
     use super::{CkptFlags, append_checkpoint, handle, read_stream, set_head};
-    use chrono::Utc;
+    use chrono::{TimeZone, Utc};
     use rusqlite::Connection;
     use shinu::{
         Image, NetConfig, VmConfig,
@@ -7655,6 +7954,291 @@ mod tests {
             Err(shinu::Error::Invalid(message))
                 if message.contains("network name must be non-empty")
         ));
+    }
+
+    #[test]
+    fn lease_routes_and_ttl_bodies_use_strict_positive_seconds() {
+        let lease = super::route("/v1/spaces/demo/lease").expect("lease route");
+        assert!(matches!(&lease, super::Endpoint::Lease(space) if space == "demo"));
+        assert!(super::method_allowed(&lease, "PATCH"));
+        assert!(!super::method_allowed(&lease, "GET"));
+        let (request, status) =
+            super::request_for(lease, "PATCH", br#"{"ttl_seconds":60}"#, None, None)
+                .expect("positive lease request");
+        assert_eq!(status, 200);
+        assert!(matches!(
+            request,
+            Req::SetLease {
+                space,
+                ttl_seconds: Some(60)
+            } if space == "demo"
+        ));
+
+        let (request, _) = super::request_for(
+            super::Endpoint::Lease("demo".into()),
+            "PATCH",
+            br#"{"ttl_seconds":null}"#,
+            None,
+            None,
+        )
+        .expect("lease clear request");
+        assert!(matches!(
+            request,
+            Req::SetLease {
+                ttl_seconds: None,
+                ..
+            }
+        ));
+        for body in [
+            br"{}".as_slice(),
+            br#"{"ttl_seconds":0}"#.as_slice(),
+            br#"{"ttl_seconds":-1}"#.as_slice(),
+            br#"{"ttl_seconds":1.5}"#.as_slice(),
+            br#"{"ttl_seconds":"60"}"#.as_slice(),
+        ] {
+            assert!(
+                super::request_for(
+                    super::Endpoint::Lease("demo".into()),
+                    "PATCH",
+                    body,
+                    None,
+                    None,
+                )
+                .is_err(),
+                "invalid lease body should fail: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn create_and_fork_ttl_bodies_accept_absent_or_null_and_reject_zero() {
+        let absent = super::new_request(br#"{"name":"web"}"#).expect("no-expiry create");
+        assert!(matches!(
+            absent,
+            Req::New {
+                ttl_seconds: None,
+                ..
+            }
+        ));
+        let explicit =
+            super::new_request(br#"{"name":"web","ttl_seconds":30}"#).expect("expiring create");
+        assert!(matches!(
+            explicit,
+            Req::New {
+                ttl_seconds: Some(30),
+                ..
+            }
+        ));
+        let cleared =
+            super::new_request(br#"{"name":"web","ttl_seconds":null}"#).expect("null create ttl");
+        assert!(matches!(
+            cleared,
+            Req::New {
+                ttl_seconds: None,
+                ..
+            }
+        ));
+        assert!(super::new_request(br#"{"name":"web","ttl_seconds":0}"#).is_err());
+
+        let checkpoint = Uuid::new_v4();
+        let fork = super::request_for(
+            super::Endpoint::Fork(checkpoint.to_string()),
+            "POST",
+            br#"{"name":"fork","ttl_seconds":30}"#,
+            None,
+            None,
+        )
+        .expect("expiring fork");
+        assert!(matches!(
+            fork.0,
+            Req::Fork {
+                ttl_seconds: Some(30),
+                ..
+            }
+        ));
+        assert!(
+            super::request_for(
+                super::Endpoint::Fork(checkpoint.to_string()),
+                "POST",
+                br#"{"name":"fork","ttl_seconds":0}"#,
+                None,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn expired_leases_are_rejected_only_by_starting_paths() {
+        let now = Utc::now();
+        let expired = Space {
+            id: Uuid::new_v4(),
+            name: "expired".into(),
+            project: "project-a".into(),
+            image: Image::Void,
+            parent: None,
+            head: None,
+            vcpus: None,
+            mem_mib: None,
+            disk_mib: None,
+            network: None,
+            expires_at: Some(now - chrono::Duration::seconds(1)),
+            created_at: now - chrono::Duration::minutes(1),
+        };
+        assert!(super::ensure_lease_active(&expired, now).is_err());
+        let mut old = expired;
+        old.expires_at = None;
+        assert!(super::ensure_lease_active(&old, now).is_ok());
+    }
+
+    #[test]
+    fn lease_mutation_returns_full_space_and_scopes_tenant() {
+        let root = test_root("lease-mutation");
+        let id = Uuid::new_v4();
+        let created_at = Utc::now();
+        store_state(
+            &root,
+            &State {
+                spaces: vec![Space {
+                    id,
+                    name: "leased".into(),
+                    project: "project-a".into(),
+                    image: Image::Void,
+                    parent: None,
+                    head: None,
+                    vcpus: None,
+                    mem_mib: None,
+                    disk_mib: None,
+                    network: None,
+                    expires_at: None,
+                    created_at,
+                }],
+                ckpts: Vec::new(),
+                templates: Vec::new(),
+            },
+        );
+        let db = test_db(&root);
+        let registry = registry();
+        let (vm_cfg, net_cfg) = test_configs();
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        let leased = handle(
+            &ctx,
+            Req::SetLease {
+                space: "leased".into(),
+                ttl_seconds: Some(60),
+            },
+            "project-a",
+        )
+        .expect("set lease");
+        assert_eq!(leased["name"], "leased");
+        assert!(leased["expires_at"].is_string());
+        let cleared = handle(
+            &ctx,
+            Req::SetLease {
+                space: "leased".into(),
+                ttl_seconds: None,
+            },
+            "project-a",
+        )
+        .expect("clear lease");
+        assert_eq!(cleared["expires_at"], serde_json::Value::Null);
+        assert!(matches!(
+            handle(
+                &ctx,
+                Req::SetLease {
+                    space: "leased".into(),
+                    ttl_seconds: Some(60),
+                },
+                "project-b",
+            ),
+            Err(shinu::Error::NotFound(_))
+        ));
+        std::fs::remove_dir_all(root).expect("remove lease test root");
+    }
+
+    #[test]
+    fn lease_sweep_stops_during_grace_and_deletes_after_claim() {
+        let now = Utc.timestamp_opt(1_700_000_100, 0).single().unwrap();
+        let expiry = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        let root = test_root("lease-sweep");
+        let id = Uuid::new_v4();
+        let state_value = State {
+            spaces: vec![Space {
+                id,
+                name: "swept".into(),
+                project: "project-a".into(),
+                image: Image::Void,
+                parent: None,
+                head: None,
+                vcpus: None,
+                mem_mib: None,
+                disk_mib: None,
+                network: None,
+                expires_at: Some(expiry),
+                created_at: expiry - chrono::Duration::minutes(1),
+            }],
+            ckpts: Vec::new(),
+            templates: Vec::new(),
+        };
+        store_state(&root, &state_value);
+        let db = test_db(&root);
+        let registry = registry();
+        let (_vm_cfg, net_cfg) = test_configs();
+        let grace_sweep = super::LeaseSweepContext {
+            root: &root,
+            db: &db,
+            registry: &registry,
+            cfg: &net_cfg,
+            now,
+            grace_secs: 300,
+        };
+        let result = super::sweep_expired_lease(&grace_sweep, "project-a", id, expiry);
+        assert!(result.is_ok(), "grace stop should not fail: {result:?}");
+        assert!(
+            super::snapshot(&db, &registry)
+                .unwrap()
+                .spaces
+                .iter()
+                .any(|space| space.id == id)
+        );
+
+        let immediate_sweep = super::LeaseSweepContext {
+            grace_secs: 0,
+            ..grace_sweep
+        };
+        let result = super::sweep_expired_lease(&immediate_sweep, "project-a", id, expiry);
+        assert!(
+            result.is_ok(),
+            "post-grace cleanup should not fail: {result:?}"
+        );
+        assert!(super::snapshot(&db, &registry).unwrap().spaces.is_empty());
+        std::fs::remove_dir_all(root).expect("remove sweep test root");
+    }
+
+    #[test]
+    fn lease_sweep_skips_busy_candidate_without_blocking_later_candidates() {
+        let registry = registry();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let first_lock = registry.space_lock(first);
+        let _first_guard = first_lock.lock().expect("hold first candidate lock");
+        let now = Utc::now();
+        let mut handled = Vec::new();
+
+        super::sweep_lease_candidates(
+            &registry,
+            vec![
+                (first, "project-a".into(), now),
+                (second, "project-a".into(), now),
+            ],
+            |id, _project, _expires_at| {
+                handled.push(id);
+                Ok(())
+            },
+        );
+
+        assert_eq!(handled, vec![second]);
     }
 
     #[test]
@@ -8665,6 +9249,90 @@ mod tests {
         child.kill().expect("stop fake firecracker");
         child.wait().expect("wait fake firecracker");
         std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn expired_checkout_rejects_before_any_side_effect() {
+        let root = test_root("checkout-expired");
+        let project = "project-a";
+        let space_id = Uuid::new_v4();
+        let target_id = Uuid::new_v4();
+        let now = Utc::now();
+        let state_value = State {
+            spaces: vec![Space {
+                id: space_id,
+                name: "expired".into(),
+                project: project.into(),
+                image: Image::Void,
+                parent: None,
+                head: Some(target_id),
+                vcpus: None,
+                mem_mib: None,
+                disk_mib: None,
+                network: None,
+                expires_at: Some(now - chrono::Duration::seconds(1)),
+                created_at: now - chrono::Duration::minutes(1),
+            }],
+            ckpts: vec![Ckpt {
+                id: target_id,
+                space: space_id,
+                project: project.into(),
+                parent: None,
+                auto: false,
+                full: true,
+                base: None,
+                note: "full restore target".into(),
+                created_at: now - chrono::Duration::minutes(1),
+                snapshot_version: Some(shinu::FC_SNAPSHOT_VERSION.into()),
+            }],
+            templates: Vec::new(),
+        };
+        store_state(&root, &state_value);
+        std::fs::create_dir_all(root.join("spaces")).expect("create space directory");
+        std::fs::create_dir_all(root.join("ckpts")).expect("create checkpoint directory");
+        std::fs::write(shinu::space_image(&root, space_id), b"before checkout")
+            .expect("write space image");
+        std::fs::write(shinu::ckpt_image(&root, target_id), b"target disk")
+            .expect("write target image");
+        std::fs::write(shinu::ckpt_mem(&root, target_id), b"target memory")
+            .expect("write target memory");
+        std::fs::write(shinu::ckpt_state(&root, target_id), b"target state")
+            .expect("write target state");
+
+        let (vm_cfg, net_cfg) = test_configs();
+        let registry = registry();
+        let db = test_db(&root);
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        let state_before = super::snapshot(&db, &registry).expect("read state before checkout");
+        let result = handle(
+            &ctx,
+            Req::Checkout {
+                space: "expired".into(),
+                commit: target_id,
+            },
+            project,
+        );
+        assert!(matches!(
+            result,
+            Err(shinu::Error::Invalid(message)) if message.contains("lease has expired")
+        ));
+        assert_eq!(
+            super::snapshot(&db, &registry).expect("read state"),
+            state_before
+        );
+        assert_eq!(
+            std::fs::read(shinu::space_image(&root, space_id)).expect("read space image"),
+            b"before checkout"
+        );
+        assert_eq!(
+            std::fs::read(shinu::ckpt_mem(&root, target_id)).expect("read target memory"),
+            b"target memory"
+        );
+        assert_eq!(
+            std::fs::read(shinu::ckpt_state(&root, target_id)).expect("read target state"),
+            b"target state"
+        );
+        std::fs::remove_dir_all(root).expect("remove expired checkout test root");
     }
 
     #[test]

@@ -695,9 +695,27 @@ tr.commit-row td {
 
 .commit-time,
 .space-created,
+.space-expires,
 .token-created {
   color: var(--ink-muted);
   font-size: 13px;
+}
+
+/* a past lease is terminal — the sweep will reclaim the space */
+.space-expires.expired {
+  color: var(--red);
+}
+
+.detail-meta {
+  margin: 0;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--edge);
+  font-size: 12px;
+  color: var(--ink-muted);
+}
+
+.detail-meta:empty {
+  display: none;
 }
 
 .commit-note {
@@ -1056,6 +1074,7 @@ tr.commit-row td {
   .data-table td,
   .panel-foot,
   .usage-line,
+  .detail-meta,
   .cli-box,
   .cli-setup {
     padding-left: 12px;

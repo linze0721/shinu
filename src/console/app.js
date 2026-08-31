@@ -121,6 +121,31 @@
     return isNaN(t.getTime()) ? String(iso || '') : t.toLocaleString();
   }
 
+  /* Future-relative counterpart to timeAgo, for lease deadlines. */
+  function timeUntil(iso) {
+    var t = new Date(iso);
+    if (isNaN(t.getTime())) return String(iso || '');
+    var s = Math.ceil((t.getTime() - Date.now()) / 1000);
+    if (s < 60) return 'in ' + Math.max(s, 1) + ' s';
+    var m = Math.floor(s / 60);
+    if (m < 60) return 'in ' + m + ' min';
+    var h = Math.floor(m / 60);
+    if (h < 24) return 'in ' + h + ' h';
+    return 'in ' + Math.floor(h / 24) + ' d';
+  }
+
+  /* expires_at is RFC3339 or null: never / in <span> / expired. The full
+     timestamp rides the title, matching the Created column. */
+  function expiryCell(iso) {
+    if (!iso) return { text: 'never', title: '', cls: '' };
+    var t = new Date(iso);
+    if (isNaN(t.getTime())) return { text: String(iso), title: '', cls: '' };
+    if (t.getTime() <= Date.now()) {
+      return { text: 'expired', title: absTime(iso), cls: ' expired' };
+    }
+    return { text: timeUntil(iso), title: absTime(iso), cls: '' };
+  }
+
   /* Copy-to-clipboard with button feedback. The async Clipboard API needs a
      secure context; plain http installs fall back to selection-copy. */
   function copyText(text, btn) {
@@ -350,9 +375,10 @@
       }
       list.innerHTML =
         '<table class="data-table"><thead><tr><th>Name</th><th>State</th>' +
-        '<th>HEAD</th><th>Disk</th><th>Created</th></tr></thead><tbody>' +
+        '<th>HEAD</th><th>Disk</th><th>Created</th><th>Expires</th></tr></thead><tbody>' +
         state.spaces
           .map(function (s) {
+            var exp = expiryCell(s.expires_at);
             return (
               '<tr class="space-row' +
               (s.name === state.selected ? ' selected' : '') +
@@ -374,6 +400,12 @@
               esc(absTime(s.created_at)) +
               '">' +
               esc(timeAgo(s.created_at)) +
+              '</td><td class="space-expires nobr' +
+              exp.cls +
+              '"' +
+              (exp.title ? ' title="' + esc(exp.title) + '"' : '') +
+              '>' +
+              esc(exp.text) +
               '</td></tr>'
             );
           })
@@ -396,17 +428,25 @@
         })
         .join('');
     }
-
-    /* The console is read-only: the detail head shows the space name plus the
-       CLI commands that change it, so the path from seeing to doing is one
-       copy away. */
+    /* The console is read-only: the detail head shows the space name, its
+       lease state, plus the CLI commands that change it, so the path from
+       seeing to doing is one copy away. */
     function renderDetailHead() {
       var s = selectedSpace();
       if (!s) return;
-      var key = s.name + '|' + s.running;
+      var key = s.name + '|' + s.running + '|' + (s.expires_at || '');
       if (key === headCacheKey) return;
       headCacheKey = key;
       $('#detail-title').textContent = s.name;
+      var exp = expiryCell(s.expires_at);
+      $('#detail-expiry').innerHTML =
+        'Expires: <span class="space-expires' +
+        exp.cls +
+        '"' +
+        (exp.title ? ' title="' + esc(exp.title) + '"' : '') +
+        '>' +
+        esc(exp.text) +
+        '</span>';
       $('#cli-box').innerHTML =
         '<p class="cli-title">Manage this space from the CLI:</p>' +
         cliLines([

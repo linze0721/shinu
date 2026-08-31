@@ -54,6 +54,21 @@ impl Server {
                 let body = resize_space_body(arguments)?;
                 request_text(&client, "PATCH", &path, Some(body))
             }
+            "shinu_set_space_lease" => {
+                let space = required_string(arguments, "space")?;
+                let ttl_seconds = required_ttl_seconds(arguments, "ttl_seconds")?;
+                let path = format!(
+                    "/v1/spaces/{}/lease",
+                    shinu_client::encode_path_segment(space)
+                );
+                request_text(
+                    &client,
+                    "PATCH",
+                    &path,
+                    Some(json!({ "ttl_seconds": ttl_seconds })),
+                )
+            }
+
             "shinu_start" => {
                 let space = required_string(arguments, "space")?;
                 let path = format!(
@@ -196,8 +211,14 @@ impl Server {
                     "/v1/commits/{}/fork",
                     shinu_client::encode_path_segment(commit)
                 );
-                request_text(&client, "POST", &path, Some(json!({ "name": name })))
+                let mut body = Map::new();
+                body.insert("name".to_owned(), Value::String(name.to_owned()));
+                if let Some(ttl_seconds) = optional_ttl_seconds(arguments, "ttl_seconds")? {
+                    body.insert("ttl_seconds".to_owned(), ttl_seconds);
+                }
+                request_text(&client, "POST", &path, Some(Value::Object(body)))
             }
+
             "shinu_delete_space" => {
                 let space = required_string(arguments, "space")?;
                 let path = format!("/v1/spaces/{}", shinu_client::encode_path_segment(space));
@@ -320,6 +341,34 @@ fn optional_string<'a>(
     }
 }
 
+fn optional_ttl_seconds(
+    arguments: &Map<String, Value>,
+    field: &str,
+) -> Result<Option<Value>, String> {
+    match arguments.get(field) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(Value::Null)),
+        Some(Value::Number(value)) => {
+            let value = value
+                .as_u64()
+                .ok_or_else(|| format!("argument {field} must be a positive integer"))?;
+            if value == 0 {
+                Err(format!("argument {field} must be at least 1"))
+            } else {
+                Ok(Some(Value::from(value)))
+            }
+        }
+        Some(_) => Err(format!(
+            "argument {field} must be a positive integer or null"
+        )),
+    }
+}
+
+fn required_ttl_seconds(arguments: &Map<String, Value>, field: &str) -> Result<Value, String> {
+    optional_ttl_seconds(arguments, field)?
+        .ok_or_else(|| format!("missing required argument {field}"))
+}
+
 fn optional_u64(arguments: &Map<String, Value>, field: &str) -> Result<Option<u64>, String> {
     match arguments.get(field) {
         None => Ok(None),
@@ -395,6 +444,9 @@ fn create_space_body(name: &str, arguments: &Map<String, Value>) -> Result<Value
     }
     if let Some(network) = optional_network(arguments, "network")? {
         object.insert("network".to_string(), Value::String(network.to_owned()));
+    }
+    if let Some(ttl_seconds) = optional_ttl_seconds(arguments, "ttl_seconds")? {
+        object.insert("ttl_seconds".to_owned(), ttl_seconds);
     }
     Ok(Value::Object(object))
 }
@@ -480,6 +532,7 @@ fn validate_arguments(name: &str, arguments: &Map<String, Value>) -> Result<(), 
             optional_positive_u64(arguments, "mem_mib")?;
             optional_positive_u64(arguments, "disk_mib")?;
             optional_network(arguments, "network")?;
+            optional_ttl_seconds(arguments, "ttl_seconds")?;
             Ok(())
         }
         "shinu_resize_space" => {
@@ -536,6 +589,12 @@ fn validate_arguments(name: &str, arguments: &Map<String, Value>) -> Result<(), 
         "shinu_fork" => {
             required_string(arguments, "commit")?;
             required_string(arguments, "name")?;
+            optional_ttl_seconds(arguments, "ttl_seconds")?;
+            Ok(())
+        }
+        "shinu_set_space_lease" => {
+            required_string(arguments, "space")?;
+            required_ttl_seconds(arguments, "ttl_seconds")?;
             Ok(())
         }
         "shinu_delete_space" => {
@@ -649,6 +708,16 @@ fn schema(properties: Value, required: &[&str]) -> Value {
     })
 }
 
+fn ttl_seconds_schema(description: &str) -> Value {
+    json!({
+        "anyOf": [
+            {"type": "integer", "minimum": 1},
+            {"type": "null"}
+        ],
+        "description": description,
+    })
+}
+
 fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
@@ -670,7 +739,8 @@ fn tool_definitions() -> Vec<Value> {
                 "vcpus": {"type": "integer", "minimum": 1, "description": "该 space 的 vCPU 数量；省略时使用 daemon 默认值。"},
                 "mem_mib": {"type": "integer", "minimum": 1, "description": "该 space 的内存上限，单位 MiB；省略时使用 daemon 默认值。"},
                 "disk_mib": {"type": "integer", "minimum": 1, "description": "该 space 的磁盘容量，单位 MiB；省略时使用 daemon 默认值。"},
-                "network": {"type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[a-z0-9-]+$", "description": "可选的项目内网络名称；同名 space 才能互相访问。"}
+                "network": {"type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[a-z0-9-]+$", "description": "可选的项目内网络名称；同名 space 才能互相访问。"},
+                "ttl_seconds": ttl_seconds_schema("可选的租约时长，单位秒；省略或 null 表示不过期。"),
             }), &["name"]),
         }),
         json!({
@@ -768,8 +838,17 @@ fn tool_definitions() -> Vec<Value> {
             "description": "在需要从已知的 commit 开出并行实验、保留原 space 不变或比较多个方案时使用；它从该存档创建新的 space。",
             "inputSchema": schema(json!({
                 "commit": {"type": "string", "minLength": 1, "description": "作为新 space 起点的 commit ID。"},
-                "name": {"type": "string", "minLength": 1, "description": "新 space 的名称。"}
+                "name": {"type": "string", "minLength": 1, "description": "新 space 的名称。"},
+                "ttl_seconds": ttl_seconds_schema("可选的租约时长，单位秒；省略或 null 表示不过期。"),
             }), &["commit", "name"]),
+        }),
+        json!({
+            "name": "shinu_set_space_lease",
+            "description": "设置或清除 space 的租约；ttl_seconds 为正整数时设置从现在起的时长，null 清除租约。",
+            "inputSchema": schema(json!({
+                "space": {"type": "string", "minLength": 1, "description": "要设置租约的 space。"},
+                "ttl_seconds": ttl_seconds_schema("新的租约时长，单位秒；null 清除租约。")
+            }), &["space", "ttl_seconds"]),
         }),
         json!({
             "name": "shinu_delete_space",
@@ -829,6 +908,7 @@ fn is_known_tool(name: &str) -> bool {
         "shinu_list_spaces"
             | "shinu_list_images"
             | "shinu_create_space"
+            | "shinu_set_space_lease"
             | "shinu_resize_space"
             | "shinu_start"
             | "shinu_stop"
@@ -1130,6 +1210,170 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn validates_space_lease_ttl_boundaries() {
+        for (tool, value) in [
+            ("shinu_create_space", json!({"name": "dev"})),
+            (
+                "shinu_create_space",
+                json!({"name": "dev", "ttl_seconds": null}),
+            ),
+            (
+                "shinu_create_space",
+                json!({"name": "dev", "ttl_seconds": 1}),
+            ),
+            ("shinu_fork", json!({"commit": "commit", "name": "dev"})),
+            (
+                "shinu_fork",
+                json!({"commit": "commit", "name": "dev", "ttl_seconds": null}),
+            ),
+            (
+                "shinu_fork",
+                json!({"commit": "commit", "name": "dev", "ttl_seconds": 1}),
+            ),
+            (
+                "shinu_set_space_lease",
+                json!({"space": "dev", "ttl_seconds": null}),
+            ),
+            (
+                "shinu_set_space_lease",
+                json!({"space": "dev", "ttl_seconds": 1}),
+            ),
+        ] {
+            assert!(
+                validate_arguments(tool, &arguments(value)).is_ok(),
+                "valid TTL arguments must be accepted for {tool}"
+            );
+        }
+
+        for value in [json!(0), json!(-1), json!(1.5), json!("1"), json!(true)] {
+            for (tool, base) in [
+                ("shinu_create_space", json!({"name": "dev"})),
+                ("shinu_fork", json!({"commit": "commit", "name": "dev"})),
+                ("shinu_set_space_lease", json!({"space": "dev"})),
+            ] {
+                let mut args = arguments(base);
+                args.insert("ttl_seconds".to_owned(), value.clone());
+                assert!(
+                    validate_arguments(tool, &args).is_err(),
+                    "invalid TTL {value} must be rejected for {tool}"
+                );
+            }
+        }
+
+        assert!(
+            validate_arguments("shinu_set_space_lease", &arguments(json!({"space": "dev"})))
+                .is_err()
+        );
+        assert!(
+            validate_arguments(
+                "shinu_set_space_lease",
+                &arguments(json!({"space": "", "ttl_seconds": 1}))
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn space_lease_tool_schemas_advertise_nullable_positive_seconds() {
+        let definitions = tool_definitions();
+        let definition = |name: &str| {
+            definitions
+                .iter()
+                .find(|definition| definition["name"] == name)
+                .expect("space lease tool definition")
+        };
+        for name in ["shinu_create_space", "shinu_fork", "shinu_set_space_lease"] {
+            let ttl_seconds = &definition(name)["inputSchema"]["properties"]["ttl_seconds"];
+            assert_eq!(
+                ttl_seconds["anyOf"],
+                json!([
+                    {"type": "integer", "minimum": 1},
+                    {"type": "null"}
+                ])
+            );
+        }
+        assert_eq!(
+            definition("shinu_create_space")["inputSchema"]["required"],
+            json!(["name"])
+        );
+        assert_eq!(
+            definition("shinu_fork")["inputSchema"]["required"],
+            json!(["commit", "name"])
+        );
+        assert_eq!(
+            definition("shinu_set_space_lease")["inputSchema"]["required"],
+            json!(["space", "ttl_seconds"])
+        );
+        assert_eq!(
+            definition("shinu_set_space_lease")["inputSchema"]["properties"]["space"]["minLength"],
+            json!(1)
+        );
+    }
+
+    #[test]
+    fn dispatches_space_lease_tools_to_expected_routes_and_bodies() {
+        let cases = [
+            (
+                "shinu_create_space",
+                json!({"name": "dev", "ttl_seconds": 60}),
+                "POST /v1/spaces HTTP/1.1",
+                json!({"name": "dev", "ttl_seconds": 60}),
+            ),
+            (
+                "shinu_create_space",
+                json!({"name": "dev", "ttl_seconds": null}),
+                "POST /v1/spaces HTTP/1.1",
+                json!({"name": "dev", "ttl_seconds": null}),
+            ),
+            (
+                "shinu_fork",
+                json!({
+                    "commit": "00000000-0000-0000-0000-00000000002a",
+                    "name": "dev",
+                    "ttl_seconds": 60
+                }),
+                "POST /v1/commits/00000000-0000-0000-0000-00000000002a/fork HTTP/1.1",
+                json!({"name": "dev", "ttl_seconds": 60}),
+            ),
+            (
+                "shinu_fork",
+                json!({
+                    "commit": "00000000-0000-0000-0000-00000000002a",
+                    "name": "dev",
+                    "ttl_seconds": null
+                }),
+                "POST /v1/commits/00000000-0000-0000-0000-00000000002a/fork HTTP/1.1",
+                json!({"name": "dev", "ttl_seconds": null}),
+            ),
+            (
+                "shinu_set_space_lease",
+                json!({"space": "dev", "ttl_seconds": 60}),
+                "PATCH /v1/spaces/dev/lease HTTP/1.1",
+                json!({"ttl_seconds": 60}),
+            ),
+            (
+                "shinu_set_space_lease",
+                json!({"space": "dev", "ttl_seconds": null}),
+                "PATCH /v1/spaces/dev/lease HTTP/1.1",
+                json!({"ttl_seconds": null}),
+            ),
+        ];
+        for (name, arguments, request_line, expected_body) in cases {
+            let (response, raw_request) =
+                dispatch_with_json_server(name, arguments, json!({"ok": true}));
+            let (header, body) = raw_request
+                .split_once("\r\n\r\n")
+                .expect("HTTP request framing");
+            assert_eq!(header.lines().next(), Some(request_line));
+            assert_eq!(
+                serde_json::from_str::<Value>(body).expect("request JSON"),
+                expected_body
+            );
+            assert_eq!(response["result"]["isError"], json!(false));
+        }
     }
 
     #[test]
@@ -1504,7 +1748,7 @@ mod tests {
     #[test]
     fn known_tools_match_tool_definitions() {
         let definitions = tool_definitions();
-        assert_eq!(definitions.len(), 20);
+        assert_eq!(definitions.len(), 21);
         for definition in definitions {
             let name = definition
                 .get("name")

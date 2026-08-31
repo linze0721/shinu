@@ -714,6 +714,80 @@ pub fn count_spaces(conn: &Connection, project: &str) -> Result<u32> {
         .map_err(|error| Error::Invalid(format!("space count out of range: {error}")))
 }
 
+/// Calculates the absolute lease deadline from an authoritative timestamp.
+///
+/// `None` means the space does not expire. A zero duration is not a lease,
+/// while values that cannot be represented by `DateTime<Utc>` are rejected
+/// instead of wrapping into an already-expired deadline.
+pub fn lease_expiry(now: DateTime<Utc>, ttl_seconds: Option<u64>) -> Result<Option<DateTime<Utc>>> {
+    let Some(ttl_seconds) = ttl_seconds else {
+        return Ok(None);
+    };
+    let seconds = i64::try_from(ttl_seconds)
+        .map_err(|error| Error::Invalid(format!("ttl_seconds is out of range: {error}")))?;
+    if seconds == 0 {
+        return Err(Error::Invalid(
+            "ttl_seconds must be greater than zero".into(),
+        ));
+    }
+    let duration = chrono::Duration::try_seconds(seconds)
+        .ok_or_else(|| Error::Invalid("ttl_seconds overflows expires_at".into()))?;
+    now.checked_add_signed(duration)
+        .ok_or_else(|| Error::Invalid("ttl_seconds overflows expires_at".into()))
+        .map(Some)
+}
+
+/// Atomically claims one expired space for destructive cleanup.
+///
+/// The caller must hold the space lock. The database transaction re-reads the
+/// complete row, verifies the advisory expiry timestamp, and rejects spaces
+/// with active detached jobs before deleting only the Space row. Checkpoints,
+/// templates, and terminal job rows remain for the caller's existing cleanup
+/// path; host files must be removed only after this function returns.
+pub fn claim_expired_space(
+    conn: &Connection,
+    id: Uuid,
+    project: &str,
+    expected_expires_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<Option<Space>> {
+    let tx = conn.unchecked_transaction()?;
+    let space = tx
+        .query_row(
+            "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at FROM spaces WHERE project = ?1 AND id = ?2 LIMIT 1",
+            params![project, id.to_string()],
+            space_from_row,
+        )
+        .optional()?;
+    let Some(space) = space else {
+        tx.commit()?;
+        return Ok(None);
+    };
+    let expires_at = Some(expected_expires_at);
+    if space.expires_at != expires_at || space.expires_at.is_none_or(|value| value > now) {
+        tx.commit()?;
+        return Ok(None);
+    }
+    let active: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM jobs WHERE project = ?1 AND space = ?2 AND state IN ('starting', 'running', 'canceling')",
+        params![project, id.to_string()],
+        |row| row.get(0),
+    )?;
+    if active != 0 {
+        tx.commit()?;
+        return Ok(None);
+    }
+    let deleted = tx.execute(
+        "DELETE FROM spaces WHERE project = ?1 AND id = ?2 AND expires_at = ?3",
+        params![project, id.to_string(), expected_expires_at.to_rfc3339()],
+    )?;
+    if deleted != 1 {
+        tx.commit()?;
+        return Ok(None);
+    }
+    tx.commit()?;
+    Ok(Some(space))
+}
 const MAX_PROJECT_JOB_ROWS: i64 = 1024;
 const MAX_GLOBAL_JOB_ROWS: i64 = 8192;
 const MAX_JOB_LIST_ROWS: usize = 64;
@@ -1789,6 +1863,85 @@ mod db_tests {
         assert_eq!(load(&conn).unwrap(), state);
         assert_eq!(find_space(&conn, "demo", "alpha").unwrap(), Some(space));
         assert_eq!(find_ckpt(&conn, ckpt.id, "alpha").unwrap(), Some(ckpt));
+    }
+
+    #[test]
+    fn lease_expiry_rejects_zero_and_unrepresentable_ttl() {
+        let now = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        assert!(matches!(
+            lease_expiry(now, Some(0)),
+            Err(Error::Invalid(message)) if message == "ttl_seconds must be greater than zero"
+        ));
+        assert!(matches!(
+            lease_expiry(now, Some(u64::MAX)),
+            Err(Error::Invalid(message)) if message.contains("out of range")
+        ));
+        assert_eq!(
+            lease_expiry(now, Some(60)).unwrap(),
+            Some(now + chrono::Duration::seconds(60))
+        );
+        assert_eq!(lease_expiry(now, None).unwrap(), None);
+    }
+
+    #[test]
+    fn expired_space_claim_preserves_checkpoints_and_templates() {
+        let conn = db();
+        let now = Utc.timestamp_opt(1_700_000_100, 0).single().unwrap();
+        let (mut state, space, checkpoint) = sample_state("alpha");
+        let expires_at = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+        state.spaces[0].expires_at = Some(expires_at);
+        state.templates.push(Template {
+            project: "alpha".into(),
+            name: "release".into(),
+            checkpoint: checkpoint.id,
+            created_at: now,
+        });
+        store(&conn, &state).unwrap();
+
+        let removed = claim_expired_space(&conn, space.id, "alpha", expires_at, now)
+            .unwrap()
+            .expect("expired space should be claimed");
+        assert_eq!(removed.id, space.id);
+        let remaining = load(&conn).unwrap();
+        assert!(remaining.spaces.is_empty());
+        assert_eq!(remaining.ckpts, vec![checkpoint]);
+        assert_eq!(remaining.templates.len(), 1);
+    }
+
+    #[test]
+    fn expired_space_claim_skips_active_jobs_and_changed_leases() {
+        let now = Utc.timestamp_opt(1_700_000_100, 0).single().unwrap();
+        let expires_at = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
+
+        let conn = db();
+        let (mut state, space, _) = sample_state("alpha");
+        state.spaces[0].expires_at = Some(expires_at);
+        store(&conn, &state).unwrap();
+        let active = sample_job("alpha", space.id, Uuid::new_v4(), JobState::Running);
+        insert_job(&conn, &active).unwrap();
+        assert!(
+            claim_expired_space(&conn, space.id, "alpha", expires_at, now)
+                .unwrap()
+                .is_none()
+        );
+        assert!(find_space(&conn, "demo", "alpha").unwrap().is_some());
+
+        let conn = db();
+        let (mut state, space, _) = sample_state("alpha");
+        let renewed = now + chrono::Duration::hours(1);
+        state.spaces[0].expires_at = Some(renewed);
+        store(&conn, &state).unwrap();
+        assert!(
+            claim_expired_space(&conn, space.id, "alpha", expires_at, now)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            find_space(&conn, "demo", "alpha")
+                .unwrap()
+                .and_then(|space| space.expires_at),
+            Some(renewed)
+        );
     }
 
     #[test]

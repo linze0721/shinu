@@ -22,6 +22,9 @@ pub enum Req {
         disk_mib: Option<u64>,
         #[serde(default)]
         network: Option<String>,
+        /// Positive lifetime in seconds; omitted or null means no expiry.
+        #[serde(default)]
+        ttl_seconds: Option<u64>,
     },
     Resize {
         space: String,
@@ -33,6 +36,9 @@ pub enum Req {
     Fork {
         ckpt: Uuid,
         name: String,
+        /// Positive lifetime in seconds; omitted or null means no expiry.
+        #[serde(default)]
+        ttl_seconds: Option<u64>,
     },
     /// `hot: true` syncs a running guest without remounting read-only and
     /// is not crash-consistent; `hot: false` requires the space to be stopped.
@@ -128,5 +134,11 @@ pub enum Req {
     /// Requests cancellation of one detached job.
     CancelJob {
         id: Uuid,
+    },
+    /// Sets or clears the authenticated space's lease.
+    SetLease {
+        space: String,
+        /// Positive lifetime in seconds; null clears the lease.
+        ttl_seconds: Option<u64>,
     },
 }

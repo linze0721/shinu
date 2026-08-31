@@ -47,6 +47,8 @@ enum Command {
         disk: Option<u64>,
         #[arg(long)]
         network: Option<String>,
+        #[arg(long, value_name = "DURATION", value_parser = parse_ttl_duration)]
+        ttl: Option<u64>,
     },
     #[command(group(
         clap::ArgGroup::new("resize-options")
@@ -154,6 +156,21 @@ enum Command {
     Fork {
         commit: Uuid,
         name: String,
+        #[arg(long, value_name = "DURATION", value_parser = parse_ttl_duration)]
+        ttl: Option<u64>,
+    },
+    #[command(group(
+        clap::ArgGroup::new("lease-options")
+            .required(true)
+            .multiple(false)
+            .args(["ttl", "clear"])
+    ))]
+    Lease {
+        space: String,
+        #[arg(long, value_name = "DURATION", value_parser = parse_ttl_duration)]
+        ttl: Option<u64>,
+        #[arg(long)]
+        clear: bool,
     },
     #[command(name = "rmckpt")]
     RmCkpt {
@@ -765,6 +782,35 @@ fn run() -> Result<i32, String> {
     }
 }
 
+const TTL_DURATION_ERROR: &str = "TTL must be a positive integer followed by one of s, m, h, or d";
+
+fn parse_ttl_duration(raw: &str) -> Result<u64, String> {
+    let bytes = raw.as_bytes();
+    let Some((&unit, digits)) = bytes.split_last() else {
+        return Err(TTL_DURATION_ERROR.to_owned());
+    };
+    let multiplier = match unit {
+        b's' => 1_u64,
+        b'm' => 60,
+        b'h' => 60 * 60,
+        b'd' => 24 * 60 * 60,
+        _ => return Err(TTL_DURATION_ERROR.to_owned()),
+    };
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return Err(TTL_DURATION_ERROR.to_owned());
+    }
+    let number = std::str::from_utf8(digits).map_err(|_| TTL_DURATION_ERROR.to_owned())?;
+    let number = number
+        .parse::<u64>()
+        .map_err(|_| "TTL duration number is too large".to_owned())?;
+    if number == 0 {
+        return Err("TTL duration must be greater than zero".to_owned());
+    }
+    number
+        .checked_mul(multiplier)
+        .ok_or_else(|| "TTL duration is too large".to_owned())
+}
+
 fn create_space_body(
     name: &str,
     image: Option<String>,
@@ -772,6 +818,7 @@ fn create_space_body(
     mem_mib: Option<u32>,
     disk_mib: Option<u64>,
     network: Option<String>,
+    ttl_seconds: Option<u64>,
 ) -> Value {
     let mut object = serde_json::Map::new();
     object.insert("name".to_owned(), Value::String(name.to_owned()));
@@ -790,7 +837,23 @@ fn create_space_body(
     if let Some(network) = network {
         object.insert("network".to_owned(), Value::String(network));
     }
+    if let Some(ttl_seconds) = ttl_seconds {
+        object.insert("ttl_seconds".to_owned(), Value::from(ttl_seconds));
+    }
     Value::Object(object)
+}
+
+fn fork_space_body(name: &str, ttl_seconds: Option<u64>) -> Value {
+    let mut object = serde_json::Map::new();
+    object.insert("name".to_owned(), Value::String(name.to_owned()));
+    if let Some(ttl_seconds) = ttl_seconds {
+        object.insert("ttl_seconds".to_owned(), Value::from(ttl_seconds));
+    }
+    Value::Object(object)
+}
+
+fn lease_space_body(ttl_seconds: Option<u64>) -> Value {
+    json!({"ttl_seconds": ttl_seconds})
 }
 
 fn resize_space_body(
@@ -940,12 +1003,15 @@ fn run_command(client: &Client, command: Command) -> Result<i32, String> {
             mem,
             disk,
             network,
+            ttl,
         } => {
             let data = response_value(request_json(
                 client,
                 "POST",
                 "/v1/spaces",
-                Some(create_space_body(&name, image, vcpus, mem, disk, network)),
+                Some(create_space_body(
+                    &name, image, vcpus, mem, disk, network, ttl,
+                )),
             )?)?;
             print_space_summary(&data);
         }
@@ -1174,14 +1240,23 @@ fi"#
                 short_id_value(data.get("auto_commit"))
             );
         }
-        Command::Fork { commit, name } => {
+        Command::Fork { commit, name, ttl } => {
             let data = response_value(request_json(
                 client,
                 "POST",
                 &format!("/v1/commits/{commit}/fork"),
-                Some(json!({ "name": name })),
+                Some(fork_space_body(&name, ttl)),
             )?)?;
             print_space_summary(&data);
+        }
+        Command::Lease { space, ttl, clear } => {
+            let data = response_value(request_json(
+                client,
+                "PATCH",
+                &format!("/v1/spaces/{}/lease", encode_path_segment(&space)),
+                Some(lease_space_body(if clear { None } else { ttl })),
+            )?)?;
+            println!("expires_at: {}", expiry_text(data.get("expires_at")));
         }
         Command::RmCkpt { commit } => {
             let data = response_value(request_json(
@@ -1606,9 +1681,23 @@ fn print_network(data: &Value, name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn print_spaces(data: &Value) {
-    let rows = data
-        .get("spaces")
+const SPACE_HEADERS: &[&str] = &[
+    "NAME",
+    "NETWORK",
+    "PROJECT",
+    "STATE",
+    "HEAD",
+    "EXCLUSIVE",
+    "CREATED",
+    "EXPIRES",
+    "IMAGE",
+    "VCPU",
+    "MEM",
+    "DISK",
+];
+
+fn space_rows(data: &Value) -> Vec<Vec<String>> {
+    data.get("spaces")
         .and_then(Value::as_array)
         .map(|spaces| {
             spaces
@@ -1634,6 +1723,7 @@ fn print_spaces(data: &Value) {
                         short_optional_value(space.get("head")),
                         human(value_u64(space.get("exclusive")).unwrap_or(0)),
                         seconds(&field_text(space, "created_at")),
+                        expiry_text(space.get("expires_at")),
                         field_text(space, "image"),
                         short_optional_value(space.get("vcpus")),
                         human_mib(space.get("mem_mib")),
@@ -1642,23 +1732,12 @@ fn print_spaces(data: &Value) {
                 })
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_default();
-    table(
-        &[
-            "NAME",
-            "NETWORK",
-            "PROJECT",
-            "STATE",
-            "HEAD",
-            "EXCLUSIVE",
-            "CREATED",
-            "IMAGE",
-            "VCPU",
-            "MEM",
-            "DISK",
-        ],
-        &rows,
-    );
+        .unwrap_or_default()
+}
+
+fn print_spaces(data: &Value) {
+    let rows = space_rows(data);
+    table(SPACE_HEADERS, &rows);
     if let Some(ckpts) = data.get("ckpts").and_then(Value::as_array) {
         println!();
         let rows = ckpts
@@ -1792,8 +1871,22 @@ fn human(n: u64) -> String {
 
 fn seconds(value: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(value)
-        .map(|date| date.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .map(|date| {
+            date.with_timezone(&Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        })
         .unwrap_or_else(|_| value.to_owned())
+}
+
+fn expiry_text(value: Option<&Value>) -> String {
+    match value {
+        None | Some(Value::Null) => "never".to_owned(),
+        Some(Value::String(value)) => seconds(value),
+        Some(value) => {
+            let value = value_text(value);
+            seconds(&value)
+        }
+    }
 }
 
 fn write_table(output: &mut impl Write, headers: &[&str], rows: &[Vec<String>]) -> io::Result<()> {
@@ -1985,7 +2078,7 @@ mod tests {
 
     #[test]
     fn create_body_omits_unspecified_optional_fields() {
-        let body = create_space_body("dev", None, None, None, None, None);
+        let body = create_space_body("dev", None, None, None, None, None, None);
         assert_eq!(body, json!({"name": "dev"}));
         assert!(body.get("image").is_none());
         assert!(body.get("vcpus").is_none());
@@ -1994,8 +2087,130 @@ mod tests {
     }
     #[test]
     fn create_body_includes_network_when_requested() {
-        let body = create_space_body("dev", None, None, None, None, Some("lan".into()));
+        let body = create_space_body("dev", None, None, None, None, Some("lan".into()), None);
         assert_eq!(body, json!({"name": "dev", "network": "lan"}));
+    }
+
+    #[test]
+    fn parses_ttl_duration_units_and_checked_boundaries() {
+        assert_eq!(parse_ttl_duration("1s"), Ok(1));
+        assert_eq!(parse_ttl_duration("2m"), Ok(120));
+        assert_eq!(parse_ttl_duration("3h"), Ok(10_800));
+        assert_eq!(parse_ttl_duration("4d"), Ok(345_600));
+        assert_eq!(parse_ttl_duration("18446744073709551615s"), Ok(u64::MAX));
+        assert!(parse_ttl_duration("18446744073709551615m").is_err());
+    }
+
+    #[test]
+    fn rejects_non_positive_or_non_integer_ttl_durations() {
+        for raw in [
+            "", "0s", "00m", "-1s", "+1s", "1.5s", "1", "1w", "1S", "1 s", "1s ",
+        ] {
+            assert!(
+                parse_ttl_duration(raw).is_err(),
+                "accepted invalid TTL {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_ttl_on_new_and_uuid_fork_commands() {
+        let cli =
+            Cli::try_parse_from(["shinu", "new", "dev", "--ttl", "2h"]).expect("parse new TTL");
+        match cli.command {
+            Command::New { ttl, .. } => assert_eq!(ttl, Some(7_200)),
+            _ => panic!("unexpected command parsed"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "shinu",
+            "fork",
+            "00000000-0000-0000-0000-000000000000",
+            "branch",
+            "--ttl",
+            "1d",
+        ])
+        .expect("parse fork TTL");
+        match cli.command {
+            Command::Fork { ttl, .. } => assert_eq!(ttl, Some(86_400)),
+            _ => panic!("unexpected command parsed"),
+        }
+    }
+
+    #[test]
+    fn lease_requires_exactly_one_ttl_or_clear_flag() {
+        assert!(Cli::try_parse_from(["shinu", "lease", "dev"]).is_err());
+        assert!(Cli::try_parse_from(["shinu", "lease", "dev", "--ttl", "1m", "--clear"]).is_err());
+
+        let cli =
+            Cli::try_parse_from(["shinu", "lease", "dev", "--ttl", "1m"]).expect("parse lease TTL");
+        match cli.command {
+            Command::Lease { space, ttl, clear } => {
+                assert_eq!(space, "dev");
+                assert_eq!(ttl, Some(60));
+                assert!(!clear);
+            }
+            _ => panic!("unexpected command parsed"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["shinu", "lease", "dev", "--clear"]).expect("parse lease clear");
+        match cli.command {
+            Command::Lease { ttl, clear, .. } => {
+                assert!(ttl.is_none());
+                assert!(clear);
+            }
+            _ => panic!("unexpected command parsed"),
+        }
+    }
+
+    #[test]
+    fn ttl_request_bodies_preserve_omission_and_encode_clear_as_null() {
+        assert_eq!(
+            create_space_body("dev", None, None, None, None, None, Some(90)),
+            json!({"name": "dev", "ttl_seconds": 90})
+        );
+        assert_eq!(fork_space_body("branch", None), json!({"name": "branch"}));
+        assert_eq!(
+            fork_space_body("branch", Some(90)),
+            json!({"name": "branch", "ttl_seconds": 90})
+        );
+        assert_eq!(lease_space_body(Some(90)), json!({"ttl_seconds": 90}));
+        assert_eq!(lease_space_body(None), json!({"ttl_seconds": null}));
+    }
+
+    #[test]
+    fn renders_canonical_expiry_and_never_in_human_space_list() {
+        let data = json!({
+            "spaces": [
+                {
+                    "name": "leased",
+                    "created_at": "2026-08-31T10:00:00+00:00",
+                    "expires_at": "2026-08-31T12:34:56+02:00"
+                },
+                {
+                    "name": "unleased",
+                    "created_at": "2026-08-31T10:00:00+00:00",
+                    "expires_at": null
+                }
+            ]
+        });
+        let rows = space_rows(&data);
+        assert_eq!(rows[0][6], "2026-08-31T10:00:00Z");
+        assert_eq!(rows[0][7], "2026-08-31T10:34:56Z");
+        assert_eq!(rows[1][7], "never");
+
+        let mut output = Vec::new();
+        write_table(&mut output, SPACE_HEADERS, &rows).expect("write spaces table");
+        let output = String::from_utf8(output).expect("UTF-8 spaces table");
+        assert!(
+            output
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .contains("EXPIRES")
+        );
+        assert!(output.contains("never"));
     }
 
     #[test]

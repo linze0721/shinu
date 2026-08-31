@@ -2,14 +2,14 @@
 
 ## Project Overview
 
-`shinu` is a multi-tenant sandbox platform designed for AI agents, offering Firecracker microVM execution with git-like version control, copy-on-write (CoW) disk image branching, per-tenant quotas, usage metering, detached jobs, named network namespaces for inter-agent communication, HTTP proxying, a guest desktop environment with a VNC bridge, user accounts, and an MCP server.
+`shinu` is a multi-tenant sandbox platform designed for AI agents, offering Firecracker microVM execution with git-like version control, copy-on-write (CoW) disk image branching, optional space leases, per-tenant quotas, usage metering, detached jobs, named network namespaces for inter-agent communication, HTTP proxying, a guest desktop environment with a VNC bridge, user accounts, and an MCP server.
 
 A **space** is a named microVM instance tied to an ext4 disk image cloned via CoW (`cp --reflink=always`) from a base rootfs image (e.g. `base-void.ext4`).
-`shinu` provides git-like disk versioning: spaces track commit DAGs, support cold/hot commits, history log chains, head checkouts (with auto-commit reflogs), and commit forks.
+`shinu` provides git-like disk versioning: spaces track commit DAGs, support cold/hot commits, history log chains, head checkouts (with auto-commit reflogs), commit forks, and optional TTL leases.
 
 VMs can run in four guest base images: `void` (default), `ubuntu`, `arch`, and `rocky`. Commits support three snapshot modes: `none`, `full`, and `diff`. A `full` snapshot captures guest memory plus CPU state; a `diff` snapshot captures dirty memory pages relative to a selected full base recorded in the `ckpts.base` field of the database. The platform also supports an image filesystem tree `diff` (entirely distinct from diff memory snapshots) that compares file-level changes between checkpoints or spaces.
 
-Clients interact with `shinud` strictly over HTTP/1.1 using Bearer token authentication or console session credentials. TLS is terminated externally (e.g., via Caddy), while the daemon listens on loopback. Synchronous `exec` runs over SSH/vsock and streams chunked NDJSON; detached jobs run asynchronously through REST, CLI, and MCP surfaces and expose terminal-rendered logs. The web console dashboard (build-free, framework-free vanilla JS) allows users to register, log in, manage access tokens, and inspect logs, but has no detached-job controls.
+Clients interact with `shinud` strictly over HTTP/1.1 using Bearer token authentication or console session credentials. TLS is terminated externally (e.g., via Caddy), while the daemon listens on loopback. Synchronous `exec` runs over SSH/vsock and streams chunked NDJSON; detached jobs run asynchronously through REST, CLI, and MCP surfaces and expose terminal-rendered logs. The web console dashboard (build-free, framework-free vanilla JS) allows users to register, log in, manage access tokens, and inspect logs plus read-only lease expiry, but has no detached-job controls.
 
 MicroVM processes are jailed inside unprivileged user/cgroup chroot sandboxes managed via Firecracker's Jailer.
 
@@ -50,7 +50,7 @@ graph TD
 - **Quotas & Throttling** — Resource ceilings and request throttling are enforced per project (`crates/shinu-store/src/quota.rs`). Limits default to 5 spaces, 10240 MiB disk, 16 vCPUs, 32768 MiB memory, 2 running VMs, and 120 API requests/min (`SHINU_LIMIT_*` env overrides, per-project overrides stored in `projects` table). Detached jobs have a fixed active cap of 64 per project. Throttling uses a 60-second sliding window with automatic expired entry pruning. Exceeding quota or rate limits yields HTTP **429 Too Many Requests** (`Error::Quota`). Rate limiting is evaluated *before* state or database locks are acquired.
 
 - **State Storage & Indexing** — SQLite in WAL mode (`<root>/shinu.db`, mode `0600`) manages state. Database schema (`crates/shinu-store/src/state.rs:139-231`) consists of ten tables:
-  - `spaces`: microVM metadata, parent commit, current head, sizing (vcpus, mem_mib, disk_mib), network name, and creation time.
+  - `spaces`: microVM metadata, parent commit, current head, sizing (vcpus, mem_mib, disk_mib), network name, creation time, and optional `expires_at` (RFC3339 or `null`).
   - `ckpts`: commit records, including auto-commits, full snapshot flag, parent/base commit UUIDs, and `snapshot_version`.
   - `projects`: project-scoped resource limit overrides.
   - `usage_events`: metered usages (disk_mib_hour, vm_seconds, api_call, space_created).
@@ -74,7 +74,7 @@ graph TD
   - `templates_project_checkpoint`
   - `spaces_project_expires`
 
-- **Usage Metering** — Metering events are captured in the `usage_events` table. A background sweep thread runs every `USAGE_SAMPLE_SECS` (30 seconds) to record `vm_seconds` and `disk_mib_hour` metrics, and purges expired sessions.
+- **Space Lease Runtime** — `expires_at` is RFC3339 or `null`; existing spaces and spaces created without a TTL use `null` and never expire. Expired leases reject new starts, auto-starts, and jobs. The expiry sweep stops a VM at expiry and, after `SHINU_LEASE_GRACE_SECS`, deletes the mutable Space using claim-before-delete; active jobs postpone cleanup, renewal under the Space lock wins, and checkpoints and templates remain.
 
 - **Concurrency & Locking Discipline** — `shinud` uses thread-per-connection concurrency with `shinu_store::registry::Registry` (`crates/shinu-store/src/registry.rs`). Locking follows a multi-tier model:
   1. Per-space lock (`Arc<Mutex<()>>` via `Registry::space_lock`): serializes long-running VM and space-scoped job operations.
@@ -97,7 +97,7 @@ graph TD
 | `src/lib.rs` | Re-export facade mapping the six workspace crates into a single flat namespace for binaries (`src/lib.rs`). |
 | `src/bin/shinu.rs` | Client CLI: Clap CLI parsing, stream parsing, and local token generation (`src/bin/shinu.rs`). |
 | `src/bin/shinud.rs` | Control daemon: Route handlers, connection loop, console auth, CSRF pre-checks, and GC (`src/bin/shinud.rs`). |
-| `src/bin/shinu-mcp.rs` | MCP Server: Line-delimited JSON-RPC 2.0 interface providing 20 tools for agents (`src/bin/shinu-mcp.rs`). |
+| `src/bin/shinu-mcp.rs` | MCP Server: Line-delimited JSON-RPC 2.0 interface providing 21 tools for agents (`src/bin/shinu-mcp.rs`). |
 | `src/bin/shinu-vsock.rs`| Stdio-to-vsock bridge helper used as SSH ProxyCommand (`src/bin/shinu-vsock.rs`). |
 | `src/console/` | Web Console: Framework-free frontend dashboard (`index.html`, `auth.html`, `app.js`, `app.css`). |
 | `site/` | Astro-based marketing and documentation site. |
@@ -124,7 +124,7 @@ Runtime layout (`crates/shinu-core/src/lib.rs:359-374` `init_layout`):
 ```sh
 cargo build                          # debug build
 cargo build --release                # release build expected by packaging/install.sh
-cargo test --workspace               # run full cargo workspace test suite (280 tests across 20 suites)
+cargo test --workspace               # run full cargo workspace test suite (302 tests across 20 suites)
 cargo clippy --all-targets           # check for lint issues against workspace posture
 cargo fmt --check                    # check formatting
 ```
@@ -152,7 +152,7 @@ export SHINU_ENDPOINT="http://127.0.0.1:7878"
 export SHINU_TOKEN="<token-from-shinu-token-new>"
 
 # CLI commands
-shinu new web --image void           # create space with void image (alternatives: ubuntu, arch, rocky)
+shinu new web --image void --ttl 2h  # create space with void image and a lease (alternatives: ubuntu, arch, rocky)
 shinu resize web --vcpus 4 --mem 2048 # resize CPU or memory allocations (must be stopped)
 shinu exec web -- uname -a           # synchronous command; streams chunked NDJSON
 # Run a detached job; this returns a job ID without waiting for completion
@@ -167,7 +167,9 @@ shinu commit web --note "hot" --hot  # create hot commit while running
 shinu log web                        # show commit history DAG
 shinu reflog web                     # show full reflog history
 shinu checkout web <commit-uuid>     # checkout commit (creates auto-commit reflog)
-shinu fork <commit-uuid> web-branch  # fork commit into a new space
+shinu fork <commit-uuid> web-branch --ttl 30m  # fork commit into a new space with a lease
+shinu lease web --ttl 2h             # set a space lease
+shinu lease web --clear              # clear a space lease
 shinu stop web                       # stop microVM
 shinu rm web                         # delete space
 shinu rmckpt <commit-uuid>           # delete commit (refused if referenced)
@@ -203,7 +205,7 @@ curl -sX POST -H "Authorization: Bearer $SHINU_TOKEN" \
 ```
 
 CLI Subcommand Surface (`src/bin/shinu.rs:33-177`):
-- `new <name> [--image <img-id>] [--vcpus <n>] [--mem <mib>] [--disk <mib>] [--network <name>]`
+- `new <name> [--image <img-id>] [--vcpus <n>] [--mem <mib>] [--disk <mib>] [--network <name>] [--ttl <duration>]`
 - `resize <space> [--vcpus <n>] [--mem <mib>] [--disk <mib>]`
 - `images`
 - `ls [--json]`
@@ -228,12 +230,14 @@ CLI Subcommand Surface (`src/bin/shinu.rs:33-177`):
 - `reflog <space> [--json]`
 - `diff <source> [target] [--all] [--limit <n>]`
 - `checkout <space> <commit-uuid>`
-- `fork <commit-uuid> <name>`
+- `fork <commit-uuid> <name> [--ttl <duration>]`
 - `rmckpt <commit-uuid>`
 - `gc --free-below <bytes> [--dry-run]`
 - `usage [--from <ts>] [--to <ts>] [--json]`
 - `limits [set <project> --spaces <n> --disk-mib <mib> --running <n> --api-per-min <n> --inherit <list>] [clear <project>] [--json]`
 - `token new --project <project> | ls | rm <hash-prefix>`
+- `lease <space> [--ttl <duration>|--clear]`
+- CLI lease durations use the grammar `N{s|m|h|d}`.
 ## Detached Jobs
 
 - REST routes: `POST /v1/spaces/{space}/jobs`, `GET /v1/jobs`, `GET /v1/jobs/{id}`, `GET /v1/jobs/{id}/logs`, and `POST /v1/jobs/{id}/cancel`.
@@ -273,6 +277,7 @@ CLI Subcommand Surface (`src/bin/shinu.rs:33-177`):
   - `SHINU_VCPUS`: VM vCPU count (default `2`).
   - `SHINU_MEM_MIB`: VM memory limit in MiB (default `1024`).
   - `SHINU_IDLE_SECS`: Idle timeout before VM shutdown (default `3600`).
+  - `SHINU_LEASE_GRACE_SECS`: Grace period in seconds after lease expiry before mutable-space cleanup (default `300`).
   - `SHINU_DISK_MIB`: Base disk size in MiB, read on base build (default `2048`).
   - `SHINU_JAIL_UID`: Unprivileged jailer UID (default `30000`).
   - `SHINU_JAIL_GID`: Unprivileged jailer GID (default `30000`).
@@ -294,10 +299,10 @@ CLI Subcommand Surface (`src/bin/shinu.rs:33-177`):
   - `SHINU_MIRROR`: Void package mirror (default `repo-default.voidlinux.org`).
   - `SHINU_ARCH`: Target guest architecture (default `uname -m`).
 - **Concurrency & Lock Order Discipline** —
-  1. Space-scoped paths lock space → optional job/checkpoint → state → database connection. Job-monitor paths lock job → state → database connection. Never acquire these locks in reverse order.
+  1. Space-scoped paths lock space → optional job/checkpoint → state → database connection. Job-monitor paths lock job → state → database connection. Lease renewal and expiry cleanup use the per-space lock; renewal wins when serialized. Never acquire these locks in reverse order.
   2. Lock hold scope must be minimal. Do NOT hold state or database locks during btrfs disk operations, subprocess spawning, VM execution, or network calls.
 - **Claim-before-Delete Pattern (GC & Mutation Discipline)** —
-  When modifying shared state and deleting disk files (e.g. during `gc` or commit deletion), atomically claim the record under state lock first (re-verify conditions and remove entry from database), release lock, and then delete files on disk.
+  When modifying shared state and deleting disk files (e.g. during `gc`, commit deletion, or expired-space cleanup), atomically claim the record under state lock first (re-verify conditions and remove entry from database), release the lock, and then delete files on disk. Expiry cleanup deletes only the mutable Space; checkpoints and templates remain. Active jobs postpone cleanup, and renewal under the Space lock wins over expiry cleanup.
 - **Automatic Snapshot Degradation Semantics** —
   - A `--full` commit request automatically degrades to Diff when a valid full ancestor exists (`full=1`, same space, `.mem` and `.state` present on disk, `snapshot_version == FC_SNAPSHOT_VERSION`).
   - Ancestor lookup walks back to the nearest *valid* full ancestor, skipping invalid ones rather than stopping at the first full. Stopping at the first full would force Full forever after a single stale pre-upgrade entry, which is exactly what the feature exists to prevent. This is safe because a diff restores from precisely the commit recorded in `ckpts.base` so intervening commits are never consulted.
@@ -323,7 +328,7 @@ CLI Subcommand Surface (`src/bin/shinu.rs:33-177`):
 
 ## Testing & QA
 
-- Total test count: **280 tests across 20 suites**.
+- Total test count: **302 tests across 20 suites**.
 - **Test Execution Environment**:
   - Tests run via built-in `cargo test --workspace`.
   - Tests are hermetic: they run against temporary directories created via `std::env::temp_dir()`, use `NetConfig { enabled: false, .. }`, do not spawn real Firecracker VMs or Jailer sandboxes, do not perform btrfs reflink operations, and do not require root privileges.
@@ -366,4 +371,5 @@ CLI Subcommand Surface (`src/bin/shinu.rs:33-177`):
 21. **Free Page Reporting Does Not Replace Explicit Reclaim** — Cold boot enables `free_page_reporting` in the `fc.json` balloon object. Measured on a v1.16.1 host: a guest that allocated 500 MiB then freed it drove firecracker RSS 102.7 MiB → 596.9 MiB → 105.0 MiB within 5 seconds with no balloon inflate issued, so reporting does work for the anonymous mappings shinu boots with. `vm::reclaim`'s periodic explicit inflate MUST still be kept: reporting only returns pages the guest kernel puts on its free list, so it does nothing for memory held in guest page cache, which is exactly what the idle sweep's inflate targets via `available_memory`. Reporting is an optimisation layered on the inflate, not a replacement for it.
 22. **Data-Sized VM API Calls Get Their Own Deadline** — `vm::api` applies `API_TIMEOUT_SECS` (5s) because a control-plane request that does not answer promptly means a wedged VMM. Snapshot creation is not a control-plane request: its duration scales with guest RAM and disk speed, measured at 5.4s for a 1 GiB guest on NVMe, which sat directly on the old shared deadline and made `commit --full` fail with HTTP 500 while Firecracker went on to write the snapshot successfully. `vm::snapshot` MUST therefore use `api_with_timeout` with `SNAPSHOT_TIMEOUT_SECS`. Any future endpoint whose cost scales with guest size, not VMM latency, MUST do the same rather than widening the shared timeout.
 23. **Dirty-Page Tracking on Snapshot Restore** — A snapshot restore MUST send `"track_dirty_pages": true` in the `PUT /snapshot/load` body because Firecracker rebuilds the dirty-page bitmap from the load request and does not inherit it from the snapshot; cold boot sets the same flag in `fc.json` via `crates/shinu-vm/src/config.rs`. Omitting it silently leaves a restored VM with no dirty tracking so every later diff becomes a full memory dump (measured 268.2 / 270.1 / 267.8 MiB on an idle restored guest, versus 8.2 and 8.0 MiB after the fix). The first diff after a restore is legitimately large (measured 269.5 MiB) because the bitmap starts empty and every page touched during restore counts dirty, converging from the second diff on. Firecracker's `SnapshotLoadParams` exposes `track_dirty_pages` with `enable_diff_snapshots` as its deprecated alias; shinu uses the current name.
-24. **Detached Job Lifetime and Output** — Existing `exec` is synchronous. Detached jobs survive client disconnect and daemon restart only while the VM stays running; active jobs refresh idle use and prevent space stop/remove; VM loss yields `lost`. Job logs are one terminal-rendered text stream capped at 1 MiB and archived with mode `0600` under `<root>/jobs/`; no follow/raw logs, force-stop, reboot survival, artifacts, or console controls.
+24. **Detached Job Lifetime and Output** — Existing `exec` is synchronous. Detached jobs survive client disconnect and daemon restart only while the VM stays running; active jobs refresh idle use and prevent space stop/remove; VM loss yields `lost`. Job logs are one terminal-rendered text stream capped at 1 MiB and archived with mode `0600` under `<root>/jobs/`; no follow/raw logs, force-stop, reboot survival, artifacts, or console controls. Automatic and manual VM stops flush guest durability with a finite 60-second process-group deadline before Firecracker receives TERM then KILL.
+25. **Space Lease Expiry and Cleanup** — `expires_at` is RFC3339 or `null`; existing and no-TTL spaces never expire. Expired leases reject new start, auto-start, and job requests. The sweep stops at expiry, waits `SHINU_LEASE_GRACE_SECS` (default `300`) before claim-before-delete cleanup of the mutable Space, postpones cleanup while active jobs run, and lets a renewal under the Space lock win. Checkpoints and templates remain.

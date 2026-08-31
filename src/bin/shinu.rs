@@ -200,9 +200,34 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    Template {
+        #[command(subcommand)]
+        command: TemplateCommand,
+    },
     Token {
         #[command(subcommand)]
         command: TokenCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum TemplateCommand {
+    Create {
+        name: String,
+        commit: Uuid,
+    },
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    Rm {
+        name: String,
+    },
+    Fork {
+        template: String,
+        space: String,
+        #[arg(long, value_name = "DURATION", value_parser = parse_ttl_duration)]
+        ttl: Option<u64>,
     },
 }
 
@@ -852,6 +877,18 @@ fn fork_space_body(name: &str, ttl_seconds: Option<u64>) -> Value {
     Value::Object(object)
 }
 
+fn template_create_body(name: &str, checkpoint: Uuid) -> Value {
+    json!({"name": name, "checkpoint": checkpoint.to_string()})
+}
+
+fn template_path(name: &str) -> String {
+    format!("/v1/templates/{}", encode_path_segment(name))
+}
+
+fn template_fork_path(name: &str) -> String {
+    format!("{}/fork", template_path(name))
+}
+
 fn lease_space_body(ttl_seconds: Option<u64>) -> Value {
     json!({"ttl_seconds": ttl_seconds})
 }
@@ -1362,6 +1399,52 @@ fi"#
                 println!("cleared limits for {project}");
             }
         }
+        Command::Template { command } => match command {
+            TemplateCommand::Create { name, commit } => {
+                let data = response_value(request_json(
+                    client,
+                    "POST",
+                    "/v1/templates",
+                    Some(template_create_body(&name, commit)),
+                )?)?;
+                println!(
+                    "created template {}  {}",
+                    field_text(&data, "name"),
+                    field_text(&data, "checkpoint")
+                );
+            }
+            TemplateCommand::Ls { json } => {
+                let response = request_json(client, "GET", "/v1/templates", None)?;
+                let body = successful_body(response)?;
+                if json {
+                    print_raw_json(&body)?;
+                } else {
+                    print_templates(&response_value_from_body(&body)?);
+                }
+            }
+            TemplateCommand::Rm { name } => {
+                let data =
+                    response_value(request_json(client, "DELETE", &template_path(&name), None)?)?;
+                println!(
+                    "removed template {}  {}",
+                    field_text(&data, "removed"),
+                    field_text(&data, "checkpoint")
+                );
+            }
+            TemplateCommand::Fork {
+                template,
+                space,
+                ttl,
+            } => {
+                let data = response_value(request_json(
+                    client,
+                    "POST",
+                    &template_fork_path(&template),
+                    Some(fork_space_body(&space, ttl)),
+                )?)?;
+                print_space_summary(&data);
+            }
+        },
         Command::Token { .. } => {
             return Err("token commands must be handled without an HTTP endpoint".to_string());
         }
@@ -1624,6 +1707,30 @@ fn write_job_logs(
 
 fn print_space_summary(data: &Value) {
     println!("{}  {}", field_text(data, "name"), field_text(data, "id"));
+}
+
+const TEMPLATE_HEADERS: &[&str] = &["NAME", "CHECKPOINT", "CREATED"];
+
+fn template_rows(data: &Value) -> Vec<Vec<String>> {
+    data.get("templates")
+        .and_then(Value::as_array)
+        .map(|templates| {
+            templates
+                .iter()
+                .map(|template| {
+                    vec![
+                        field_text(template, "name"),
+                        field_text(template, "checkpoint"),
+                        seconds(&field_text(template, "created_at")),
+                    ]
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn print_templates(data: &Value) {
+    table(TEMPLATE_HEADERS, &template_rows(data));
 }
 
 fn print_images(data: &Value) {
@@ -2089,6 +2196,109 @@ mod tests {
     fn create_body_includes_network_when_requested() {
         let body = create_space_body("dev", None, None, None, None, Some("lan".into()), None);
         assert_eq!(body, json!({"name": "dev", "network": "lan"}));
+    }
+
+    #[test]
+    fn parses_nested_template_commands_and_full_uuid_commit() {
+        let checkpoint = "00000000-0000-0000-0000-000000000000";
+        let cli = Cli::try_parse_from(["shinu", "template", "create", "release", checkpoint])
+            .expect("parse template create");
+        match cli.command {
+            Command::Template {
+                command: TemplateCommand::Create { name, commit },
+            } => {
+                assert_eq!(name, "release");
+                assert_eq!(commit.to_string(), checkpoint);
+            }
+            _ => panic!("unexpected command parsed"),
+        }
+
+        assert!(Cli::try_parse_from(["shinu", "template", "create", "release", "short"]).is_err());
+    }
+
+    #[test]
+    fn parses_template_fork_ttl_and_json_list_flag() {
+        let cli = Cli::try_parse_from([
+            "shinu", "template", "fork", "release", "branch", "--ttl", "2h",
+        ])
+        .expect("parse template fork");
+        match cli.command {
+            Command::Template {
+                command:
+                    TemplateCommand::Fork {
+                        template,
+                        space,
+                        ttl,
+                    },
+            } => {
+                assert_eq!(template, "release");
+                assert_eq!(space, "branch");
+                assert_eq!(ttl, Some(7_200));
+            }
+            _ => panic!("unexpected command parsed"),
+        }
+
+        let cli = Cli::try_parse_from(["shinu", "template", "ls", "--json"])
+            .expect("parse template JSON list");
+        match cli.command {
+            Command::Template {
+                command: TemplateCommand::Ls { json },
+            } => assert!(json),
+            _ => panic!("unexpected command parsed"),
+        }
+    }
+
+    #[test]
+    fn template_request_body_and_paths_are_concrete_and_encoded() {
+        let checkpoint = Uuid::parse_str("00000000-0000-0000-0000-000000000000")
+            .expect("template checkpoint UUID");
+        assert_eq!(
+            template_create_body("release", checkpoint),
+            json!({
+                "name": "release",
+                "checkpoint": "00000000-0000-0000-0000-000000000000"
+            })
+        );
+        assert_eq!(
+            template_path("release/name"),
+            "/v1/templates/release%2Fname"
+        );
+        assert_eq!(
+            template_fork_path("release/name"),
+            "/v1/templates/release%2Fname/fork"
+        );
+    }
+
+    #[test]
+    fn renders_template_rows_with_full_checkpoint_and_normalized_created_time() {
+        let data = json!({
+            "templates": [{
+                "name": "release",
+                "checkpoint": "00000000-0000-0000-0000-000000000000",
+                "created_at": "2026-08-31T12:34:56+02:00"
+            }]
+        });
+        let rows = template_rows(&data);
+        assert_eq!(
+            rows,
+            vec![vec![
+                "release".to_owned(),
+                "00000000-0000-0000-0000-000000000000".to_owned(),
+                "2026-08-31T10:34:56Z".to_owned(),
+            ]]
+        );
+
+        let mut output = Vec::new();
+        write_table(&mut output, TEMPLATE_HEADERS, &rows).expect("write template table");
+        let output = String::from_utf8(output).expect("UTF-8 template table");
+        assert!(
+            output
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .contains("CHECKPOINT")
+        );
+        assert!(output.contains("00000000-0000-0000-0000-000000000000"));
     }
 
     #[test]

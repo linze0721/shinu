@@ -43,6 +43,19 @@ impl Server {
         match name {
             "shinu_list_spaces" => request_text(&client, "GET", "/v1/spaces", None),
             "shinu_list_images" => request_text(&client, "GET", "/v1/images", None),
+            "shinu_list_templates" => {
+                request_structured_json(&client, "GET", "/v1/templates", None)
+            }
+            "shinu_create_template" => {
+                let name = required_template_name(arguments, "name")?;
+                let checkpoint = required_uuid(arguments, "checkpoint")?;
+                request_structured_json(
+                    &client,
+                    "POST",
+                    "/v1/templates",
+                    Some(json!({"name": name, "checkpoint": checkpoint})),
+                )
+            }
             "shinu_create_space" => {
                 let name = required_string(arguments, "name")?;
                 let body = create_space_body(name, arguments)?;
@@ -218,6 +231,28 @@ impl Server {
                 }
                 request_text(&client, "POST", &path, Some(Value::Object(body)))
             }
+            "shinu_fork_template" => {
+                let template = required_template_name(arguments, "template")?;
+                let name = required_string(arguments, "name")?;
+                let path = format!(
+                    "/v1/templates/{}/fork",
+                    shinu_client::encode_path_segment(template)
+                );
+                let mut body = Map::new();
+                body.insert("name".to_owned(), Value::String(name.to_owned()));
+                if let Some(ttl_seconds) = optional_ttl_seconds(arguments, "ttl_seconds")? {
+                    body.insert("ttl_seconds".to_owned(), ttl_seconds);
+                }
+                request_structured_json(&client, "POST", &path, Some(Value::Object(body)))
+            }
+            "shinu_delete_template" => {
+                let template = required_template_name(arguments, "name")?;
+                let path = format!(
+                    "/v1/templates/{}",
+                    shinu_client::encode_path_segment(template)
+                );
+                request_structured_json(&client, "DELETE", &path, None)
+            }
 
             "shinu_delete_space" => {
                 let space = required_string(arguments, "space")?;
@@ -288,6 +323,22 @@ fn required_string<'a>(arguments: &'a Map<String, Value>, field: &str) -> Result
 fn required_uuid(arguments: &Map<String, Value>, field: &str) -> Result<Uuid, String> {
     let value = required_string(arguments, field)?;
     Uuid::parse_str(value).map_err(|error| format!("argument {field} must be a full UUID: {error}"))
+}
+fn required_template_name<'a>(
+    arguments: &'a Map<String, Value>,
+    field: &str,
+) -> Result<&'a str, String> {
+    let value = required_string(arguments, field)?;
+    if value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(format!(
+            "argument {field} must be 1-64 lowercase ASCII letters, digits, or hyphens"
+        ));
+    }
+    Ok(value)
 }
 
 fn required_text<'a>(arguments: &'a Map<String, Value>, field: &str) -> Result<&'a str, String> {
@@ -523,8 +574,15 @@ fn required_job_command(arguments: &Map<String, Value>) -> Result<&[Value], Stri
 
 fn validate_arguments(name: &str, arguments: &Map<String, Value>) -> Result<(), String> {
     match name {
-        "shinu_list_spaces" | "shinu_list_images" | "shinu_list_jobs" => Ok(()),
+        "shinu_list_spaces" | "shinu_list_images" | "shinu_list_jobs" | "shinu_list_templates" => {
+            Ok(())
+        }
 
+        "shinu_create_template" => {
+            required_template_name(arguments, "name")?;
+            required_uuid(arguments, "checkpoint")?;
+            Ok(())
+        }
         "shinu_create_space" => {
             required_string(arguments, "name")?;
             optional_image(arguments, "image")?;
@@ -590,6 +648,16 @@ fn validate_arguments(name: &str, arguments: &Map<String, Value>) -> Result<(), 
             required_string(arguments, "commit")?;
             required_string(arguments, "name")?;
             optional_ttl_seconds(arguments, "ttl_seconds")?;
+            Ok(())
+        }
+        "shinu_fork_template" => {
+            required_template_name(arguments, "template")?;
+            required_string(arguments, "name")?;
+            optional_ttl_seconds(arguments, "ttl_seconds")?;
+            Ok(())
+        }
+        "shinu_delete_template" => {
+            required_template_name(arguments, "name")?;
             Ok(())
         }
         "shinu_set_space_lease" => {
@@ -729,6 +797,35 @@ fn tool_definitions() -> Vec<Value> {
             "name": "shinu_list_images",
             "description": "在创建 space 前查看可用的 guest image 及其构建状态；它只列出固定的 void、ubuntu、arch、rocky image。",
             "inputSchema": schema(json!({}), &[]),
+        }),
+        json!({
+            "name": "shinu_list_templates",
+            "description": "列出当前项目可见的不可变 checkpoint template，返回结构化 JSON。",
+            "inputSchema": schema(json!({}), &[]),
+        }),
+        json!({
+            "name": "shinu_create_template",
+            "description": "为项目内已有的 checkpoint 创建不可变的命名 template；template 名称只能包含小写 ASCII 字母、数字和连字符。",
+            "inputSchema": schema(json!({
+                "name": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9-]+$", "description": "项目内 template 名称。"},
+                "checkpoint": {"type": "string", "format": "uuid", "description": "要固定引用的完整 checkpoint UUID。"}
+            }), &["name", "checkpoint"]),
+        }),
+        json!({
+            "name": "shinu_delete_template",
+            "description": "删除项目内的 checkpoint template 引用；不会删除其 checkpoint。",
+            "inputSchema": schema(json!({
+                "name": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9-]+$", "description": "要删除的 template 名称。"}
+            }), &["name"]),
+        }),
+        json!({
+            "name": "shinu_fork_template",
+            "description": "从项目内的 checkpoint template 创建新的 space；fork 会固定 template 当前解析到的 checkpoint UUID。",
+            "inputSchema": schema(json!({
+                "template": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9-]+$", "description": "作为新 space 起点的 template 名称。"},
+                "name": {"type": "string", "minLength": 1, "description": "新 space 的名称。"},
+                "ttl_seconds": ttl_seconds_schema("可选的租约时长，单位秒；省略或 null 表示不过期。"),
+            }), &["template", "name"]),
         }),
         json!({
             "name": "shinu_create_space",
@@ -907,6 +1004,10 @@ fn is_known_tool(name: &str) -> bool {
         name,
         "shinu_list_spaces"
             | "shinu_list_images"
+            | "shinu_list_templates"
+            | "shinu_create_template"
+            | "shinu_delete_template"
+            | "shinu_fork_template"
             | "shinu_create_space"
             | "shinu_set_space_lease"
             | "shinu_resize_space"
@@ -1377,6 +1478,236 @@ mod tests {
     }
 
     #[test]
+    fn validates_checkpoint_template_tool_boundaries() {
+        let checkpoint = "00000000-0000-0000-0000-00000000002a";
+        assert!(validate_arguments("shinu_list_templates", &Map::new()).is_ok());
+        assert!(
+            validate_arguments(
+                "shinu_create_template",
+                &arguments(json!({"name": "release-1", "checkpoint": checkpoint}))
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_arguments(
+                "shinu_delete_template",
+                &arguments(json!({"name": "release-1"}))
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_arguments(
+                "shinu_fork_template",
+                &arguments(json!({"template": "release-1", "name": "dev"}))
+            )
+            .is_ok()
+        );
+
+        let maximum_name = "a".repeat(64);
+        assert!(
+            validate_arguments(
+                "shinu_create_template",
+                &arguments(json!({"name": maximum_name, "checkpoint": checkpoint}))
+            )
+            .is_ok()
+        );
+        for invalid_name in [
+            "",
+            " ",
+            "Release-1",
+            "release_1",
+            "release 1",
+            "release/1",
+            "é",
+        ] {
+            assert!(
+                validate_arguments(
+                    "shinu_create_template",
+                    &arguments(json!({"name": invalid_name, "checkpoint": checkpoint}))
+                )
+                .is_err(),
+                "invalid template name {invalid_name:?} must be rejected"
+            );
+        }
+        let too_long_name = "a".repeat(65);
+        assert!(
+            validate_arguments(
+                "shinu_create_template",
+                &arguments(json!({"name": too_long_name, "checkpoint": checkpoint}))
+            )
+            .is_err()
+        );
+
+        assert!(
+            validate_arguments(
+                "shinu_create_template",
+                &arguments(json!({"name": "release-1", "checkpoint": "short-id"}))
+            )
+            .is_err()
+        );
+        assert!(
+            validate_arguments(
+                "shinu_create_template",
+                &arguments(json!({"name": "release-1"}))
+            )
+            .is_err()
+        );
+
+        for ttl_seconds in [json!(null), json!(1)] {
+            let mut args = arguments(json!({"template": "release-1", "name": "dev"}));
+            args.insert("ttl_seconds".to_owned(), ttl_seconds);
+            assert!(validate_arguments("shinu_fork_template", &args).is_ok());
+        }
+        for ttl_seconds in [json!(0), json!(-1), json!(1.5), json!("1"), json!(true)] {
+            let mut args = arguments(json!({"template": "release-1", "name": "dev"}));
+            args.insert("ttl_seconds".to_owned(), ttl_seconds);
+            assert!(validate_arguments("shinu_fork_template", &args).is_err());
+        }
+        for tool in ["shinu_delete_template", "shinu_fork_template"] {
+            let field = if tool == "shinu_delete_template" {
+                "name"
+            } else {
+                "template"
+            };
+            let mut args = arguments(json!({"name": "dev", "template": "release-1"}));
+            args.remove(field);
+            assert!(validate_arguments(tool, &args).is_err());
+        }
+    }
+
+    #[test]
+    fn template_tool_schemas_advertise_runtime_boundaries() {
+        let definitions = tool_definitions();
+        let definition = |name: &str| {
+            definitions
+                .iter()
+                .find(|definition| definition["name"] == name)
+                .expect("template tool definition")
+        };
+
+        let list = definition("shinu_list_templates");
+        assert_eq!(list["inputSchema"]["properties"], json!({}));
+        assert_eq!(list["inputSchema"]["required"], json!([]));
+
+        let create = definition("shinu_create_template");
+        assert_eq!(
+            create["inputSchema"]["required"],
+            json!(["name", "checkpoint"])
+        );
+        assert_eq!(
+            create["inputSchema"]["properties"]["name"]["minLength"],
+            json!(1)
+        );
+        assert_eq!(
+            create["inputSchema"]["properties"]["name"]["maxLength"],
+            json!(64)
+        );
+        assert_eq!(
+            create["inputSchema"]["properties"]["name"]["pattern"],
+            json!("^[a-z0-9-]+$")
+        );
+        assert_eq!(
+            create["inputSchema"]["properties"]["checkpoint"]["format"],
+            json!("uuid")
+        );
+
+        let delete = definition("shinu_delete_template");
+        assert_eq!(delete["inputSchema"]["required"], json!(["name"]));
+        assert_eq!(
+            delete["inputSchema"]["properties"]["name"]["maxLength"],
+            json!(64)
+        );
+        assert_eq!(
+            delete["inputSchema"]["properties"]["name"]["pattern"],
+            json!("^[a-z0-9-]+$")
+        );
+
+        let fork = definition("shinu_fork_template");
+        assert_eq!(fork["inputSchema"]["required"], json!(["template", "name"]));
+        assert_eq!(
+            fork["inputSchema"]["properties"]["template"]["maxLength"],
+            json!(64)
+        );
+        assert_eq!(
+            fork["inputSchema"]["properties"]["template"]["pattern"],
+            json!("^[a-z0-9-]+$")
+        );
+        assert_eq!(
+            fork["inputSchema"]["properties"]["ttl_seconds"]["anyOf"],
+            json!([
+                {"type": "integer", "minimum": 1},
+                {"type": "null"}
+            ])
+        );
+    }
+
+    #[test]
+    fn dispatches_template_tools_to_expected_routes_bodies_and_json() {
+        let checkpoint = "00000000-0000-0000-0000-00000000002a";
+        let cases = vec![
+            (
+                "shinu_create_template",
+                json!({"name": "release-1", "checkpoint": checkpoint}),
+                "POST /v1/templates HTTP/1.1",
+                Some(json!({"name": "release-1", "checkpoint": checkpoint})),
+                json!({"project": "project-a", "name": "release-1", "checkpoint": checkpoint}),
+            ),
+            (
+                "shinu_list_templates",
+                json!({}),
+                "GET /v1/templates HTTP/1.1",
+                None,
+                json!({"templates": []}),
+            ),
+            (
+                "shinu_delete_template",
+                json!({"name": "release-1"}),
+                "DELETE /v1/templates/release-1 HTTP/1.1",
+                None,
+                json!({"removed": "release-1", "checkpoint": checkpoint}),
+            ),
+            (
+                "shinu_fork_template",
+                json!({"template": "release-1", "name": "dev", "ttl_seconds": 60}),
+                "POST /v1/templates/release-1/fork HTTP/1.1",
+                Some(json!({"name": "dev", "ttl_seconds": 60})),
+                json!({"id": "00000000-0000-0000-0000-000000000007", "name": "dev"}),
+            ),
+            (
+                "shinu_fork_template",
+                json!({"template": "release-1", "name": "dev", "ttl_seconds": null}),
+                "POST /v1/templates/release-1/fork HTTP/1.1",
+                Some(json!({"name": "dev", "ttl_seconds": null})),
+                json!({"id": "00000000-0000-0000-0000-000000000007", "name": "dev"}),
+            ),
+        ];
+
+        for (name, arguments, request_line, expected_request_body, expected_response_body) in cases
+        {
+            let (response, raw_request) =
+                dispatch_with_json_server(name, arguments, expected_response_body.clone());
+            let (header, body) = raw_request
+                .split_once("\r\n\r\n")
+                .expect("HTTP request framing");
+            assert_eq!(header.lines().next(), Some(request_line));
+            let actual_request_body = if body.is_empty() {
+                None
+            } else {
+                Some(serde_json::from_str::<Value>(body).expect("request JSON"))
+            };
+            assert_eq!(actual_request_body, expected_request_body);
+            assert_eq!(response["result"]["isError"], json!(false));
+            let output = response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("structured MCP output");
+            assert_eq!(
+                serde_json::from_str::<Value>(output).expect("output JSON"),
+                expected_response_body
+            );
+        }
+    }
+
+    #[test]
     fn validates_all_advertised_resource_and_network_boundaries() {
         for (field, value) in [
             ("vcpus", json!(0)),
@@ -1748,7 +2079,7 @@ mod tests {
     #[test]
     fn known_tools_match_tool_definitions() {
         let definitions = tool_definitions();
-        assert_eq!(definitions.len(), 21);
+        assert_eq!(definitions.len(), 25);
         for definition in definitions {
             let name = definition
                 .get("name")

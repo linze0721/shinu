@@ -141,4 +141,23 @@ pub enum Req {
         /// Positive lifetime in seconds; null clears the lease.
         ttl_seconds: Option<u64>,
     },
+    /// Creates an immutable project-scoped checkpoint template.
+    CreateTemplate {
+        name: String,
+        checkpoint: Uuid,
+    },
+    /// Lists immutable checkpoint templates in the authenticated project.
+    ListTemplates,
+    /// Removes one project-scoped checkpoint template reference.
+    DeleteTemplate {
+        name: String,
+    },
+    /// Forks a space from a project-scoped checkpoint template.
+    ForkTemplate {
+        template: String,
+        name: String,
+        /// Positive lifetime in seconds; omitted or null means no expiry.
+        #[serde(default)]
+        ttl_seconds: Option<u64>,
+    },
 }

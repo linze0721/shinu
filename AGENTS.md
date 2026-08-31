@@ -6,6 +6,7 @@
 
 A **space** is a named microVM instance tied to an ext4 disk image cloned via CoW (`cp --reflink=always`) from a base rootfs image (e.g. `base-void.ext4`).
 `shinu` provides git-like disk versioning: spaces track commit DAGs, support cold/hot commits, history log chains, head checkouts (with auto-commit reflogs), commit forks, and optional TTL leases.
+A **Template** is an immutable, project-scoped name-to-checkpoint reference with logical fields `{name, checkpoint, created_at}`. Names are 1–64 lowercase ASCII characters matching `[a-z0-9-]`; template deletion removes only the reference, never checkpoint files.
 
 VMs can run in four guest base images: `void` (default), `ubuntu`, `arch`, and `rocky`. Commits support three snapshot modes: `none`, `full`, and `diff`. A `full` snapshot captures guest memory plus CPU state; a `diff` snapshot captures dirty memory pages relative to a selected full base recorded in the `ckpts.base` field of the database. The platform also supports an image filesystem tree `diff` (entirely distinct from diff memory snapshots) that compares file-level changes between checkpoints or spaces.
 
@@ -47,7 +48,7 @@ graph TD
 
 - **Jailer Sandbox Isolation** — `vm::start` (`crates/shinu-vm/src/vm.rs:988`) launches Firecracker microVMs inside jailer chroot sandboxes (`/usr/bin/jailer`). Process credentials drop to unprivileged `shinu-jail` user/group (`SHINU_JAIL_UID` / `SHINU_JAIL_GID`, default 30000). cgroup v2 resource limits are enforced on each sandbox (`memory.max=<mem>M`, `pids.max=512`). Kernel (`assets/vmlinux`) and rootfs images are hardlinked into the chroot tree at `<root>/jail/firecracker/<uuid>/root/` (`link_resource` in `crates/shinu-vm/src/vm.rs:920-935`).
 
-- **Quotas & Throttling** — Resource ceilings and request throttling are enforced per project (`crates/shinu-store/src/quota.rs`). Limits default to 5 spaces, 10240 MiB disk, 16 vCPUs, 32768 MiB memory, 2 running VMs, and 120 API requests/min (`SHINU_LIMIT_*` env overrides, per-project overrides stored in `projects` table). Detached jobs have a fixed active cap of 64 per project. Throttling uses a 60-second sliding window with automatic expired entry pruning. Exceeding quota or rate limits yields HTTP **429 Too Many Requests** (`Error::Quota`). Rate limiting is evaluated *before* state or database locks are acquired.
+- **Quotas & Throttling** — Resource ceilings and request throttling are enforced per project (`crates/shinu-store/src/quota.rs`). Limits default to 5 spaces, 10240 MiB disk, 16 vCPUs, 32768 MiB memory, 2 running VMs, and 120 API requests/min (`SHINU_LIMIT_*` env overrides, per-project overrides stored in `projects` table). Detached jobs have a fixed active cap of 64 per project. Template retention is capped at 256 retained refs per project and 2048 globally; creation over either cap returns HTTP **429 Too Many Requests**, and listing is bounded to the project's 256-ref cap. Throttling uses a 60-second sliding window with automatic expired entry pruning. Exceeding quota or rate limits yields HTTP **429 Too Many Requests** (`Error::Quota`). Rate limiting is evaluated *before* state or database locks are acquired.
 
 - **State Storage & Indexing** — SQLite in WAL mode (`<root>/shinu.db`, mode `0600`) manages state. Database schema (`crates/shinu-store/src/state.rs:139-231`) consists of ten tables:
   - `spaces`: microVM metadata, parent commit, current head, sizing (vcpus, mem_mib, disk_mib), network name, creation time, and optional `expires_at` (RFC3339 or `null`).
@@ -58,7 +59,7 @@ graph TD
   - `memberships`: maps users to projects with roles.
   - `sessions`: session IDs, user IDs, and expiration times.
   - `jobs`: detached command records with columns `id`, `project`, `space`, `command`, `state`, `created_at`, `started_at`, `finished_at`, `exit_code`, `error`, `log_bytes`, and `log_truncated`. States are `starting`, `running`, `canceling`, `exited`, `canceled`, and `lost`.
-  - `templates`: project-scoped checkpoint template records.
+  - `templates`: immutable project-scoped checkpoint template records with `{name, checkpoint, created_at}`; names are unique per project and constrained to 1–64 lowercase ASCII characters matching `[a-z0-9-]`. Retained references are capped at 256 per project and 2048 globally; list results are bounded to the project's 256-reference cap, and creation over either cap returns quota 429.
   - `sqlite_sequence`: internal autoincrement tracking.
   
   Indexes (`templates_project_checkpoint` at `crates/shinu-store/src/state.rs:224`; `spaces_project_expires` in `init_schema` at `state.rs:317-318`):
@@ -82,7 +83,7 @@ graph TD
   3. Global state lock (`Registry::state_lock`): serializes SQLite transactions and state modifications.
   4. Database connection lock (`Mutex<Connection>`): serializes SQLite access.
   
-  **Lock Order Invariant**: Space-scoped paths acquire space → optional job/checkpoint → state → database connection. Job-monitor paths acquire job → state → database connection. Never hold state or database locks across long disk CoW, subprocess, VM, or network operations.
+  **Lock Order Invariant**: Space-scoped paths acquire space → optional job/checkpoint → state → database connection. Job-monitor paths acquire job → state → database connection. Template create/delete/fork state transitions resolve project-scoped references under state → database connection and template fork releases those locks before CoW/VM work. Never hold state or database locks across long disk CoW, subprocess, VM, or network operations.
 
 ## Key Directories
 
@@ -97,7 +98,7 @@ graph TD
 | `src/lib.rs` | Re-export facade mapping the six workspace crates into a single flat namespace for binaries (`src/lib.rs`). |
 | `src/bin/shinu.rs` | Client CLI: Clap CLI parsing, stream parsing, and local token generation (`src/bin/shinu.rs`). |
 | `src/bin/shinud.rs` | Control daemon: Route handlers, connection loop, console auth, CSRF pre-checks, and GC (`src/bin/shinud.rs`). |
-| `src/bin/shinu-mcp.rs` | MCP Server: Line-delimited JSON-RPC 2.0 interface providing 21 tools for agents (`src/bin/shinu-mcp.rs`). |
+| `src/bin/shinu-mcp.rs` | MCP Server: Line-delimited JSON-RPC 2.0 interface providing 25 tools for agents (`src/bin/shinu-mcp.rs`). |
 | `src/bin/shinu-vsock.rs`| Stdio-to-vsock bridge helper used as SSH ProxyCommand (`src/bin/shinu-vsock.rs`). |
 | `src/console/` | Web Console: Framework-free frontend dashboard (`index.html`, `auth.html`, `app.js`, `app.css`). |
 | `site/` | Astro-based marketing and documentation site. |
@@ -124,7 +125,7 @@ Runtime layout (`crates/shinu-core/src/lib.rs:359-374` `init_layout`):
 ```sh
 cargo build                          # debug build
 cargo build --release                # release build expected by packaging/install.sh
-cargo test --workspace               # run full cargo workspace test suite (302 tests across 20 suites)
+cargo test --workspace               # run full cargo workspace test suite (314 tests across 20 suites)
 cargo clippy --all-targets           # check for lint issues against workspace posture
 cargo fmt --check                    # check formatting
 ```
@@ -168,6 +169,13 @@ shinu log web                        # show commit history DAG
 shinu reflog web                     # show full reflog history
 shinu checkout web <commit-uuid>     # checkout commit (creates auto-commit reflog)
 shinu fork <commit-uuid> web-branch --ttl 30m  # fork commit into a new space with a lease
+# Name and list a checkpoint with an immutable template reference (up to 256 retained refs/project, 2048 global; over-cap create returns 429)
+shinu template create baseline <commit-uuid>
+shinu template ls
+# Fork the template's concrete checkpoint into a new space
+shinu template fork baseline template-demo --ttl 30m
+# Remove only the template reference; the checkpoint remains
+shinu template rm baseline
 shinu lease web --ttl 2h             # set a space lease
 shinu lease web --clear              # clear a space lease
 shinu stop web                       # stop microVM
@@ -232,6 +240,11 @@ CLI Subcommand Surface (`src/bin/shinu.rs:33-177`):
 - `checkout <space> <commit-uuid>`
 - `fork <commit-uuid> <name> [--ttl <duration>]`
 - `rmckpt <commit-uuid>`
+- `template create <name> <checkpoint-uuid>`
+- `template ls`
+- `template rm <name>`
+- `template fork <template> <destination> [--ttl <duration>]`
+- Template names are 1–64 characters matching `[a-z0-9-]`; missing or foreign checkpoint targets return 404, invalid or duplicate names return 400, and creation over the 256-per-project or 2048-global retention cap returns 429. Listing is bounded to the project's 256 retained-reference cap.
 - `gc --free-below <bytes> [--dry-run]`
 - `usage [--from <ts>] [--to <ts>] [--json]`
 - `limits [set <project> --spaces <n> --disk-mib <mib> --running <n> --api-per-min <n> --inherit <list>] [clear <project>] [--json]`
@@ -302,7 +315,7 @@ CLI Subcommand Surface (`src/bin/shinu.rs:33-177`):
   1. Space-scoped paths lock space → optional job/checkpoint → state → database connection. Job-monitor paths lock job → state → database connection. Lease renewal and expiry cleanup use the per-space lock; renewal wins when serialized. Never acquire these locks in reverse order.
   2. Lock hold scope must be minimal. Do NOT hold state or database locks during btrfs disk operations, subprocess spawning, VM execution, or network calls.
 - **Claim-before-Delete Pattern (GC & Mutation Discipline)** —
-  When modifying shared state and deleting disk files (e.g. during `gc`, commit deletion, or expired-space cleanup), atomically claim the record under state lock first (re-verify conditions and remove entry from database), release the lock, and then delete files on disk. Expiry cleanup deletes only the mutable Space; checkpoints and templates remain. Active jobs postpone cleanup, and renewal under the Space lock wins over expiry cleanup.
+  When modifying shared state and deleting disk files (e.g. during `gc`, commit deletion, or expired-space cleanup), atomically claim the record under state lock first (re-verify conditions and remove entry from database), release the lock, and then delete files on disk. Expiry cleanup deletes only the mutable Space; checkpoints and templates remain. Template deletion is reference-only and MUST NOT unlink checkpoint files. `rmckpt` and GC MUST treat a template's checkpoint as referenced. Active jobs postpone cleanup, and renewal under the Space lock wins over expiry cleanup.
 - **Automatic Snapshot Degradation Semantics** —
   - A `--full` commit request automatically degrades to Diff when a valid full ancestor exists (`full=1`, same space, `.mem` and `.state` present on disk, `snapshot_version == FC_SNAPSHOT_VERSION`).
   - Ancestor lookup walks back to the nearest *valid* full ancestor, skipping invalid ones rather than stopping at the first full. Stopping at the first full would force Full forever after a single stale pre-upgrade entry, which is exactly what the feature exists to prevent. This is safe because a diff restores from precisely the commit recorded in `ckpts.base` so intervening commits are never consulted.
@@ -328,7 +341,7 @@ CLI Subcommand Surface (`src/bin/shinu.rs:33-177`):
 
 ## Testing & QA
 
-- Total test count: **302 tests across 20 suites**.
+- Total test count: **314 tests across 20 suites**.
 - **Test Execution Environment**:
   - Tests run via built-in `cargo test --workspace`.
   - Tests are hermetic: they run against temporary directories created via `std::env::temp_dir()`, use `NetConfig { enabled: false, .. }`, do not spawn real Firecracker VMs or Jailer sandboxes, do not perform btrfs reflink operations, and do not require root privileges.
@@ -373,3 +386,4 @@ CLI Subcommand Surface (`src/bin/shinu.rs:33-177`):
 23. **Dirty-Page Tracking on Snapshot Restore** — A snapshot restore MUST send `"track_dirty_pages": true` in the `PUT /snapshot/load` body because Firecracker rebuilds the dirty-page bitmap from the load request and does not inherit it from the snapshot; cold boot sets the same flag in `fc.json` via `crates/shinu-vm/src/config.rs`. Omitting it silently leaves a restored VM with no dirty tracking so every later diff becomes a full memory dump (measured 268.2 / 270.1 / 267.8 MiB on an idle restored guest, versus 8.2 and 8.0 MiB after the fix). The first diff after a restore is legitimately large (measured 269.5 MiB) because the bitmap starts empty and every page touched during restore counts dirty, converging from the second diff on. Firecracker's `SnapshotLoadParams` exposes `track_dirty_pages` with `enable_diff_snapshots` as its deprecated alias; shinu uses the current name.
 24. **Detached Job Lifetime and Output** — Existing `exec` is synchronous. Detached jobs survive client disconnect and daemon restart only while the VM stays running; active jobs refresh idle use and prevent space stop/remove; VM loss yields `lost`. Job logs are one terminal-rendered text stream capped at 1 MiB and archived with mode `0600` under `<root>/jobs/`; no follow/raw logs, force-stop, reboot survival, artifacts, or console controls. Automatic and manual VM stops flush guest durability with a finite 60-second process-group deadline before Firecracker receives TERM then KILL.
 25. **Space Lease Expiry and Cleanup** — `expires_at` is RFC3339 or `null`; existing and no-TTL spaces never expire. Expired leases reject new start, auto-start, and job requests. The sweep stops at expiry, waits `SHINU_LEASE_GRACE_SECS` (default `300`) before claim-before-delete cleanup of the mutable Space, postpones cleanup while active jobs run, and lets a renewal under the Space lock win. Checkpoints and templates remain.
+26. **Immutable Project-Scoped Template References** — A Template is exactly `{name, checkpoint, created_at}` plus project scope. Names MUST be 1–64 lowercase ASCII characters matching `[a-z0-9-]`; invalid or duplicate names return HTTP 400, and missing or foreign checkpoint targets return HTTP 404. Retained references MUST be capped at 256 per project and 2048 globally; listing MUST be bounded to the project's 256-reference cap, and creation over either cap returns HTTP 429. `template fork` MUST resolve the stored concrete checkpoint UUID and set the destination Space `parent` and `head` to that UUID, with optional TTL support. `rmckpt` and GC MUST treat template checkpoint references as live; deleting a template removes only the reference and never checkpoint files. Templates have no tags, updates, renames, sharing, catalogs, or console UI.

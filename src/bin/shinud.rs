@@ -25,7 +25,7 @@ use shinu::{
     proto::{Req, SnapshotMode},
     quota::{self, Limits, RateLimiter},
     registry::Registry,
-    state::{self, Ckpt, Space, State},
+    state::{self, Ckpt, Space, State, Template},
 };
 use shinu_image::{
     DEFAULT_DIFF_LIMIT, DEFAULT_EXCLUSIONS, DiffEntry, DiffOptions, DiffResult, DiffStatus,
@@ -60,6 +60,8 @@ const JOB_LIST_LIMIT: usize = 64;
 const DEFAULT_FULL_EVERY: usize = 8;
 const LEASE_GRACE_DEFAULT_SECS: u64 = 300;
 const DIFF_TMP_DIR: &str = "diff-tmp";
+const TEMPLATE_PROJECT_CAP: usize = 256;
+const TEMPLATE_GLOBAL_CAP: usize = 2048;
 
 #[derive(Parser)]
 #[command(name = "shinud")]
@@ -1660,6 +1662,24 @@ fn check_name(state: &State, name: &str, project: &str) -> shinu::Result<()> {
     }
     Ok(())
 }
+fn check_template_capacity(state: &State, project: &str) -> shinu::Result<()> {
+    if state.templates.len() >= TEMPLATE_GLOBAL_CAP {
+        return Err(shinu::Error::Quota(format!(
+            "template limit exceeded: host may retain at most {TEMPLATE_GLOBAL_CAP} templates"
+        )));
+    }
+    let project_count = state
+        .templates
+        .iter()
+        .filter(|template| template.project == project)
+        .count();
+    if project_count >= TEMPLATE_PROJECT_CAP {
+        return Err(shinu::Error::Quota(format!(
+            "template limit exceeded: project may retain at most {TEMPLATE_PROJECT_CAP} templates"
+        )));
+    }
+    Ok(())
+}
 
 fn require_checkpoint_note(note: &str) -> shinu::Result<()> {
     if note.trim().is_empty() {
@@ -2161,6 +2181,126 @@ fn fork_space(
         let _ = std::fs::remove_dir_all(&mount);
     }
     result
+}
+fn create_template(
+    ctx: &Ctx<'_>,
+    project: &str,
+    name: String,
+    checkpoint: Uuid,
+) -> shinu::Result<Value> {
+    state::validate_template_name(&name)?;
+    // This lookup only selects the checkpoint lock. The authoritative target
+    // and template uniqueness checks happen again under state → DB below.
+    let checkpoint = {
+        let connection = lock_db(ctx.db);
+        state::find_ckpt(&connection, checkpoint, project)?
+            .ok_or_else(|| shinu::Error::NotFound(checkpoint.to_string()))?
+    };
+    let checkpoint_guard = ctx.registry.checkpoint_lock(checkpoint.id);
+    let _checkpoint_guard = checkpoint_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let template = update_state(ctx.db, ctx.registry, |state| {
+        let target = state
+            .ckpts
+            .iter()
+            .find(|candidate| candidate.id == checkpoint.id && candidate.project == project)
+            .ok_or_else(|| shinu::Error::NotFound(checkpoint.id.to_string()))?;
+        if state
+            .templates
+            .iter()
+            .any(|template| template.project == project && template.name == name)
+        {
+            return Err(shinu::Error::Invalid(format!(
+                "template name already exists: {name}"
+            )));
+        }
+        check_template_capacity(state, project)?;
+        let template = Template {
+            project: project.to_owned(),
+            name: name.clone(),
+            checkpoint: target.id,
+            created_at: Utc::now(),
+        };
+        state.templates.push(template.clone());
+        Ok(template)
+    })?;
+    Ok(serde_json::to_value(template)?)
+}
+
+fn list_templates(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
+    let state = snapshot(ctx.db, ctx.registry)?;
+    let mut templates = state
+        .templates
+        .into_iter()
+        .filter(|template| template.project == project)
+        .collect::<Vec<_>>();
+    // Template names are the primary stable order. The timestamp and concrete
+    // checkpoint identity make ties deterministic even for hand-written state.
+    templates.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.created_at.cmp(&right.created_at))
+            .then_with(|| left.checkpoint.cmp(&right.checkpoint))
+    });
+    Ok(json!({ "templates": templates }))
+}
+
+fn delete_template(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value> {
+    state::validate_template_name(&name)?;
+    // Resolve the project-scoped ref before waiting on its target. A tenant
+    // that cannot see this name receives the same 404 whether another tenant
+    // owns it or it does not exist.
+    let checkpoint = {
+        let state = snapshot(ctx.db, ctx.registry)?;
+        state
+            .templates
+            .iter()
+            .find(|template| template.project == project && template.name == name)
+            .map(|template| template.checkpoint)
+            .ok_or_else(|| shinu::Error::NotFound(name.clone()))?
+    };
+    let checkpoint_guard = ctx.registry.checkpoint_lock(checkpoint);
+    let _checkpoint_guard = checkpoint_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (removed, checkpoint) = update_state(ctx.db, ctx.registry, |state| {
+        let index = state
+            .templates
+            .iter()
+            .position(|template| {
+                template.project == project
+                    && template.name == name
+                    && template.checkpoint == checkpoint
+            })
+            .ok_or_else(|| shinu::Error::NotFound(name.clone()))?;
+        let template = state.templates.remove(index);
+        Ok((template.name, template.checkpoint))
+    })?;
+    Ok(json!({ "removed": removed, "checkpoint": checkpoint }))
+}
+
+fn fork_template(
+    ctx: &Ctx<'_>,
+    project: &str,
+    template: String,
+    name: String,
+    ttl_seconds: Option<u64>,
+) -> shinu::Result<Value> {
+    state::validate_template_name(&template)?;
+    // Resolve the ref once, then deliberately hand the concrete checkpoint to
+    // the existing fork path. That path owns all checkpoint/base validation,
+    // quota checks, TTL handling, and the established lock order.
+    let checkpoint = {
+        let state = snapshot(ctx.db, ctx.registry)?;
+        state
+            .templates
+            .iter()
+            .find(|entry| entry.project == project && entry.name == template)
+            .map(|entry| entry.checkpoint)
+            .ok_or_else(|| shinu::Error::NotFound(template.clone()))?
+    };
+    fork_space(ctx, project, checkpoint, name, ttl_seconds)
 }
 
 fn commit_space(
@@ -3526,6 +3666,14 @@ fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
             disk_mib,
         } => resize_space(ctx, project, space, vcpus, mem_mib, disk_mib),
         Req::Images => Ok(list_images(ctx)),
+        Req::CreateTemplate { name, checkpoint } => create_template(ctx, project, name, checkpoint),
+        Req::ListTemplates => list_templates(ctx, project),
+        Req::DeleteTemplate { name } => delete_template(ctx, project, name),
+        Req::ForkTemplate {
+            template,
+            name,
+            ttl_seconds,
+        } => fork_template(ctx, project, template, name, ttl_seconds),
         Req::Fork {
             ckpt,
             name,
@@ -3741,6 +3889,9 @@ enum Endpoint {
     ConsoleTokens,
     ConsoleToken(String),
     Spaces,
+    Templates,
+    Template(String),
+    TemplateFork(String),
     JobSubmit(String),
     JobList,
     Job(String),
@@ -3824,6 +3975,19 @@ fn route(path: &str) -> Option<Endpoint> {
     }
     if segments.len() == 5 && segments[2] == "spaces" && segments[4] == "jobs" {
         return Some(Endpoint::JobSubmit(segments[3].clone()));
+    }
+    if segments.len() == 3 && segments[2] == "templates" {
+        return Some(Endpoint::Templates);
+    }
+    if segments.len() == 4 && segments[2] == "templates" && !segments[3].is_empty() {
+        return Some(Endpoint::Template(segments[3].clone()));
+    }
+    if segments.len() == 5
+        && segments[2] == "templates"
+        && !segments[3].is_empty()
+        && segments[4] == "fork"
+    {
+        return Some(Endpoint::TemplateFork(segments[3].clone()));
     }
     if segments.len() == 3 && segments[2] == "spaces" {
         return Some(Endpoint::Spaces);
@@ -4056,6 +4220,9 @@ fn method_allowed(endpoint: &Endpoint, method: &str) -> bool {
         Endpoint::ConsoleTokens => method == "GET" || method == "POST",
         Endpoint::ConsoleToken(_) => method == "DELETE",
         Endpoint::Spaces => method == "GET" || method == "POST",
+        Endpoint::Templates => method == "GET" || method == "POST",
+        Endpoint::Template(_) => method == "DELETE",
+        Endpoint::TemplateFork(_) => method == "POST",
         Endpoint::JobList | Endpoint::Job(_) | Endpoint::JobLogs(_) => method == "GET",
         Endpoint::JobSubmit(_) | Endpoint::JobCancel(_) => method == "POST",
         Endpoint::Usage
@@ -4284,6 +4451,24 @@ fn fork_request(body: &[u8], ckpt: Uuid) -> shinu::Result<Req> {
         ttl_seconds: value_optional_ttl(&value, "ttl_seconds")?,
     })
 }
+fn template_create_request(body: &[u8]) -> shinu::Result<Req> {
+    let value = parse_body(body)?;
+    let name = value_string(&value, "name")?;
+    state::validate_template_name(&name)?;
+    let checkpoint = Uuid::parse_str(&value_string(&value, "checkpoint")?)
+        .map_err(|error| shinu::Error::Invalid(format!("invalid checkpoint id: {error}")))?;
+    Ok(Req::CreateTemplate { name, checkpoint })
+}
+
+fn template_fork_request(body: &[u8], template: String) -> shinu::Result<Req> {
+    state::validate_template_name(&template)?;
+    let value = parse_body(body)?;
+    Ok(Req::ForkTemplate {
+        template,
+        name: value_string(&value, "name")?,
+        ttl_seconds: value_optional_ttl(&value, "ttl_seconds")?,
+    })
+}
 
 fn lease_request(body: &[u8], space: String) -> shinu::Result<Req> {
     let value = parse_body(body)?;
@@ -4318,6 +4503,13 @@ fn request_for(
     match endpoint {
         Endpoint::Spaces if method == "GET" => Ok((Req::Ls, 200)),
         Endpoint::Spaces => Ok((new_request(body)?, 201)),
+        Endpoint::Templates if method == "GET" => Ok((Req::ListTemplates, 200)),
+        Endpoint::Templates => Ok((template_create_request(body)?, 201)),
+        Endpoint::Template(name) => {
+            state::validate_template_name(&name)?;
+            Ok((Req::DeleteTemplate { name }, 200))
+        }
+        Endpoint::TemplateFork(template) => Ok((template_fork_request(body, template)?, 201)),
         Endpoint::JobSubmit(space) => Ok((job_request(body, space)?, 202)),
         Endpoint::JobList => Ok((Req::ListJobs, 200)),
         Endpoint::Job(id) => Ok((
@@ -7107,7 +7299,7 @@ mod tests {
         Image, NetConfig, VmConfig,
         proto::{Req, SnapshotMode},
         quota::{Limits, RateLimiter},
-        state::{self, Ckpt, Space, State},
+        state::{self, Ckpt, Space, State, Template},
         vm,
     };
     use std::collections::HashMap;
@@ -8242,6 +8434,148 @@ mod tests {
     }
 
     #[test]
+    fn template_capacity_has_project_and_global_boundaries() {
+        let now = Utc::now();
+        let mut project_state = State::default();
+        project_state
+            .templates
+            .extend(
+                (0..(super::TEMPLATE_PROJECT_CAP - 1)).map(|index| Template {
+                    project: "project-a".into(),
+                    name: format!("template-{index}"),
+                    checkpoint: Uuid::nil(),
+                    created_at: now,
+                }),
+            );
+        assert!(super::check_template_capacity(&project_state, "project-a").is_ok());
+        project_state.templates.push(Template {
+            project: "project-a".into(),
+            name: "template-last".into(),
+            checkpoint: Uuid::nil(),
+            created_at: now,
+        });
+        let project_error = super::check_template_capacity(&project_state, "project-a")
+            .expect_err("project cap must reject the next template");
+        assert!(matches!(
+            project_error,
+            shinu::Error::Quota(message)
+                if message == "template limit exceeded: project may retain at most 256 templates"
+        ));
+        assert!(super::check_template_capacity(&project_state, "project-b").is_ok());
+
+        let global_state = State {
+            templates: (0..super::TEMPLATE_GLOBAL_CAP)
+                .map(|index| Template {
+                    project: format!("project-{}", index / super::TEMPLATE_PROJECT_CAP),
+                    name: format!("template-{index}"),
+                    checkpoint: Uuid::nil(),
+                    created_at: now,
+                })
+                .collect(),
+            ..State::default()
+        };
+        let global_error = super::check_template_capacity(&global_state, "project-new")
+            .expect_err("global cap must reject the next template");
+        assert!(matches!(
+            global_error,
+            shinu::Error::Quota(message)
+                if message == "template limit exceeded: host may retain at most 2048 templates"
+        ));
+    }
+
+    #[test]
+    fn template_routes_methods_and_bodies_are_explicit() {
+        let checkpoint = Uuid::new_v4();
+        let collection = super::route("/v1/templates").expect("template collection route");
+        assert!(matches!(&collection, super::Endpoint::Templates));
+        assert!(super::method_allowed(&collection, "GET"));
+        assert!(super::method_allowed(&collection, "POST"));
+        assert!(!super::method_allowed(&collection, "DELETE"));
+
+        let item = super::route("/v1/templates/release").expect("template item route");
+        assert!(matches!(&item, super::Endpoint::Template(name) if name == "release"));
+        assert!(super::method_allowed(&item, "DELETE"));
+        assert!(!super::method_allowed(&item, "GET"));
+
+        let fork = super::route("/v1/templates/release/fork").expect("template fork route");
+        assert!(matches!(&fork, super::Endpoint::TemplateFork(name) if name == "release"));
+        assert!(super::method_allowed(&fork, "POST"));
+        assert!(!super::method_allowed(&fork, "GET"));
+
+        let body = format!(r#"{{"name":"release","checkpoint":"{checkpoint}"}}"#);
+        let (request, status) = super::request_for(collection, "POST", body.as_bytes(), None, None)
+            .expect("create template request");
+        assert_eq!(status, 201);
+        assert!(matches!(
+            request,
+            Req::CreateTemplate { name, checkpoint: actual }
+                if name == "release" && actual == checkpoint
+        ));
+
+        let (request, status) = super::request_for(
+            super::route("/v1/templates").expect("list route"),
+            "GET",
+            &[],
+            None,
+            None,
+        )
+        .expect("list template request");
+        assert_eq!(status, 200);
+        assert!(matches!(request, Req::ListTemplates));
+
+        let (request, status) =
+            super::request_for(item, "DELETE", &[], None, None).expect("delete template request");
+        assert_eq!(status, 200);
+        assert!(matches!(request, Req::DeleteTemplate { name } if name == "release"));
+
+        let (request, status) = super::request_for(
+            fork,
+            "POST",
+            br#"{"name":"forked","ttl_seconds":60}"#,
+            None,
+            None,
+        )
+        .expect("fork template request");
+        assert_eq!(status, 201);
+        assert!(matches!(
+            request,
+            Req::ForkTemplate { template, name, ttl_seconds: Some(60) }
+                if template == "release" && name == "forked"
+        ));
+
+        assert!(
+            super::request_for(
+                super::Endpoint::Templates,
+                "POST",
+                br#"{"name":"release","checkpoint":"not-a-uuid"}"#,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            super::request_for(
+                super::Endpoint::Templates,
+                "POST",
+                br#"{"name":"Release","checkpoint":"00000000-0000-0000-0000-000000000000"}"#,
+                None,
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            super::request_for(
+                super::Endpoint::Template("Release".into()),
+                "DELETE",
+                &[],
+                None,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn transfer_routes_and_methods_are_explicit() {
         let push = super::route("/v1/spaces/demo/push?path=%2Ftmp%2Ffile").expect("push route");
         let pull = super::route("/v1/spaces/demo/pull?path=%2Ftmp%2Ffile").expect("pull route");
@@ -9333,6 +9667,357 @@ mod tests {
             b"target state"
         );
         std::fs::remove_dir_all(root).expect("remove expired checkout test root");
+    }
+
+    #[test]
+    fn template_listing_is_project_scoped_and_sorted_by_name() {
+        let root = test_root("template-list");
+        let project = "project-a";
+        let space_id = Uuid::new_v4();
+        let alpha_id = Uuid::new_v4();
+        let beta_id = Uuid::new_v4();
+        let zeta_id = Uuid::new_v4();
+        let foreign_id = Uuid::new_v4();
+        let now = Utc::now();
+        store_state(
+            &root,
+            &State {
+                spaces: Vec::new(),
+                ckpts: vec![
+                    Ckpt {
+                        id: alpha_id,
+                        space: space_id,
+                        project: project.into(),
+                        parent: None,
+                        auto: false,
+                        full: false,
+                        base: None,
+                        note: "alpha".into(),
+                        created_at: now,
+                        snapshot_version: None,
+                    },
+                    Ckpt {
+                        id: beta_id,
+                        space: space_id,
+                        project: project.into(),
+                        parent: None,
+                        auto: false,
+                        full: false,
+                        base: None,
+                        note: "beta".into(),
+                        created_at: now,
+                        snapshot_version: None,
+                    },
+                    Ckpt {
+                        id: zeta_id,
+                        space: space_id,
+                        project: project.into(),
+                        parent: None,
+                        auto: false,
+                        full: false,
+                        base: None,
+                        note: "zeta".into(),
+                        created_at: now,
+                        snapshot_version: None,
+                    },
+                    Ckpt {
+                        id: foreign_id,
+                        space: space_id,
+                        project: "project-b".into(),
+                        parent: None,
+                        auto: false,
+                        full: false,
+                        base: None,
+                        note: "foreign".into(),
+                        created_at: now,
+                        snapshot_version: None,
+                    },
+                ],
+                templates: vec![
+                    Template {
+                        project: project.into(),
+                        name: "zeta".into(),
+                        checkpoint: zeta_id,
+                        created_at: now,
+                    },
+                    Template {
+                        project: "project-b".into(),
+                        name: "hidden".into(),
+                        checkpoint: foreign_id,
+                        created_at: now,
+                    },
+                    Template {
+                        project: project.into(),
+                        name: "alpha".into(),
+                        checkpoint: alpha_id,
+                        created_at: now,
+                    },
+                    Template {
+                        project: project.into(),
+                        name: "beta".into(),
+                        checkpoint: beta_id,
+                        created_at: now,
+                    },
+                ],
+            },
+        );
+        let db = test_db(&root);
+        let (vm_cfg, net_cfg) = test_configs();
+        let registry = registry();
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        let listed = handle(&ctx, Req::ListTemplates, project).expect("list templates");
+        let names = listed["templates"]
+            .as_array()
+            .expect("template array")
+            .iter()
+            .map(|template| template["name"].as_str().expect("template name"))
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["alpha", "beta", "zeta"]);
+        std::fs::remove_dir_all(root).expect("remove template list test root");
+    }
+
+    #[test]
+    fn template_creation_enforces_project_cap_transactionally() {
+        let root = test_root("template-project-cap");
+        let project = "project-a";
+        let checkpoint_id = Uuid::new_v4();
+        let now = Utc::now();
+        let state = State {
+            spaces: Vec::new(),
+            ckpts: vec![Ckpt {
+                id: checkpoint_id,
+                space: Uuid::new_v4(),
+                project: project.into(),
+                parent: None,
+                auto: false,
+                full: false,
+                base: None,
+                note: "template target".into(),
+                created_at: now,
+                snapshot_version: None,
+            }],
+            templates: (0..super::TEMPLATE_PROJECT_CAP)
+                .map(|index| Template {
+                    project: project.into(),
+                    name: format!("template-{index}"),
+                    checkpoint: checkpoint_id,
+                    created_at: now,
+                })
+                .collect(),
+        };
+        store_state(&root, &state);
+        let db = test_db(&root);
+        let (vm_cfg, net_cfg) = test_configs();
+        let registry = registry();
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        let result = handle(
+            &ctx,
+            Req::CreateTemplate {
+                name: "template-next".into(),
+                checkpoint: checkpoint_id,
+            },
+            project,
+        );
+        assert!(matches!(
+            result,
+            Err(shinu::Error::Quota(message))
+                if message == "template limit exceeded: project may retain at most 256 templates"
+        ));
+        let after = super::snapshot(&db, &registry).expect("read state after cap refusal");
+        assert_eq!(after.templates.len(), super::TEMPLATE_PROJECT_CAP);
+        assert!(
+            after
+                .templates
+                .iter()
+                .all(|template| template.name != "template-next")
+        );
+        std::fs::remove_dir_all(root).expect("remove template cap test root");
+    }
+
+    #[test]
+    fn template_refs_pin_and_unpin_checkpoints_without_file_deletion() {
+        let root = test_root("template-pinning");
+        let project = "project-a";
+        let foreign_project = "project-b";
+        let space_id = Uuid::new_v4();
+        let checkpoint_id = Uuid::new_v4();
+        let foreign_checkpoint_id = Uuid::new_v4();
+        let now = Utc::now();
+        let state = State {
+            spaces: vec![Space {
+                id: space_id,
+                name: "web".into(),
+                project: project.into(),
+                image: Image::Void,
+                parent: None,
+                head: None,
+                vcpus: None,
+                mem_mib: None,
+                disk_mib: None,
+                network: None,
+                expires_at: None,
+                created_at: now,
+            }],
+            ckpts: vec![
+                Ckpt {
+                    id: checkpoint_id,
+                    space: space_id,
+                    project: project.into(),
+                    parent: None,
+                    auto: true,
+                    full: false,
+                    base: None,
+                    note: "old auto checkpoint".into(),
+                    created_at: now - chrono::Duration::days(30),
+                    snapshot_version: None,
+                },
+                Ckpt {
+                    id: foreign_checkpoint_id,
+                    space: Uuid::new_v4(),
+                    project: foreign_project.into(),
+                    parent: None,
+                    auto: false,
+                    full: false,
+                    base: None,
+                    note: "foreign checkpoint".into(),
+                    created_at: now,
+                    snapshot_version: None,
+                },
+            ],
+            templates: Vec::new(),
+        };
+        store_state(&root, &state);
+        std::fs::create_dir_all(root.join("ckpts")).expect("create checkpoint directory");
+        let image = shinu::ckpt_image(&root, checkpoint_id);
+        std::fs::write(&image, b"checkpoint").expect("write checkpoint image");
+
+        let (vm_cfg, net_cfg) = test_configs();
+        let registry = registry();
+        let db = test_db(&root);
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        let created = handle(
+            &ctx,
+            Req::CreateTemplate {
+                name: "release".into(),
+                checkpoint: checkpoint_id,
+            },
+            project,
+        )
+        .expect("create template");
+        assert_eq!(created["name"], "release");
+        assert_eq!(created["checkpoint"], checkpoint_id.to_string());
+
+        let duplicate = handle(
+            &ctx,
+            Req::CreateTemplate {
+                name: "release".into(),
+                checkpoint: checkpoint_id,
+            },
+            project,
+        );
+        assert!(
+            matches!(duplicate, Err(shinu::Error::Invalid(message)) if message.contains("already exists"))
+        );
+
+        let invalid_name = handle(
+            &ctx,
+            Req::CreateTemplate {
+                name: "Release".into(),
+                checkpoint: checkpoint_id,
+            },
+            project,
+        );
+        assert!(matches!(invalid_name, Err(shinu::Error::Invalid(_))));
+
+        let foreign_target = handle(
+            &ctx,
+            Req::CreateTemplate {
+                name: "foreign".into(),
+                checkpoint: checkpoint_id,
+            },
+            foreign_project,
+        );
+        assert!(matches!(foreign_target, Err(shinu::Error::NotFound(_))));
+
+        // The same immutable name is independent in another project.
+        let foreign_created = handle(
+            &ctx,
+            Req::CreateTemplate {
+                name: "release".into(),
+                checkpoint: foreign_checkpoint_id,
+            },
+            foreign_project,
+        )
+        .expect("create same template name in another project");
+        assert_eq!(foreign_created["name"], "release");
+        assert_eq!(
+            handle(&ctx, Req::ListTemplates, project).expect("list project templates")["templates"]
+                .as_array()
+                .expect("template list"),
+            &vec![created]
+        );
+        assert_eq!(
+            handle(&ctx, Req::ListTemplates, "project-c").expect("list foreign project")["templates"],
+            serde_json::json!([])
+        );
+        let hidden_delete = handle(
+            &ctx,
+            Req::DeleteTemplate {
+                name: "release".into(),
+            },
+            "project-c",
+        );
+        assert!(matches!(hidden_delete, Err(shinu::Error::NotFound(_))));
+        let hidden_fork = handle(
+            &ctx,
+            Req::ForkTemplate {
+                template: "release".into(),
+                name: "copy".into(),
+                ttl_seconds: Some(60),
+            },
+            "project-c",
+        );
+        assert!(matches!(hidden_fork, Err(shinu::Error::NotFound(_))));
+
+        // Both GC inspection and checkpoint removal consult the template root.
+        let dry_run = super::gc(&ctx, project, u64::MAX, true).expect("GC dry run");
+        assert_eq!(dry_run["deleted"], serde_json::json!([]));
+        let refused = handle(
+            &ctx,
+            Req::RmCkpt {
+                ckpt: checkpoint_id,
+            },
+            project,
+        );
+        assert!(
+            matches!(refused, Err(shinu::Error::Invalid(message)) if message.contains("release"))
+        );
+        assert!(image.exists(), "a pinned checkpoint image must remain");
+
+        let removed = handle(
+            &ctx,
+            Req::DeleteTemplate {
+                name: "release".into(),
+            },
+            project,
+        )
+        .expect("delete template ref");
+        assert_eq!(
+            removed,
+            serde_json::json!({ "removed": "release", "checkpoint": checkpoint_id })
+        );
+        assert!(image.exists(), "deleting a template must not delete files");
+
+        handle(
+            &ctx,
+            Req::RmCkpt {
+                ckpt: checkpoint_id,
+            },
+            project,
+        )
+        .expect("remove unpinned checkpoint");
+        assert!(!image.exists(), "unpinning permits checkpoint removal");
+        std::fs::remove_dir_all(root).expect("remove template pinning test root");
     }
 
     #[test]

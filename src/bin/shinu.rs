@@ -173,6 +173,10 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    Job {
+        #[command(subcommand)]
+        command: JobCommand,
+    },
     Limits {
         #[command(subcommand)]
         command: Option<LimitsCommand>,
@@ -182,6 +186,40 @@ enum Command {
     Token {
         #[command(subcommand)]
         command: TokenCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum JobCommand {
+    Run {
+        #[arg(value_name = "SPACE")]
+        space: String,
+        #[arg(long, value_name = "FILE")]
+        stdin: Option<String>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        cmd: Vec<String>,
+    },
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    Status {
+        #[arg(value_name = "UUID")]
+        id: Uuid,
+        #[arg(long)]
+        json: bool,
+    },
+    Logs {
+        #[arg(value_name = "UUID")]
+        id: Uuid,
+    },
+    Wait {
+        #[arg(value_name = "UUID")]
+        id: Uuid,
+    },
+    Cancel {
+        #[arg(value_name = "UUID")]
+        id: Uuid,
     },
 }
 
@@ -592,6 +630,109 @@ fn read_exec_stdin(path: &str) -> Result<String, String> {
     }
 }
 
+const JOB_WAIT_INTERVAL: Duration = Duration::from_millis(250);
+
+fn job_run_body(command: &[String], stdin_path: Option<&str>) -> Result<Value, String> {
+    let mut body = json!({ "cmd": command });
+    if let Some(path) = stdin_path {
+        body["stdin"] = Value::String(read_exec_stdin(path)?);
+    }
+    Ok(body)
+}
+
+fn job_path(id: Uuid) -> String {
+    format!("/v1/jobs/{id}")
+}
+
+fn job_logs_path(id: Uuid) -> String {
+    format!("/v1/jobs/{id}/logs")
+}
+fn job_cancel_path(id: Uuid) -> String {
+    format!("/v1/jobs/{id}/cancel")
+}
+
+fn job_wait_status(data: &Value) -> Result<Option<i32>, String> {
+    let state = data
+        .get("state")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "job response is missing a string state".to_string())?;
+    match state {
+        "starting" | "running" | "canceling" => Ok(None),
+        "canceled" | "lost" => Ok(Some(1)),
+        "exited" => {
+            let exit = data
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| "exited job response is missing an integer exit_code".to_string())?;
+            let exit = i32::try_from(exit)
+                .map_err(|_| format!("job exit status is out of range: {exit}"))?;
+            Ok(Some(exit))
+        }
+        other => Err(format!("unknown job state {other:?}")),
+    }
+}
+
+fn wait_for_job(client: &Client, id: Uuid) -> Result<i32, String> {
+    loop {
+        let data = response_value(request_json(client, "GET", &job_path(id), None)?)?;
+        if let Some(status) = job_wait_status(&data)? {
+            return Ok(status);
+        }
+        thread::sleep(JOB_WAIT_INTERVAL);
+    }
+}
+
+fn run_job_command(client: &Client, command: JobCommand) -> Result<i32, String> {
+    match command {
+        JobCommand::Run { space, stdin, cmd } => {
+            let body = job_run_body(&cmd, stdin.as_deref())?;
+            let data = response_value(request_json(
+                client,
+                "POST",
+                &format!("/v1/spaces/{}/jobs", encode_path_segment(&space)),
+                Some(body),
+            )?)?;
+            println!(
+                "{}  {}",
+                field_text(&data, "id"),
+                field_text(&data, "state")
+            );
+        }
+        JobCommand::Ls { json } => {
+            let response = request_json(client, "GET", "/v1/jobs", None)?;
+            let body = successful_body(response)?;
+            if json {
+                print_raw_json(&body)?;
+            } else {
+                print_jobs(&response_value_from_body(&body)?)?;
+            }
+        }
+        JobCommand::Status { id, json } => {
+            let response = request_json(client, "GET", &job_path(id), None)?;
+            let body = successful_body(response)?;
+            if json {
+                print_raw_json(&body)?;
+            } else {
+                print_job_status(&response_value_from_body(&body)?)?;
+            }
+        }
+        JobCommand::Logs { id } => {
+            let data = response_value(request_json(client, "GET", &job_logs_path(id), None)?)?;
+            let stdout = io::stdout();
+            let mut output = stdout.lock();
+            let stderr = io::stderr();
+            let mut errors = stderr.lock();
+            write_job_logs(&data, &mut output, &mut errors)?;
+        }
+        JobCommand::Wait { id } => return wait_for_job(client, id),
+        JobCommand::Cancel { id } => {
+            let data = response_value(request_json(client, "POST", &job_cancel_path(id), None)?)?;
+            print_job_status(&data)?;
+        }
+    }
+    Ok(0)
+}
+
 fn client_from_options(endpoint: Option<String>, token: Option<String>) -> Result<Client, String> {
     let endpoint = endpoint.unwrap_or_else(shinu_client::endpoint_value_from_env_preserving_empty);
     let token = token
@@ -921,6 +1062,7 @@ fi"#
         } => {
             return stream_exec(client, &space, &cmd, stdin.as_deref(), session.as_deref());
         }
+        Command::Job { command } => return run_job_command(client, command),
         Command::Push {
             space,
             local_file,
@@ -1289,12 +1431,118 @@ fn response_value_from_body(body: &[u8]) -> Result<Value, String> {
     }
 }
 
-fn print_raw_json(body: &[u8]) -> Result<(), String> {
+fn write_raw_json(output: &mut impl Write, body: &[u8]) -> Result<(), String> {
     let text =
         std::str::from_utf8(body).map_err(|error| format!("invalid UTF-8 response: {error}"))?;
-    print!("{text}");
+    output
+        .write_all(text.as_bytes())
+        .map_err(|error| error.to_string())?;
     if !text.ends_with('\n') {
-        println!();
+        output.write_all(b"\n").map_err(|error| error.to_string())?;
+    }
+    output.flush().map_err(|error| error.to_string())
+}
+
+fn print_raw_json(body: &[u8]) -> Result<(), String> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    write_raw_json(&mut output, body)
+}
+
+fn job_command_text(value: &Value) -> String {
+    let Some(command) = value.get("command").and_then(Value::as_array) else {
+        return "-".to_owned();
+    };
+    if command.is_empty() {
+        return "-".to_owned();
+    }
+    command.iter().map(value_text).collect::<Vec<_>>().join(" ")
+}
+
+fn job_rows(data: &Value) -> Vec<Vec<String>> {
+    data.get("jobs")
+        .and_then(Value::as_array)
+        .map(|jobs| {
+            jobs.iter()
+                .map(|job| {
+                    vec![
+                        field_text(job, "id"),
+                        field_text(job, "space"),
+                        field_text(job, "state"),
+                        seconds(&field_text(job, "created_at")),
+                        seconds(&field_text(job, "started_at")),
+                        seconds(&field_text(job, "finished_at")),
+                        field_text(job, "exit_code"),
+                        job_command_text(job),
+                    ]
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn print_jobs(data: &Value) -> Result<(), String> {
+    let rows = job_rows(data);
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    write_table(
+        &mut output,
+        &[
+            "ID", "SPACE", "STATE", "CREATED", "STARTED", "FINISHED", "EXIT", "COMMAND",
+        ],
+        &rows,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn write_job_status(output: &mut impl Write, data: &Value) -> io::Result<()> {
+    writeln!(output, "state: {}", field_text(data, "state"))?;
+    writeln!(
+        output,
+        "created: {}",
+        seconds(&field_text(data, "created_at"))
+    )?;
+    writeln!(
+        output,
+        "started: {}",
+        seconds(&field_text(data, "started_at"))
+    )?;
+    writeln!(
+        output,
+        "finished: {}",
+        seconds(&field_text(data, "finished_at"))
+    )?;
+    writeln!(output, "exit: {}", field_text(data, "exit_code"))?;
+    writeln!(output, "error: {}", field_text(data, "error"))
+}
+
+fn print_job_status(data: &Value) -> Result<(), String> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    write_job_status(&mut output, data).map_err(|error| error.to_string())
+}
+
+fn write_job_logs(
+    data: &Value,
+    output: &mut impl Write,
+    errors: &mut impl Write,
+) -> Result<(), String> {
+    let log = data
+        .get("data")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "job logs response is missing string data".to_string())?;
+    output
+        .write_all(log.as_bytes())
+        .map_err(|error| error.to_string())?;
+    output.flush().map_err(|error| error.to_string())?;
+    if data
+        .get("log_truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let retained = value_u64(data.get("log_bytes")).unwrap_or(0);
+        writeln!(errors, "warning: job log truncated to {retained} bytes")
+            .map_err(|error| error.to_string())?;
     }
     Ok(())
 }
@@ -1548,7 +1796,7 @@ fn seconds(value: &str) -> String {
         .unwrap_or_else(|_| value.to_owned())
 }
 
-fn table(headers: &[&str], rows: &[Vec<String>]) {
+fn write_table(output: &mut impl Write, headers: &[&str], rows: &[Vec<String>]) -> io::Result<()> {
     let widths: Vec<usize> = headers
         .iter()
         .enumerate()
@@ -1562,28 +1810,35 @@ fn table(headers: &[&str], rows: &[Vec<String>]) {
         .collect();
     for (index, header) in headers.iter().enumerate() {
         if index > 0 {
-            print!("  ");
+            write!(output, "  ")?;
         }
         if index + 1 == headers.len() {
-            print!("{header}");
+            write!(output, "{header}")?;
         } else {
-            print!("{header:<width$}", width = widths[index]);
+            write!(output, "{header:<width$}", width = widths[index])?;
         }
     }
-    println!();
+    writeln!(output)?;
     for row in rows {
         for (index, cell) in row.iter().enumerate() {
             if index > 0 {
-                print!("  ");
+                write!(output, "  ")?;
             }
             if index + 1 == row.len() {
-                print!("{cell}");
+                write!(output, "{cell}")?;
             } else {
-                print!("{cell:<width$}", width = widths[index]);
+                write!(output, "{cell:<width$}", width = widths[index])?;
             }
         }
-        println!();
+        writeln!(output)?;
     }
+    Ok(())
+}
+
+fn table(headers: &[&str], rows: &[Vec<String>]) {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    let _ = write_table(&mut output, headers, rows);
 }
 
 fn stream_ndjson(
@@ -1876,6 +2131,125 @@ mod tests {
         );
         assert_eq!(stdout, b"out\n");
         assert_eq!(stderr, b"warn\n");
+    }
+
+    #[test]
+    fn parses_job_run_with_stdin_and_command_separator() {
+        let cli = Cli::try_parse_from([
+            "shinu",
+            "job",
+            "run",
+            "demo",
+            "--stdin",
+            "input.txt",
+            "--",
+            "printf",
+            "%s",
+            "hello",
+        ])
+        .expect("parse job run command");
+        match cli.command {
+            Command::Job {
+                command: JobCommand::Run { space, stdin, cmd },
+            } => {
+                assert_eq!(space, "demo");
+                assert_eq!(stdin.as_deref(), Some("input.txt"));
+                assert_eq!(cmd, vec!["printf", "%s", "hello"]);
+            }
+            _ => panic!("unexpected command parsed"),
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_job_uuid_in_clap_parse_path() {
+        let parsed = Cli::try_parse_from(["shinu", "job", "status", "not-a-uuid"]);
+        let error = match parsed {
+            Ok(_) => panic!("invalid UUID unexpectedly parsed"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("invalid value"));
+    }
+
+    #[test]
+    fn job_run_body_includes_command_and_optional_stdin() {
+        let path = std::env::temp_dir().join(format!("shinu-job-stdin-{}", Uuid::new_v4()));
+        std::fs::write(&path, "input\n").expect("write job stdin fixture");
+        let path_text = path.to_string_lossy().into_owned();
+        let body = job_run_body(&["cat".to_owned()], Some(&path_text)).expect("job body");
+        std::fs::remove_file(path).expect("remove job stdin fixture");
+        assert_eq!(body, json!({"cmd": ["cat"], "stdin": "input\n"}));
+    }
+
+    #[test]
+    fn maps_terminal_job_states_to_wait_statuses() {
+        assert_eq!(job_wait_status(&json!({"state": "starting"})), Ok(None));
+        assert_eq!(job_wait_status(&json!({"state": "running"})), Ok(None));
+        assert_eq!(job_wait_status(&json!({"state": "canceling"})), Ok(None));
+        assert_eq!(
+            job_wait_status(&json!({"state": "exited", "exit_code": 17})),
+            Ok(Some(17))
+        );
+        assert_eq!(job_wait_status(&json!({"state": "canceled"})), Ok(Some(1)));
+        assert_eq!(job_wait_status(&json!({"state": "lost"})), Ok(Some(1)));
+    }
+
+    #[test]
+    fn raw_json_and_job_logs_preserve_output_contracts() {
+        let mut raw = Vec::new();
+        write_raw_json(&mut raw, br#"{"jobs":[]}"#).expect("write raw JSON");
+        assert_eq!(raw, b"{\"jobs\":[]}\n");
+
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+        write_job_logs(
+            &json!({
+                "data": "line 1\nline 2",
+                "log_bytes": 13,
+                "log_truncated": true
+            }),
+            &mut output,
+            &mut errors,
+        )
+        .expect("write job logs");
+        assert_eq!(output, b"line 1\nline 2");
+        assert!(
+            String::from_utf8(errors)
+                .expect("UTF-8 warning")
+                .contains("truncated")
+        );
+    }
+
+    #[test]
+    fn renders_job_status_fields_and_stable_list_rows() {
+        let status = json!({
+            "state": "exited",
+            "created_at": "2026-08-31T10:00:00+00:00",
+            "started_at": "2026-08-31T10:00:01+00:00",
+            "finished_at": "2026-08-31T10:00:02+00:00",
+            "exit_code": 3,
+            "error": null
+        });
+        let mut rendered = Vec::new();
+        write_job_status(&mut rendered, &status).expect("write job status");
+        let rendered = String::from_utf8(rendered).expect("UTF-8 status");
+        assert!(rendered.contains("state: exited"));
+        assert!(rendered.contains("exit: 3"));
+        assert!(rendered.contains("finished: 2026-08-31T10:00:02Z"));
+
+        let rows = job_rows(&json!({
+            "jobs": [{
+                "id": "job-id",
+                "space": "space-id",
+                "state": "running",
+                "created_at": "2026-08-31T10:00:00+00:00",
+                "command": ["echo", "hello"]
+            }]
+        }));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], "job-id");
+        assert_eq!(rows[0][1], "space-id");
+        assert_eq!(rows[0][2], "running");
+        assert_eq!(rows[0][7], "echo hello");
     }
 
     #[test]

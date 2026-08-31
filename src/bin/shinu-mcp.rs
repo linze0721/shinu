@@ -4,9 +4,12 @@ use shinu_client::{Client, Endpoint, Response};
 use std::env;
 use std::fmt::Write as _;
 use std::io::{self, BufRead, BufReader, Write};
+use uuid::Uuid;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const SERVER_NAME: &str = "shinu-mcp";
+const MAX_JOB_ARGUMENTS: usize = 256;
+const MAX_JOB_ARGUMENT_BYTES: usize = 8192;
 
 struct Server {
     endpoint: String,
@@ -115,6 +118,36 @@ impl Server {
                     request_checked_json(&client, "POST", &path, Some(json!({ "cmd": command })))?;
                 aggregate_exec(&response.body)
             }
+            "shinu_run_job" => {
+                let space = required_string(arguments, "space")?;
+                let command = required_job_command(arguments)?;
+                let stdin = optional_text(arguments, "stdin")?;
+                let path = format!(
+                    "/v1/spaces/{}/jobs",
+                    shinu_client::encode_path_segment(space)
+                );
+                let body = stdin.map_or_else(
+                    || json!({"cmd": command}),
+                    |stdin| json!({"cmd": command, "stdin": stdin}),
+                );
+                request_structured_json(&client, "POST", &path, Some(body))
+            }
+            "shinu_list_jobs" => request_structured_json(&client, "GET", "/v1/jobs", None),
+            "shinu_job_status" => {
+                let job = required_uuid(arguments, "job")?;
+                let path = format!("/v1/jobs/{job}");
+                request_structured_json(&client, "GET", &path, None)
+            }
+            "shinu_job_logs" => {
+                let job = required_uuid(arguments, "job")?;
+                let path = format!("/v1/jobs/{job}/logs");
+                request_structured_json(&client, "GET", &path, None)
+            }
+            "shinu_cancel_job" => {
+                let job = required_uuid(arguments, "job")?;
+                let path = format!("/v1/jobs/{job}/cancel");
+                request_structured_json(&client, "POST", &path, None)
+            }
             "shinu_commit" => {
                 let space = required_string(arguments, "space")?;
                 let note = required_string(arguments, "note")?;
@@ -210,6 +243,18 @@ fn request_text(
     shinu_client::body_text(&response.body).map_err(|error| error.to_string())
 }
 
+fn request_structured_json(
+    client: &Client,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Result<String, String> {
+    let response = request_checked_json(client, method, path, body)?;
+    let value: Value = serde_json::from_slice(&response.body)
+        .map_err(|error| format!("HTTP response was not valid JSON: {error}"))?;
+    serde_json::to_string(&value).map_err(|error| format!("could not serialize API JSON: {error}"))
+}
+
 fn required_string<'a>(arguments: &'a Map<String, Value>, field: &str) -> Result<&'a str, String> {
     let value = required_text(arguments, field)?;
     if value.trim().is_empty() {
@@ -219,11 +264,27 @@ fn required_string<'a>(arguments: &'a Map<String, Value>, field: &str) -> Result
     }
 }
 
+fn required_uuid(arguments: &Map<String, Value>, field: &str) -> Result<Uuid, String> {
+    let value = required_string(arguments, field)?;
+    Uuid::parse_str(value).map_err(|error| format!("argument {field} must be a full UUID: {error}"))
+}
+
 fn required_text<'a>(arguments: &'a Map<String, Value>, field: &str) -> Result<&'a str, String> {
     match arguments.get(field) {
         Some(Value::String(value)) => Ok(value),
         Some(_) => Err(format!("argument {field} must be a string")),
         None => Err(format!("missing required argument {field}")),
+    }
+}
+
+fn optional_text<'a>(
+    arguments: &'a Map<String, Value>,
+    field: &str,
+) -> Result<Option<&'a str>, String> {
+    match arguments.get(field) {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(format!("argument {field} must be a string")),
     }
 }
 
@@ -379,9 +440,39 @@ fn required_command(arguments: &Map<String, Value>) -> Result<&[Value], String> 
     Ok(values)
 }
 
+fn required_job_command(arguments: &Map<String, Value>) -> Result<&[Value], String> {
+    let values = required_command(arguments)?;
+    if values.len() > MAX_JOB_ARGUMENTS {
+        return Err(format!(
+            "argument cmd must contain at most {MAX_JOB_ARGUMENTS} command arguments"
+        ));
+    }
+    let mut total_bytes = 0_usize;
+    for (index, value) in values.iter().enumerate() {
+        let command = value
+            .as_str()
+            .ok_or_else(|| format!("argument cmd[{index}] must be a string"))?;
+        if command.len() > MAX_JOB_ARGUMENT_BYTES {
+            return Err(format!(
+                "argument cmd[{index}] must be at most {MAX_JOB_ARGUMENT_BYTES} UTF-8 bytes"
+            ));
+        }
+        total_bytes = total_bytes
+            .checked_add(command.len())
+            .ok_or_else(|| "argument cmd exceeds the total UTF-8 byte limit".to_string())?;
+    }
+    if total_bytes > MAX_JOB_ARGUMENT_BYTES {
+        return Err(format!(
+            "argument cmd must use at most {MAX_JOB_ARGUMENT_BYTES} total UTF-8 bytes"
+        ));
+    }
+    Ok(values)
+}
+
 fn validate_arguments(name: &str, arguments: &Map<String, Value>) -> Result<(), String> {
     match name {
-        "shinu_list_spaces" | "shinu_list_images" => Ok(()),
+        "shinu_list_spaces" | "shinu_list_images" | "shinu_list_jobs" => Ok(()),
+
         "shinu_create_space" => {
             required_string(arguments, "name")?;
             optional_image(arguments, "image")?;
@@ -414,6 +505,16 @@ fn validate_arguments(name: &str, arguments: &Map<String, Value>) -> Result<(), 
         "shinu_exec" => {
             required_string(arguments, "space")?;
             required_command(arguments)?;
+            Ok(())
+        }
+        "shinu_run_job" => {
+            required_string(arguments, "space")?;
+            required_job_command(arguments)?;
+            optional_text(arguments, "stdin")?;
+            Ok(())
+        }
+        "shinu_job_status" | "shinu_job_logs" | "shinu_cancel_job" => {
+            required_uuid(arguments, "job")?;
             Ok(())
         }
         "shinu_commit" => {
@@ -677,6 +778,48 @@ fn tool_definitions() -> Vec<Value> {
                 "space": {"type": "string", "minLength": 1, "description": "要删除的 space。"}
             }), &["space"]),
         }),
+        json!({
+            "name": "shinu_run_job",
+            "description": "在需要让命令脱离 MCP 客户端连接、并在 space 仍运行时继续执行时使用；返回 detached job 的结构化 JSON，不会等待命令结束。",
+            "inputSchema": schema(json!({
+                "space": {"type": "string", "minLength": 1, "description": "要执行命令的 space。"},
+                "cmd": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_JOB_ARGUMENTS,
+                    "prefixItems": [{"type": "string", "minLength": 1, "maxLength": MAX_JOB_ARGUMENT_BYTES}],
+                    "items": {"type": "string", "maxLength": MAX_JOB_ARGUMENT_BYTES},
+                    "description": "命令及其参数；数组第一个元素必须非空，后续参数可以是空字符串。"
+                },
+                "stdin": {"type": "string", "description": "可选的一次性标准输入；不会持久化。"}
+            }), &["space", "cmd"]),
+        }),
+        json!({
+            "name": "shinu_list_jobs",
+            "description": "列出当前项目可见的 detached jobs，返回结构化 JSON。",
+            "inputSchema": schema(json!({}), &[]),
+        }),
+        json!({
+            "name": "shinu_job_status",
+            "description": "查看一个 detached job 的当前状态，返回结构化 Job JSON。",
+            "inputSchema": schema(json!({
+                "job": {"type": "string", "format": "uuid", "description": "要查看的完整 job UUID。"}
+            }), &["job"]),
+        }),
+        json!({
+            "name": "shinu_job_logs",
+            "description": "读取一个 detached job 的有界终端日志，返回结构化 JSON。",
+            "inputSchema": schema(json!({
+                "job": {"type": "string", "format": "uuid", "description": "要读取日志的完整 job UUID。"}
+            }), &["job"]),
+        }),
+        json!({
+            "name": "shinu_cancel_job",
+            "description": "请求取消一个 detached job，返回权威的结构化 Job JSON；重复调用安全。",
+            "inputSchema": schema(json!({
+                "job": {"type": "string", "format": "uuid", "description": "要取消的完整 job UUID。"}
+            }), &["job"]),
+        }),
     ]
 }
 
@@ -698,6 +841,11 @@ fn is_known_tool(name: &str) -> bool {
             | "shinu_checkout"
             | "shinu_fork"
             | "shinu_delete_space"
+            | "shinu_run_job"
+            | "shinu_list_jobs"
+            | "shinu_job_status"
+            | "shinu_job_logs"
+            | "shinu_cancel_job"
     )
 }
 
@@ -869,6 +1017,63 @@ mod tests {
             .clone()
     }
 
+    fn dispatch_with_json_server(
+        name: &str,
+        arguments: Value,
+        response_body: Value,
+    ) -> (Value, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let response_bytes = serde_json::to_vec(&response_body).expect("response JSON");
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept MCP request");
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0_u8; 1];
+                std::io::Read::read_exact(&mut stream, &mut byte).expect("read request header");
+                request.push(byte[0]);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let header = std::str::from_utf8(&request).expect("request header UTF-8");
+            let content_length = header
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().expect("content length"))
+                })
+                .unwrap_or(0);
+            let mut body = vec![0_u8; content_length];
+            std::io::Read::read_exact(&mut stream, &mut body).expect("read request body");
+            request.extend_from_slice(&body);
+            let response_header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_bytes.len()
+            );
+            std::io::Write::write_all(&mut stream, response_header.as_bytes())
+                .expect("write response header");
+            std::io::Write::write_all(&mut stream, &response_bytes).expect("write response body");
+            request
+        });
+
+        let server = Server {
+            endpoint: format!("http://{address}"),
+            token: Some("test-token".to_owned()),
+        };
+        let request = json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}
+        });
+        let request = request.as_object().expect("MCP request object");
+        let response = dispatch(&server, request, json!(1));
+        let raw_request =
+            String::from_utf8(handle.join().expect("test server thread")).expect("request UTF-8");
+        (response, raw_request)
+    }
+
     #[test]
     fn validates_lifecycle_and_file_tools() {
         assert!(validate_arguments("shinu_start", &arguments(json!({"space": "dev"}))).is_ok());
@@ -1016,6 +1221,247 @@ mod tests {
     }
 
     #[test]
+    fn validates_detached_job_tools_and_command_boundaries() {
+        let job = Uuid::from_u128(1).to_string();
+        assert!(validate_arguments("shinu_list_jobs", &Map::new()).is_ok());
+
+        for command in [
+            json!(["echo"]),
+            json!(["echo", ""]),
+            json!(["echo", "", "arg"]),
+        ] {
+            let args = arguments(json!({"space": "dev", "cmd": command, "stdin": ""}));
+            assert!(validate_arguments("shinu_run_job", &args).is_ok());
+        }
+        for command in [json!([]), json!([""]), json!(["echo", 7])] {
+            let args = arguments(json!({"space": "dev", "cmd": command}));
+            assert!(validate_arguments("shinu_run_job", &args).is_err());
+        }
+        assert!(
+            validate_arguments(
+                "shinu_run_job",
+                &arguments(json!({"space": "dev", "cmd": ["echo"], "stdin": 7}))
+            )
+            .is_err()
+        );
+
+        let mut max_count_command = vec![Value::String("echo".to_owned())];
+        max_count_command.resize(MAX_JOB_ARGUMENTS, Value::String(String::new()));
+        assert!(
+            validate_arguments(
+                "shinu_run_job",
+                &arguments(json!({"space": "dev", "cmd": max_count_command}))
+            )
+            .is_ok()
+        );
+        let mut too_many_command = vec![Value::String("echo".to_owned())];
+        too_many_command.resize(MAX_JOB_ARGUMENTS + 1, Value::String(String::new()));
+        assert!(
+            validate_arguments(
+                "shinu_run_job",
+                &arguments(json!({"space": "dev", "cmd": too_many_command}))
+            )
+            .is_err()
+        );
+
+        let exact_byte_limit = vec![
+            Value::String("xx".to_owned()),
+            Value::String("é".repeat(4095)),
+        ];
+        assert_eq!(
+            exact_byte_limit
+                .iter()
+                .map(|value| value.as_str().unwrap().len())
+                .sum::<usize>(),
+            MAX_JOB_ARGUMENT_BYTES
+        );
+        assert!(
+            validate_arguments(
+                "shinu_run_job",
+                &arguments(json!({"space": "dev", "cmd": exact_byte_limit}))
+            )
+            .is_ok()
+        );
+        let over_byte_limit = vec![
+            Value::String("xx".to_owned()),
+            Value::String("é".repeat(4096)),
+        ];
+        assert!(
+            validate_arguments(
+                "shinu_run_job",
+                &arguments(json!({"space": "dev", "cmd": over_byte_limit}))
+            )
+            .is_err()
+        );
+        let over_item_limit = vec![Value::String("x".repeat(MAX_JOB_ARGUMENT_BYTES + 1))];
+        assert!(
+            validate_arguments(
+                "shinu_run_job",
+                &arguments(json!({"space": "dev", "cmd": over_item_limit}))
+            )
+            .is_err()
+        );
+
+        for tool in ["shinu_job_status", "shinu_job_logs", "shinu_cancel_job"] {
+            assert!(validate_arguments(tool, &arguments(json!({"job": job}))).is_ok());
+            assert!(validate_arguments(tool, &arguments(json!({"job": "short-id"}))).is_err());
+            assert!(validate_arguments(tool, &Map::new()).is_err());
+        }
+    }
+
+    #[test]
+    fn detached_job_schemas_advertise_runtime_boundaries() {
+        let definitions = tool_definitions();
+        let definition = |name: &str| {
+            definitions
+                .iter()
+                .find(|definition| definition["name"] == name)
+                .expect("detached job tool definition")
+        };
+
+        let run = definition("shinu_run_job");
+        assert_eq!(run["inputSchema"]["required"], json!(["space", "cmd"]));
+        assert_eq!(
+            run["inputSchema"]["properties"]["space"]["minLength"],
+            json!(1)
+        );
+        assert_eq!(
+            run["inputSchema"]["properties"]["cmd"]["minItems"],
+            json!(1)
+        );
+        assert_eq!(
+            run["inputSchema"]["properties"]["cmd"]["maxItems"],
+            json!(MAX_JOB_ARGUMENTS)
+        );
+        assert_eq!(
+            run["inputSchema"]["properties"]["cmd"]["prefixItems"][0]["maxLength"],
+            json!(MAX_JOB_ARGUMENT_BYTES)
+        );
+        assert_eq!(
+            run["inputSchema"]["properties"]["cmd"]["items"]["maxLength"],
+            json!(MAX_JOB_ARGUMENT_BYTES)
+        );
+        assert_eq!(
+            run["inputSchema"]["properties"]["cmd"]["prefixItems"][0]["minLength"],
+            json!(1)
+        );
+        assert_eq!(
+            run["inputSchema"]["properties"]["cmd"]["items"]["type"],
+            json!("string")
+        );
+        assert_eq!(
+            run["inputSchema"]["properties"]["stdin"]["type"],
+            json!("string")
+        );
+
+        let list = definition("shinu_list_jobs");
+        assert_eq!(list["inputSchema"]["properties"], json!({}));
+        assert_eq!(list["inputSchema"]["required"], json!([]));
+        for name in ["shinu_job_status", "shinu_job_logs", "shinu_cancel_job"] {
+            let item = definition(name);
+            assert_eq!(item["inputSchema"]["required"], json!(["job"]));
+            assert_eq!(
+                item["inputSchema"]["properties"]["job"]["type"],
+                json!("string")
+            );
+            assert_eq!(
+                item["inputSchema"]["properties"]["job"]["format"],
+                json!("uuid")
+            );
+        }
+    }
+
+    #[test]
+    fn dispatches_detached_job_tools_to_json_api_routes() {
+        let job = Uuid::from_u128(7).to_string();
+        let cases = vec![
+            (
+                "shinu_run_job",
+                json!({"space": "dev", "cmd": ["echo", ""], "stdin": ""}),
+                "POST /v1/spaces/dev/jobs HTTP/1.1",
+                Some(json!({"cmd": ["echo", ""], "stdin": ""})),
+                json!({"id": job, "state": "starting"}),
+            ),
+            (
+                "shinu_list_jobs",
+                json!({}),
+                "GET /v1/jobs HTTP/1.1",
+                None,
+                json!({"jobs": []}),
+            ),
+            (
+                "shinu_job_status",
+                json!({"job": job}),
+                "GET /v1/jobs/00000000-0000-0000-0000-000000000007 HTTP/1.1",
+                None,
+                json!({"id": job, "state": "running"}),
+            ),
+            (
+                "shinu_job_logs",
+                json!({"job": job}),
+                "GET /v1/jobs/00000000-0000-0000-0000-000000000007/logs HTTP/1.1",
+                None,
+                json!({"id": job, "data": "output\n", "log_bytes": 7, "log_truncated": false, "terminal": true}),
+            ),
+            (
+                "shinu_cancel_job",
+                json!({"job": job}),
+                "POST /v1/jobs/00000000-0000-0000-0000-000000000007/cancel HTTP/1.1",
+                None,
+                json!({"id": job, "state": "canceling"}),
+            ),
+        ];
+
+        for (name, arguments, request_line, expected_request_body, expected_response_body) in cases
+        {
+            let (response, raw_request) =
+                dispatch_with_json_server(name, arguments, expected_response_body.clone());
+            let (header, body) = raw_request
+                .split_once("\r\n\r\n")
+                .expect("HTTP request framing");
+            assert_eq!(header.lines().next(), Some(request_line));
+            let actual_request_body = if body.is_empty() {
+                None
+            } else {
+                Some(serde_json::from_str::<Value>(body).expect("request JSON"))
+            };
+            assert_eq!(actual_request_body, expected_request_body);
+            assert_eq!(response["result"]["isError"], json!(false));
+            let output = response["result"]["content"][0]["text"]
+                .as_str()
+                .expect("structured MCP output");
+            assert_eq!(
+                serde_json::from_str::<Value>(output).expect("output JSON"),
+                expected_response_body
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_job_uuid_before_http_dispatch() {
+        let request = json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {
+                "name": "shinu_job_status",
+                "arguments": {"job": "short-id"}
+            }
+        });
+        let request = request.as_object().expect("request object");
+        let server = Server {
+            endpoint: shinu_client::DEFAULT_ENDPOINT.to_owned(),
+            token: None,
+        };
+        let response = dispatch(&server, request, json!(1));
+        assert_eq!(response["error"]["code"], json!(-32602));
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("full UUID"))
+        );
+    }
+
+    #[test]
     fn invalid_tool_arguments_keep_json_rpc_invalid_params_code() {
         let request = json!({
             "jsonrpc": "2.0",
@@ -1058,7 +1504,7 @@ mod tests {
     #[test]
     fn known_tools_match_tool_definitions() {
         let definitions = tool_definitions();
-        assert_eq!(definitions.len(), 15);
+        assert_eq!(definitions.len(), 20);
         for definition in definitions {
             let name = definition
                 .get("name")

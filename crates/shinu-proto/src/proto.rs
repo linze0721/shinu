@@ -108,4 +108,25 @@ pub enum Req {
         free_below: u64,
         dry_run: bool,
     },
+    /// Starts a command detached from the submitting HTTP connection.
+    SubmitJob {
+        space: String,
+        cmd: Vec<String>,
+        #[serde(default)]
+        stdin: Option<String>,
+    },
+    /// Lists detached jobs in the authenticated project.
+    ListJobs,
+    /// Retrieves one detached job in the authenticated project.
+    GetJob {
+        id: Uuid,
+    },
+    /// Retrieves the bounded terminal-rendered log for one detached job.
+    GetJobLogs {
+        id: Uuid,
+    },
+    /// Requests cancellation of one detached job.
+    CancelJob {
+        id: Uuid,
+    },
 }

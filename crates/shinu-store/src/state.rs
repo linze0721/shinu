@@ -128,6 +128,16 @@ pub struct Job {
     pub log_truncated: bool,
 }
 
+/// One terminal outcome and its bounded combined-log accounting.
+#[derive(Clone, Copy, Debug)]
+pub struct JobCompletion<'a> {
+    pub state: JobState,
+    pub exit_code: Option<i32>,
+    pub error: Option<&'a str>,
+    pub log_bytes: u64,
+    pub log_truncated: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq, Eq)]
 pub struct State {
     pub spaces: Vec<Space>,
@@ -704,11 +714,14 @@ pub fn count_spaces(conn: &Connection, project: &str) -> Result<u32> {
         .map_err(|error| Error::Invalid(format!("space count out of range: {error}")))
 }
 
+const MAX_PROJECT_JOB_ROWS: i64 = 1024;
+const MAX_GLOBAL_JOB_ROWS: i64 = 8192;
+const MAX_JOB_LIST_ROWS: usize = 64;
+
 fn sqlite_i64(value: u64, field: &str) -> Result<i64> {
     i64::try_from(value)
         .map_err(|error| Error::Invalid(format!("{field} out of range for SQLite: {error}")))
 }
-
 /// Inserts one detached job row without persisting command input or log data.
 pub fn insert_job(conn: &Connection, job: &Job) -> Result<()> {
     let command = serde_json::to_string(&job.command)?;
@@ -732,6 +745,164 @@ pub fn insert_job(conn: &Connection, job: &Job) -> Result<()> {
     )?;
     Ok(())
 }
+/// Inserts a starting job only when active and retained-row limits permit it.
+/// The count and insert share one `SQLite` transaction so concurrent
+/// submissions cannot pass any cap together.
+pub fn insert_job_if_capacity(conn: &Connection, job: &Job, max_active: u32) -> Result<bool> {
+    insert_job_if_capacity_with_limits(
+        conn,
+        job,
+        max_active,
+        MAX_PROJECT_JOB_ROWS,
+        MAX_GLOBAL_JOB_ROWS,
+    )
+}
+
+/// Variant with explicit caps used by hermetic store tests.
+pub fn insert_job_if_capacity_with_limits(
+    conn: &Connection,
+    job: &Job,
+    max_active: u32,
+    max_project_rows: i64,
+    max_global_rows: i64,
+) -> Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let active: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM jobs WHERE project = ?1 AND state IN ('starting', 'running', 'canceling')",
+        params![job.project.as_str()],
+        |row| row.get(0),
+    )?;
+    let project_rows: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM jobs WHERE project = ?1",
+        params![job.project.as_str()],
+        |row| row.get(0),
+    )?;
+    let global_rows: i64 = tx.query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))?;
+    if active >= i64::from(max_active)
+        || project_rows >= max_project_rows
+        || global_rows >= max_global_rows
+    {
+        return Ok(false);
+    }
+    let command = serde_json::to_string(&job.command)?;
+    let log_bytes = sqlite_i64(job.log_bytes, "log_bytes")?;
+    tx.execute(
+        "INSERT INTO jobs (id, project, space, command, state, created_at, started_at, finished_at, exit_code, error, log_bytes, log_truncated) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            job.id.to_string(),
+            job.project.as_str(),
+            job.space.to_string(),
+            command,
+            job.state.as_str(),
+            job.created_at.to_rfc3339(),
+            job.started_at.map(|at| at.to_rfc3339()),
+            job.finished_at.map(|at| at.to_rfc3339()),
+            job.exit_code.map(i64::from),
+            job.error.as_deref(),
+            log_bytes,
+            i32::from(job.log_truncated),
+        ],
+    )?;
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Lists every active job during daemon startup recovery.
+pub fn all_active_jobs(conn: &Connection) -> Result<Vec<Job>> {
+    let mut statement = conn.prepare(
+        "SELECT id, project, space, command, state, created_at, started_at, finished_at, exit_code, error, log_bytes, log_truncated FROM jobs WHERE state IN ('starting', 'running', 'canceling') ORDER BY created_at DESC, id DESC LIMIT 8192",
+    )?;
+    statement
+        .query_map([], job_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+/// Atomically claims and removes terminal rows older than the retention cutoff.
+///
+/// Returned rows identify the host log files that the caller must remove after
+/// releasing the database lock. Active rows are never claimed.
+pub fn claim_terminal_jobs_before(
+    conn: &Connection,
+    project: Option<&str>,
+    before: DateTime<Utc>,
+) -> Result<Vec<Job>> {
+    let tx = conn.unchecked_transaction()?;
+    let cutoff = before.to_rfc3339();
+    let mut jobs = Vec::new();
+    {
+        let mut statement = if project.is_some() {
+            tx.prepare(
+                "SELECT id, project, space, command, state, created_at, started_at, finished_at, exit_code, error, log_bytes, log_truncated FROM jobs WHERE project = ?1 AND state IN ('exited', 'canceled', 'lost') AND finished_at IS NOT NULL AND finished_at < ?2 ORDER BY finished_at, id LIMIT 8192",
+            )?
+        } else {
+            tx.prepare(
+                "SELECT id, project, space, command, state, created_at, started_at, finished_at, exit_code, error, log_bytes, log_truncated FROM jobs WHERE state IN ('exited', 'canceled', 'lost') AND finished_at IS NOT NULL AND finished_at < ?1 ORDER BY finished_at, id LIMIT 8192",
+            )?
+        };
+        let rows = if let Some(project) = project {
+            statement.query_map(params![project, cutoff], job_from_row)?
+        } else {
+            statement.query_map(params![cutoff], job_from_row)?
+        };
+        for row in rows {
+            jobs.push(row?);
+        }
+    }
+    for job in &jobs {
+        tx.execute(
+            "DELETE FROM jobs WHERE id = ?1 AND project = ?2 AND state IN ('exited', 'canceled', 'lost')",
+            params![job.id.to_string(), job.project.as_str()],
+        )?;
+    }
+    tx.commit()?;
+    Ok(jobs)
+}
+
+/// Atomically claims all terminal rows belonging to one space.
+///
+/// The caller must hold the space lock and separately reject active rows. Host
+/// log deletion happens after this transaction, never while the DB is locked.
+pub fn claim_terminal_jobs_by_space(
+    conn: &Connection,
+    space: Uuid,
+    project: &str,
+) -> Result<Vec<Job>> {
+    claim_terminal_jobs_where(conn, Some(space), Some(project))
+}
+
+fn claim_terminal_jobs_where(
+    conn: &Connection,
+    space: Option<Uuid>,
+    project: Option<&str>,
+) -> Result<Vec<Job>> {
+    let tx = conn.unchecked_transaction()?;
+    let mut jobs = Vec::new();
+    {
+        let (space, project) = match (space, project) {
+            (Some(space), Some(project)) => (space, project),
+            _ => {
+                return Err(Error::Invalid(
+                    "terminal job claim requires a space and project".into(),
+                ));
+            }
+        };
+        let mut statement = tx.prepare(
+            "SELECT id, project, space, command, state, created_at, started_at, finished_at, exit_code, error, log_bytes, log_truncated FROM jobs WHERE space = ?1 AND project = ?2 AND state IN ('exited', 'canceled', 'lost') ORDER BY created_at, id",
+        )?;
+        for row in statement.query_map(params![space.to_string(), project], job_from_row)? {
+            jobs.push(row?);
+        }
+    }
+    for job in &jobs {
+        tx.execute(
+            "DELETE FROM jobs WHERE id = ?1 AND project = ?2 AND state IN ('exited', 'canceled', 'lost')",
+            params![job.id.to_string(), job.project.as_str()],
+        )?;
+    }
+    tx.commit()?;
+    Ok(jobs)
+}
 
 /// Retrieves one job only within the requested project's namespace.
 pub fn get_job(conn: &Connection, id: Uuid, project: &str) -> Result<Option<Job>> {
@@ -753,6 +924,27 @@ pub fn list_jobs(conn: &Connection, project: &str) -> Result<Vec<Job>> {
         .query_map(params![project], job_from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(Into::into)
+}
+
+/// Returns only the newest bounded page and whether more rows exist.
+pub fn list_jobs_page(
+    conn: &Connection,
+    project: &str,
+    requested_limit: usize,
+) -> Result<(Vec<Job>, bool)> {
+    let limit = requested_limit.min(MAX_JOB_LIST_ROWS);
+    let query_limit = sqlite_i64((limit.saturating_add(1)) as u64, "job list limit")?;
+    let mut statement = conn.prepare(
+        "SELECT id, project, space, command, state, created_at, started_at, finished_at, exit_code, error, log_bytes, log_truncated FROM jobs WHERE project = ?1 ORDER BY created_at DESC, id DESC LIMIT ?2",
+    )?;
+    let mut jobs = statement
+        .query_map(params![project, query_limit], job_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let truncated = jobs.len() > limit;
+    if truncated {
+        jobs.truncate(limit);
+    }
+    Ok((jobs, truncated))
 }
 
 /// Lists active jobs for one space and project. Active means starting,
@@ -869,6 +1061,47 @@ pub fn finish_job(
             now,
             exit_code.map(i64::from),
             error,
+        ],
+    )?;
+    let result = tx
+        .query_row(
+            "SELECT id, project, space, command, state, created_at, started_at, finished_at, exit_code, error, log_bytes, log_truncated FROM jobs WHERE project = ?1 AND id = ?2 LIMIT 1",
+            params![project, id.to_string()],
+            job_from_row,
+        )
+        .optional()?;
+    tx.commit()?;
+    Ok(result)
+}
+
+/// Atomically commits a terminal outcome and its bounded log metadata only
+/// while the row is active. This keeps a terminal row from advertising log
+/// accounting that was written by a losing cancellation/natural-exit race.
+pub fn finish_job_with_log_metadata(
+    conn: &Connection,
+    id: Uuid,
+    project: &str,
+    completion: JobCompletion<'_>,
+) -> Result<Option<Job>> {
+    if completion.state.is_active() {
+        return Err(Error::Invalid(
+            "job terminal transition requires exited, canceled, or lost state".into(),
+        ));
+    }
+    let log_bytes = sqlite_i64(completion.log_bytes, "log_bytes")?;
+    let tx = conn.unchecked_transaction()?;
+    let now = Utc::now().to_rfc3339();
+    tx.execute(
+        "UPDATE jobs SET state = ?3, finished_at = ?4, exit_code = ?5, error = ?6, log_bytes = ?7, log_truncated = ?8 WHERE project = ?1 AND id = ?2 AND state IN ('starting', 'running', 'canceling')",
+        params![
+            project,
+            id.to_string(),
+            completion.state.as_str(),
+            now,
+            completion.exit_code.map(i64::from),
+            completion.error,
+            log_bytes,
+            i32::from(completion.log_truncated),
         ],
     )?;
     let result = tx

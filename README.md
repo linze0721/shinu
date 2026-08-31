@@ -1,7 +1,7 @@
 shinu
 =====
 
-Agent-first Firecracker microVM sandboxes with copy-on-write disk states and git-like snapshot, rollback, and branching workflows.
+Agent-first Firecracker microVM sandboxes with copy-on-write disk states, detached jobs, and git-like snapshot, rollback, and branching workflows.
 
 A **space** is an ext4 guest disk image cloned from a golden base via btrfs reflink, bound to an isolated Firecracker microVM instance. `shinu exec <space> [--stdin <file>] [--session <id>] -- <cmd...>` boots the VM on demand (~1.7 s cold), runs the command over host `ssh` with `shinu-vsock` as `ProxyCommand`, tunnelled through Firecracker's AF_VSOCK device to an in-guest `socat` listener (`VSOCK-LISTEN:2222`) forwarding to guest `sshd` (`127.0.0.1:22`), leaving the VM warm for subsequent calls (~0.4 s hot). Command execution travels strictly over vsock rather than host network interfaces, keeping the guest firewalled from host networks while remaining reachable. Idle VMs release unused host memory via virtio-balloon and shut down automatically after an idle threshold.
 
@@ -14,6 +14,7 @@ A **space** is an ext4 guest disk image cloned from a golden base via btrfs refl
 - **HTTP Proxying**: Transparent reverse proxying from host paths to guest ports.
 - **Web Console**: An administrative dashboard for user registration, login, and bearer token creation.
 - **MCP Server**: Model Context Protocol (MCP) tool integration for programmatic access by agents.
+- **Detached Jobs**: Run commands asynchronously with `shinu job run`; inspect status and terminal-rendered logs, wait, or cancel through the CLI, REST API, or MCP. The active-job cap is 64 per project.
 - **`commits`**: CoW ext4 disk state snapshots (`hot` or cold, optionally with memory).
 - **`checkout`**: Rewinds space state back to any commit, automatically saving current state before rewind (reflog semantics).
 - **`fork`**: Creates new independent spaces branching off any existing commit.
@@ -76,7 +77,16 @@ shinu stop web
 shinu resize web --vcpus 2 --mem 1024 --disk 8192
 
 # Execute command inside VM (boots on demand)
-shinu exec web -- uname -a
+shinu exec web -- uname -a           # synchronous command; streams chunked NDJSON
+# Run a detached job; this returns a job ID without waiting for completion
+shinu job run web -- sh -c 'echo started; sleep 5; echo done'
+shinu job ls
+shinu job status <job-uuid>
+shinu job logs <job-uuid>
+shinu job wait <job-uuid>
+# Request cancellation for a running job
+shinu job cancel <job-uuid>
+
 
 # Pass stdin to guest command via exec
 shinu exec web --stdin input.txt -- grep -i "pattern"
@@ -162,6 +172,11 @@ Shinu features a Model Context Protocol (MCP) server integration implemented in 
 * `shinu_write_file`: Surgical text-only file write to an absolute path inside the space guest.
 * `shinu_read_file`: Reads text contents of a guest file by absolute path.
 * `shinu_exec`: Synchronously executes a command inside the guest, returning aggregated stdout, stderr, and the exit code.
+* `shinu_run_job`: Starts a detached command in a space and returns its job ID.
+* `shinu_list_jobs`: Lists detached jobs in the current project.
+* `shinu_job_status`: Returns a detached job's lifecycle state and metadata.
+* `shinu_job_logs`: Returns the job's terminal-rendered log text.
+* `shinu_cancel_job`: Requests cancellation of a detached job.
 * `shinu_commit`: Creates an immutable commit checkpoint. Allows specifying `hot: true/false` and snapshot mode (`none`, `full`, `diff`).
 * `shinu_log`: Returns the linear HEAD git-like commit log chain of checkpoints for the space.
 * `shinu_reflog`: Returns the reflog commit list, containing discarded checkout checkpoints for recovery.
@@ -169,7 +184,7 @@ Shinu features a Model Context Protocol (MCP) server integration implemented in 
 * `shinu_fork`: Creates a new independent space cloned from an immutable commit checkpoint.
 * `shinu_delete_space`: Deletes a space and unlinks its image and VM configurations (refuses if running).
 
-> **Design Limitation**: Binary transfers (`push`, `pull`), GC operations (`gc`), usage queries (`usage`), limits modification (`limits`), desktop toggling (`desktop`), reverse proxying (`proxy`), and VNC bridges (`vnc`) are deliberately **not** exposed over MCP.
+> **Design Limitations**: Binary transfers (`push`, `pull`), GC operations (`gc`), usage queries (`usage`), limits modification (`limits`), desktop toggling (`desktop`), reverse proxying (`proxy`), and VNC bridges (`vnc`) are deliberately **not** exposed over MCP. Detached jobs have no follow or raw log modes, force-stop, reboot survival, artifacts, or web-console controls.
 
 ---
 
@@ -180,7 +195,7 @@ Shinu features a Model Context Protocol (MCP) server integration implemented in 
 - **Access & Security**: Authenticates using same-origin cookie credentials (`shinu_session`). Password registration requires at least 12 characters, and passwords are hashed using PBKDF2-HMAC-SHA256 (210,000 iterations). 
 - **CSRF Protection**: State-changing console routes enforce strict CSRF origin verification on request headers (`Origin` and `Host` matching/validation).
 - **Token Management**: The console allows the user to view, mint (generating 32-byte `/dev/urandom` lower-hex tokens), and delete API bearer tokens.
-- **Read-Only Context**: Apart from registration, login, logout, and token administration, the console is strictly read-only; it displays project resource usages, limits, space tables, and space logs, but does not allow VM lifecycle, command execution, or commit modifications.
+- **Read-Only Context**: Apart from registration, login, logout, and token administration, the console is strictly read-only; it displays project resource usages, limits, space tables, and space logs, but does not allow VM lifecycle, command execution, commit modifications, or detached-job controls.
 
 ---
 
@@ -277,7 +292,15 @@ or `GET /v1/usage?from=<ts>&to=<ts>`:
 ### State Storage (`shinu.db`)
 State is stored in SQLite at `<root>/shinu.db` (`0600` permissions, WAL mode enabled for concurrent reads without blocking writes).
 
+The schema has ten tables: `spaces`, `ckpts`, `projects`, `usage_events`, `users`, `memberships`, `sessions`, `jobs`, `templates`, and SQLite's `sqlite_sequence`. The `jobs` table has columns `id`, `project`, `space`, `command`, `state`, `created_at`, `started_at`, `finished_at`, `exit_code`, `error`, `log_bytes`, and `log_truncated`; states are `starting`, `running`, `canceling`, `exited`, `canceled`, and `lost`.
+
+Indexes include `spaces(project, name)`, `ckpts(project)`, `ckpts(space)`, `usage_events(project, "at")`, `sessions(user_id)`, `memberships(project)`, `jobs_project_created(project, created_at DESC, id DESC)`, `jobs_project_space_state(project, space, state)`, `jobs_project_state(project, state)`, `templates_project_checkpoint`, and `spaces_project_expires`.
+
 **Automatic Migration**: On startup, if `<root>/state.json` exists and `<root>/shinu.db` is empty, `shinud` automatically migrates spaces, checkpoints, and tokens into SQLite and renames `<root>/state.json` to `<root>/state.json.migrated` (preserving old state files without deletion).
+### Concurrency & Detached-Job Invariants
+
+Space-scoped operations acquire locks in this order: space → optional job/checkpoint → state → database connection. Job-monitor paths use job → state → database connection. Lock hold scope stays minimal; state and database locks do not span disk CoW, subprocess, VM, or network work. Active jobs refresh VM idle use and block space stop/remove; VM loss yields job state `lost`.
+
 
 
 ## HTTP REST API
@@ -307,7 +330,12 @@ All API routes require authentication header: `Authorization: Bearer <token>`.
 | `PATCH` | `/v1/spaces/{name}` | `{"vcpus":4,"mem_mib":2048,"disk_mib":4096}` | `200 OK` | Resize VM limits (space must be stopped, disk only grows) |
 | `POST` | `/v1/spaces/{name}/start` | — | `200 OK` `{"booted":true}` | Start Firecracker VM for space |
 | `POST` | `/v1/spaces/{name}/stop` | — | `200 OK` `{"stopped":"...","was_running":true}` | Stop VM, flush disk, release memory |
-| `POST` | `/v1/spaces/{name}/exec` | `{"cmd":["..."],"stdin":"...","session":"..."}` | `200 OK` Chunked NDJSON stream | Execute command inside VM (optional persistent `session` id) |
+| `POST` | `/v1/spaces/{name}/exec` | `{"cmd":["..."],"stdin":"...","session":"..."}` | `200 OK` Chunked NDJSON stream | Execute a command synchronously inside VM (optional persistent `session` id) |
+| `POST` | `/v1/spaces/{space}/jobs` | JSON command | Job record | Start a detached command without waiting for completion |
+| `GET` | `/v1/jobs` | — | `200 OK` `{"jobs":[...],"truncated":...}` | List the newest 64 detached jobs in the project |
+| `GET` | `/v1/jobs/{id}` | — | `200 OK` job record | Get detached job state and metadata |
+| `GET` | `/v1/jobs/{id}/logs` | — | `200 OK` terminal-rendered text (max 1 MiB) | Get the job log |
+| `POST` | `/v1/jobs/{id}/cancel` | — | `200 OK` job record | Request cancellation of a detached job |
 | `POST` | `/v1/spaces/{name}/push?path=<path>` | Raw bytes (up to 256 MiB) | `200 OK` `{"path":"...","bytes":N}` | Stream binary data directly into guest file |
 | `GET` | `/v1/spaces/{name}/pull?path=<path>` | — | `200 OK` Raw bytes (`application/octet-stream`) | Stream binary file out of guest |
 | `GET` | `/v1/spaces/{name}/vnc` | — | `200 OK` raw TCP tunnel | VNC Vsock bridge to port 2223 (VNC port) |
@@ -330,13 +358,13 @@ All API routes require authentication header: `Authorization: Bearer <token>`.
 
 Shinu provides three mechanisms to move data into and out of guest spaces:
 
-1. **`exec` `stdin` & `session`**: Paste text strings directly into commands via `{"cmd":[...], "stdin":"...", "session":"..."}` on `POST /v1/spaces/{name}/exec`. This rides the standard 1 MiB JSON request body limit and closes stdin upon writing so the guest command receives clean EOF. When `session` is provided, commands execute in a persistent shell session within the VM.
+1. **Synchronous `exec` `stdin` & `session`**: Paste text strings directly into commands via `{"cmd":[...], "stdin":"...", "session":"..."}` on `POST /v1/spaces/{name}/exec`. This rides the standard 1 MiB JSON request body limit and closes stdin upon writing so the guest command receives clean EOF. When `session` is provided, commands execute in a persistent shell session within the VM.
 2. **`push` / `pull`**: Stream binary files up to 256 MiB directly to or from absolute guest paths (`POST /v1/spaces/{name}/push?path=...` with raw request body, and `GET /v1/spaces/{name}/pull?path=...` returning `application/octet-stream`). `push` streams socket bytes to guest `cat > <quoted path>`, while `pull` checks file existence (`test -f`) before responding and streams `cat <quoted path>`. Both endpoints auto-start stopped VMs and record usage events. Directories return 400.
 3. **`tar` over `exec`**: Transfer directories or multi-file trees by piping `tar` archives through `exec` with stdin or stdout.
 
-### Streaming `exec` Format (NDJSON)
+### Synchronous `exec` Streaming Format (NDJSON)
 
-The `POST /v1/spaces/{name}/exec` endpoint uses `Transfer-Encoding: chunked` returning newline-delimited JSON (NDJSON) messages:
+The `POST /v1/spaces/{name}/exec` endpoint is synchronous. It uses `Transfer-Encoding: chunked` and returns newline-delimited JSON (NDJSON) messages:
 
 ```json
 {"stream":"stdout","data":"Linux guest 6.1.102 #1 SMP ...\n"}
@@ -344,7 +372,7 @@ The `POST /v1/spaces/{name}/exec` endpoint uses `Transfer-Encoding: chunked` ret
 {"exit":0}
 ```
 
-Every execution stream guarantees a final `{"exit": N}` payload terminating the response.
+Every execution stream guarantees a final `{"exit": N}` payload terminating the response. Detached jobs use a separate lifecycle: `POST /v1/spaces/{space}/jobs` returns a job record while the command runs, and `GET /v1/jobs/{id}/logs` returns one terminal-rendered text stream capped at 1 MiB. Job logs are not chunked NDJSON and have no follow or raw mode. Job states are `starting`, `running`, `canceling`, `exited`, `canceled`, and `lost`.
 
 ### Error Handling & Response Format
 
@@ -442,6 +470,7 @@ Daemon configuration via environment variables:
 | `SHINU_LISTEN` | `127.0.0.1:7878` | Network address and port for HTTP server binding. |
 | `SHINU_ADMIN_TOKEN` | — | Global administrator authorization token for managing quotas. Unset secret fails closed. |
 | `SHINU_REFLOG_DAYS` | `7` | Retention period in days for unreferenced `auto` checkout commits during GC. |
+| `SHINU_JOB_RETENTION_DAYS` | `7` | Retention period in days for archived detached-job logs. |
 | `SHINU_FULL_EVERY` | `8` | Maximum diff checkpoints per full base before auto-promoting to a new full base (0 disables cap). |
 | `SHINU_SESSION_DAYS` | `7` | Default longevity of cookie sessions issued by the console. |
 | `SHINU_VCPUS` | `2` | Default number of virtual CPUs per microVM. |
@@ -480,6 +509,9 @@ Client environment variables:
 
 **Boot Readiness SSH vsock handshake**: When starting a VM, `shinud` performs boot readiness checking. It does not simply return success as soon as the Firecracker process starts or the vsock connection opens. Instead, it repeatedly probes vsock port 2222 (`VSOCK_SSH_PORT`), establishes the handshake, reads bytes one by one to avoid swallowing any banners, and verifies both the `OK ` vsock handshake prefix and a second line beginning with `SSH-`. This prevents subsequent VM executions from failing with connection issues during guest boot.
 
+**Detached jobs**: `shinu job run` and `POST /v1/spaces/{space}/jobs` start an asynchronous command; existing `exec` remains synchronous. Job states are `starting`, `running`, `canceling`, `exited`, `canceled`, and `lost`. Jobs survive client disconnect and daemon restart only while the VM stays running. Active jobs refresh idle use and block `stop` and space removal; VM loss yields `lost`. Each job has one terminal-rendered text log capped at 1 MiB, archived with mode `0600` at `<root>/jobs/<uuid>.log` and retained for 7 days by default (`SHINU_JOB_RETENTION_DAYS`). The active cap is 64 jobs per project. There is no follow or raw log mode, force-stop, reboot survival, artifact support, or console control.
+**Detached job limits and control**: Detached commands accept at most 256 argv elements and 8192 total argument bytes. Job retention caps are 64 active jobs per project, 1024 total jobs per project, and 8192 total jobs globally. `GET /v1/jobs` returns the newest 64 jobs and includes `truncated` when older jobs are omitted. Bounded control SSH kills its local process group on deadline or overflow; cancellation fences the command before final capture, archive, and cleanup.
+
 **Upgrading Firecracker strands existing memory snapshots.** Firecracker validates the snapshot data format version on load, and that format went `8.0.0` (v1.13.1) to `10.0.0` (v1.16.1). Every `full` and `diff` checkpoint captured by a pre-v1.14 binary is therefore no longer restorable as running VM state. `shinud` records the format version per checkpoint and refuses the restore with **400 Bad Request** naming both versions, instead of letting the load fail opaquely.
 
 Nothing is deleted. The checkpoint's disk image remains usable, and disk-only checkpoints, `ls`, `log`, `reflog`, plus `checkout` and `fork` of disk-only checkpoints are all unaffected. There is no in-place snapshot converter; the remedy is to take a fresh commit after upgrading.
@@ -517,7 +549,8 @@ e2fsck -E discard -fp <root>/spaces/<uuid>.ext4
 
 ```text
 <root>/shinu.db                         SQLite database containing tables: spaces, ckpts, projects,
-                                        usage_events, users, memberships, sessions (mode 0600)
+                                        usage_events, users, memberships, sessions, jobs, templates,
+                                        sqlite_sequence (mode 0600)
 <root>/tokens.json                      JSON array containing hashed bearer tokens (mode 0600)
 <root>/base-<image>.ext4                golden rootfs images (e.g., base-void.ext4, base-ubuntu.ext4,
                                         base-arch.ext4, base-rocky.ext4, mode 0600)
@@ -525,6 +558,8 @@ e2fsck -E discard -fp <root>/spaces/<uuid>.ext4
 <root>/ckpts/<uuid>.ext4                immutable checkpoint disk images (mode 0700 dir)
 <root>/ckpts/<uuid>.mem                 immutable checkpoint guest memory states (for full/diff, mode 0700 dir)
 <root>/ckpts/<uuid>.state               immutable checkpoint Firecracker CPU/VM states (for full/diff, mode 0700 dir)
+<root>/jobs/                             root-owned detached-job log directory (mode 0700)
+<root>/jobs/<uuid>.log                   archived terminal-rendered job log (mode 0600)
 <root>/jail/firecracker/<uuid>/root/    chroot jail directory for the space jailer container (mode 0700):
                                           fc.json               Firecracker runtime configuration
                                           fc.sock               Firecracker control UDS socket
@@ -543,7 +578,7 @@ e2fsck -E discard -fp <root>/spaces/<uuid>.ext4
 <root>/cache/                           downloaded image bootstrap tarballs and cache files (mode 0755)
 ```
 
-Direct host path permissions on `<root>/spaces/`, `<root>/ckpts/`, `<root>/jail/`, and `<root>/vm/` are strictly restricted to `0700` owned by `root`. Clients interact exclusively over HTTP API endpoints or via the MCP server.
+Direct host path permissions on `<root>/spaces/`, `<root>/ckpts/`, `<root>/jobs/`, `<root>/jail/`, and `<root>/vm/` are strictly restricted to `0700` owned by `root`. Clients interact exclusively over HTTP API endpoints or via the MCP server.
 
 - **Host Path Isolation**: Control sockets, state directories, and ext4 image files are secured at mode `0700` owned by `root`. Non-root clients communicate solely over the `shinud` HTTP daemon proxy and cannot directly access or tamper with host disk files.
 - **MCP Server Integration**: `shinu-mcp` exposes Model Context Protocol (MCP) tools for agents. Because MCP is a JSON protocol, file tools (`shinu_write_file` and `shinu_read_file`) operate strictly on text payloads; binary file transfers should use the `shinu push` and `shinu pull` CLI commands or HTTP endpoints.

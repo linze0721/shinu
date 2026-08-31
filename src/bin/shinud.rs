@@ -1,10 +1,13 @@
 use chrono::Utc;
 use clap::Parser;
 use serde_json::{Value, json};
-use std::collections::{HashMap, VecDeque};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
@@ -46,6 +49,14 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Maximum number of diff snapshots anchored to one full base before a new
 /// full snapshot is captured. `SHINU_FULL_EVERY` overrides this value; zero
 /// disables automatic degradation.
+const JOB_ACTIVE_CAP: u32 = 64;
+const JOB_LOG_CAP: usize = 1024 * 1024;
+const JOB_TOUCH_EVERY: Duration = Duration::from_secs(10);
+const JOB_POLL_EVERY: Duration = Duration::from_secs(2);
+const JOB_RETENTION_DEFAULT_DAYS: i64 = 7;
+const JOB_MAX_ARGS: usize = 256;
+const JOB_MAX_ARG_BYTES: usize = 8 * 1024;
+const JOB_LIST_LIMIT: usize = 64;
 const DEFAULT_FULL_EVERY: usize = 8;
 const DIFF_TMP_DIR: &str = "diff-tmp";
 
@@ -109,35 +120,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let register_rate = Arc::new(register_rate);
     let admin_token = Arc::new(admin_token);
     let registry = Arc::new(Registry::new());
+    // Recover active detached jobs before the idle sweep or request listener
+    // can observe the VM. A running VM is the sole survival boundary across
+    // daemon restarts; stopped or missing guests are reconciled as lost.
+    let jobs = JobRuntime::new(Arc::clone(&root), Arc::clone(&db), Arc::clone(&registry));
+    jobs.recover();
 
     let sweep_root = Arc::clone(&root);
     let sweep_vm_cfg = Arc::clone(&vm_cfg);
     let sweep_net_cfg = Arc::clone(&net_cfg);
     let sweep_db = Arc::clone(&db);
     let sweep_registry = Arc::clone(&registry);
+    let sweep_jobs = Arc::clone(&jobs);
     thread::spawn(move || {
         loop {
             thread::sleep(Duration::from_secs(shinu::USAGE_SAMPLE_SECS));
-            match shinu::vm::sweep_idle(
+            sweep_jobs.touch_active();
+            let stopped = match shinu::vm::sweep_idle(
                 sweep_root.as_path(),
                 sweep_vm_cfg.idle_secs,
                 sweep_net_cfg.as_ref(),
             ) {
-                Ok(stopped) => {
-                    for dir in &stopped {
-                        eprintln!("idle sweep stopped {}", dir.display());
-                    }
-                    if let Err(error) = refresh_idle_networks(
-                        sweep_root.as_path(),
-                        &sweep_db,
-                        &sweep_registry,
-                        sweep_net_cfg.as_ref(),
-                        &stopped,
-                    ) {
-                        eprintln!("idle network refresh: {error}");
-                    }
+                Ok(stopped) => stopped,
+                Err(error) => {
+                    eprintln!("idle sweep: {error}");
+                    Vec::new()
                 }
-                Err(error) => eprintln!("idle sweep: {error}"),
+            };
+            for dir in &stopped {
+                eprintln!("idle sweep stopped {}", dir.display());
+            }
+            if let Err(error) = refresh_idle_networks(
+                sweep_root.as_path(),
+                &sweep_db,
+                &sweep_registry,
+                sweep_net_cfg.as_ref(),
+                &stopped,
+            ) {
+                eprintln!("idle network refresh: {error}");
             }
             if let Err(error) = record_sweep_usage(sweep_root.as_path(), &sweep_db, &sweep_registry)
             {
@@ -154,6 +174,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(_) => {}
                 Err(error) => eprintln!("session sweep: {error}"),
             }
+            sweep_jobs.purge_retention();
         }
     });
 
@@ -176,6 +197,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let connection_register_rate = Arc::clone(&register_rate);
                 let connection_registry = Arc::clone(&registry);
                 let connection_admin_token = Arc::clone(&admin_token);
+                let connection_jobs = Arc::clone(&jobs);
                 thread::spawn(move || {
                     let ctx = Ctx {
                         root: connection_root.as_path(),
@@ -186,6 +208,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         rate: connection_rate.as_ref(),
                         register_rate: connection_register_rate.as_ref(),
                         registry: connection_registry.as_ref(),
+                        jobs: Some(connection_jobs),
                         admin_token: connection_admin_token.as_deref(),
                     };
                     if let Err(error) = serve_connection(stream, &ctx) {
@@ -207,7 +230,574 @@ struct Ctx<'a> {
     rate: &'a RateLimiter,
     register_rate: &'a RegistrationLimiter,
     registry: &'a Registry,
+    jobs: Option<Arc<JobRuntime>>,
     admin_token: Option<&'a str>,
+}
+
+struct JobRuntime {
+    root: Arc<PathBuf>,
+    db: Arc<Mutex<Connection>>,
+    registry: Arc<Registry>,
+    monitors: Arc<Mutex<HashSet<Uuid>>>,
+}
+
+impl JobRuntime {
+    fn new(root: Arc<PathBuf>, db: Arc<Mutex<Connection>>, registry: Arc<Registry>) -> Arc<Self> {
+        Arc::new(Self {
+            root,
+            db,
+            registry,
+            monitors: Arc::new(Mutex::new(HashSet::new())),
+        })
+    }
+
+    fn recover(self: &Arc<Self>) {
+        let active = {
+            let connection = lock_db(&self.db);
+            match state::all_active_jobs(&connection) {
+                Ok(jobs) => jobs,
+                Err(error) => {
+                    eprintln!("job startup recovery query: {error}");
+                    return;
+                }
+            }
+        };
+        for job in active {
+            self.ensure_monitor(job.id, job.project);
+        }
+    }
+
+    fn ensure_monitor(self: &Arc<Self>, id: Uuid, project: String) {
+        let should_spawn = {
+            let mut monitors = self
+                .monitors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            monitors.insert(id)
+        };
+        if !should_spawn {
+            return;
+        }
+        let runtime = Arc::clone(self);
+        thread::spawn(move || {
+            runtime.monitor_loop(id, &project);
+            let mut monitors = runtime
+                .monitors
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            monitors.remove(&id);
+        });
+    }
+
+    fn touch_active(&self) {
+        let active = {
+            let connection = lock_db(&self.db);
+            state::all_active_jobs(&connection).unwrap_or_default()
+        };
+        for job in active {
+            let _ = shinu::vm::touch(&shinu::vm_dir(&self.root, job.space));
+        }
+    }
+
+    fn purge_retention(&self) {
+        let days = std::env::var("SHINU_JOB_RETENTION_DAYS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|days| *days >= 0)
+            .unwrap_or(JOB_RETENTION_DEFAULT_DAYS);
+        let cutoff = Utc::now() - chrono::Duration::days(days);
+        let claimed = {
+            let _state_guard = lock_state(&self.registry);
+            let connection = lock_db(&self.db);
+            match state::claim_terminal_jobs_before(&connection, None, cutoff) {
+                Ok(jobs) => jobs,
+                Err(error) => {
+                    eprintln!("job retention claim: {error}");
+                    return;
+                }
+            }
+        };
+        for job in claimed {
+            if let Err(error) = remove_file_if_missing(&shinu::job_log_path(&self.root, job.id)) {
+                eprintln!("job retention log {}: {error}", job.id);
+            }
+        }
+    }
+
+    fn monitor_loop(&self, id: Uuid, project: &str) {
+        let mut last_touch = Instant::now();
+        loop {
+            let done = {
+                let job_lock = self.registry.job_lock(id);
+                let _job_guard = job_lock
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.monitor_iteration(id, project, &mut last_touch)
+            };
+            if done {
+                break;
+            }
+            thread::sleep(JOB_POLL_EVERY);
+        }
+    }
+
+    fn monitor_iteration(&self, id: Uuid, project: &str, last_touch: &mut Instant) -> bool {
+        let job = {
+            let _state_guard = lock_state(&self.registry);
+            let connection = lock_db(&self.db);
+            match state::get_job(&connection, id, project) {
+                Ok(Some(job)) => job,
+                Ok(None) | Err(_) => return true,
+            }
+        };
+        if !job.state.is_active() {
+            return true;
+        }
+        if !shinu::vm::is_running(&shinu::vm_dir(&self.root, job.space)) {
+            return self
+                .finish(
+                    &job,
+                    state::JobState::Lost,
+                    None,
+                    Some("space VM is stopped or missing"),
+                )
+                .is_ok();
+        }
+        if last_touch.elapsed() >= JOB_TOUCH_EVERY {
+            let _ = shinu::vm::touch(&shinu::vm_dir(&self.root, job.space));
+            *last_touch = Instant::now();
+        }
+        if job.state == state::JobState::Canceling {
+            return self.monitor_canceling(&job);
+        }
+        match probe_job(&self.root, &job) {
+            Ok(JobProbe::Active { log, truncated }) => {
+                let _ = self.update_metadata(&job, log.len() as u64, truncated);
+                false
+            }
+            Ok(JobProbe::Terminal {
+                state,
+                exit_code,
+                error,
+                log,
+                truncated,
+            }) => {
+                if archive_job_log_preserving_existing(&self.root, job.id, &log).is_err() {
+                    // Never terminalize or remove the guest status while the
+                    // authoritative host archive is unavailable.
+                    return false;
+                }
+                if self
+                    .finish_with_log(
+                        &job,
+                        state,
+                        exit_code,
+                        error.as_deref(),
+                        log.len() as u64,
+                        truncated,
+                    )
+                    .is_err()
+                {
+                    return false;
+                }
+                if let Err(error) = cleanup_guest_job(&self.root, job.id, job.space) {
+                    eprintln!("job {} guest cleanup: {error}", job.id);
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn monitor_canceling(&self, job: &state::Job) -> bool {
+        if !shinu::vm::is_running(&shinu::vm_dir(&self.root, job.space)) {
+            return self
+                .finish(
+                    job,
+                    state::JobState::Lost,
+                    None,
+                    Some("space VM is stopped or missing during cancellation"),
+                )
+                .is_ok();
+        }
+        let decision = match cancel_guest_job(&self.root, job.id, job.space) {
+            Ok(decision) => decision,
+            Err(_) => return false,
+        };
+        let target = match job_ssh_target(&self.root, job.space) {
+            Ok(target) => target,
+            Err(_) => return false,
+        };
+        let (log, truncated) = match capture_job_log(&target, job.id) {
+            Ok(value) => value,
+            Err(CaptureFailure::MissingSession) => {
+                match read_archived_job_log(&self.root, job.id) {
+                    Ok(value) => value,
+                    Err(_) => return false,
+                }
+            }
+            Err(CaptureFailure::Other(_)) => return false,
+        };
+        if archive_job_log_preserving_existing(&self.root, job.id, &log).is_err() {
+            return false;
+        }
+        let (terminal, exit_code) = match decision {
+            CancelDecision::Exited(code) => (state::JobState::Exited, Some(code)),
+            CancelDecision::Canceled => (state::JobState::Canceled, None),
+        };
+        if self
+            .finish_with_log(job, terminal, exit_code, None, log.len() as u64, truncated)
+            .is_err()
+        {
+            return false;
+        }
+        if let Err(error) = cleanup_guest_job(&self.root, job.id, job.space) {
+            eprintln!("job {} guest cleanup: {error}", job.id);
+        }
+        true
+    }
+
+    fn update_metadata(&self, job: &state::Job, bytes: u64, truncated: bool) -> shinu::Result<()> {
+        let _state_guard = lock_state(&self.registry);
+        let connection = lock_db(&self.db);
+        state::set_job_log_metadata(&connection, job.id, &job.project, bytes, truncated)?;
+        Ok(())
+    }
+
+    fn finish(
+        &self,
+        job: &state::Job,
+        state_value: state::JobState,
+        exit_code: Option<i32>,
+        error: Option<&str>,
+    ) -> shinu::Result<()> {
+        self.finish_with_log(
+            job,
+            state_value,
+            exit_code,
+            error,
+            job.log_bytes,
+            job.log_truncated,
+        )
+    }
+
+    fn finish_with_log(
+        &self,
+        job: &state::Job,
+        state_value: state::JobState,
+        exit_code: Option<i32>,
+        error: Option<&str>,
+        log_bytes: u64,
+        log_truncated: bool,
+    ) -> shinu::Result<()> {
+        let _state_guard = lock_state(&self.registry);
+        let connection = lock_db(&self.db);
+        let _ = state::finish_job_with_log_metadata(
+            &connection,
+            job.id,
+            &job.project,
+            state::JobCompletion {
+                state: state_value,
+                exit_code,
+                error,
+                log_bytes,
+                log_truncated,
+            },
+        )?;
+        Ok(())
+    }
+}
+
+enum JobProbe {
+    Active {
+        log: String,
+        truncated: bool,
+    },
+    Terminal {
+        state: state::JobState,
+        exit_code: Option<i32>,
+        error: Option<String>,
+        log: String,
+        truncated: bool,
+    },
+}
+
+enum CaptureFailure {
+    MissingSession,
+    Other(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CancelDecision {
+    Exited(i32),
+    Canceled,
+}
+
+fn job_session(id: Uuid) -> String {
+    format!("job-{}", id.simple())
+}
+
+fn job_status_path(id: Uuid) -> String {
+    format!("/run/shinu/jobs/{id}.status")
+}
+
+fn job_stdin_path(id: Uuid) -> String {
+    format!("/run/shinu/jobs/{id}.stdin")
+}
+
+fn job_wrapper_path(id: Uuid) -> String {
+    format!("/run/shinu/jobs/{id}.wrapper")
+}
+
+fn job_pid_path(id: Uuid) -> String {
+    format!("/run/shinu/jobs/{id}.pid")
+}
+
+fn job_cancel_path(id: Uuid) -> String {
+    format!("/run/shinu/jobs/{id}.cancel")
+}
+
+fn tmux_args(command: &str, target: Uuid) -> Vec<String> {
+    vec![
+        "tmux".to_owned(),
+        "-L".to_owned(),
+        "shinu-jobs".to_owned(),
+        "-f".to_owned(),
+        "/dev/null".to_owned(),
+        command.to_owned(),
+        "-t".to_owned(),
+        job_session(target),
+    ]
+}
+
+fn tmux_shell(command: &str, target: Uuid) -> String {
+    shinu::shell_quote(&tmux_args(command, target))
+}
+
+fn read_job_status(target: &SshTarget, id: Uuid) -> std::result::Result<Option<i32>, String> {
+    let status_path = shinu::shell_quote_word(&job_status_path(id));
+    let remote = vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        format!(
+            "if [ -f {status_path} ]; then head -c 32 {status_path}; else printf '%s' __SHINU_NO_STATUS__; fi"
+        ),
+    ];
+    let output = run_job_ssh(
+        target,
+        &remote,
+        None,
+        JOB_PROBE_TIMEOUT,
+        JOB_RUNNER_STDOUT_CAP,
+    )
+    .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "status probe failed: {}",
+            guest_stderr(output.stderr, output.status.code())
+        ));
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if value == "__SHINU_NO_STATUS__" {
+        return Ok(None);
+    }
+    let status = value
+        .parse::<i32>()
+        .map_err(|error| format!("invalid detached job status {value:?}: {error}"))?;
+    Ok(Some(status))
+}
+
+fn capture_job_log(
+    target: &SshTarget,
+    id: Uuid,
+) -> std::result::Result<(String, bool), CaptureFailure> {
+    let session = tmux_shell("has-session", id);
+    let capture = tmux_shell("capture-pane", id);
+    let remote = vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        format!(
+            "{session} >/dev/null 2>&1 || exit 42; {capture} -p -S - -E - | tail -c {}",
+            JOB_LOG_CAP.saturating_add(1)
+        ),
+    ];
+    let output = run_job_ssh(
+        target,
+        &remote,
+        None,
+        JOB_PROBE_TIMEOUT,
+        JOB_LOG_CAP.saturating_add(1),
+    )
+    .map_err(|error| CaptureFailure::Other(error.to_string()))?;
+    if !output.status.success() {
+        if output.status.code() == Some(42) {
+            return Err(CaptureFailure::MissingSession);
+        }
+        return Err(CaptureFailure::Other(format!(
+            "log capture failed: {}",
+            guest_stderr(output.stderr, output.status.code())
+        )));
+    }
+    let truncated = output.stdout.len() > JOB_LOG_CAP;
+    let start = output.stdout.len().saturating_sub(JOB_LOG_CAP);
+    let log = String::from_utf8_lossy(&output.stdout[start..]).into_owned();
+    Ok((log, truncated))
+}
+
+fn probe_job(root: &Path, job: &state::Job) -> std::result::Result<JobProbe, String> {
+    let vm_dir = shinu::vm_dir(root, job.space);
+    if !shinu::vm::is_running(&vm_dir) {
+        return Ok(JobProbe::Terminal {
+            state: state::JobState::Lost,
+            exit_code: None,
+            error: Some("space VM is stopped or missing".to_owned()),
+            log: String::new(),
+            truncated: false,
+        });
+    }
+    let target = job_ssh_target(root, job.space).map_err(|error| error.to_string())?;
+    let status = match read_job_status(&target, job.id) {
+        Ok(status) => status,
+        Err(error) if error.starts_with("invalid detached job status") => {
+            return Ok(JobProbe::Terminal {
+                state: state::JobState::Lost,
+                exit_code: None,
+                error: Some(error),
+                log: String::new(),
+                truncated: false,
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    let captured = match capture_job_log(&target, job.id) {
+        Ok(value) => value,
+        Err(CaptureFailure::MissingSession) if status.is_some() => (String::new(), false),
+        Err(CaptureFailure::MissingSession) => {
+            return Ok(JobProbe::Terminal {
+                state: state::JobState::Lost,
+                exit_code: None,
+                error: Some("detached job tmux session disappeared before status".to_owned()),
+                log: String::new(),
+                truncated: false,
+            });
+        }
+        Err(CaptureFailure::Other(error)) => return Err(error),
+    };
+    let (log, truncated) = captured;
+    let Some(status) = status else {
+        return Ok(JobProbe::Active { log, truncated });
+    };
+    Ok(JobProbe::Terminal {
+        state: state::JobState::Exited,
+        exit_code: Some(status),
+        error: None,
+        log,
+        truncated,
+    })
+}
+
+fn archive_job_log(root: &Path, id: Uuid, log: &str) -> shinu::Result<()> {
+    let jobs = shinu::jobs_dir(root);
+    std::fs::create_dir_all(&jobs)?;
+    std::fs::set_permissions(&jobs, std::fs::Permissions::from_mode(0o700))?;
+    let bytes = log.as_bytes();
+    let start = bytes.len().saturating_sub(JOB_LOG_CAP);
+    let temporary = jobs.join(format!(".{id}.log.{}.tmp", Uuid::new_v4()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    if let Err(error) = file
+        .write_all(&bytes[start..])
+        .and_then(|()| file.sync_all())
+    {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+    if let Err(error) = std::fs::rename(&temporary, shinu::job_log_path(root, id)) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+fn archive_job_log_preserving_existing(root: &Path, id: Uuid, log: &str) -> shinu::Result<()> {
+    if log.is_empty()
+        && std::fs::metadata(shinu::job_log_path(root, id))
+            .ok()
+            .is_some_and(|metadata| metadata.len() > 0)
+    {
+        return Ok(());
+    }
+    archive_job_log(root, id, log)
+}
+
+fn cleanup_guest_job(root: &Path, id: Uuid, space: Uuid) -> shinu::Result<()> {
+    let target = job_ssh_target(root, space)?;
+    let status = shinu::shell_quote_word(&job_status_path(id));
+    let stdin = shinu::shell_quote_word(&job_stdin_path(id));
+    let pid = shinu::shell_quote_word(&job_pid_path(id));
+    let cancel = shinu::shell_quote_word(&job_cancel_path(id));
+    let wrapper = shinu::shell_quote_word(&job_wrapper_path(id));
+    let remote = vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        format!(
+            "{} >/dev/null 2>&1 || :; rm -f {status} {stdin} {pid} {wrapper}; rm -rf {cancel}",
+            tmux_shell("kill-session", id)
+        ),
+    ];
+    let output = run_job_ssh(
+        &target,
+        &remote,
+        None,
+        JOB_PROBE_TIMEOUT,
+        JOB_RUNNER_STDOUT_CAP,
+    )?;
+    if !output.status.success() {
+        return Err(shinu::Error::Invalid(format!(
+            "detached job cleanup failed: {}",
+            guest_stderr(output.stderr, output.status.code())
+        )));
+    }
+    Ok(())
+}
+
+fn cancel_guest_job(root: &Path, id: Uuid, space: Uuid) -> shinu::Result<CancelDecision> {
+    let target = job_ssh_target(root, space)?;
+    let status = shinu::shell_quote_word(&job_status_path(id));
+    let pid = shinu::shell_quote_word(&job_pid_path(id));
+    let cancel = shinu::shell_quote_word(&job_cancel_path(id));
+    let remote = vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        format!(
+            "if [ -f {status} ] && [ ! -e {cancel} ]; then head -c 32 {status}; exit 43; fi; mkdir {cancel} 2>/dev/null || :; command_pid=; loops=0; while [ ! -s {status} ] && [ -z \"$command_pid\" ] && [ \"$loops\" -lt 40 ]; do command_pid=$(head -c 32 {pid} 2>/dev/null || :); case \"$command_pid\" in ''|*[!0-9]*) command_pid=;; esac; [ -n \"$command_pid\" ] || sleep 0.1; loops=$(($loops + 1)); done; if [ -n \"$command_pid\" ]; then kill -TERM -- -\"$command_pid\" 2>/dev/null || kill -TERM \"$command_pid\" 2>/dev/null || :; loops=0; while kill -0 -- -\"$command_pid\" 2>/dev/null && [ \"$loops\" -lt 10 ]; do sleep 0.1; loops=$(($loops + 1)); done; if kill -0 -- -\"$command_pid\" 2>/dev/null; then kill -KILL -- -\"$command_pid\" 2>/dev/null || kill -KILL \"$command_pid\" 2>/dev/null || :; fi; fi; loops=0; while [ ! -s {status} ] && [ \"$loops\" -lt 40 ]; do sleep 0.1; loops=$(($loops + 1)); done; [ -s {status} ] || exit 44"
+        ),
+    ];
+    let output = run_job_ssh(
+        &target,
+        &remote,
+        None,
+        JOB_PROBE_TIMEOUT,
+        JOB_RUNNER_STDOUT_CAP,
+    )?;
+    if output.status.code() == Some(43) {
+        let status = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let code = status.parse::<i32>().map_err(|error| {
+            shinu::Error::Invalid(format!("invalid detached job status {status:?}: {error}"))
+        })?;
+        return Ok(CancelDecision::Exited(code));
+    }
+    if !output.status.success() {
+        return Err(shinu::Error::Invalid(format!(
+            "detached job cancellation failed: {}",
+            guest_stderr(output.stderr, output.status.code())
+        )));
+    }
+    Ok(CancelDecision::Canceled)
 }
 
 /// Keeps the parsed header bytes available for proxy forwarding while leaving
@@ -1491,6 +2081,7 @@ fn checkout_space(
     let _checkpoint_guard = checkpoint_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let vm_running = shinu::vm::is_running(&shinu::vm_dir(ctx.root, space_id));
     let (target, current_head, space_name, image_kind, vcpus, mem_mib) = {
         let _state_guard = lock_state(ctx.registry);
         let connection = lock_db(ctx.db);
@@ -1500,10 +2091,15 @@ fn checkout_space(
             .iter()
             .find(|entry| entry.id == space_id && entry.project == project)
             .ok_or_else(|| shinu::Error::NotFound(space.clone()))?;
-        let vm_dir = shinu::vm_dir(ctx.root, entry.id);
-        if shinu::vm::is_running(&vm_dir) {
+        if vm_running {
             return Err(shinu::Error::Invalid(format!(
                 "stop the space before checking it out: {}",
+                entry.name
+            )));
+        }
+        if !state::active_jobs_by_space(&connection, entry.id, project)?.is_empty() {
+            return Err(shinu::Error::Invalid(format!(
+                "space {} has active detached jobs",
                 entry.name
             )));
         }
@@ -1643,9 +2239,17 @@ fn remove_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Val
     let resolved_name = current.name;
     let network = current.network;
     // Capture previous_running before removal for the network rule diff.
-    let (state, previous_running, peers) = {
+    // Claiming the Space lock first makes this check race-free with submit:
+    // a new Starting row cannot appear until removal has completed.
+    let (state, previous_running, peers, terminal_jobs) = {
         let _state_guard = lock_state(ctx.registry);
         let connection = lock_db(ctx.db);
+        let active = state::active_jobs_by_space(&connection, id, project)?;
+        if !active.is_empty() {
+            return Err(shinu::Error::Invalid(format!(
+                "space {name} has active detached jobs"
+            )));
+        }
         let mut state = state::load(&connection)?;
         let space = state
             .spaces
@@ -1658,8 +2262,14 @@ fn remove_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Val
         let peers = peer_ips(&space, &previous_running, ctx.net_cfg);
         state.spaces.retain(|space| space.id != id);
         state::store(&connection, &state)?;
-        (state, previous_running, peers)
+        let terminal_jobs = state::claim_terminal_jobs_by_space(&connection, id, project)?;
+        (state, previous_running, peers, terminal_jobs)
     };
+    // Host log unlinking follows the DB claim and is intentionally outside the
+    // state/DB lock scope.
+    for job in terminal_jobs {
+        remove_file_if_missing(&shinu::job_log_path(ctx.root, job.id))?;
+    }
     shinu::vm::stop_with_peers(&shinu::vm_dir(ctx.root, id), ctx.net_cfg, &peers)?;
     let current_running =
         refresh_network_rules(ctx, &state, project, network.as_deref(), &previous_running)?;
@@ -1852,6 +2462,15 @@ fn stop_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let space = revalidate_space(ctx, project, initial.id, &name)?;
+    {
+        let _state_guard = lock_state(ctx.registry);
+        let connection = lock_db(ctx.db);
+        if !state::active_jobs_by_space(&connection, space.id, project)?.is_empty() {
+            return Err(shinu::Error::Invalid(format!(
+                "space {name} has active detached jobs"
+            )));
+        }
+    }
     let (state, previous_running, peers) = {
         let _state_guard = lock_state(ctx.registry);
         let connection = lock_db(ctx.db);
@@ -2320,6 +2939,313 @@ fn diff_status_marker(entry: &DiffEntry) -> &'static str {
     }
 }
 
+fn job_runtime(ctx: &Ctx<'_>) -> shinu::Result<Arc<JobRuntime>> {
+    ctx.jobs
+        .clone()
+        .ok_or_else(|| shinu::Error::Internal("detached job runtime is not initialized".into()))
+}
+
+fn job_json(job: &state::Job) -> shinu::Result<Value> {
+    Ok(serde_json::to_value(job)?)
+}
+
+fn job_row(ctx: &Ctx<'_>, id: Uuid, project: &str) -> shinu::Result<state::Job> {
+    let _state_guard = lock_state(ctx.registry);
+    let connection = lock_db(ctx.db);
+    state::get_job(&connection, id, project)?.ok_or_else(|| shinu::Error::NotFound(id.to_string()))
+}
+
+fn finish_probe(
+    ctx: &Ctx<'_>,
+    job: &state::Job,
+    state_value: state::JobState,
+    exit_code: Option<i32>,
+    error: Option<&str>,
+    log: &str,
+    truncated: bool,
+) -> shinu::Result<state::Job> {
+    archive_job_log_preserving_existing(ctx.root, job.id, log)?;
+    {
+        let _state_guard = lock_state(ctx.registry);
+        let connection = lock_db(ctx.db);
+        state::finish_job_with_log_metadata(
+            &connection,
+            job.id,
+            &job.project,
+            state::JobCompletion {
+                state: state_value,
+                exit_code,
+                error,
+                log_bytes: log.len() as u64,
+                log_truncated: truncated,
+            },
+        )?;
+    }
+    if let Err(cleanup_error) = cleanup_guest_job(ctx.root, job.id, job.space) {
+        eprintln!("job {} guest cleanup: {cleanup_error}", job.id);
+    }
+    job_row(ctx, job.id, &job.project)
+}
+
+fn submit_job(
+    ctx: &Ctx<'_>,
+    project: &str,
+    space: String,
+    command: Vec<String>,
+    stdin: Option<String>,
+) -> shinu::Result<Value> {
+    let runtime = job_runtime(ctx)?;
+    let initial = find_space(ctx.db, &space, project)?;
+    let space_guard = ctx.registry.space_lock(initial.id);
+    let _space_guard = space_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = revalidate_space(ctx, project, initial.id, &space)?;
+    let job = state::Job {
+        id: Uuid::new_v4(),
+        project: project.to_owned(),
+        space: entry.id,
+        command,
+        state: state::JobState::Starting,
+        created_at: Utc::now(),
+        started_at: None,
+        finished_at: None,
+        exit_code: None,
+        error: None,
+        log_bytes: 0,
+        log_truncated: false,
+    };
+    let inserted = {
+        let _state_guard = lock_state(ctx.registry);
+        let connection = lock_db(ctx.db);
+        state::insert_job_if_capacity(&connection, &job, JOB_ACTIVE_CAP)?
+    };
+    if !inserted {
+        return Err(shinu::Error::Quota(format!(
+            "project active detached job limit is {JOB_ACTIVE_CAP}"
+        )));
+    }
+    let target = match prepare_ssh_entry(ctx, project, &entry) {
+        Ok(target) => target,
+        Err(error) => {
+            let message = format!("could not prepare detached job VM: {error}");
+            let _ = finish_probe(
+                ctx,
+                &job,
+                state::JobState::Lost,
+                None,
+                Some(&message),
+                "",
+                false,
+            );
+            return job_row(ctx, job.id, project).and_then(|row| job_json(&row));
+        }
+    };
+    if let Err(error) = launch_job(&target, job.id, &job.command, stdin.as_deref()) {
+        let message = error.to_string();
+        let _ = cleanup_guest_job(ctx.root, job.id, job.space);
+        let _ = finish_probe(
+            ctx,
+            &job,
+            state::JobState::Lost,
+            None,
+            Some(&message),
+            "",
+            false,
+        );
+        return job_row(ctx, job.id, project).and_then(|row| job_json(&row));
+    }
+    let running = {
+        let _state_guard = lock_state(ctx.registry);
+        let connection = lock_db(ctx.db);
+        state::set_job_running(&connection, job.id, project)?
+            .ok_or_else(|| shinu::Error::NotFound(job.id.to_string()))?
+    };
+    runtime.ensure_monitor(job.id, project.to_owned());
+    job_json(&running)
+}
+
+fn list_jobs(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
+    let _state_guard = lock_state(ctx.registry);
+    let connection = lock_db(ctx.db);
+    let (jobs, truncated) = state::list_jobs_page(&connection, project, JOB_LIST_LIMIT)?;
+    let jobs = jobs
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(json!({ "jobs": jobs, "truncated": truncated }))
+}
+
+fn get_job_value(ctx: &Ctx<'_>, project: &str, id: Uuid) -> shinu::Result<Value> {
+    job_json(&job_row(ctx, id, project)?)
+}
+
+fn read_archived_job_log(root: &Path, id: Uuid) -> shinu::Result<(String, bool)> {
+    let path = shinu::job_log_path(root, id);
+    let mut file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((String::new(), false));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let length = file.metadata()?.len();
+    let truncated = length > JOB_LOG_CAP as u64;
+    let start = length.saturating_sub(JOB_LOG_CAP as u64);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::with_capacity(JOB_LOG_CAP);
+    let _ = file
+        .take((JOB_LOG_CAP as u64).saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > JOB_LOG_CAP {
+        bytes.drain(..bytes.len() - JOB_LOG_CAP);
+    }
+    Ok((String::from_utf8_lossy(&bytes).into_owned(), truncated))
+}
+
+fn get_job_logs(ctx: &Ctx<'_>, project: &str, id: Uuid) -> shinu::Result<Value> {
+    let _runtime = job_runtime(ctx)?;
+    let job_lock = ctx.registry.job_lock(id);
+    let _job_guard = job_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut job = job_row(ctx, id, project)?;
+    let (data, captured_truncated) = if job.state.is_active() {
+        match probe_job(ctx.root, &job) {
+            Ok(JobProbe::Active { log, truncated }) => {
+                let _state_guard = lock_state(ctx.registry);
+                let connection = lock_db(ctx.db);
+                state::set_job_log_metadata(&connection, id, project, log.len() as u64, truncated)?;
+                job = state::get_job(&connection, id, project)?
+                    .ok_or_else(|| shinu::Error::NotFound(id.to_string()))?;
+                (log, truncated)
+            }
+            Ok(JobProbe::Terminal {
+                state,
+                exit_code,
+                error,
+                log,
+                truncated,
+            }) => {
+                job = finish_probe(
+                    ctx,
+                    &job,
+                    state,
+                    exit_code,
+                    error.as_deref(),
+                    &log,
+                    truncated,
+                )?;
+                (log, truncated)
+            }
+            Err(_) => (String::new(), job.log_truncated),
+        }
+    } else {
+        read_archived_job_log(ctx.root, id)?
+    };
+    let log_bytes = job.log_bytes.max(data.len() as u64);
+    let log_truncated = job.log_truncated || captured_truncated;
+    Ok(json!({
+        "id": id,
+        "data": data,
+        "log_bytes": log_bytes,
+        "log_truncated": log_truncated,
+        "terminal": job.state.is_terminal(),
+    }))
+}
+
+fn cancel_job(ctx: &Ctx<'_>, project: &str, id: Uuid) -> shinu::Result<Value> {
+    let _runtime = job_runtime(ctx)?;
+    // Resolve the target before acquiring locks, then re-read it after both
+    // locks. The stable id only selects the lock; project scope is rechecked
+    // under the lock so a deleted/replaced row cannot be acted upon.
+    let initial = job_row(ctx, id, project)?;
+    let space_guard = ctx.registry.space_lock(initial.space);
+    let _space_guard = space_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let job_guard = ctx.registry.job_lock(id);
+    let _job_guard = job_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let current = job_row(ctx, id, project)?;
+    if current.state.is_terminal() {
+        return job_json(&current);
+    }
+
+    // Natural completion wins if the status file is already authoritative.
+    match probe_job(ctx.root, &current) {
+        Ok(JobProbe::Terminal {
+            state,
+            exit_code,
+            error,
+            log,
+            truncated,
+        }) => {
+            return job_json(&finish_probe(
+                ctx,
+                &current,
+                state,
+                exit_code,
+                error.as_deref(),
+                &log,
+                truncated,
+            )?);
+        }
+        Ok(JobProbe::Active { .. }) | Err(_) => {}
+    }
+
+    let canceling = {
+        let _state_guard = lock_state(ctx.registry);
+        let connection = lock_db(ctx.db);
+        state::request_job_cancel(&connection, id, project)?
+            .ok_or_else(|| shinu::Error::NotFound(id.to_string()))?
+    };
+    if canceling.state.is_terminal() {
+        return job_json(&canceling);
+    }
+
+    let decision = cancel_guest_job(ctx.root, id, canceling.space)?;
+    let target = job_ssh_target(ctx.root, canceling.space)?;
+    let (log, truncated) = match capture_job_log(&target, id) {
+        Ok(value) => value,
+        Err(CaptureFailure::MissingSession) => read_archived_job_log(ctx.root, id)?,
+        Err(CaptureFailure::Other(error)) => {
+            return Err(shinu::Error::Internal(format!(
+                "detached job log capture failed: {error}"
+            )));
+        }
+    };
+    if let Err(error) = archive_job_log_preserving_existing(ctx.root, id, &log) {
+        return Err(shinu::Error::Internal(format!(
+            "detached job log archive failed: {error}"
+        )));
+    }
+    let (terminal, exit_code) = match decision {
+        CancelDecision::Exited(code) => (state::JobState::Exited, Some(code)),
+        CancelDecision::Canceled => (state::JobState::Canceled, None),
+    };
+    {
+        let _state_guard = lock_state(ctx.registry);
+        let connection = lock_db(ctx.db);
+        state::finish_job_with_log_metadata(
+            &connection,
+            id,
+            project,
+            state::JobCompletion {
+                state: terminal,
+                exit_code,
+                error: None,
+                log_bytes: log.len() as u64,
+                log_truncated: truncated,
+            },
+        )?;
+    }
+    if let Err(error) = cleanup_guest_job(ctx.root, id, canceling.space) {
+        eprintln!("job {id} guest cleanup: {error}");
+    }
+    job_json(&job_row(ctx, id, project)?)
+}
 fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
     match req {
         Req::New {
@@ -2394,6 +3320,11 @@ fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
         Req::Rm { space } => remove_space(ctx, project, space),
         Req::RmCkpt { ckpt } => remove_checkpoint(ctx, project, ckpt),
         Req::Ls => list_spaces(ctx, project),
+        Req::SubmitJob { space, cmd, stdin } => submit_job(ctx, project, space, cmd, stdin),
+        Req::ListJobs => list_jobs(ctx, project),
+        Req::GetJob { id } => get_job_value(ctx, project, id),
+        Req::GetJobLogs { id } => get_job_logs(ctx, project, id),
+        Req::CancelJob { id } => cancel_job(ctx, project, id),
         Req::Start { space } => start_space(ctx, project, space),
         Req::Stop { space } => stop_space(ctx, project, space),
         Req::Touch { space } => touch_space(ctx, project, space),
@@ -2487,6 +3418,58 @@ fn exec_command_value(value: &Value) -> shinu::Result<(Vec<String>, Option<Strin
     Ok((command, stdin))
 }
 
+fn job_request(body: &[u8], space: String) -> shinu::Result<Req> {
+    let value = parse_body(body)?;
+    let command = value
+        .get("cmd")
+        .and_then(Value::as_array)
+        .ok_or_else(|| shinu::Error::Invalid("body field cmd must be an array".into()))?;
+    if command.is_empty() {
+        return Err(shinu::Error::Invalid("job needs a command".into()));
+    }
+    if command.len() > JOB_MAX_ARGS {
+        return Err(shinu::Error::Invalid(format!(
+            "detached job command must contain at most {JOB_MAX_ARGS} arguments"
+        )));
+    }
+    let command = command
+        .iter()
+        .map(|argument| {
+            argument
+                .as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| shinu::Error::Invalid("cmd arguments must be strings".into()))
+        })
+        .collect::<shinu::Result<Vec<_>>>()?;
+    let argument_bytes = command.iter().fold(0usize, |total, argument| {
+        total.saturating_add(argument.len())
+    });
+    if argument_bytes > JOB_MAX_ARG_BYTES {
+        return Err(shinu::Error::Invalid(format!(
+            "detached job command arguments must total at most {JOB_MAX_ARG_BYTES} bytes"
+        )));
+    }
+    if command.first().is_some_and(|argument| argument.is_empty()) {
+        return Err(shinu::Error::Invalid(
+            "job executable must not be empty".into(),
+        ));
+    }
+    let stdin = match value.get("stdin") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .ok_or_else(|| shinu::Error::Invalid("stdin must be a string".into()))?
+                .to_owned(),
+        ),
+    };
+    Ok(Req::SubmitJob {
+        space,
+        cmd: command,
+        stdin,
+    })
+}
+
 #[derive(Debug)]
 enum Endpoint {
     Root,
@@ -2501,6 +3484,11 @@ enum Endpoint {
     ConsoleTokens,
     ConsoleToken(String),
     Spaces,
+    JobSubmit(String),
+    JobList,
+    Job(String),
+    JobLogs(String),
+    JobCancel(String),
     Images,
     Usage,
     Limits,
@@ -2562,6 +3550,22 @@ fn route(path: &str) -> Option<Endpoint> {
             return Some(Endpoint::ConsoleToken(segments[3].clone()));
         }
         return None;
+    }
+    if segments.len() == 3 && segments[2] == "jobs" {
+        return Some(Endpoint::JobList);
+    }
+    if segments.len() == 4 && segments[2] == "jobs" && !segments[3].is_empty() {
+        return Some(Endpoint::Job(segments[3].clone()));
+    }
+    if segments.len() == 5 && segments[2] == "jobs" && !segments[3].is_empty() {
+        return match segments[4].as_str() {
+            "logs" => Some(Endpoint::JobLogs(segments[3].clone())),
+            "cancel" => Some(Endpoint::JobCancel(segments[3].clone())),
+            _ => None,
+        };
+    }
+    if segments.len() == 5 && segments[2] == "spaces" && segments[4] == "jobs" {
+        return Some(Endpoint::JobSubmit(segments[3].clone()));
     }
     if segments.len() == 3 && segments[2] == "spaces" {
         return Some(Endpoint::Spaces);
@@ -2793,6 +3797,8 @@ fn method_allowed(endpoint: &Endpoint, method: &str) -> bool {
         Endpoint::ConsoleTokens => method == "GET" || method == "POST",
         Endpoint::ConsoleToken(_) => method == "DELETE",
         Endpoint::Spaces => method == "GET" || method == "POST",
+        Endpoint::JobList | Endpoint::Job(_) | Endpoint::JobLogs(_) => method == "GET",
+        Endpoint::JobSubmit(_) | Endpoint::JobCancel(_) => method == "POST",
         Endpoint::Usage
         | Endpoint::Limits
         | Endpoint::Log(_)
@@ -3000,6 +4006,11 @@ fn gc_request(body: &[u8]) -> shinu::Result<Req> {
     })
 }
 
+fn parse_job_uuid(value: &str) -> shinu::Result<Uuid> {
+    Uuid::parse_str(value)
+        .map_err(|error| shinu::Error::Invalid(format!("invalid job id: {error}")))
+}
+
 fn request_for(
     endpoint: Endpoint,
     method: &str,
@@ -3010,6 +4021,26 @@ fn request_for(
     match endpoint {
         Endpoint::Spaces if method == "GET" => Ok((Req::Ls, 200)),
         Endpoint::Spaces => Ok((new_request(body)?, 201)),
+        Endpoint::JobSubmit(space) => Ok((job_request(body, space)?, 202)),
+        Endpoint::JobList => Ok((Req::ListJobs, 200)),
+        Endpoint::Job(id) => Ok((
+            Req::GetJob {
+                id: parse_job_uuid(&id)?,
+            },
+            200,
+        )),
+        Endpoint::JobLogs(id) => Ok((
+            Req::GetJobLogs {
+                id: parse_job_uuid(&id)?,
+            },
+            200,
+        )),
+        Endpoint::JobCancel(id) => Ok((
+            Req::CancelJob {
+                id: parse_job_uuid(&id)?,
+            },
+            200,
+        )),
         Endpoint::Images => Ok((Req::Images, 200)),
         Endpoint::Usage => Ok((Req::Usage { from, to }, 200)),
         Endpoint::Limits => Ok((Req::Limits, 200)),
@@ -3102,25 +4133,36 @@ struct SshTarget {
     proxy: String,
 }
 
-fn prepare_ssh(ctx: &Ctx<'_>, project: &str, space: &str) -> shinu::Result<SshTarget> {
-    let initial = find_space(ctx.db, space, project)?;
-    let space_id = initial.id;
-    let space_guard = ctx.registry.space_lock(space_id);
-    let _space_guard = space_guard
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let entry = revalidate_space(ctx, project, space_id, space)?;
+fn ssh_target_for_vm(root: &Path, space_id: Uuid) -> shinu::Result<SshTarget> {
+    let vm_dir = shinu::vm_dir(root, space_id);
+    let helper = shinu::vsock_helper()?;
+    let proxy = format!(
+        "ProxyCommand={} {} {}",
+        shinu::shell_quote_word(&helper.to_string_lossy()),
+        shinu::shell_quote_word(&shinu::vm::vsock_path(&vm_dir).to_string_lossy()),
+        shinu::VSOCK_SSH_PORT
+    );
+    Ok(SshTarget { vm_dir, proxy })
+}
+
+fn job_ssh_target(root: &Path, space_id: Uuid) -> shinu::Result<SshTarget> {
+    ssh_target_for_vm(root, space_id)
+}
+
+/// Prepares an SSH target while the caller owns the Space lock. No lock is
+/// acquired here so submit can keep the lock through VM start and tmux launch.
+fn prepare_ssh_entry(ctx: &Ctx<'_>, project: &str, entry: &Space) -> shinu::Result<SshTarget> {
     let limits = effective_limits(ctx, project)?;
     check_vm_sizing(ctx, &limits, entry.vcpus, entry.mem_mib)?;
     let (already_running, state, previous_running) =
-        space_start_state(ctx, project, &entry, &limits)?;
+        space_start_state(ctx, project, entry, &limits)?;
     let restore_checkpoint = entry
         .head
         .and_then(|head| state.ckpts.iter().find(|checkpoint| checkpoint.id == head));
     if !already_running {
         start_vm_with_pending_restore(
             ctx,
-            space_id,
+            entry.id,
             entry.image,
             entry.vcpus,
             entry.mem_mib,
@@ -3136,15 +4178,17 @@ fn prepare_ssh(ctx: &Ctx<'_>, project: &str, space: &str) -> shinu::Result<SshTa
     )?;
     let all_members = network_members(&state, project, entry.network.as_deref());
     sync_network_hosts(ctx, &current_running, &all_members);
-    let vm_dir = shinu::vm_dir(ctx.root, space_id);
-    let helper = shinu::vsock_helper()?;
-    let proxy = format!(
-        "ProxyCommand={} {} {}",
-        shinu::shell_quote_word(&helper.to_string_lossy()),
-        shinu::shell_quote_word(&shinu::vm::vsock_path(&vm_dir).to_string_lossy()),
-        shinu::VSOCK_SSH_PORT
-    );
-    Ok(SshTarget { vm_dir, proxy })
+    ssh_target_for_vm(ctx.root, entry.id)
+}
+
+fn prepare_ssh(ctx: &Ctx<'_>, project: &str, space: &str) -> shinu::Result<SshTarget> {
+    let initial = find_space(ctx.db, space, project)?;
+    let space_guard = ctx.registry.space_lock(initial.id);
+    let _space_guard = space_guard
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = revalidate_space(ctx, project, initial.id, space)?;
+    prepare_ssh_entry(ctx, project, &entry)
 }
 
 fn ssh_command(target: &SshTarget, remote: &[String]) -> Command {
@@ -3168,6 +4212,365 @@ fn ssh_command(target: &SshTarget, remote: &[String]) -> Command {
         .arg("--")
         .arg(shinu::shell_quote(remote));
     command
+}
+
+const JOB_RUNNER_STDOUT_CAP: usize = 64 * 1024;
+const JOB_RUNNER_STDERR_CAP: usize = 64 * 1024;
+const JOB_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const JOB_LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Kills the local SSH process group before reaping the direct child. SSH can
+/// leave a descendant holding stdout/stderr open; killing only the direct
+/// process would make the bounded reader joins wait forever.
+fn kill_job_process_group_only(child: &mut Child) -> Option<String> {
+    let group = format!("-{}", child.id());
+    match Command::new("kill")
+        .args(["-KILL", "--", group.as_str()])
+        .output()
+    {
+        Ok(output) if output.status.success() => None,
+        Ok(output) => {
+            let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            let _ = child.kill();
+            Some(if message.is_empty() {
+                "kill of detached SSH process group failed".to_owned()
+            } else {
+                format!("kill of detached SSH process group failed: {message}")
+            })
+        }
+        Err(error) => {
+            let _ = child.kill();
+            Some(format!(
+                "kill of detached SSH process group failed: {error}"
+            ))
+        }
+    }
+}
+
+/// Kills the local SSH process group and reaps the direct child.
+fn kill_job_process_group(child: &mut Child) -> Option<String> {
+    let mut failure = kill_job_process_group_only(child);
+    if let Err(error) = child.wait() {
+        let message = format!("reaping detached SSH child failed: {error}");
+        failure = Some(failure.map_or_else(
+            || message.clone(),
+            |existing| format!("{existing}; {message}"),
+        ));
+    }
+    failure
+}
+
+fn read_job_stream<R: Read>(
+    mut reader: R,
+    cap: usize,
+    overflow: Arc<AtomicBool>,
+) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(cap.min(8192));
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = reader.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(output);
+        }
+        let available = cap.saturating_sub(output.len());
+        let keep = count.min(available);
+        output.extend_from_slice(&buffer[..keep]);
+        if keep != count {
+            overflow.store(true, Ordering::Release);
+            return Ok(output);
+        }
+    }
+}
+
+struct JobCommandOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn run_job_ssh(
+    target: &SshTarget,
+    remote: &[String],
+    stdin: Option<&[u8]>,
+    timeout: Duration,
+    stdout_cap: usize,
+) -> shinu::Result<JobCommandOutput> {
+    let mut command = ssh_command(target, remote);
+    command.process_group(0);
+    let mut child = command
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            let kill_error = kill_job_process_group(&mut child);
+            let message = kill_error.map_or_else(
+                || "detached SSH stdout unavailable".to_owned(),
+                |error| format!("detached SSH stdout unavailable; {error}"),
+            );
+            return Err(shinu::Error::Internal(message));
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            let kill_error = kill_job_process_group(&mut child);
+            let message = kill_error.map_or_else(
+                || "detached SSH stderr unavailable".to_owned(),
+                |error| format!("detached SSH stderr unavailable; {error}"),
+            );
+            return Err(shinu::Error::Internal(message));
+        }
+    };
+    let overflow = Arc::new(AtomicBool::new(false));
+    let stdout_overflow = Arc::clone(&overflow);
+    let stderr_overflow = Arc::clone(&overflow);
+    let stdout_done = Arc::new(AtomicBool::new(false));
+    let stderr_done = Arc::new(AtomicBool::new(false));
+    let stdout_done_worker = Arc::clone(&stdout_done);
+    let stderr_done_worker = Arc::clone(&stderr_done);
+    let stdout_reader = thread::spawn(move || {
+        let result = read_job_stream(stdout, stdout_cap, stdout_overflow);
+        stdout_done_worker.store(true, Ordering::Release);
+        result
+    });
+    let stderr_reader = thread::spawn(move || {
+        let result = read_job_stream(stderr, JOB_RUNNER_STDERR_CAP, stderr_overflow);
+        stderr_done_worker.store(true, Ordering::Release);
+        result
+    });
+    let stdin_writer = if let Some(input) = stdin {
+        let Some(mut writer) = child.stdin.take() else {
+            let kill_error = kill_job_process_group(&mut child);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            let message = kill_error.map_or_else(
+                || "detached SSH stdin unavailable".to_owned(),
+                |error| format!("detached SSH stdin unavailable; {error}"),
+            );
+            return Err(shinu::Error::Internal(message));
+        };
+        let input = input.to_vec();
+        Some(thread::spawn(move || writer.write_all(&input)))
+    } else {
+        None
+    };
+    let deadline = Instant::now() + timeout;
+    let mut timed_out = false;
+    let mut wait_error = None;
+    let mut termination_error = None;
+    let status = loop {
+        if overflow.load(Ordering::Acquire) {
+            termination_error = kill_job_process_group(&mut child);
+            break None;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() >= deadline => {
+                timed_out = true;
+                termination_error = kill_job_process_group(&mut child);
+                break None;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                wait_error = Some(error.to_string());
+                termination_error = kill_job_process_group(&mut child);
+                break None;
+            }
+        }
+    };
+    let mut drain_error = None;
+    if status.is_some() {
+        while !(stdout_done.load(Ordering::Acquire) && stderr_done.load(Ordering::Acquire))
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !(stdout_done.load(Ordering::Acquire) && stderr_done.load(Ordering::Acquire)) {
+            drain_error = kill_job_process_group_only(&mut child);
+        }
+    }
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| shinu::Error::Internal("detached SSH stdout reader failed".into()))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| shinu::Error::Internal("detached SSH stderr reader failed".into()))??;
+    let stdin_error =
+        stdin_writer.and_then(|writer| writer.join().ok().and_then(|result| result.err()));
+    if let Some(error) = wait_error {
+        return Err(shinu::Error::Invalid(format!(
+            "detached SSH wait failed: {error}"
+        )));
+    }
+    if let Some(error) = stdin_error {
+        return Err(shinu::Error::Invalid(format!(
+            "detached SSH stdin failed: {error}"
+        )));
+    }
+    if let Some(error) = drain_error {
+        return Err(shinu::Error::Internal(error));
+    }
+    if let Some(error) = termination_error {
+        return Err(shinu::Error::Internal(error));
+    }
+    if timed_out {
+        return Err(shinu::Error::Invalid(format!(
+            "detached SSH command exceeded {} second deadline",
+            timeout.as_secs()
+        )));
+    }
+    if overflow.load(Ordering::Acquire) {
+        return Err(shinu::Error::Invalid(
+            "detached SSH command output exceeded its bound".into(),
+        ));
+    }
+    let Some(status) = status else {
+        return Err(shinu::Error::Invalid(
+            "detached SSH command was terminated".into(),
+        ));
+    };
+    Ok(JobCommandOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn job_launch_remote(id: Uuid, command: &[String], has_stdin: bool) -> Vec<String> {
+    let status = job_status_path(id);
+    let input = job_stdin_path(id);
+    let pid = job_pid_path(id);
+    let cancel = job_cancel_path(id);
+    let wrapper = job_wrapper_path(id);
+    let session = job_session(id);
+    let wrapper_body = r#"#!/bin/sh
+set +e
+status_path=$1
+input_path=$2
+pid_path=$3
+cancel_path=$4
+stdin_present=$5
+shift 5
+if [ "$stdin_present" = 1 ]; then
+    setsid -- "$@" < "$input_path" &
+else
+    setsid -- "$@" </dev/null &
+fi
+command_pid=$!
+temporary="${pid_path}.tmp.$$"
+if ! printf '%s\n' "$command_pid" > "$temporary" || ! mv -f -- "$temporary" "$pid_path"; then
+    rm -f -- "$temporary"
+    kill -KILL -- -"$command_pid" 2>/dev/null || kill -KILL "$command_pid" 2>/dev/null || :
+    exit 255
+fi
+wait "$command_pid"
+status=$?
+if [ "$stdin_present" = 1 ]; then
+    rm -f -- "$input_path"
+fi
+temporary="${status_path}.tmp.$$"
+if ! printf '%s\n' "$status" > "$temporary" || ! mv -f -- "$temporary" "$status_path"; then
+    rm -f -- "$temporary"
+    exit 255
+fi
+# Keep the pane alive until the daemon captures and archives its history.
+while :; do
+    sleep 3600
+done
+"#;
+    let quoted_status = shinu::shell_quote_word(&status);
+    let quoted_input = shinu::shell_quote_word(&input);
+    let quoted_pid = shinu::shell_quote_word(&pid);
+    let quoted_cancel = shinu::shell_quote_word(&cancel);
+    let quoted_wrapper = shinu::shell_quote_word(&wrapper);
+    let quoted_session = shinu::shell_quote_word(&session);
+    let mut script = String::new();
+    script.push_str("set -eu\n");
+    script.push_str("job_dir=/run/shinu/jobs\n");
+    script.push_str("mkdir -p -- \"$job_dir\"\n");
+    script.push_str("chmod 700 -- \"$job_dir\"\n");
+    script.push_str("status_path=");
+    script.push_str(&quoted_status);
+    script.push_str("\ninput_path=");
+    script.push_str(&quoted_input);
+    script.push_str("\npid_path=");
+    script.push_str(&quoted_pid);
+    script.push_str("\ncancel_path=");
+    script.push_str(&quoted_cancel);
+    script.push_str("\nwrapper_path=");
+    script.push_str(&quoted_wrapper);
+    script.push_str("\nsession=");
+    script.push_str(&quoted_session);
+    script.push_str("\nrm -f -- \"$status_path\" \"$input_path\" \"$pid_path\" \"$cancel_path\" \"$wrapper_path\"\n");
+    script.push_str("wrapper_tmp=\"${wrapper_path}.tmp.$$\"\n");
+    script.push_str("cat > \"$wrapper_tmp\" <<'SHINU_JOB_WRAPPER'\n");
+    script.push_str(wrapper_body);
+    script.push_str("SHINU_JOB_WRAPPER\n");
+    script.push_str("chmod 700 -- \"$wrapper_tmp\"\n");
+    script.push_str("mv -f -- \"$wrapper_tmp\" \"$wrapper_path\"\n");
+    if has_stdin {
+        script.push_str("stdin_present=1\n");
+        script.push_str("cat > \"$input_path\"\n");
+    } else {
+        script.push_str("stdin_present=0\n");
+    }
+    let stdin_flag = if has_stdin { "1" } else { "0" };
+    let mut tmux = vec![
+        "tmux".to_owned(),
+        "-L".to_owned(),
+        "shinu-jobs".to_owned(),
+        "-f".to_owned(),
+        "/dev/null".to_owned(),
+        "new-session".to_owned(),
+        "-d".to_owned(),
+        "-s".to_owned(),
+        session,
+        "-x".to_owned(),
+        "200".to_owned(),
+        "-y".to_owned(),
+        "50".to_owned(),
+        "--".to_owned(),
+        wrapper,
+        status,
+        input,
+        pid,
+        cancel,
+        stdin_flag.to_owned(),
+    ];
+    tmux.extend(command.iter().cloned());
+    script.push_str(&shinu::shell_quote(&tmux));
+    script.push('\n');
+    vec!["sh".to_owned(), "-c".to_owned(), script]
+}
+
+fn launch_job(
+    target: &SshTarget,
+    id: Uuid,
+    command: &[String],
+    stdin: Option<&str>,
+) -> shinu::Result<()> {
+    let remote = job_launch_remote(id, command, stdin.is_some());
+    let output = run_job_ssh(
+        target,
+        &remote,
+        stdin.map(str::as_bytes),
+        JOB_LAUNCH_TIMEOUT,
+        JOB_RUNNER_STDOUT_CAP,
+    )?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(shinu::Error::Invalid(format!(
+        "detached job launch failed: {}",
+        guest_stderr(output.stderr, output.status.code())
+    )))
 }
 
 fn session_remote_command(session: &str, command: &[String], has_stdin: bool) -> Vec<String> {
@@ -5412,6 +6815,7 @@ mod tests {
     use std::io::{Read as IoRead, Write as IoWrite};
     use std::net::{TcpListener, TcpStream};
     use std::os::unix::fs::symlink;
+    use std::os::unix::process::CommandExt;
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
     use std::sync::{Arc, LazyLock, Mutex};
@@ -5425,6 +6829,47 @@ mod tests {
         root
     }
 
+    #[test]
+    fn detached_runner_kills_process_group_with_pipe_holding_descendant() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 30 & wait"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command.process_group(0);
+        let mut child = command.spawn().expect("spawn process-group test child");
+        let error = super::kill_job_process_group(&mut child);
+        assert!(error.is_none(), "process-group kill failed: {error:?}");
+    }
+
+    #[test]
+    fn detached_job_parser_rejects_oversized_argv() {
+        let too_many = format!(
+            "{{\"cmd\":[{}]}}",
+            (0..257).map(|_| "\"x\"").collect::<Vec<_>>().join(",")
+        );
+        assert!(
+            super::request_for(
+                super::Endpoint::JobSubmit("demo".into()),
+                "POST",
+                too_many.as_bytes(),
+                None,
+                None,
+            )
+            .is_err()
+        );
+        let too_wide = format!("{{\"cmd\":[\"echo\",\"{}\"]}}", "x".repeat(8 * 1024));
+        assert!(
+            super::request_for(
+                super::Endpoint::JobSubmit("demo".into()),
+                "POST",
+                too_wide.as_bytes(),
+                None,
+                None,
+            )
+            .is_err()
+        );
+    }
     #[test]
     fn startup_purges_diff_temp_and_allocates_unique_paths() {
         let root = test_root("diff-temp-cleanup");
@@ -5598,6 +7043,7 @@ mod tests {
             rate: test_rate(),
             register_rate: test_register_rate(),
             registry,
+            jobs: None,
             admin_token: None,
         }
     }
@@ -6701,6 +8147,7 @@ mod tests {
             rate: &rate,
             register_rate: test_register_rate(),
             registry: &registry,
+            jobs: None,
             admin_token: None,
         };
         let override_limits = super::effective_limits(&ctx, "project-a").expect("override");
@@ -7088,6 +8535,7 @@ mod tests {
             rate: &rate,
             register_rate: &register_rate,
             registry: &registry,
+            jobs: None,
             admin_token: None,
         };
         // Committed only after resize_space has already cleared its pre-check.
@@ -7696,6 +9144,7 @@ mod tests {
             rate: test_rate(),
             register_rate: test_register_rate(),
             registry,
+            jobs: None,
             admin_token: None,
         }
     }

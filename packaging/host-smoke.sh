@@ -32,6 +32,7 @@ TOKEN_A=
 TOKEN_B=
 TRACK_A=
 TRACK_B=
+JOB_IDS=
 CLI_OUT=
 CLI_ERR=
 
@@ -43,6 +44,13 @@ SPACE_PEER=smoke-peer
 SPACE_BETA=smoke-beta
 SPACE_FORK=smoke-fork
 SPACE_REMOVE=smoke-remove
+SPACE_TEMPLATE=smoke-template-fork
+SPACE_JOBS=smoke-jobs
+TEMPLATE_NAME=smoke-baseline
+
+API_OUT=
+API_ERR=
+API_STATUS=
 GUEST_HTTP_PORT=18080
 NET_BASE=172.30
 export SHINU_NET_BASE="$NET_BASE"
@@ -123,6 +131,7 @@ cleanup() {
         if [ -n "${DAEMON_PID:-}" ]; then
             if daemon_identity "$DAEMON_PID" "$DAEMON_START_TIME"; then
                 daemon_owned=1
+                cancel_tracked_jobs "$TOKEN_A" "$JOB_IDS"
                 stop_tracked_spaces "$TOKEN_A" "$TRACK_A"
                 stop_tracked_spaces "$TOKEN_B" "$TRACK_B"
                 if daemon_identity "$DAEMON_PID" "$DAEMON_START_TIME"; then
@@ -171,6 +180,7 @@ cleanup() {
                 recovery_attempts=$((recovery_attempts + 1))
             done
             if [ "$recovery_ready" -eq 1 ]; then
+                cancel_tracked_jobs "$TOKEN_A" "$JOB_IDS"
                 stop_tracked_spaces "$TOKEN_A" "$TRACK_A"
                 stop_tracked_spaces "$TOKEN_B" "$TRACK_B"
             else
@@ -365,6 +375,17 @@ SMOKE_ARCH=${SHINU_ARCH:-}
 SMOKE_PAYLOAD=${SHINU_PAYLOAD:-}
 SMOKE_PAYLOAD_SERVICE=${SHINU_PAYLOAD_SERVICE:-}
 SMOKE_ADMIN_TOKEN=${SHINU_ADMIN_TOKEN:-}
+SMOKE_LEASE_GRACE_SECS=${SHINU_LEASE_GRACE_SECS:-30}
+case "$SMOKE_LEASE_GRACE_SECS" in
+    ''|*[!0-9]*) fail "SHINU_LEASE_GRACE_SECS must be numeric: $SMOKE_LEASE_GRACE_SECS" ;;
+esac
+[ "$SMOKE_LEASE_GRACE_SECS" -ge 15 ] || fail "SHINU_LEASE_GRACE_SECS must be at least 15 seconds for smoke"
+[ "$SMOKE_LEASE_GRACE_SECS" -le 45 ] || fail "SHINU_LEASE_GRACE_SECS must be at most 45 seconds for smoke"
+LEASE_SWEEP_SECS=30
+LEASE_TTL_SECS=5
+LEASE_ACTIVE_MIN_WAIT_SECS=$((LEASE_TTL_SECS + LEASE_SWEEP_SECS + 5))
+LEASE_ACTIVE_WAIT_SECS=$((LEASE_TTL_SECS + (LEASE_SWEEP_SECS * 2) + 10))
+LEASE_DELETE_WAIT_SECS=$((SMOKE_LEASE_GRACE_SECS + (LEASE_SWEEP_SECS * 2) + 15))
 
 LEDGER=$ROOT/host-ledger
 mkdir "$LEDGER"
@@ -928,6 +949,47 @@ stop_tracked_spaces() {
         fi
     done
 }
+cancel_tracked_jobs() {
+    cancel_token=$1
+    cancel_jobs=$2
+    [ -n "$cancel_token" ] || return
+    [ -n "$cancel_jobs" ] || return
+    for cancel_job in $cancel_jobs; do
+        cancel_out="$ROOT/cleanup-job-$cancel_job.out"
+        cancel_err="$ROOT/cleanup-job-$cancel_job.err"
+        cancel_status=
+        if ! cancel_status=$(curl --noproxy '*' -sS --connect-timeout 5 --max-time 15 \
+            -X POST -H "Authorization: Bearer $cancel_token" \
+            -o "$cancel_out" -w '%{http_code}' \
+            "http://127.0.0.1:$PORT/v1/jobs/$cancel_job/cancel" \
+            2> "$cancel_err" ); then
+            printf 'host-smoke: cleanup job cancellation failed for %s: %s\n' \
+                "$cancel_job" "$(cat "$cancel_err" 2>/dev/null || printf '')" >&2
+            cleanup_ok=0
+            continue
+        fi
+        case "$cancel_status" in
+            404) ;;
+            200)
+                cancel_state=$(sed -n 's/.*"state":"\([^"\\]*\)".*/\1/p' "$cancel_out" | sed -n '1p')
+                case "$cancel_state" in
+                    canceled|exited|lost) ;;
+                    *)
+                        printf 'host-smoke: cleanup job cancellation returned unknown state for %s: %s\n' \
+                            "$cancel_job" "$(cat "$cancel_out" 2>/dev/null || printf '')" >&2
+                        cleanup_ok=0
+                        ;;
+                esac
+                ;;
+            *)
+                printf 'host-smoke: cleanup job cancellation returned HTTP %s for %s: %s\n' \
+                    "$cancel_status" "$cancel_job" "$(cat "$cancel_out" 2>/dev/null || printf '')" >&2
+                cleanup_ok=0
+                ;;
+        esac
+    done
+}
+
 
 # Every daemon launch is hermetic. Empty optional values are intentional and
 # prevent caller credentials or network policy from leaking into the test.
@@ -940,6 +1002,7 @@ daemon_exec() {
         SHINU_VCPUS="$SMOKE_VCPUS" \
         SHINU_MEM_MIB="$SMOKE_MEM_MIB" \
         SHINU_IDLE_SECS="$SMOKE_IDLE_SECS" \
+        SHINU_LEASE_GRACE_SECS="$SMOKE_LEASE_GRACE_SECS" \
         SHINU_DISK_MIB="$SMOKE_DISK_MIB" \
         SHINU_JAIL_UID="$JAIL_UID" \
         SHINU_JAIL_GID="$JAIL_GID" \
@@ -1089,6 +1152,193 @@ cli_failure() {
         *) fail "failed CLI command did not contain $fragment: $error_text" ;;
     esac
 }
+cli_failure_fragments() {
+    token=$1
+    fragment_a=$2
+    fragment_b=$3
+    shift 3
+    CLI_OUT=$ROOT/cli.out
+    CLI_ERR=$ROOT/cli.err
+    status=0
+    if "$SHINU_BIN" --endpoint "http://127.0.0.1:$PORT" --token "$token" "$@" \
+        > "$CLI_OUT" 2> "$CLI_ERR"; then
+        fail "expected CLI failure did not occur"
+    else
+        status=$?
+    fi
+    [ "$status" -ne 0 ] || fail "expected CLI failure returned status zero"
+    [ ! -s "$CLI_OUT" ] || fail "failed CLI command wrote unexpected stdout: $(cat "$CLI_OUT")"
+    error_text=$(cat "$CLI_ERR")
+    case "$error_text" in
+        *"$fragment_a"*) ;;
+        *) fail "failed CLI command did not contain $fragment_a: $error_text" ;;
+    esac
+    case "$error_text" in
+        *"$fragment_b"*) ;;
+        *) fail "failed CLI command did not contain $fragment_b: $error_text" ;;
+    esac
+}
+api_request() {
+    api_token=$1
+    api_method=$2
+    api_path=$3
+    api_body=$4
+    api_expected=$5
+    API_OUT=$ROOT/api.out
+    API_ERR=$ROOT/api.err
+    if [ -n "$api_body" ]; then
+        if ! API_STATUS=$(curl --noproxy '*' -sS --connect-timeout 5 --max-time 15 \
+            -X "$api_method" -H "Authorization: Bearer $api_token" \
+            -H 'Content-Type: application/json' -d "$api_body" \
+            -o "$API_OUT" -w '%{http_code}' "http://127.0.0.1:$PORT$api_path" \
+            2> "$API_ERR" ); then
+            cat "$API_ERR" >&2
+            fail "API request failed: $api_method $api_path"
+        fi
+    else
+        if ! API_STATUS=$(curl --noproxy '*' -sS --connect-timeout 5 --max-time 15 \
+            -X "$api_method" -H "Authorization: Bearer $api_token" \
+            -o "$API_OUT" -w '%{http_code}' "http://127.0.0.1:$PORT$api_path" \
+            2> "$API_ERR" ); then
+            cat "$API_ERR" >&2
+            fail "API request failed: $api_method $api_path"
+        fi
+    fi
+    case "$API_STATUS" in
+        [0-9][0-9][0-9]) ;;
+        *) fail "API request returned an invalid HTTP status: $API_STATUS" ;;
+    esac
+    [ "$API_STATUS" = "$api_expected" ] || \
+        fail "unexpected API status for $api_method $api_path: $API_STATUS (expected $api_expected): $(cat "$API_OUT")"
+}
+
+json_uuid_field() {
+    json_uuid_file=$1
+    json_uuid_name=$2
+    json_uuid_value=$(sed -n "s/.*\"$json_uuid_name\":\"\([0-9a-f]\{8\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{12\}\)\".*/\1/p" \
+        "$json_uuid_file" | sed -n '1p')
+    [ -n "$json_uuid_value" ] || return 1
+    printf '%s\n' "$json_uuid_value"
+}
+
+job_state_from_json() {
+    job_state_file=$1
+    sed -n 's/.*"state":"\([^"]*\)".*/\1/p' "$job_state_file" | sed -n '1p'
+}
+
+assert_job_state() {
+    expected_job_state=$1
+    job_state_file=$2
+    if ! actual_job_state=$(job_state_from_json "$job_state_file"); then
+        fail "job response omitted state: $(cat "$job_state_file")"
+    fi
+    [ -n "$actual_job_state" ] || fail "job response omitted state: $(cat "$job_state_file")"
+    [ "$actual_job_state" = "$expected_job_state" ] || \
+        fail "job state was $actual_job_state, expected $expected_job_state: $(cat "$job_state_file")"
+}
+
+assert_job_active() {
+    job_state_file=$1
+    if ! actual_job_state=$(job_state_from_json "$job_state_file"); then
+        fail "job response omitted state: $(cat "$job_state_file")"
+    fi
+    [ -n "$actual_job_state" ] || fail "job response omitted state: $(cat "$job_state_file")"
+    case "$actual_job_state" in
+        starting|running|canceling) ;;
+        *) fail "job stopped before the active assertion: $actual_job_state" ;;
+    esac
+}
+wait_for_job_active() {
+    wait_token=$1
+    wait_job_id=$2
+    wait_limit=$3
+    wait_attempt=0
+    while [ "$wait_attempt" -lt "$wait_limit" ]; do
+        api_request "$wait_token" GET "/v1/jobs/$wait_job_id" '' 200
+        if ! wait_state=$(job_state_from_json "$API_OUT"); then
+            fail "job status response could not be parsed: $(cat "$API_OUT")"
+        fi
+        [ -n "$wait_state" ] || fail "job status response omitted state: $(cat "$API_OUT")"
+        case "$wait_state" in
+            starting|running|canceling) return 0 ;;
+            exited|canceled|lost)
+                fail "job reached terminal state before active assertion: $wait_state" ;;
+            *) fail "job status returned an unknown state: $wait_state" ;;
+        esac
+        sleep 1
+        wait_attempt=$((wait_attempt + 1))
+    done
+    fail "job did not remain active within $wait_limit seconds"
+}
+
+wait_for_job_log_marker() {
+    wait_token=$1
+    wait_job_id=$2
+    wait_marker=$3
+    wait_limit=$4
+    wait_attempt=0
+    while [ "$wait_attempt" -lt "$wait_limit" ]; do
+        api_request "$wait_token" GET "/v1/jobs/$wait_job_id/logs" '' 200
+        # The logs endpoint returns a JSON envelope with plain string data;
+        # searching this bounded response keeps the smoke dependency-free.
+        case "$(cat "$API_OUT")" in
+            *"$wait_marker"*) return 0 ;;
+            *) ;;
+        esac
+        sleep 1
+        wait_attempt=$((wait_attempt + 1))
+    done
+    fail "job log did not contain marker within $wait_limit seconds: $wait_marker"
+}
+
+wait_for_lease_active_space() {
+    wait_token=$1
+    wait_space=$2
+    wait_job_id=$3
+    wait_attempt=0
+    while [ "$wait_attempt" -lt "$LEASE_ACTIVE_WAIT_SECS" ]; do
+        if [ "$wait_attempt" -ge "$LEASE_ACTIVE_MIN_WAIT_SECS" ]; then
+            api_request "$wait_token" GET /v1/spaces '' 200
+            wait_spaces=$(cat "$API_OUT")
+            case "$wait_spaces" in
+                *"\"name\":\"$wait_space\""*)
+                    json_object_with "$API_OUT" "\"name\":\"$wait_space\""
+                    api_request "$wait_token" GET "/v1/jobs/$wait_job_id" '' 200
+                    if ! wait_state=$(job_state_from_json "$API_OUT"); then
+                        fail "job status response could not be parsed: $(cat "$API_OUT")"
+                    fi
+                    case "$wait_state" in
+                        starting|running|canceling) return 0 ;;
+                        exited|canceled|lost)
+                            fail "lease job reached terminal state while lease was active: $wait_state" ;;
+                        *) fail "lease job returned an unknown state: $wait_state" ;;
+                    esac
+                    ;;
+                *) ;;
+            esac
+        fi
+        sleep 1
+        wait_attempt=$((wait_attempt + 1))
+    done
+    fail "leased space was not retained while its detached job was active"
+}
+
+wait_for_space_deleted() {
+    wait_token=$1
+    wait_space=$2
+    wait_attempt=0
+    while [ "$wait_attempt" -lt "$LEASE_DELETE_WAIT_SECS" ]; do
+        api_request "$wait_token" GET /v1/spaces '' 200
+        wait_spaces=$(cat "$API_OUT")
+        case "$wait_spaces" in
+            *"\"name\":\"$wait_space\""*) ;;
+            *) return 0 ;;
+        esac
+        sleep 1
+        wait_attempt=$((wait_attempt + 1))
+    done
+    fail "leased space was not deleted within $LEASE_DELETE_WAIT_SECS seconds"
+}
 
 assert_cli_output() {
     expected=$1
@@ -1108,9 +1358,18 @@ cli_new() {
     token=$1
     space=$2
     network=$3
+    ttl=${4:-}
     if [ -n "$network" ]; then
+        if [ -n "$ttl" ]; then
+            cli_run "$token" new "$space" --vcpus "$SMOKE_VCPUS" --mem "$SMOKE_MEM_MIB" \
+                --disk "$SMOKE_DISK_MIB" --network "$network" --ttl "$ttl"
+        else
+            cli_run "$token" new "$space" --vcpus "$SMOKE_VCPUS" --mem "$SMOKE_MEM_MIB" \
+                --disk "$SMOKE_DISK_MIB" --network "$network"
+        fi
+    elif [ -n "$ttl" ]; then
         cli_run "$token" new "$space" --vcpus "$SMOKE_VCPUS" --mem "$SMOKE_MEM_MIB" \
-            --disk "$SMOKE_DISK_MIB" --network "$network"
+            --disk "$SMOKE_DISK_MIB" --ttl "$ttl"
     else
         cli_run "$token" new "$space" --vcpus "$SMOKE_VCPUS" --mem "$SMOKE_MEM_MIB" \
             --disk "$SMOKE_DISK_MIB"
@@ -1413,6 +1672,122 @@ assert_object_has "\"base\":\"$FULL_ID\""
 assert_object_has '"snapshot_version":"'
 snapshot_files_exist "$DIFF_ID"
 cli_stop "$TOKEN_A" "$SPACE_MAIN"
+
+step "creating, pinning, forking, and deleting a checkpoint template"
+cli_run "$TOKEN_A" template create "$TEMPLATE_NAME" "$FULL_ID"
+assert_cli_output "created template $TEMPLATE_NAME  $FULL_ID"
+cli_run "$TOKEN_A" template ls --json
+json_object_with "$CLI_OUT" "\"name\":\"$TEMPLATE_NAME\""
+assert_object_has "\"checkpoint\":\"$FULL_ID\""
+cli_failure_fragments "$TOKEN_A" 'still referenced by:' "$TEMPLATE_NAME" rmckpt "$FULL_ID"
+TRACK_A="$TRACK_A $SPACE_TEMPLATE"
+cli_run "$TOKEN_A" template fork "$TEMPLATE_NAME" "$SPACE_TEMPLATE"
+template_fork_line=$(sed -n '1p' "$CLI_OUT")
+[ "$(cat "$CLI_OUT")" = "$template_fork_line" ] || \
+    fail "template fork wrote unexpected extra output"
+case "$template_fork_line" in
+    "$SPACE_TEMPLATE  "*) ;;
+    *) fail "template fork returned unexpected summary: $template_fork_line" ;;
+esac
+TEMPLATE_FORK_ID=$(printf '%s\n' "$template_fork_line" | awk '{print $2}')
+is_uuid "$TEMPLATE_FORK_ID"
+cli_run "$TOKEN_A" ls --json
+json_object_with "$CLI_OUT" "\"name\":\"$SPACE_TEMPLATE\""
+assert_object_has "\"parent\":\"$FULL_ID\""
+assert_object_has "\"head\":\"$FULL_ID\""
+cli_start "$TOKEN_A" "$SPACE_TEMPLATE"
+cli_exec_expect "$TOKEN_A" "$SPACE_TEMPLATE" template-fork-ok printf template-fork-ok
+cli_stop "$TOKEN_A" "$SPACE_TEMPLATE"
+cli_run "$TOKEN_A" template rm "$TEMPLATE_NAME"
+assert_cli_output "removed template $TEMPLATE_NAME  $FULL_ID"
+cli_run "$TOKEN_A" template ls --json
+case "$(cat "$CLI_OUT")" in
+    *"\"name\":\"$TEMPLATE_NAME\""*) fail "deleted template remains visible" ;;
+    *) ;;
+esac
+cli_run "$TOKEN_A" log "$SPACE_TEMPLATE" --json
+grep -F "\"id\":\"$FULL_ID\"" "$CLI_OUT" >/dev/null || \
+    fail "template fork no longer retained its concrete checkpoint"
+cli_remove "$TOKEN_A" "$SPACE_TEMPLATE"
+
+step "exercising detached jobs, daemon restart, and lease cleanup"
+TRACK_A="$TRACK_A $SPACE_JOBS"
+cli_new "$TOKEN_A" "$SPACE_JOBS" '' "${LEASE_TTL_SECS}s"
+JOB_SPACE_ID=$LAST_SPACE_ID
+is_uuid "$JOB_SPACE_ID"
+cli_run "$TOKEN_A" ls --json
+json_object_with "$CLI_OUT" "\"name\":\"$SPACE_JOBS\""
+case "$JSON_OBJECT" in
+    *'"expires_at":null'*) fail "job space did not retain its short lease" ;;
+    *) ;;
+esac
+JOB_MARKER=detached-job-marker
+JOB_BODY="{\"cmd\":[\"sh\",\"-c\",\"printf $JOB_MARKER; sleep 180\"]}"
+api_request "$TOKEN_A" POST "/v1/spaces/$SPACE_JOBS/jobs" "$JOB_BODY" 202
+if ! JOB_ID=$(json_uuid_field "$API_OUT" id); then
+    fail "job submission response omitted exactly one UUID id: $(cat "$API_OUT")"
+fi
+JOB_IDS="$JOB_IDS $JOB_ID"
+is_uuid "$JOB_ID"
+if ! JOB_SUBMIT_STATE=$(job_state_from_json "$API_OUT"); then
+    fail "job submission response could not be parsed: $(cat "$API_OUT")"
+fi
+case "$JOB_SUBMIT_STATE" in
+    starting|running) ;;
+    *) fail "job submission completed unexpectedly: $JOB_SUBMIT_STATE" ;;
+esac
+api_request "$TOKEN_A" GET /v1/jobs '' 200
+case "$(cat "$API_OUT")" in
+    *"\"id\":\"$JOB_ID\""*) ;;
+    *) fail "job list omitted the submitted job: $(cat "$API_OUT")" ;;
+esac
+api_request "$TOKEN_A" GET "/v1/jobs/$JOB_ID" '' 200
+assert_job_active "$API_OUT"
+wait_for_job_log_marker "$TOKEN_A" "$JOB_ID" "$JOB_MARKER" 20
+cli_run "$TOKEN_A" job ls --json
+case "$(cat "$CLI_OUT")" in
+    *"\"id\":\"$JOB_ID\""*) ;;
+    *) fail "CLI job list omitted the submitted job: $(cat "$CLI_OUT")" ;;
+esac
+cli_failure "$TOKEN_A" 'active detached jobs' stop "$SPACE_JOBS"
+
+step "restarting shinud while the detached job and its VM remain active"
+restart_daemon
+wait_for_job_active "$TOKEN_A" "$JOB_ID" 20
+wait_for_job_log_marker "$TOKEN_A" "$JOB_ID" "$JOB_MARKER" 20
+cli_run "$TOKEN_A" job status "$JOB_ID" --json
+assert_job_active "$CLI_OUT"
+
+step "observing lease expiry without deleting its active-job space"
+wait_for_lease_active_space "$TOKEN_A" "$SPACE_JOBS" "$JOB_ID"
+
+step "canceling the detached job and retaining its terminal log"
+cli_run "$TOKEN_A" job cancel "$JOB_ID"
+case "$(cat "$CLI_OUT")" in
+    'state: canceled'*) ;;
+    *) fail "job cancellation did not return canceled: $(cat "$CLI_OUT")" ;;
+esac
+api_request "$TOKEN_A" GET "/v1/jobs/$JOB_ID" '' 200
+assert_job_state canceled "$API_OUT"
+api_request "$TOKEN_A" GET "/v1/jobs/$JOB_ID/logs" '' 200
+case "$(cat "$API_OUT")" in
+    *"$JOB_MARKER"*) ;;
+    *) fail "canceled job log omitted its marker: $(cat "$API_OUT")" ;;
+esac
+cli_run "$TOKEN_A" job logs "$JOB_ID"
+case "$(cat "$CLI_OUT")" in
+    *"$JOB_MARKER"*) ;;
+    *) fail "CLI canceled job log omitted its marker: $(cat "$CLI_OUT")" ;;
+esac
+
+step "waiting for lease grace and sweep deletion"
+wait_for_space_deleted "$TOKEN_A" "$SPACE_JOBS"
+cli_failure "$TOKEN_A" 'HTTP 404' start "$SPACE_JOBS"
+cli_run "$TOKEN_B" ls --json
+case "$(cat "$CLI_OUT")" in
+    *"\"name\":\"$SPACE_JOBS\""*) fail "project B disclosed deleted project A job space" ;;
+    *) ;;
+esac
 
 step "checking out the cold commit and verifying reflog behavior"
 cli_run "$TOKEN_A" checkout "$SPACE_MAIN" "$COLD_ID"

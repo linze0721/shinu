@@ -361,7 +361,7 @@ All API routes require authentication header: `Authorization: Bearer <token>`.
 | `POST` | `/v1/spaces/{space}/jobs` | JSON command | Job record | Start a detached command without waiting for completion |
 | `GET` | `/v1/jobs` | — | `200 OK` `{"jobs":[...],"truncated":...}` | List the newest 64 detached jobs in the project |
 | `GET` | `/v1/jobs/{id}` | — | `200 OK` job record | Get detached job state and metadata |
-| `GET` | `/v1/jobs/{id}/logs` | — | `200 OK` terminal-rendered text (max 1 MiB) | Get the job log |
+| `GET` | `/v1/jobs/{id}/logs` | — | `200 OK` `{"id":"...","data":"...","log_bytes":N,"log_truncated":false,"terminal":false}` | Get the bounded terminal-rendered job log in a JSON envelope |
 | `POST` | `/v1/jobs/{id}/cancel` | — | `200 OK` job record | Request cancellation of a detached job |
 | `POST` | `/v1/spaces/{name}/push?path=<path>` | Raw bytes (up to 256 MiB) | `200 OK` `{"path":"...","bytes":N}` | Stream binary data directly into guest file |
 | `GET` | `/v1/spaces/{name}/pull?path=<path>` | — | `200 OK` Raw bytes (`application/octet-stream`) | Stream binary file out of guest |
@@ -399,7 +399,7 @@ The `POST /v1/spaces/{name}/exec` endpoint is synchronous. It uses `Transfer-Enc
 {"exit":0}
 ```
 
-Every execution stream guarantees a final `{"exit": N}` payload terminating the response. Detached jobs use a separate lifecycle: `POST /v1/spaces/{space}/jobs` returns a job record while the command runs, and `GET /v1/jobs/{id}/logs` returns one terminal-rendered text stream capped at 1 MiB. Job logs are not chunked NDJSON and have no follow or raw mode. Job states are `starting`, `running`, `canceling`, `exited`, `canceled`, and `lost`.
+Every execution stream guarantees a final `{"exit": N}` payload terminating the response. Detached jobs use a separate lifecycle: `POST /v1/spaces/{space}/jobs` returns a job record while the command runs, and `GET /v1/jobs/{id}/logs` returns a JSON envelope whose `data` field contains the terminal-rendered log, capped at 1 MiB. Job logs are not chunked NDJSON and have no follow or raw mode. Job states are `starting`, `running`, `canceling`, `exited`, `canceled`, and `lost`.
 
 ### Error Handling & Response Format
 

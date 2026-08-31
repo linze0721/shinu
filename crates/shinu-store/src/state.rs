@@ -38,6 +38,8 @@ pub struct Space {
     pub disk_mib: Option<u64>,
     #[serde(default)]
     pub network: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -66,10 +68,72 @@ pub struct Ckpt {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Serialize, Deserialize, Default, Debug, PartialEq, Eq)]
+/// An immutable, project-scoped name for a checkpoint.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Template {
+    pub project: String,
+    pub name: String,
+    pub checkpoint: Uuid,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Persistent lifecycle states for detached jobs.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum JobState {
+    Starting,
+    Running,
+    Canceling,
+    Exited,
+    Canceled,
+    Lost,
+}
+
+impl JobState {
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Starting | Self::Running | Self::Canceling)
+    }
+
+    pub fn is_terminal(self) -> bool {
+        !self.is_active()
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Canceling => "canceling",
+            Self::Exited => "exited",
+            Self::Canceled => "canceled",
+            Self::Lost => "lost",
+        }
+    }
+}
+
+/// Durable metadata for one detached command. Log bytes are retained on the
+/// host in the root jobs directory; this row stores only bounded accounting.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Job {
+    pub id: Uuid,
+    pub project: String,
+    pub space: Uuid,
+    pub command: Vec<String>,
+    pub state: JobState,
+    pub created_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub exit_code: Option<i32>,
+    pub error: Option<String>,
+    pub log_bytes: u64,
+    pub log_truncated: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq, Eq)]
 pub struct State {
     pub spaces: Vec<Space>,
     pub ckpts: Vec<Ckpt>,
+    #[serde(default)]
+    pub templates: Vec<Template>,
 }
 
 const SCHEMA: &str = r#"
@@ -84,6 +148,7 @@ const SCHEMA: &str = r#"
         mem_mib INTEGER,
         disk_mib INTEGER,
         network TEXT,
+        expires_at TEXT,
         created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS ckpts (
@@ -97,6 +162,27 @@ const SCHEMA: &str = r#"
         full INTEGER NOT NULL DEFAULT 0,
         base TEXT,
         snapshot_version TEXT
+    );
+    CREATE TABLE IF NOT EXISTS templates (
+        project TEXT NOT NULL,
+        name TEXT NOT NULL,
+        checkpoint TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (project, name)
+    );
+    CREATE TABLE IF NOT EXISTS jobs (
+        id TEXT PRIMARY KEY,
+        project TEXT NOT NULL,
+        space TEXT NOT NULL,
+        command TEXT NOT NULL,
+        state TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        finished_at TEXT,
+        exit_code INTEGER,
+        error TEXT,
+        log_bytes INTEGER NOT NULL DEFAULT 0,
+        log_truncated INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS projects (
         project TEXT PRIMARY KEY,
@@ -135,6 +221,10 @@ const SCHEMA: &str = r#"
     CREATE INDEX IF NOT EXISTS spaces_project_name ON spaces(project, name);
     CREATE INDEX IF NOT EXISTS ckpts_project ON ckpts(project);
     CREATE INDEX IF NOT EXISTS ckpts_space ON ckpts(space);
+    CREATE INDEX IF NOT EXISTS templates_project_checkpoint ON templates(project, checkpoint);
+    CREATE INDEX IF NOT EXISTS jobs_project_created ON jobs(project, created_at DESC, id DESC);
+    CREATE INDEX IF NOT EXISTS jobs_project_space_state ON jobs(project, space, state);
+    CREATE INDEX IF NOT EXISTS jobs_project_state ON jobs(project, state);
     CREATE INDEX IF NOT EXISTS usage_events_project_at ON usage_events(project, "at");
     CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
     CREATE INDEX IF NOT EXISTS memberships_project ON memberships(project);
@@ -148,6 +238,7 @@ fn migrate_space_columns(conn: &Connection) -> Result<()> {
         ("mem_mib", "INTEGER"),
         ("disk_mib", "INTEGER"),
         ("network", "TEXT"),
+        ("expires_at", "TEXT"),
     ] {
         let present: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('spaces') WHERE name = ?1",
@@ -184,6 +275,21 @@ pub fn validate_network_name(network: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Validates an immutable project-scoped template name.
+pub fn validate_template_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .bytes()
+            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'))
+    {
+        return Err(Error::Invalid(
+            "template name must be non-empty, at most 64 bytes, and contain only [a-z0-9-]".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn migrate_ckpt_columns(conn: &Connection) -> Result<()> {
     for (name, definition) in [
         ("full", "INTEGER NOT NULL DEFAULT 0"),
@@ -206,6 +312,11 @@ fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
     migrate_space_columns(conn)?;
     migrate_ckpt_columns(conn)?;
+    // This index references a column that older databases may receive above;
+    // creating it here keeps the ALTER and index creation ordered safely.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS spaces_project_expires ON spaces(project, expires_at)",
+    )?;
     Ok(())
 }
 
@@ -257,6 +368,13 @@ fn parse_datetime(value: String, column: usize) -> rusqlite::Result<DateTime<Utc
         })
 }
 
+fn parse_optional_datetime(
+    value: Option<String>,
+    column: usize,
+) -> rusqlite::Result<Option<DateTime<Utc>>> {
+    value.map(|value| parse_datetime(value, column)).transpose()
+}
+
 fn parse_image(value: String) -> rusqlite::Result<Image> {
     value.parse::<Image>().map_err(|error| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -266,6 +384,43 @@ fn parse_image(value: String) -> rusqlite::Result<Image> {
                 "invalid image {value}: {error}"
             ))),
         )
+    })
+}
+
+fn parse_job_state(value: String, column: usize) -> rusqlite::Result<JobState> {
+    let state = match value.as_str() {
+        "starting" => JobState::Starting,
+        "running" => JobState::Running,
+        "canceling" => JobState::Canceling,
+        "exited" => JobState::Exited,
+        "canceled" => JobState::Canceled,
+        "lost" => JobState::Lost,
+        _ => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                column,
+                Type::Text,
+                Box::new(std::io::Error::other(format!(
+                    "invalid persisted job state {value:?}"
+                ))),
+            ));
+        }
+    };
+    Ok(state)
+}
+
+fn parse_optional_i32(value: Option<i64>, column: usize) -> rusqlite::Result<Option<i32>> {
+    value
+        .map(|value| {
+            i32::try_from(value).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(error))
+            })
+        })
+        .transpose()
+}
+
+fn parse_u64(value: i64, column: usize) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(column, Type::Integer, Box::new(error))
     })
 }
 
@@ -281,9 +436,11 @@ fn space_from_row(row: &Row<'_>) -> rusqlite::Result<Space> {
         mem_mib: row.get(7)?,
         disk_mib: row.get(8)?,
         network: row.get(9)?,
-        created_at: parse_datetime(row.get(10)?, 10)?,
+        expires_at: parse_optional_datetime(row.get(10)?, 10)?,
+        created_at: parse_datetime(row.get(11)?, 11)?,
     })
 }
+
 fn ckpt_from_row(row: &Row<'_>) -> rusqlite::Result<Ckpt> {
     Ok(Ckpt {
         id: parse_uuid(row.get(0)?, 0)?,
@@ -299,9 +456,39 @@ fn ckpt_from_row(row: &Row<'_>) -> rusqlite::Result<Ckpt> {
     })
 }
 
+fn template_from_row(row: &Row<'_>) -> rusqlite::Result<Template> {
+    Ok(Template {
+        project: row.get(0)?,
+        name: row.get(1)?,
+        checkpoint: parse_uuid(row.get(2)?, 2)?,
+        created_at: parse_datetime(row.get(3)?, 3)?,
+    })
+}
+
+fn job_from_row(row: &Row<'_>) -> rusqlite::Result<Job> {
+    let command_json: String = row.get(3)?;
+    let command = serde_json::from_str(&command_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(3, Type::Text, Box::new(error))
+    })?;
+    Ok(Job {
+        id: parse_uuid(row.get(0)?, 0)?,
+        project: row.get(1)?,
+        space: parse_uuid(row.get(2)?, 2)?,
+        command,
+        state: parse_job_state(row.get(4)?, 4)?,
+        created_at: parse_datetime(row.get(5)?, 5)?,
+        started_at: parse_optional_datetime(row.get(6)?, 6)?,
+        finished_at: parse_optional_datetime(row.get(7)?, 7)?,
+        exit_code: parse_optional_i32(row.get(8)?, 8)?,
+        error: row.get(9)?,
+        log_bytes: parse_u64(row.get(10)?, 10)?,
+        log_truncated: row.get::<_, i64>(11)? != 0,
+    })
+}
+
 fn insert_space(tx: &Transaction<'_>, space: &Space) -> rusqlite::Result<usize> {
     tx.execute(
-        "INSERT INTO spaces (id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "INSERT INTO spaces (id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             space.id.to_string(),
             space.name,
@@ -313,6 +500,7 @@ fn insert_space(tx: &Transaction<'_>, space: &Space) -> rusqlite::Result<usize> 
             space.mem_mib,
             space.disk_mib,
             space.network,
+            space.expires_at.map(|at| at.to_rfc3339()),
             space.created_at.to_rfc3339(),
         ],
     )
@@ -336,6 +524,18 @@ fn insert_ckpt(tx: &Transaction<'_>, ckpt: &Ckpt) -> rusqlite::Result<usize> {
     )
 }
 
+fn insert_template(tx: &Transaction<'_>, template: &Template) -> rusqlite::Result<usize> {
+    tx.execute(
+        "INSERT INTO templates (project, name, checkpoint, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![
+            template.project.as_str(),
+            template.name.as_str(),
+            template.checkpoint.to_string(),
+            template.created_at.to_rfc3339(),
+        ],
+    )
+}
+
 impl State {
     pub fn load(root: &Path) -> Result<State> {
         let conn = open(root)?;
@@ -354,7 +554,8 @@ impl State {
 pub fn migrate_from_json(root: &Path, conn: &Connection) -> Result<bool> {
     let spaces: i64 = conn.query_row("SELECT COUNT(*) FROM spaces", [], |row| row.get(0))?;
     let ckpts: i64 = conn.query_row("SELECT COUNT(*) FROM ckpts", [], |row| row.get(0))?;
-    if spaces != 0 || ckpts != 0 {
+    let templates: i64 = conn.query_row("SELECT COUNT(*) FROM templates", [], |row| row.get(0))?;
+    if spaces != 0 || ckpts != 0 || templates != 0 {
         return Ok(false);
     }
 
@@ -368,12 +569,16 @@ pub fn migrate_from_json(root: &Path, conn: &Connection) -> Result<bool> {
     for space in &state.spaces {
         validate_network_name(space.network.as_deref())?;
     }
+    validate_templates(&state)?;
     let tx = conn.unchecked_transaction()?;
     for space in &state.spaces {
         insert_space(&tx, space)?;
     }
     for ckpt in &state.ckpts {
         insert_ckpt(&tx, ckpt)?;
+    }
+    for template in &state.templates {
+        insert_template(&tx, template)?;
     }
     tx.commit()?;
     std::fs::rename(path, root.join("state.json.migrated"))?;
@@ -384,7 +589,7 @@ pub fn migrate_from_json(root: &Path, conn: &Connection) -> Result<bool> {
 pub fn load(conn: &Connection) -> Result<State> {
     let spaces = {
         let mut statement = conn.prepare(
-            "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, created_at FROM spaces ORDER BY rowid",
+            "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at FROM spaces ORDER BY rowid",
         )?;
         statement
             .query_map([], space_from_row)?
@@ -398,15 +603,49 @@ pub fn load(conn: &Connection) -> Result<State> {
             .query_map([], ckpt_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
-    Ok(State { spaces, ckpts })
+    let templates = {
+        let mut statement = conn.prepare(
+            "SELECT project, name, checkpoint, created_at FROM templates ORDER BY rowid",
+        )?;
+        statement
+            .query_map([], template_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    Ok(State {
+        spaces,
+        ckpts,
+        templates,
+    })
 }
 
-/// Replaces persisted space and checkpoint rows atomically.
+fn validate_templates(state: &State) -> Result<()> {
+    for template in &state.templates {
+        validate_template_name(&template.name)?;
+        let target = state
+            .ckpts
+            .iter()
+            .find(|ckpt| ckpt.id == template.checkpoint);
+        let valid_target = target.is_some_and(|ckpt| ckpt.project == template.project);
+        if !valid_target {
+            return Err(Error::Invalid(format!(
+                "template {} points to a missing checkpoint {}",
+                template.name, template.checkpoint
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Replaces persisted spaces, checkpoints, and template refs atomically.
 pub fn store(conn: &Connection, state: &State) -> Result<()> {
     for space in &state.spaces {
         validate_network_name(space.network.as_deref())?;
     }
+    validate_templates(state)?;
     let tx = conn.unchecked_transaction()?;
+    // Refs must disappear before their checkpoint targets so a full replacement
+    // remains valid even when foreign keys are enabled by a future schema.
+    tx.execute("DELETE FROM templates", [])?;
     tx.execute("DELETE FROM ckpts", [])?;
     tx.execute("DELETE FROM spaces", [])?;
     for space in &state.spaces {
@@ -415,6 +654,9 @@ pub fn store(conn: &Connection, state: &State) -> Result<()> {
     for ckpt in &state.ckpts {
         insert_ckpt(&tx, ckpt)?;
     }
+    for template in &state.templates {
+        insert_template(&tx, template)?;
+    }
     tx.commit()?;
     Ok(())
 }
@@ -422,7 +664,7 @@ pub fn store(conn: &Connection, state: &State) -> Result<()> {
 pub fn find_space(conn: &Connection, name: &str, project: &str) -> Result<Option<Space>> {
     let by_name = conn
         .query_row(
-            "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, created_at FROM spaces WHERE project = ?1 AND name = ?2 LIMIT 1",
+            "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at FROM spaces WHERE project = ?1 AND name = ?2 LIMIT 1",
             params![project, name],
             space_from_row,
         )
@@ -434,7 +676,7 @@ pub fn find_space(conn: &Connection, name: &str, project: &str) -> Result<Option
         return Ok(None);
     };
     conn.query_row(
-        "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, created_at FROM spaces WHERE project = ?1 AND id = ?2 LIMIT 1",
+        "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at FROM spaces WHERE project = ?1 AND id = ?2 LIMIT 1",
         params![project, id.to_string()],
         space_from_row,
     )
@@ -460,6 +702,184 @@ pub fn count_spaces(conn: &Connection, project: &str) -> Result<u32> {
     )?;
     u32::try_from(count)
         .map_err(|error| Error::Invalid(format!("space count out of range: {error}")))
+}
+
+fn sqlite_i64(value: u64, field: &str) -> Result<i64> {
+    i64::try_from(value)
+        .map_err(|error| Error::Invalid(format!("{field} out of range for SQLite: {error}")))
+}
+
+/// Inserts one detached job row without persisting command input or log data.
+pub fn insert_job(conn: &Connection, job: &Job) -> Result<()> {
+    let command = serde_json::to_string(&job.command)?;
+    let log_bytes = sqlite_i64(job.log_bytes, "log_bytes")?;
+    conn.execute(
+        "INSERT INTO jobs (id, project, space, command, state, created_at, started_at, finished_at, exit_code, error, log_bytes, log_truncated) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            job.id.to_string(),
+            job.project.as_str(),
+            job.space.to_string(),
+            command,
+            job.state.as_str(),
+            job.created_at.to_rfc3339(),
+            job.started_at.map(|at| at.to_rfc3339()),
+            job.finished_at.map(|at| at.to_rfc3339()),
+            job.exit_code.map(i64::from),
+            job.error.as_deref(),
+            log_bytes,
+            i32::from(job.log_truncated),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Retrieves one job only within the requested project's namespace.
+pub fn get_job(conn: &Connection, id: Uuid, project: &str) -> Result<Option<Job>> {
+    conn.query_row(
+        "SELECT id, project, space, command, state, created_at, started_at, finished_at, exit_code, error, log_bytes, log_truncated FROM jobs WHERE project = ?1 AND id = ?2 LIMIT 1",
+        params![project, id.to_string()],
+        job_from_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Lists jobs newest first without disclosing another project's rows.
+pub fn list_jobs(conn: &Connection, project: &str) -> Result<Vec<Job>> {
+    let mut statement = conn.prepare(
+        "SELECT id, project, space, command, state, created_at, started_at, finished_at, exit_code, error, log_bytes, log_truncated FROM jobs WHERE project = ?1 ORDER BY created_at DESC, id DESC",
+    )?;
+    statement
+        .query_map(params![project], job_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+/// Lists active jobs for one space and project. Active means starting,
+/// running, or canceling; terminal rows are never returned.
+pub fn active_jobs_by_space(conn: &Connection, space: Uuid, project: &str) -> Result<Vec<Job>> {
+    let mut statement = conn.prepare(
+        "SELECT id, project, space, command, state, created_at, started_at, finished_at, exit_code, error, log_bytes, log_truncated FROM jobs WHERE project = ?1 AND space = ?2 AND state IN ('starting', 'running', 'canceling') ORDER BY created_at DESC, id DESC",
+    )?;
+    statement
+        .query_map(params![project, space.to_string()], job_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+/// Lists all active jobs in one project without exposing other projects.
+pub fn active_jobs_by_project(conn: &Connection, project: &str) -> Result<Vec<Job>> {
+    let mut statement = conn.prepare(
+        "SELECT id, project, space, command, state, created_at, started_at, finished_at, exit_code, error, log_bytes, log_truncated FROM jobs WHERE project = ?1 AND state IN ('starting', 'running', 'canceling') ORDER BY created_at DESC, id DESC",
+    )?;
+    statement
+        .query_map(params![project], job_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
+/// Updates bounded combined-log accounting without storing log contents.
+pub fn set_job_log_metadata(
+    conn: &Connection,
+    id: Uuid,
+    project: &str,
+    log_bytes: u64,
+    log_truncated: bool,
+) -> Result<Option<Job>> {
+    let log_bytes = sqlite_i64(log_bytes, "log_bytes")?;
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE jobs SET log_bytes = ?3, log_truncated = ?4 WHERE project = ?1 AND id = ?2",
+        params![project, id.to_string(), log_bytes, i32::from(log_truncated),],
+    )?;
+    let result = tx
+        .query_row(
+            "SELECT id, project, space, command, state, created_at, started_at, finished_at, exit_code, error, log_bytes, log_truncated FROM jobs WHERE project = ?1 AND id = ?2 LIMIT 1",
+            params![project, id.to_string()],
+            job_from_row,
+        )
+        .optional()?;
+    tx.commit()?;
+    Ok(result)
+}
+
+/// Moves a starting job to running. A later or terminal state is returned
+/// unchanged so recovery callers can safely repeat this operation.
+pub fn set_job_running(conn: &Connection, id: Uuid, project: &str) -> Result<Option<Job>> {
+    let tx = conn.unchecked_transaction()?;
+    let now = Utc::now().to_rfc3339();
+    tx.execute(
+        "UPDATE jobs SET state = 'running', started_at = COALESCE(started_at, ?3) WHERE project = ?1 AND id = ?2 AND state = 'starting'",
+        params![project, id.to_string(), now],
+    )?;
+    let result = tx
+        .query_row(
+            "SELECT id, project, space, command, state, created_at, started_at, finished_at, exit_code, error, log_bytes, log_truncated FROM jobs WHERE project = ?1 AND id = ?2 LIMIT 1",
+            params![project, id.to_string()],
+            job_from_row,
+        )
+        .optional()?;
+    tx.commit()?;
+    Ok(result)
+}
+
+/// Requests cancellation with a compare-and-set transition. Repeating the
+/// request for a canceling or terminal job returns its authoritative row.
+pub fn request_job_cancel(conn: &Connection, id: Uuid, project: &str) -> Result<Option<Job>> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "UPDATE jobs SET state = 'canceling' WHERE project = ?1 AND id = ?2 AND state IN ('starting', 'running')",
+        params![project, id.to_string()],
+    )?;
+    let result = tx
+        .query_row(
+            "SELECT id, project, space, command, state, created_at, started_at, finished_at, exit_code, error, log_bytes, log_truncated FROM jobs WHERE project = ?1 AND id = ?2 LIMIT 1",
+            params![project, id.to_string()],
+            job_from_row,
+        )
+        .optional()?;
+    tx.commit()?;
+    Ok(result)
+}
+
+/// Commits one terminal outcome only while the row is active. This makes the
+/// first terminal observer authoritative when cancellation and natural exit
+/// race; the losing caller receives that committed row.
+pub fn finish_job(
+    conn: &Connection,
+    id: Uuid,
+    project: &str,
+    state: JobState,
+    exit_code: Option<i32>,
+    error: Option<&str>,
+) -> Result<Option<Job>> {
+    if state.is_active() {
+        return Err(Error::Invalid(
+            "job terminal transition requires exited, canceled, or lost state".into(),
+        ));
+    }
+    let tx = conn.unchecked_transaction()?;
+    let now = Utc::now().to_rfc3339();
+    tx.execute(
+        "UPDATE jobs SET state = ?3, finished_at = ?4, exit_code = ?5, error = ?6 WHERE project = ?1 AND id = ?2 AND state IN ('starting', 'running', 'canceling')",
+        params![
+            project,
+            id.to_string(),
+            state.as_str(),
+            now,
+            exit_code.map(i64::from),
+            error,
+        ],
+    )?;
+    let result = tx
+        .query_row(
+            "SELECT id, project, space, command, state, created_at, started_at, finished_at, exit_code, error, log_bytes, log_truncated FROM jobs WHERE project = ?1 AND id = ?2 LIMIT 1",
+            params![project, id.to_string()],
+            job_from_row,
+        )
+        .optional()?;
+    tx.commit()?;
+    Ok(result)
 }
 
 fn normalize_email(email: &str) -> String {
@@ -781,6 +1201,8 @@ mod db_tests {
             mem_mib: None,
             disk_mib: None,
             network: Some("lan".into()),
+            expires_at: None,
+
             created_at,
         };
         let ckpt = Ckpt {
@@ -798,15 +1220,33 @@ mod db_tests {
         let state = State {
             spaces: vec![space.clone()],
             ckpts: vec![ckpt.clone()],
+            templates: Vec::new(),
         };
         (state, space, ckpt)
+    }
+
+    fn sample_job(project: &str, space: Uuid, id: Uuid, state: JobState) -> Job {
+        Job {
+            id,
+            project: project.into(),
+            space,
+            command: vec!["printf".into(), "hello".into()],
+            state,
+            created_at: Utc.timestamp_opt(1_700_000_000, 0).single().unwrap(),
+            started_at: None,
+            finished_at: None,
+            exit_code: None,
+            error: None,
+            log_bytes: 5,
+            log_truncated: false,
+        }
     }
     #[test]
     fn user_schema_is_idempotent_in_memory() {
         let conn = Connection::open_in_memory().expect("open memory database");
         init_schema(&conn).expect("create schema");
         init_schema(&conn).expect("reapply schema");
-        for table in ["users", "memberships", "sessions"] {
+        for table in ["users", "memberships", "sessions", "templates", "jobs"] {
             let count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -854,28 +1294,58 @@ mod db_tests {
         .expect("insert legacy space");
 
         migrate_space_columns(&conn).expect("apply sizing migration");
-        let row: (
-            String,
-            Option<i64>,
-            Option<i64>,
-            Option<i64>,
-            Option<String>,
-        ) = conn
+        let (image, vcpus, mem_mib, disk_mib, network, expires_at) = conn
             .query_row(
-                "SELECT image, vcpus, mem_mib, disk_mib, network FROM spaces",
+                "SELECT image, vcpus, mem_mib, disk_mib, network, expires_at FROM spaces",
                 [],
                 |row| {
                     Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
                     ))
                 },
             )
             .expect("read migrated space");
-        assert_eq!(row, ("void".into(), None, None, None, None));
+        assert_eq!(image, "void");
+        assert_eq!(vcpus, None);
+        assert_eq!(mem_mib, None);
+        assert_eq!(disk_mib, None);
+        assert_eq!(network, None);
+        assert_eq!(expires_at, None);
+    }
+
+    #[test]
+    fn old_schema_migration_is_idempotent_and_indexes_expiry_after_alter() {
+        let conn = Connection::open_in_memory().expect("open legacy database");
+        conn.execute_batch(
+            "CREATE TABLE spaces (id TEXT PRIMARY KEY, name TEXT NOT NULL, project TEXT NOT NULL, parent TEXT, head TEXT, created_at TEXT NOT NULL);
+             CREATE TABLE ckpts (id TEXT PRIMARY KEY, space TEXT NOT NULL, project TEXT NOT NULL, parent TEXT, auto INTEGER NOT NULL, note TEXT NOT NULL, created_at TEXT NOT NULL);",
+        )
+        .expect("create legacy tables");
+
+        init_schema(&conn).expect("apply first migration");
+        init_schema(&conn).expect("apply second migration");
+
+        let expiry_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('spaces') WHERE name = 'expires_at'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect expiry column");
+        assert_eq!(expiry_columns, 1);
+        let expiry_indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'spaces_project_expires'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect expiry index");
+        assert_eq!(expiry_indexes, 1);
     }
     #[test]
     fn legacy_checkpoint_rows_gain_snapshot_columns() {
@@ -1044,12 +1514,12 @@ mod db_tests {
         let conn = open(&root).expect("second open");
         let tables: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('spaces', 'ckpts', 'projects', 'usage_events', 'users', 'memberships', 'sessions')",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('spaces', 'ckpts', 'templates', 'jobs', 'projects', 'usage_events', 'users', 'memberships', 'sessions')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(tables, 7);
+        assert_eq!(tables, 9);
         let journal_mode: String = conn
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
@@ -1079,11 +1549,178 @@ mod db_tests {
     #[test]
     fn spaces_and_checkpoints_round_trip() {
         let conn = db();
-        let (state, space, ckpt) = sample_state("alpha");
+        let (mut state, _, ckpt) = sample_state("alpha");
+        state.spaces[0].expires_at = Some(Utc.timestamp_opt(1_800_000_000, 0).single().unwrap());
+        let space = state.spaces[0].clone();
         store(&conn, &state).unwrap();
         assert_eq!(load(&conn).unwrap(), state);
         assert_eq!(find_space(&conn, "demo", "alpha").unwrap(), Some(space));
         assert_eq!(find_ckpt(&conn, ckpt.id, "alpha").unwrap(), Some(ckpt));
+    }
+
+    #[test]
+    fn templates_round_trip_with_project_scoped_names_and_full_replacement() {
+        let conn = db();
+        let (alpha, alpha_space, alpha_ckpt) = sample_state("alpha");
+        let (beta, beta_space, beta_ckpt) = sample_state("beta");
+        let created_at = Utc.timestamp_opt(1_700_000_123, 0).single().unwrap();
+        let state = State {
+            spaces: vec![alpha_space, beta_space],
+            ckpts: vec![alpha_ckpt.clone(), beta_ckpt.clone()],
+            templates: vec![
+                Template {
+                    project: "alpha".into(),
+                    name: "release".into(),
+                    checkpoint: alpha_ckpt.id,
+                    created_at,
+                },
+                Template {
+                    project: "beta".into(),
+                    name: "release".into(),
+                    checkpoint: beta_ckpt.id,
+                    created_at,
+                },
+            ],
+        };
+        assert_eq!(alpha.templates, Vec::<Template>::new());
+        assert_eq!(beta.templates, Vec::<Template>::new());
+        store(&conn, &state).expect("store templates");
+        assert_eq!(load(&conn).expect("load templates"), state);
+
+        let mut duplicate = state.clone();
+        let duplicate_template = duplicate.templates[0].clone();
+        duplicate.templates.push(duplicate_template);
+        assert!(store(&conn, &duplicate).is_err());
+        assert_eq!(load(&conn).expect("load after duplicate"), state);
+
+        let mut replacement = state;
+        replacement.templates.clear();
+        store(&conn, &replacement).expect("replace templates");
+        assert!(load(&conn).expect("load replacement").templates.is_empty());
+    }
+
+    #[test]
+    fn template_name_validation_is_strict_and_byte_bounded() {
+        let valid_long = "a".repeat(64);
+        for name in ["a", "release-01", valid_long.as_str()] {
+            validate_template_name(name).expect("valid template name");
+        }
+        let invalid_long = "a".repeat(65);
+        for name in [
+            "",
+            "A",
+            "release_name",
+            "release name",
+            "é",
+            invalid_long.as_str(),
+        ] {
+            assert!(matches!(
+                validate_template_name(name),
+                Err(Error::Invalid(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn jobs_round_trip_and_project_lookup_is_private() {
+        let conn = db();
+        let space = Uuid::new_v4();
+        let job = sample_job("alpha", space, Uuid::new_v4(), JobState::Starting);
+        insert_job(&conn, &job).expect("insert job");
+
+        assert_eq!(
+            get_job(&conn, job.id, "alpha").expect("get job"),
+            Some(job.clone())
+        );
+        assert!(
+            get_job(&conn, job.id, "other")
+                .expect("foreign get")
+                .is_none()
+        );
+        assert_eq!(list_jobs(&conn, "alpha").expect("list jobs"), vec![job]);
+        assert!(list_jobs(&conn, "other").expect("foreign list").is_empty());
+    }
+
+    #[test]
+    fn jobs_transition_once_and_active_filters_are_strict() {
+        let conn = db();
+        let space = Uuid::new_v4();
+        let starting = sample_job("alpha", space, Uuid::new_v4(), JobState::Starting);
+        let running = sample_job("alpha", space, Uuid::new_v4(), JobState::Running);
+        let canceling = sample_job("alpha", space, Uuid::new_v4(), JobState::Canceling);
+        let exited = sample_job("alpha", space, Uuid::new_v4(), JobState::Exited);
+        for job in [&starting, &running, &canceling, &exited] {
+            insert_job(&conn, job).expect("insert active-filter job");
+        }
+
+        let active = active_jobs_by_space(&conn, space, "alpha").expect("space active jobs");
+        assert_eq!(active.len(), 3);
+        assert!(active.iter().all(|job| job.state.is_active()));
+        assert_eq!(active_jobs_by_project(&conn, "alpha").unwrap().len(), 3);
+        assert!(
+            active_jobs_by_space(&conn, space, "other")
+                .unwrap()
+                .is_empty()
+        );
+
+        let transition = sample_job("alpha", space, Uuid::new_v4(), JobState::Starting);
+        insert_job(&conn, &transition).expect("insert transition job");
+        let running = set_job_running(&conn, transition.id, "alpha")
+            .expect("set running")
+            .expect("transition job");
+        assert_eq!(running.state, JobState::Running);
+        assert!(running.started_at.is_some());
+        assert!(finish_job(&conn, transition.id, "alpha", JobState::Running, None, None).is_err());
+        let canceling = request_job_cancel(&conn, transition.id, "alpha")
+            .expect("request cancellation")
+            .expect("transition job");
+        assert_eq!(canceling.state, JobState::Canceling);
+        let canceled = finish_job(
+            &conn,
+            transition.id,
+            "alpha",
+            JobState::Canceled,
+            Some(130),
+            Some("cancelled"),
+        )
+        .expect("finish canceled")
+        .expect("transition job");
+        assert_eq!(canceled.state, JobState::Canceled);
+        assert_eq!(canceled.exit_code, Some(130));
+
+        let loser = finish_job(
+            &conn,
+            transition.id,
+            "alpha",
+            JobState::Exited,
+            Some(0),
+            None,
+        )
+        .expect("losing terminal transition")
+        .expect("transition job");
+        assert_eq!(loser.state, JobState::Canceled);
+        assert_eq!(loser.exit_code, Some(130));
+        assert!(
+            active_jobs_by_space(&conn, space, "alpha")
+                .unwrap()
+                .iter()
+                .all(|job| job.id != transition.id)
+        );
+    }
+
+    #[test]
+    fn corrupt_persisted_job_state_is_a_conversion_error() {
+        let conn = db();
+        let space = Uuid::new_v4();
+        let job = sample_job("alpha", space, Uuid::new_v4(), JobState::Starting);
+        insert_job(&conn, &job).expect("insert job");
+        conn.execute(
+            "UPDATE jobs SET state = 'not-a-job-state' WHERE id = ?1",
+            params![job.id.to_string()],
+        )
+        .expect("corrupt persisted state");
+
+        assert!(get_job(&conn, job.id, "alpha").is_err());
     }
 
     #[test]
@@ -1277,9 +1914,11 @@ mod db_tests {
         assert_eq!(state.spaces.len(), 1);
         assert_eq!(state.spaces[0].project, "default");
         assert_eq!(state.spaces[0].image, Image::Void);
+        assert_eq!(state.spaces[0].expires_at, None);
         assert_eq!(state.ckpts.len(), 1);
         assert_eq!(state.ckpts[0].project, "default");
         assert_eq!(state.ckpts[0].snapshot_version, None);
+        assert!(state.templates.is_empty());
         assert!(
             find_space(&conn, "05d48e52-e935-4009-ba1d-ece1aa240034", "default")
                 .unwrap()

@@ -1201,6 +1201,8 @@ fn create_space(ctx: &Ctx<'_>, project: &str, spec: SpaceSpec) -> shinu::Result<
                     mem_mib,
                     disk_mib,
                     network: network.clone(),
+                    expires_at: None,
+
                     created_at: Utc::now(),
                 };
                 state.spaces.push(space.clone());
@@ -1321,6 +1323,8 @@ fn fork_space(ctx: &Ctx<'_>, project: &str, ckpt: Uuid, name: String) -> shinu::
                     mem_mib: source_space.mem_mib,
                     disk_mib: source_space.disk_mib,
                     network: source_space.network.clone(),
+                    expires_at: None,
+
                     created_at: Utc::now(),
                 };
                 state.spaces.push(space.clone());
@@ -5461,6 +5465,7 @@ mod tests {
                     created_at: Utc::now() - chrono::Duration::days(30),
                     snapshot_version: None,
                 }],
+                templates: Vec::new(),
             },
         );
         let db = test_db(&root);
@@ -5518,6 +5523,8 @@ mod tests {
                 mem_mib: None,
                 disk_mib: None,
                 network: network.map(str::to_owned),
+                expires_at: None,
+
                 created_at: Utc::now(),
             }
         }
@@ -5530,6 +5537,7 @@ mod tests {
                 space(Uuid::new_v4(), "isolated", "project-a", None),
             ],
             ckpts: Vec::new(),
+            templates: Vec::new(),
         };
         let members = super::network_members(&state, "project-a", Some("blue"));
         assert_eq!(
@@ -5605,6 +5613,8 @@ mod tests {
             mem_mib: None,
             disk_mib: None,
             network: None,
+            expires_at: None,
+
             created_at: Utc::now(),
         }
     }
@@ -5666,6 +5676,7 @@ mod tests {
             State {
                 spaces: vec![space],
                 ckpts: checkpoints,
+                templates: Vec::new(),
             },
             base_id,
         )
@@ -5678,6 +5689,7 @@ mod tests {
         let state = State {
             spaces: vec![space.clone()],
             ckpts: Vec::new(),
+            templates: Vec::new(),
         };
 
         let (mode, base) =
@@ -5705,6 +5717,7 @@ mod tests {
         let state = State {
             spaces: vec![space.clone()],
             ckpts: vec![base],
+            templates: Vec::new(),
         };
 
         let (mode, selected) =
@@ -5751,6 +5764,7 @@ mod tests {
         let state = State {
             spaces: vec![space.clone()],
             ckpts: vec![base],
+            templates: Vec::new(),
         };
 
         let (mode, selected) =
@@ -5779,6 +5793,7 @@ mod tests {
         let state = State {
             spaces: vec![space.clone()],
             ckpts: vec![base],
+            templates: Vec::new(),
         };
 
         let (mode, selected) =
@@ -5811,6 +5826,7 @@ mod tests {
         let state = State {
             spaces: vec![space.clone()],
             ckpts: Vec::new(),
+            templates: Vec::new(),
         };
 
         let result = super::resolve_snapshot_mode(&root, &state, &space, SnapshotMode::Diff, 8);
@@ -5847,6 +5863,7 @@ mod tests {
         let state = State {
             spaces: vec![space.clone()],
             ckpts: vec![old_base, stale_base],
+            templates: Vec::new(),
         };
 
         let (mode, selected) =
@@ -5886,6 +5903,7 @@ mod tests {
             &State {
                 spaces: vec![space],
                 ckpts: vec![base, diff],
+                templates: Vec::new(),
             },
         );
         let db = test_db(&root);
@@ -6595,11 +6613,14 @@ mod tests {
                     mem_mib: None,
                     disk_mib: None,
                     network: None,
+                    expires_at: None,
+
                     parent: None,
                     head: None,
                     created_at: Utc::now(),
                 }],
                 ckpts: Vec::new(),
+                templates: Vec::new(),
             },
         );
         let db = test_db(&root);
@@ -6723,9 +6744,12 @@ mod tests {
                     mem_mib: None,
                     disk_mib: Some(100),
                     network: None,
+                    expires_at: None,
+
                     created_at: Utc::now(),
                 }],
                 ckpts: Vec::new(),
+                templates: Vec::new(),
             },
         );
         let db = test_db(&root);
@@ -6769,6 +6793,8 @@ mod tests {
                 mem_mib: None,
                 disk_mib: None,
                 network: None,
+                expires_at: None,
+
                 parent: None,
                 head: None,
                 created_at: Utc::now(),
@@ -6785,6 +6811,7 @@ mod tests {
                 created_at: Utc::now(),
                 snapshot_version: None,
             }],
+            templates: Vec::new(),
         };
         store_state(root, &state);
         let fake_firecracker = root.join("firecracker");
@@ -6859,9 +6886,12 @@ mod tests {
                     mem_mib: Some(512),
                     disk_mib: Some(10),
                     network: Some("old".into()),
+                    expires_at: None,
+
                     created_at: Utc::now(),
                 }],
                 ckpts: Vec::new(),
+                templates: Vec::new(),
             },
         );
         let db = test_db(&root);
@@ -6953,9 +6983,12 @@ mod tests {
                     mem_mib: None,
                     disk_mib: None,
                     network: None,
+                    expires_at: None,
+
                     created_at: Utc::now(),
                 }],
                 ckpts: Vec::new(),
+                templates: Vec::new(),
             },
         );
         let db = Arc::new(test_db(&root));
@@ -7006,6 +7039,8 @@ mod tests {
             mem_mib: None,
             disk_mib: Some(disk_mib),
             network: None,
+            expires_at: None,
+
             parent: None,
             head: None,
             created_at: Utc::now(),
@@ -7015,6 +7050,7 @@ mod tests {
             &State {
                 spaces: vec![space(target, "target", 10), space(sibling, "sibling", 10)],
                 ckpts: Vec::new(),
+                templates: Vec::new(),
             },
         );
         // Sized at the request already, so resize_disk_image is skipped and the
@@ -7112,11 +7148,14 @@ mod tests {
                     mem_mib: None,
                     disk_mib: Some(10),
                     network: None,
+                    expires_at: None,
+
                     parent: None,
                     head: None,
                     created_at: Utc::now(),
                 }],
                 ckpts: Vec::new(),
+                templates: Vec::new(),
             },
         );
         let image = shinu::space_image(&root, id);
@@ -7196,6 +7235,8 @@ mod tests {
                 mem_mib: None,
                 disk_mib: None,
                 network: None,
+                expires_at: None,
+
                 parent: Some(checkpoint_id),
                 head: None,
                 created_at: Utc::now(),
@@ -7212,6 +7253,7 @@ mod tests {
                 created_at: Utc::now(),
                 snapshot_version: None,
             }],
+            templates: Vec::new(),
         };
         store_state(&root, &state);
         std::fs::create_dir_all(root.join("ckpts")).expect("create checkpoint directory");
@@ -7254,6 +7296,7 @@ mod tests {
                 created_at: Utc::now(),
                 snapshot_version: None,
             }],
+            templates: Vec::new(),
         };
         store_state(&root, &state);
         let (vm_cfg, net_cfg) = test_configs();
@@ -7316,11 +7359,14 @@ mod tests {
                 mem_mib: None,
                 disk_mib: None,
                 network: None,
+                expires_at: None,
+
                 parent: None,
                 head: None,
                 created_at: Utc::now(),
             }],
             ckpts: Vec::new(),
+            templates: Vec::new(),
         };
         let first = append_checkpoint(
             &mut state,
@@ -7376,6 +7422,8 @@ mod tests {
                 mem_mib: None,
                 disk_mib: None,
                 network: None,
+                expires_at: None,
+
                 parent: None,
                 head: Some(target_id),
                 created_at: Utc::now(),
@@ -7392,6 +7440,7 @@ mod tests {
                 created_at: Utc::now(),
                 snapshot_version: None,
             }],
+            templates: Vec::new(),
         };
         let auto = append_checkpoint(
             &mut state,
@@ -7431,6 +7480,8 @@ mod tests {
                 mem_mib: None,
                 disk_mib: None,
                 network: None,
+                expires_at: None,
+
                 parent: None,
                 head: Some(old_id),
                 created_at: Utc::now(),
@@ -7461,6 +7512,7 @@ mod tests {
                     snapshot_version: None,
                 },
             ],
+            templates: Vec::new(),
         };
         store_state(&root, &state);
         let (vm_cfg, net_cfg) = test_configs();
@@ -7516,6 +7568,8 @@ mod tests {
                 mem_mib: None,
                 disk_mib: None,
                 network: None,
+                expires_at: None,
+
                 parent: None,
                 // The racing fork landed between the snapshot and the claim.
                 head: Some(raced_id),
@@ -7547,6 +7601,7 @@ mod tests {
                     snapshot_version: None,
                 },
             ],
+            templates: Vec::new(),
         };
         // Both looked collectable when the snapshot was taken.
         let candidates = [stale_id, raced_id];

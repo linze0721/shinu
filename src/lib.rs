@@ -5,9 +5,9 @@ pub use shinu_core::{
     KERNEL_URL, MAX_UPLOAD_BYTES, Result, USAGE_SAMPLE_SECS, VSOCK_SSH_PORT, VSOCK_VNC_PORT,
     assets_dir, avail_bytes, base_path, btrfs, cache_dir, chown_tree, ckpt_image, ckpt_mem,
     ckpt_state, env_u32, firecracker_bin, init_daemon_layout, init_layout,
-    is_blocked_guest_destination, is_rfc1918, jailer_bin, kernel_path, migrate_base, parse_ipv4,
-    parse_ipv4_cidr, parse_net_base, resolve_root, shell_quote, shell_quote_word, space_image,
-    vm_dir, vsock_helper,
+    is_blocked_guest_destination, is_rfc1918, jailer_bin, job_log_path, jobs_dir, kernel_path,
+    migrate_base, parse_ipv4, parse_ipv4_cidr, parse_net_base, resolve_root, shell_quote,
+    shell_quote_word, space_image, vm_dir, vsock_helper,
 };
 
 // Keep the hash implementation private; expose only helpers used by callers.

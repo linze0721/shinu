@@ -87,6 +87,11 @@ pub fn is_referenced(st: &state::State, ckpt: Uuid) -> Vec<String> {
             references.push(space.name.clone());
         }
     }
+    for template in &st.templates {
+        if template.checkpoint == ckpt {
+            references.push(template.name.clone());
+        }
+    }
     for other in &st.ckpts {
         if other.id != ckpt && (other.parent == Some(ckpt) || other.base == Some(ckpt)) {
             references.push(short_id(other.id));
@@ -118,6 +123,8 @@ mod chain_tests {
             mem_mib: None,
             disk_mib: None,
             network: None,
+            expires_at: None,
+
             created_at: Utc::now(),
         }
     }
@@ -151,6 +158,7 @@ mod chain_tests {
                 ckpt(second, space_id, Some(first)),
                 ckpt(third, space_id, Some(second)),
             ],
+            templates: Vec::new(),
         };
 
         let chain = log_chain(&state, &space);
@@ -175,6 +183,7 @@ mod chain_tests {
                 ckpt(left, source_space, Some(first)),
                 ckpt(right, source_space, Some(first)),
             ],
+            templates: Vec::new(),
         };
 
         assert_eq!(
@@ -205,6 +214,7 @@ mod chain_tests {
                 ckpt(first, space_id, Some(second)),
                 ckpt(second, space_id, Some(first)),
             ],
+            templates: Vec::new(),
         };
 
         let chain = log_chain(&state, &space);
@@ -250,6 +260,7 @@ mod chain_tests {
                 ckpt(foreign, other_space_id, None),
                 same_second_checkpoint,
             ],
+            templates: Vec::new(),
         };
 
         assert_eq!(
@@ -292,12 +303,19 @@ mod chain_tests {
                 diff.base = Some(target);
                 diff
             }],
+            templates: vec![crate::state::Template {
+                project: "project".to_owned(),
+                name: "release".to_owned(),
+                checkpoint: target,
+                created_at: Utc::now(),
+            }],
         };
 
         let references = is_referenced(&state, target);
-        assert_eq!(references.len(), 3);
+        assert_eq!(references.len(), 4);
         assert!(references.contains(&"derived".to_owned()));
         assert!(references.contains(&"checked-out".to_owned()));
         assert!(references.contains(&"20000000".to_owned()));
+        assert!(references.contains(&"release".to_owned()));
     }
 }

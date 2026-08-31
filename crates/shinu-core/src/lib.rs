@@ -304,6 +304,16 @@ pub fn space_image(root: &Path, id: Uuid) -> PathBuf {
     root.join(format!("spaces/{id}.ext4"))
 }
 
+/// `<root>/jobs` — root-owned metadata and bounded detached-job logs.
+pub fn jobs_dir(root: &Path) -> PathBuf {
+    root.join("jobs")
+}
+
+/// Deterministic host archive path for one detached job's combined terminal log.
+pub fn job_log_path(root: &Path, id: Uuid) -> PathBuf {
+    jobs_dir(root).join(format!("{id}.log"))
+}
+
 fn ckpt_path(root: &Path, id: Uuid, extension: &str) -> PathBuf {
     root.join(format!("ckpts/{id}.{extension}"))
 }
@@ -350,12 +360,13 @@ pub fn vm_dir(root: &Path, id: Uuid) -> PathBuf {
 }
 
 const DAEMON_UID: u32 = 0;
-const PROTECTED_LAYOUT_DIRS: [&str; 7] = [
+const PROTECTED_LAYOUT_DIRS: [&str; 8] = [
     "spaces",
     "ckpts",
     "vm",
     "assets",
     "cache",
+    "jobs",
     "jail",
     "jail/firecracker",
 ];
@@ -515,6 +526,7 @@ pub fn init_layout(root: &Path) -> Result<()> {
         (root.join("vm"), 0o700),
         (assets_dir(root), 0o755),
         (cache_dir(root), 0o755),
+        (jobs_dir(root), 0o700),
         (root.join("jail"), 0o700),
         (root.join("jail/firecracker"), 0o700),
     ] {
@@ -621,10 +633,31 @@ pub fn avail_bytes(path: &Path) -> Result<u64> {
 
 #[cfg(test)]
 mod layout_tests {
-    use super::{init_daemon_layout, validate_ancestor_attributes, validate_directory_attributes};
-    use std::os::unix::fs::symlink;
+    use super::{
+        init_daemon_layout, job_log_path, jobs_dir, validate_ancestor_attributes,
+        validate_directory_attributes,
+    };
+    use std::os::unix::fs::{MetadataExt, symlink};
     use std::path::PathBuf;
     use uuid::Uuid;
+
+    #[test]
+    fn creates_private_jobs_directory_and_deterministic_log_path() {
+        let root = test_root("jobs");
+        init_daemon_layout(&root).expect("initialize daemon layout");
+        let jobs = jobs_dir(&root);
+        assert!(jobs.is_dir());
+        assert_eq!(
+            std::fs::metadata(&jobs).expect("jobs metadata").mode() & 0o777,
+            0o700
+        );
+        let id = Uuid::from_u128(7);
+        assert_eq!(
+            job_log_path(&root, id),
+            jobs.join("00000000-0000-0000-0000-000000000007.log")
+        );
+        std::fs::remove_dir_all(root).expect("remove jobs layout");
+    }
 
     fn test_root(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("shinu-layout-{label}-{}", Uuid::new_v4()))

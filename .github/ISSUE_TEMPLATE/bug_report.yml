@@ -1,0 +1,75 @@
+name: Bug report
+description: Report incorrect behavior in shinu, shinud, or a guest image.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Many failures are host-setup issues rather than bugs: missing btrfs reflink support,
+        no `shinu-jail` user/group (uid/gid 30000), cgroup v2 not mounted at `/sys/fs/cgroup`,
+        or a missing `/usr/bin/jailer`. Run `packaging/preflight.sh` first and include its
+        output below if anything fails.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: The observed behavior, including exact error messages.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Exact commands or API requests, in order.
+      render: sh
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: shinu / shinud version or commit
+      placeholder: "0.1.0 or git rev-parse HEAD"
+    validations:
+      required: true
+  - type: textarea
+    id: host
+    attributes:
+      label: Host environment
+      description: Kernel, distro, btrfs (yes/no), cgroup v2 (yes/no), `/dev/kvm` present (yes/no).
+      value: |
+        kernel:
+        distro:
+        btrfs:
+        cgroup v2:
+        /dev/kvm:
+    validations:
+      required: true
+  - type: input
+    id: firecracker
+    attributes:
+      label: Firecracker / jailer version
+      placeholder: "firecracker --version"
+  - type: dropdown
+    id: image
+    attributes:
+      label: Guest image
+      options:
+        - void
+        - ubuntu
+        - arch
+        - rocky
+        - n/a
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: shinud stderr output
+      description: Relevant daemon log lines and `packaging/preflight.sh` output.
+      render: text

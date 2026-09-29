@@ -2,6 +2,12 @@
 name = "shinu-crypto"
 version.workspace = true
 edition.workspace = true
+description = "Cryptographic primitives for shinu: SHA-256, password authentication, and hashed Bearer token verification."
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
 
 [lints]
 workspace = true

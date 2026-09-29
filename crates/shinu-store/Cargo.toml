@@ -2,6 +2,12 @@
 name = "shinu-store"
 version.workspace = true
 edition.workspace = true
+description = "SQLite state store for shinu: schema and migrations, lock registry, commit DAG traversal, and per-project quotas and rate limiting."
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
 
 [lints]
 workspace = true

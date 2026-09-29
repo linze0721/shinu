@@ -5,6 +5,12 @@ resolver = "3"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/linze0721/shinu"
+homepage = "https://github.com/linze0721/shinu"
+authors = ["shinu contributors"]
+# Duration::from_mins / from_hours are stable since 1.91.
+rust-version = "1.91"
 
 # Declared once so a version bump cannot leave crates disagreeing.
 [workspace.dependencies]
@@ -66,6 +72,13 @@ str_to_string = { level = "allow", priority = 0 }
 name = "shinu"
 version.workspace = true
 edition.workspace = true
+description = "Firecracker microVM sandboxes for AI agents, with copy-on-write disk branching and git-like snapshot and rollback workflows."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
 
 [lints]
 workspace = true

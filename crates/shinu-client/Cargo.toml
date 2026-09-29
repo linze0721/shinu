@@ -2,6 +2,12 @@
 name = "shinu-client"
 version.workspace = true
 edition.workspace = true
+description = "Synchronous HTTP/1.1 client transport shared by the shinu CLI and MCP server."
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
 
 [lints]
 workspace = true

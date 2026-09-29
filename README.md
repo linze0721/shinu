@@ -1,6 +1,8 @@
 shinu
 =====
 
+[![CI](https://github.com/linze0721/shinu/actions/workflows/ci.yml/badge.svg)](https://github.com/linze0721/shinu/actions/workflows/ci.yml) [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+
 Agent-first Firecracker microVM sandboxes with copy-on-write disk states, detached jobs, and git-like snapshot, rollback, and branching workflows.
 
 A **space** is an ext4 guest disk image cloned from a golden base via btrfs reflink, bound to an isolated Firecracker microVM instance. `shinu exec <space> [--stdin <file>] [--session <id>] -- <cmd...>` boots the VM on demand (~1.7 s cold), runs the command over host `ssh` with `shinu-vsock` as `ProxyCommand`, tunnelled through Firecracker's AF_VSOCK device to an in-guest `socat` listener (`VSOCK-LISTEN:2222`) forwarding to guest `sshd` (`127.0.0.1:22`), leaving the VM warm for subsequent calls (~0.4 s hot). Command execution travels strictly over vsock rather than host network interfaces, keeping the guest firewalled from host networks while remaining reachable. Idle VMs release unused host memory via virtio-balloon and shut down automatically after an idle threshold.
@@ -641,3 +643,17 @@ This release provides a **managed SaaS Demo** for early customer testing and mon
 1. **Single-Host Daemon**: `shinud` manages microVMs on a single physical host. Multi-host scheduling or cross-node VM migration is not implemented.
 2. **No Integrated Billing/Payment Processing**: `shinud` provides granular usage accounting (`vm_seconds`, `disk_mib_hour`, `api_calls`), but payment gateway integration (e.g. Stripe) must be handled by an upstream control plane.
 3. **Monotonic In-Flight Disk Growth & Commercial Implication**: Firecracker block devices do not support TRIM/discard (unchanged at v1.16.1; upstream issue #2708 is parked). While a space runs, deleting files inside the guest does not release host ext4 blocks, so its footprint only grows. `shinud` compensates offline: the idle sweep runs `e2fsck -E discard` on stopped images once they have grown past a threshold, releasing unshared extents while reflinked checkpoint blocks stay protected by COW. Long-running spaces that never stop therefore hold their peak allocation, which remains a cost parameter for hosting providers.
+
+---
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the contributor guide, [AGENTS.md](AGENTS.md) for the authoritative architecture and invariants, and [SECURITY.md](SECURITY.md) to report security issues.
+
+---
+
+## License
+
+Copyright 2026 shinu contributors.
+
+Licensed under the Apache License, Version 2.0 (Apache-2.0). See [LICENSE](LICENSE).

@@ -2,6 +2,12 @@
 name = "shinu-core"
 version.workspace = true
 edition.workspace = true
+description = "Common types and constants for shinu: error enum, image enum, path resolution, runtime layout setup, and btrfs copy-on-write helpers."
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
 
 [lints]
 workspace = true

@@ -2,6 +2,12 @@
 name = "shinu-vm"
 version.workspace = true
 edition.workspace = true
+description = "Firecracker microVM lifecycle for shinu: jailer launch, snapshots, VM configuration, and TAP networking with iptables rules."
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
 
 [lints]
 workspace = true

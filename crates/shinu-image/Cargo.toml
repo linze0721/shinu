@@ -2,6 +2,12 @@
 name = "shinu-image"
 version.workspace = true
 edition.workspace = true
+description = "Guest image handling for shinu: asset download, OCI base image fetch and build, guest network configuration, extraction, and tree diffing."
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+publish = false
 
 [lints]
 workspace = true

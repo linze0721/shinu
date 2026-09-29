@@ -737,9 +737,7 @@ fn archive_job_log(root: &Path, id: Uuid, log: &str) -> shinu::Result<()> {
 
 fn archive_job_log_preserving_existing(root: &Path, id: Uuid, log: &str) -> shinu::Result<()> {
     if log.is_empty()
-        && std::fs::metadata(shinu::job_log_path(root, id))
-            .ok()
-            .is_some_and(|metadata| metadata.len() > 0)
+        && std::fs::metadata(shinu::job_log_path(root, id)).is_ok_and(|metadata| metadata.len() > 0)
     {
         return Ok(());
     }
@@ -2891,8 +2889,8 @@ fn resize_space(
             .position(|space| space.id == existing.id && space.project == project)
             .ok_or_else(|| shinu::Error::NotFound(name.clone()))?;
         let current = state.spaces[index].clone();
-        let new_vcpus = vcpus.map_or(current.vcpus, |value| value);
-        let new_mem_mib = mem_mib.map_or(current.mem_mib, |value| value);
+        let new_vcpus = vcpus.unwrap_or(current.vcpus);
+        let new_mem_mib = mem_mib.unwrap_or(current.mem_mib);
         ensure_positive_size("vcpus", new_vcpus.map(u64::from))?;
         ensure_positive_size("mem_mib", new_mem_mib.map(u64::from))?;
         check_vm_sizing(ctx, &limits, new_vcpus, new_mem_mib)?;
@@ -3925,7 +3923,7 @@ enum Endpoint {
 }
 
 fn route(path: &str) -> Option<Endpoint> {
-    let (path_without_query, query) = path.split_once('?').map_or((path, ""), |parts| parts);
+    let (path_without_query, query) = path.split_once('?').unwrap_or((path, ""));
     match path_without_query {
         "/" => return Some(Endpoint::Root),
         "/login" => return Some(Endpoint::LoginPage),

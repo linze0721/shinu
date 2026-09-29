@@ -564,6 +564,14 @@ mod asset_tests {
         std::env::temp_dir().join(format!("shinu-assets-{}", Uuid::new_v4()))
     }
 
+    /// `/proc/self` is owned by the process's effective uid, which avoids a
+    /// libc dependency for the one check that needs it.
+    fn process_uid() -> u32 {
+        std::fs::metadata("/proc/self")
+            .expect("read /proc/self")
+            .uid()
+    }
+
     fn current_manifest() -> AssetManifest {
         AssetManifest::current("a".repeat(64), "b".repeat(64), "c".repeat(64))
     }
@@ -639,8 +647,14 @@ mod asset_tests {
         assert!(!trusted_kernel_attributes(true, 0, 0o664, 0));
     }
 
+    /// `write_manifest` re-validates the renamed file against uid 0, so the
+    /// on-disk half only succeeds as root. The attribute predicates below
+    /// are pure and stay covered on every host.
     #[test]
     fn atomic_manifest_write_sets_mode_and_cleans_staging_file() {
+        if process_uid() != 0 {
+            return;
+        }
         let root = test_root();
         let assets = assets_dir(&root);
         std::fs::create_dir_all(&assets).expect("create fixture assets");

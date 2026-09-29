@@ -156,7 +156,7 @@ fn default_uplink() -> Option<String> {
 
 impl NetConfig {
     pub fn from_env() -> Result<Self> {
-        let enabled = !std::env::var("SHINU_NET_ENABLE").ok().is_some_and(|value| {
+        let enabled = !std::env::var("SHINU_NET_ENABLE").is_ok_and(|value| {
             let value = value.trim();
             value == "0" || value.eq_ignore_ascii_case("false")
         });

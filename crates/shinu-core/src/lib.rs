@@ -641,9 +641,20 @@ mod layout_tests {
     use std::path::PathBuf;
     use uuid::Uuid;
 
+    /// The daemon layout is validated against `DAEMON_UID`, so creating it
+    /// only succeeds as root. Gate that half rather than skipping the test:
+    /// the log path is pure and must be checked on every host.
     #[test]
     fn creates_private_jobs_directory_and_deterministic_log_path() {
         let root = test_root("jobs");
+        let id = Uuid::from_u128(7);
+        assert_eq!(
+            job_log_path(&root, id),
+            jobs_dir(&root).join("00000000-0000-0000-0000-000000000007.log")
+        );
+        if process_uid() != super::DAEMON_UID {
+            return;
+        }
         init_daemon_layout(&root).expect("initialize daemon layout");
         let jobs = jobs_dir(&root);
         assert!(jobs.is_dir());
@@ -651,12 +662,15 @@ mod layout_tests {
             std::fs::metadata(&jobs).expect("jobs metadata").mode() & 0o777,
             0o700
         );
-        let id = Uuid::from_u128(7);
-        assert_eq!(
-            job_log_path(&root, id),
-            jobs.join("00000000-0000-0000-0000-000000000007.log")
-        );
         std::fs::remove_dir_all(root).expect("remove jobs layout");
+    }
+
+    /// `/proc/self` is owned by the process's effective uid, which avoids a
+    /// libc dependency for the one check that needs it.
+    fn process_uid() -> u32 {
+        std::fs::metadata("/proc/self")
+            .expect("read /proc/self")
+            .uid()
     }
 
     fn test_root(label: &str) -> PathBuf {

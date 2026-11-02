@@ -330,6 +330,11 @@ pub fn ckpt_state(root: &Path, id: Uuid) -> PathBuf {
     ckpt_path(root, id, "state")
 }
 
+/// SSH private key retained with a memory checkpoint; `.pub` holds its public key.
+pub fn ckpt_key(root: &Path, id: Uuid) -> PathBuf {
+    ckpt_path(root, id, "key")
+}
+
 /// `<root>/assets` — the firecracker binary and the guest kernel.
 pub fn assets_dir(root: &Path) -> PathBuf {
     root.join("assets")

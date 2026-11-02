@@ -16,8 +16,8 @@ A **space** is an ext4 guest disk image cloned from a golden base via btrfs refl
 - **HTTP Proxying**: Transparent reverse proxying from host paths to guest ports.
 - **Web Console**: An administrative dashboard for user registration, login, and bearer token creation.
 - **MCP Server**: Model Context Protocol (MCP) tool integration for programmatic access by agents.
-- **Detached Jobs**: Run commands asynchronously with `shinu job run`; inspect status and terminal-rendered logs, wait, or cancel through the CLI, REST API, or MCP. The active-job cap is 64 per project.
-- **Space Leases**: Optional TTLs expose an expiry as RFC3339 data or `null`; spaces without a TTL never expire, and expired mutable spaces are stopped and cleaned up after a grace period while checkpoints and templates remain.
+- **Detached Jobs**: Run commands asynchronously with `shinu job run`; inspect status and terminal-rendered logs, wait, or cancel through the CLI, REST API, or MCP. The active-job cap is 64 per project. Jobs default to a 3600-second wall-clock limit, shortened by their host Space lease.
+- **Space Leases**: Optional TTLs expose an expiry as RFC3339 data or `null`; spaces without a TTL never expire. Expiry cancels active jobs through their normal final-log pipeline before stopping and cleaning the mutable Space after a grace period; retained checkpoints and templates remain forkable without the source Space.
 - **Named Checkpoint Templates**: Immutable, project-scoped names point to concrete checkpoint UUIDs for reuse. Names are 1–64 characters matching `[a-z0-9-]`; at most 256 retained references are allowed per project and 2048 globally, and creation over either cap returns 429. Deleting a template removes only the reference, never checkpoint files. There are no tags, updates, renames, sharing, catalogs, or console UI.
 - **`commits`**: CoW ext4 disk state snapshots (`hot` or cold, optionally with memory).
 - **`checkout`**: Rewinds space state back to any commit, automatically saving current state before rewind (reflog semantics).
@@ -316,6 +316,8 @@ State is stored in SQLite at `<root>/shinu.db` (`0600` permissions, WAL mode ena
 
 The schema has ten tables: `spaces`, `ckpts`, `projects`, `usage_events`, `users`, `memberships`, `sessions`, `jobs`, `templates`, and SQLite's `sqlite_sequence`. Space records include optional `expires_at` serialized as RFC3339 or `null`. The project-scoped `templates` table stores immutable Template references with logical fields `{name, checkpoint, created_at}` and a project tenant key. Names are unique per project and must be 1–64 characters matching `[a-z0-9-]`; retained references are capped at 256 per project and 2048 globally, so list results are bounded to 256 for the project and creation over either cap returns quota 429. Deleting a template removes only this reference. The `jobs` table has columns `id`, `project`, `space`, `command`, `state`, `created_at`, `started_at`, `finished_at`, `exit_code`, `error`, `log_bytes`, and `log_truncated`; states are `starting`, `running`, `canceling`, `exited`, `canceled`, and `lost`.
 
+Checkpoint rows capture nullable `vcpus`, `mem_mib`, and `disk_mib` sizing. Existing SQLite rows are backfilled once from surviving source spaces; orphan legacy checkpoints retain NULL fields and fork using the documented fallback below.
+
 Indexes include `spaces(project, name)`, `ckpts(project)`, `ckpts(space)`, `usage_events(project, "at")`, `sessions(user_id)`, `memberships(project)`, `jobs_project_created(project, created_at DESC, id DESC)`, `jobs_project_space_state(project, space, state)`, `jobs_project_state(project, state)`, `templates_project_checkpoint`, and `spaces_project_expires`.
 
 **Automatic Migration**: On startup, if `<root>/state.json` exists and `<root>/shinu.db` is empty, `shinud` automatically migrates spaces, checkpoints, and tokens into SQLite and renames `<root>/state.json` to `<root>/state.json.migrated` (preserving old state files without deletion).
@@ -323,7 +325,7 @@ Indexes include `spaces(project, name)`, `ckpts(project)`, `ckpts(space)`, `usag
 
 Space-scoped operations acquire locks in this order: space → optional job/checkpoint → state → database connection. Job-monitor paths use job → state → database connection. Template create/delete/fork mutations resolve and update project-scoped references while holding state/database locks; template fork releases those locks before CoW/VM work. Lock hold scope stays minimal; state and database locks do not span disk CoW, subprocess, VM, or network work. Active jobs refresh VM idle use and block space stop/remove; VM loss yields job state `lost`.
 - Lease expiry is optional: `expires_at` is RFC3339 or `null`; existing spaces and spaces created without a TTL use `null` and never expire. Expired leases reject new starts, auto-starts, and jobs.
-- The expiry sweep stops a VM at expiry and, after `SHINU_LEASE_GRACE_SECS`, deletes the mutable Space using claim-before-delete. Active jobs postpone cleanup; renewal under the Space lock wins over expiry cleanup. Checkpoints and templates remain.
+- The expiry sweep stops a VM after active jobs finish their lease-capped cancellation pipeline and, after `SHINU_LEASE_GRACE_SECS`, deletes the mutable Space using claim-before-delete. Active jobs still postpone cleanup; renewal under the Space lock wins over expiry cleanup. Checkpoints, their archived snapshot SSH credentials, and templates remain usable without the source Space.
 
 
 
@@ -481,17 +483,18 @@ curl -s -X DELETE "$API/v1/templates/baseline" \
 Shinu implements explicit version control semantics over guest ext4 image states:
 
 - **`Space { project, parent, head, expires_at }`**: Represents an active working branch. `head` points to the latest commit ID (or `None` for a fresh space); `expires_at` is an RFC3339 expiry or `null` for spaces without a TTL.
-- **`Ckpt { project, space, parent, auto, note, full, base, snapshot_version }`**: Represents an immutable disk image commit snapshot. `parent` points to the prior commit ID.
+- **`Ckpt { project, space, parent, auto, note, full, base, snapshot_version, vcpus, mem_mib, disk_mib }`**: Represents an immutable disk image commit snapshot. `parent` points to the prior commit ID; nullable sizing captures the Space's allocation when committed.
   - **Snapshot Modes**:
     - `none`: Captures the guest disk CoW state only.
     - `full`: Captures both the guest disk CoW state and running guest memory + CPU state files (`ckpt_mem` as `.mem` and `ckpt_state` as `.state`). A `--full` request automatically degrades to `diff` when a valid full ancestor exists. Validity requires: `full=1`, same space, `.mem` and `.state` present on disk, and `snapshot_version` matching current `FC_SNAPSHOT_VERSION` (`10.0.0`). Search walks back to the nearest valid full ancestor, skipping invalid ones.
     - `diff`: Captures guest disk CoW state alongside dirty memory pages relative to the nearest valid full checkpoint base in the space history. The base commit's UUID is recorded in the checkpoint's `base` field. Commit, log, reflog, and ls JSON include the `snapshot` mode field (`none`, `full`, or `diff`).
   - **Auto-Degradation & Cap**: `SHINU_FULL_EVERY` caps how many diffs may hang off one full base on the auto path. On exceeding the cap, the next auto commit becomes a new full base. The cap governs the auto path only; an explicit `--diff` bypasses it and errors only when no valid base exists. Auto-degradation only moves Full to Diff, never Diff to Full. Measured live: first Full 1.0 GiB exclusive, next degraded Diff 8.4 MiB (restored correctly). With `SHINU_FULL_EVERY=2`, the observed chain was c1 to the prior base, c2 promoted to a new base, then c3 and c4 hanging off c2. Note: diff size tracks guest activity rather than a fixed ratio; diffs taken after heavy guest memory activity measured 745 MiB to 1002 MiB in testing.
   - **Snapshot Format Version**: `snapshot_version` records the Firecracker snapshot data format version the guest memory state was captured with (`10.0.0` for the pinned v1.16.1 binaries). It is `null` for disk-only commits and for commits written before the field existed. Restoring a memory-carrying commit whose recorded version differs from the running binary is refused with **400 Bad Request** naming both versions; the commit's files are left on disk and its disk image stays usable.
+  - **Memory Snapshot Credentials**: Full and diff commits archive the source SSH private key as `<root>/ckpts/<id>.key` and public key as `<id>.pub`, both mode `0600`. These survive mutable Space/lease cleanup and are unlinked with checkpoint assets by `rmckpt` and GC. A memory fork prefers archived credentials, then a surviving source keypair, and returns a clear **400 Bad Request** if neither remains; disk-only forks still install a fresh keypair.
   - **Commit Deletion Guard**: A commit checkpoint cannot be deleted via `rmckpt` (or `DELETE /v1/commits/{id}`) if it is currently referenced as a parent of any space or checkpoint, as a `base` for any diff checkpoint, or as the target of a template reference.
   - **File Tree Diff (`shinu diff`)**: Entirely distinct from memory/diff snapshots, this is a *filesystem tree comparison* between loop-mounted read-only guest ext4 images. By default, it ignores standard guest runtime churn directories (such as `/dev`, `/proc`, `/run`, `/sys`, `/tmp`, `/var/log`, `/etc/machine-id`, `/etc/ssh/ssh_host_*`).
 - **`Template {name, checkpoint, created_at}`**: An immutable project-scoped reference to a concrete checkpoint UUID. `name` is 1–64 chars matching `[a-z0-9-]`; retained references are capped at 256 per project and 2048 globally, with list results bounded to 256 for the project. Creation over either cap returns 429. Duplicate or invalid names return 400, and missing or foreign checkpoint targets return 404.
-  - `template fork` resolves the stored checkpoint UUID and creates a new `Space` with both `parent` and `head` set to that UUID; optional `ttl_seconds` applies to the destination.
+  - `template fork` resolves the stored checkpoint UUID and creates a new `Space` with both `parent` and `head` set to that UUID; optional `ttl_seconds` applies to the destination. The source Space need not exist.
   - Templates are references only: `rmckpt` and GC treat the target as referenced; deleting a template removes the reference and never its checkpoint files. There is no update, rename, tags, sharing, catalog, or console UI.
 - **`commit` (`POST /v1/spaces/{name}/commits`)**:
   - Sets `parent = space.head`, creates a btrfs reflink snapshot under `<root>/ckpts/<id>.ext4`, and updates `space.head = new_id`.
@@ -503,6 +506,7 @@ Shinu implements explicit version control semantics over guest ext4 image states
   - Replaces space ext4 image with a reflink copy of the target commit image, retaining the space's VM directory and SSH key identity.
 - **`fork` (`POST /v1/commits/{id}/fork`)**:
   - Creates a brand new `Space` whose initial image is a reflink clone of the specified commit, setting `parent = target_commit_id` and `head = target_commit_id`.
+  - Resolves each sizing field from the checkpoint first, then a surviving same-project source Space, then the checkpoint image's logical size for disk or `SHINU_VCPUS` / `SHINU_MEM_MIB` defaults for CPU/memory. Missing source Space rows do not prevent fork; foreign checkpoints still return 404. Image kind and network metadata are inherited only while the source Space exists; otherwise the destination uses `void` metadata and no named network (the checkpoint disk contents are unchanged).
 - **`rmckpt` (`DELETE /v1/commits/{id}`)**:
   - Refuses deletion if the commit is currently referenced by any space's `parent`, any space's `head`, any other commit's `parent`, any other commit's `base`, or any template's `checkpoint` (`is_referenced` check). GC applies the same reference guard and removes only eligible checkpoint files.
 ---
@@ -518,6 +522,7 @@ Daemon configuration via environment variables:
 | `SHINU_ADMIN_TOKEN` | — | Global administrator authorization token for managing quotas. Unset secret fails closed. |
 | `SHINU_REFLOG_DAYS` | `7` | Retention period in days for unreferenced `auto` checkout commits during GC. |
 | `SHINU_JOB_RETENTION_DAYS` | `7` | Retention period in days for archived detached-job logs. |
+| `SHINU_JOB_MAX_SECS` | `3600` | Wall-clock limit for detached jobs from submission; `0` disables this cap, but the current host Space lease expiry still applies. |
 | `SHINU_FULL_EVERY` | `8` | Maximum diff checkpoints per full base before auto-promoting to a new full base (0 disables cap). |
 | `SHINU_SESSION_DAYS` | `7` | Default longevity of cookie sessions issued by the console. |
 | `SHINU_VCPUS` | `2` | Default number of virtual CPUs per microVM. |
@@ -559,6 +564,8 @@ Client environment variables:
 
 **Detached jobs**: `shinu job run` and `POST /v1/spaces/{space}/jobs` start an asynchronous command; existing `exec` remains synchronous. Job states are `starting`, `running`, `canceling`, `exited`, `canceled`, and `lost`. Jobs survive client disconnect and daemon restart only while the VM stays running. Active jobs refresh idle use and block `stop` and space removal; VM loss yields `lost`. Each job has one terminal-rendered text log capped at 1 MiB, archived with mode `0600` at `<root>/jobs/<uuid>.log` and retained for 7 days by default (`SHINU_JOB_RETENTION_DAYS`). The active cap is 64 jobs per project. There is no follow or raw log mode, force-stop, reboot survival, artifact support, or console control.
 **Detached job limits and control**: Detached commands accept at most 256 argv elements and 8192 total argument bytes. Job retention caps are 64 active jobs per project, 1024 total jobs per project, and 8192 total jobs globally. `GET /v1/jobs` returns the newest 64 jobs and includes `truncated` when older jobs are omitted. Bounded control SSH kills its local process group on deadline or overflow; cancellation fences the command before final capture, archive, and cleanup. Automatic and manual VM stops flush guest durability with a finite 60-second process-group deadline before Firecracker receives TERM then KILL.
+
+**Detached job deadlines**: The monitor uses the earlier of submission time plus `SHINU_JOB_MAX_SECS` and the current host Space's `expires_at`. An expired deadline durably requests `canceling`, then reuses the existing fence → final capture → archive → cleanup path; a canceled job's `error` identifies the deadline. Natural completion already recorded in the guest still wins. Renewal or clearing a lease before cancellation updates this bound, but cannot revive a durably canceling job. The monitor polls every two seconds; existing bounded SSH control calls and retryable archive/fence failures govern cancellation completion. No second process-killing path is introduced.
 
 **Upgrading Firecracker strands existing memory snapshots.** Firecracker validates the snapshot data format version on load, and that format went `8.0.0` (v1.13.1) to `10.0.0` (v1.16.1). Every `full` and `diff` checkpoint captured by a pre-v1.14 binary is therefore no longer restorable as running VM state. `shinud` records the format version per checkpoint and refuses the restore with **400 Bad Request** naming both versions, instead of letting the load fail opaquely.
 
@@ -606,6 +613,8 @@ e2fsck -E discard -fp <root>/spaces/<uuid>.ext4
 <root>/ckpts/<uuid>.ext4                immutable checkpoint disk images (mode 0700 dir)
 <root>/ckpts/<uuid>.mem                 immutable checkpoint guest memory states (for full/diff, mode 0700 dir)
 <root>/ckpts/<uuid>.state               immutable checkpoint Firecracker CPU/VM states (for full/diff, mode 0700 dir)
+<root>/ckpts/<uuid>.key                 retained snapshot SSH private key (mode 0600)
+<root>/ckpts/<uuid>.pub                 retained snapshot SSH public key (mode 0600)
 <root>/jobs/                             root-owned detached-job log directory (mode 0700)
 <root>/jobs/<uuid>.log                   archived terminal-rendered job log (mode 0600)
 <root>/jail/firecracker/<uuid>/root/    chroot jail directory for the space jailer container (mode 0700):

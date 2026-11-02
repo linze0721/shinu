@@ -54,6 +54,7 @@ const JOB_LOG_CAP: usize = 1024 * 1024;
 const JOB_TOUCH_EVERY: Duration = Duration::from_secs(10);
 const JOB_POLL_EVERY: Duration = Duration::from_secs(2);
 const JOB_RETENTION_DEFAULT_DAYS: i64 = 7;
+const JOB_MAX_DEFAULT_SECS: u64 = 3600;
 const JOB_MAX_ARGS: usize = 256;
 const JOB_MAX_ARG_BYTES: usize = 8 * 1024;
 const JOB_LIST_LIMIT: usize = 64;
@@ -251,6 +252,7 @@ struct JobRuntime {
     db: Arc<Mutex<Connection>>,
     registry: Arc<Registry>,
     monitors: Arc<Mutex<HashSet<Uuid>>>,
+    max_secs: u64,
 }
 
 impl JobRuntime {
@@ -260,6 +262,10 @@ impl JobRuntime {
             db,
             registry,
             monitors: Arc::new(Mutex::new(HashSet::new())),
+            max_secs: std::env::var("SHINU_JOB_MAX_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(JOB_MAX_DEFAULT_SECS),
         })
     }
 
@@ -344,7 +350,7 @@ impl JobRuntime {
                 let _job_guard = job_lock
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                self.monitor_iteration(id, project, &mut last_touch)
+                self.monitor_iteration(id, project, &mut last_touch, Utc::now())
             };
             if done {
                 break;
@@ -353,13 +359,46 @@ impl JobRuntime {
         }
     }
 
-    fn monitor_iteration(&self, id: Uuid, project: &str, last_touch: &mut Instant) -> bool {
+    fn monitor_iteration(
+        &self,
+        id: Uuid,
+        project: &str,
+        last_touch: &mut Instant,
+        now: DateTime<Utc>,
+    ) -> bool {
         let job = {
             let _state_guard = lock_state(&self.registry);
             let connection = lock_db(&self.db);
-            match state::get_job(&connection, id, project) {
+            let job = match state::get_job(&connection, id, project) {
                 Ok(Some(job)) => job,
                 Ok(None) | Err(_) => return true,
+            };
+            if matches!(
+                job.state,
+                state::JobState::Starting | state::JobState::Running
+            ) {
+                let expires_at = match state::find_space_by_id(&connection, job.space, project) {
+                    Ok(space) => space.and_then(|space| space.expires_at),
+                    Err(_) => return false,
+                };
+                if job_deadline(job.created_at, expires_at, self.max_secs)
+                    .is_some_and(|deadline| now >= deadline)
+                {
+                    match state::request_job_cancel(
+                        &connection,
+                        id,
+                        project,
+                        Some("detached job deadline exceeded"),
+                    ) {
+                        Ok(Some(canceling)) => canceling,
+                        Ok(None) => return true,
+                        Err(_) => return false,
+                    }
+                } else {
+                    job
+                }
+            } else {
+                job
             }
         };
         if !job.state.is_active() {
@@ -457,8 +496,11 @@ impl JobRuntime {
             CancelDecision::Exited(code) => (state::JobState::Exited, Some(code)),
             CancelDecision::Canceled => (state::JobState::Canceled, None),
         };
+        let error = (terminal == state::JobState::Canceled)
+            .then_some(job.error.as_deref())
+            .flatten();
         if self
-            .finish_with_log(job, terminal, exit_code, None, log.len() as u64, truncated)
+            .finish_with_log(job, terminal, exit_code, error, log.len() as u64, truncated)
             .is_err()
         {
             return false;
@@ -517,6 +559,24 @@ impl JobRuntime {
             },
         )?;
         Ok(())
+    }
+}
+
+fn job_deadline(
+    created_at: DateTime<Utc>,
+    expires_at: Option<DateTime<Utc>>,
+    max_secs: u64,
+) -> Option<DateTime<Utc>> {
+    let maximum = (max_secs != 0).then(|| {
+        i64::try_from(max_secs)
+            .ok()
+            .and_then(chrono::Duration::try_seconds)
+            .and_then(|duration| created_at.checked_add_signed(duration))
+            .unwrap_or(DateTime::<Utc>::MAX_UTC)
+    });
+    match (maximum, expires_at) {
+        (Some(maximum), Some(expiry)) => Some(maximum.min(expiry)),
+        (maximum, expiry) => maximum.or(expiry),
     }
 }
 
@@ -696,7 +756,7 @@ fn probe_job(root: &Path, job: &state::Job) -> std::result::Result<JobProbe, Str
         Err(CaptureFailure::Other(error)) => return Err(error),
     };
     let (log, truncated) = captured;
-    let Some(status) = status else {
+    let Some(status) = status.filter(|_| job.state != state::JobState::Canceling) else {
         return Ok(JobProbe::Active { log, truncated });
     };
     Ok(JobProbe::Terminal {
@@ -1439,11 +1499,19 @@ fn sweep_expired_lease(
     remove_space_files(sweep.root, id)
 }
 fn checkpoint_exclusive(root: &Path, id: Uuid) -> shinu::Result<u64> {
+    #[cfg(test)]
+    if root.join("test-fork-host").is_file() {
+        return std::fs::metadata(shinu::ckpt_image(root, id))
+            .map(|metadata| metadata.len())
+            .map_err(Into::into);
+    }
     let mut total: u64 = 0;
     for path in [
         shinu::ckpt_image(root, id),
         shinu::ckpt_mem(root, id),
         shinu::ckpt_state(root, id),
+        shinu::ckpt_key(root, id),
+        shinu::ckpt_key(root, id).with_extension("pub"),
     ] {
         total = total.saturating_add(shinu::btrfs::exclusive(&path)?);
     }
@@ -1737,6 +1805,9 @@ fn append_checkpoint(
         auto: flags.auto,
         full: flags.full,
         base: flags.base,
+        vcpus: state.spaces[space_index].vcpus,
+        mem_mib: state.spaces[space_index].mem_mib,
+        disk_mib: state.spaces[space_index].disk_mib,
         note,
         snapshot_version: flags.full.then(|| shinu::FC_SNAPSHOT_VERSION.to_owned()),
         created_at: Utc::now(),
@@ -2071,7 +2142,7 @@ fn fork_space(
     let _checkpoint_guard = checkpoint_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (source_checkpoint, source_space) = {
+    let (source_checkpoint, image, network, vcpus, mem_mib, disk_mib) = {
         let _state_guard = lock_state(ctx.registry);
         let connection = lock_db(ctx.db);
         let state = state::load(&connection)?;
@@ -2093,59 +2164,37 @@ fn fork_space(
         let source_space = state
             .spaces
             .iter()
-            .find(|space| space.id == checkpoint.space && space.project == project)
-            .cloned()
-            .ok_or_else(|| shinu::Error::NotFound(checkpoint.space.to_string()))?;
-        let source_disk = source_space
+            .find(|space| space.id == checkpoint.space && space.project == project);
+        let vcpus = checkpoint
+            .vcpus
+            .or_else(|| source_space.and_then(|space| space.vcpus))
+            .unwrap_or(ctx.vm_cfg.vcpus);
+        let mem_mib = checkpoint
+            .mem_mib
+            .or_else(|| source_space.and_then(|space| space.mem_mib))
+            .unwrap_or(ctx.vm_cfg.mem_mib);
+        let disk_mib = checkpoint
             .disk_mib
+            .or_else(|| source_space.and_then(|space| space.disk_mib))
             .unwrap_or_else(|| image_size_mib(&shinu::ckpt_image(ctx.root, checkpoint.id)));
-        check_space_quota(ctx.root, &connection, project, &limits, source_disk)?;
-        check_vm_sizing(ctx, &limits, source_space.vcpus, source_space.mem_mib)?;
-        (checkpoint, source_space)
+        check_space_quota(ctx.root, &connection, project, &limits, disk_mib)?;
+        check_vm_sizing(ctx, &limits, Some(vcpus), Some(mem_mib))?;
+        let image = source_space.map_or(Image::Void, |space| space.image);
+        let network = source_space.and_then(|space| space.network.clone());
+        (checkpoint, image, network, vcpus, mem_mib, disk_mib)
     };
     let source = source_checkpoint.id;
-    let source_full = source_checkpoint.full;
     let image_path = shinu::space_image(ctx.root, id);
-    let snapshot_mem = space_snapshot_mem(ctx.root, id);
-    let snapshot_state = space_snapshot_state(ctx.root, id);
-    let source_image = shinu::ckpt_image(ctx.root, source);
-    shinu::btrfs::clone_for(&source_image, &image_path, 0, 0)?;
     let mount = ctx.root.join(format!("authorize.{id}.mnt"));
     let result = (|| -> shinu::Result<Value> {
-        if source_full {
-            // A restored guest keeps the sshd and page cache captured in the
-            // snapshot, so rewriting authorized_keys on the reflinked disk
-            // would be invisible to it and every exec would fall back to a
-            // password prompt. Inheriting the source key instead keeps the
-            // fork's credentials consistent with the memory it resumes from;
-            // the disk already trusts that key because it is a reflink.
-            let source_dir = shinu::vm_dir(ctx.root, source_space.id);
-            let fork_dir = shinu::vm_dir(ctx.root, id);
-            std::fs::create_dir_all(&fork_dir)?;
-            for suffix in ["id_ed25519", "id_ed25519.pub"] {
-                std::fs::copy(source_dir.join(suffix), fork_dir.join(suffix))?;
-            }
-        }
-        let public_key = shinu::vm::prepare(&shinu::vm_dir(ctx.root, id), 0, 0)?;
-        if !source_full {
-            // A disk-only fork boots cold, so it can safely be given a
-            // distinct key even though its disk starts as a reflink.
-            shinu::vm::authorize(&image_path, &public_key, &mount)?;
-        }
-        if source_full {
-            materialize_checkpoint_memory(ctx.root, &source_checkpoint, &snapshot_mem)?;
-            shinu::btrfs::clone_for(&shinu::ckpt_state(ctx.root, source), &snapshot_state, 0, 0)?;
-        }
-        let source_disk = source_space
-            .disk_mib
-            .unwrap_or_else(|| image_size_mib(&source_image));
+        materialize_fork(ctx.root, &source_checkpoint, id)?;
         let space = update_state_with_quota(
             ctx.root,
             ctx.db,
             ctx.registry,
             project,
             &limits,
-            source_disk,
+            disk_mib,
             |state| {
                 check_name(state, &name, project)?;
                 shinu::find_ckpt(state, source, project)?;
@@ -2155,13 +2204,13 @@ fn fork_space(
                     id,
                     name: name.clone(),
                     project: project.to_owned(),
-                    image: source_space.image,
+                    image,
                     parent: Some(source),
                     head: Some(source),
-                    vcpus: source_space.vcpus,
-                    mem_mib: source_space.mem_mib,
-                    disk_mib: source_space.disk_mib,
-                    network: source_space.network.clone(),
+                    vcpus: Some(vcpus),
+                    mem_mib: Some(mem_mib),
+                    disk_mib: Some(disk_mib),
+                    network: network.clone(),
                     expires_at,
                     created_at,
                 };
@@ -2179,6 +2228,66 @@ fn fork_space(
         let _ = std::fs::remove_dir_all(&mount);
     }
     result
+}
+
+fn copy_ssh_credentials(source: &Path, destination: &Path) -> shinu::Result<()> {
+    std::fs::copy(source, destination)?;
+    std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o600))?;
+    std::fs::copy(
+        source.with_extension("pub"),
+        destination.with_extension("pub"),
+    )?;
+    std::fs::set_permissions(
+        destination.with_extension("pub"),
+        std::fs::Permissions::from_mode(0o600),
+    )?;
+    Ok(())
+}
+
+fn materialize_fork(root: &Path, checkpoint: &Ckpt, id: Uuid) -> shinu::Result<()> {
+    let fork_dir = shinu::vm_dir(root, id);
+    if checkpoint.full {
+        // A resumed sshd keeps the credentials captured in guest memory;
+        // rewriting authorized_keys on the reflinked disk is not visible.
+        let archived_key = shinu::ckpt_key(root, checkpoint.id);
+        let source_key = shinu::vm::key_path(&shinu::vm_dir(root, checkpoint.space));
+        let key = [&archived_key, &source_key]
+            .into_iter()
+            .find(|key| key.is_file() && key.with_extension("pub").is_file())
+            .ok_or_else(|| {
+                shinu::Error::Invalid(format!(
+                    "checkpoint {} memory snapshot has no retained SSH key and its source space key is unavailable",
+                    checkpoint.id
+                ))
+            })?;
+        std::fs::create_dir_all(&fork_dir)?;
+        std::fs::set_permissions(&fork_dir, std::fs::Permissions::from_mode(0o700))?;
+        copy_ssh_credentials(key, &shinu::vm::key_path(&fork_dir))?;
+    }
+    #[cfg(test)]
+    if tests::materialize_fork_fixture(root, checkpoint, id)? {
+        return Ok(());
+    }
+    let image_path = shinu::space_image(root, id);
+    shinu::btrfs::clone_for(&shinu::ckpt_image(root, checkpoint.id), &image_path, 0, 0)?;
+    let public_key = shinu::vm::prepare(&fork_dir, 0, 0)?;
+    if checkpoint.full {
+        materialize_checkpoint_memory(root, checkpoint, &space_snapshot_mem(root, id))?;
+        shinu::btrfs::clone_for(
+            &shinu::ckpt_state(root, checkpoint.id),
+            &space_snapshot_state(root, id),
+            0,
+            0,
+        )?;
+    } else {
+        // Disk-only forks boot cold and can safely receive distinct keys.
+        shinu::vm::authorize(
+            &image_path,
+            &public_key,
+            &root.join(format!("authorize.{id}.mnt")),
+        )?;
+    }
+    Ok(())
 }
 fn create_template(
     ctx: &Ctx<'_>,
@@ -2381,6 +2490,10 @@ fn commit_space(
             let (snapshot_mem, snapshot_state) = shinu::vm::snapshot(&vm_dir, kind)?;
             std::fs::rename(snapshot_mem, shinu::ckpt_mem(ctx.root, id))?;
             std::fs::rename(snapshot_state, shinu::ckpt_state(ctx.root, id))?;
+            copy_ssh_credentials(
+                &shinu::vm::key_path(&vm_dir),
+                &shinu::ckpt_key(ctx.root, id),
+            )?;
         }
         let checkpoint = update_state(ctx.db, ctx.registry, |state| {
             if let Some(limits) = snapshot_limits.as_ref() {
@@ -2424,6 +2537,8 @@ fn commit_space(
         let _ = std::fs::remove_file(&image);
         let _ = remove_file_if_missing(&shinu::ckpt_mem(ctx.root, id));
         let _ = remove_file_if_missing(&shinu::ckpt_state(ctx.root, id));
+        let _ = remove_file_if_missing(&shinu::ckpt_key(ctx.root, id));
+        let _ = remove_file_if_missing(&shinu::ckpt_key(ctx.root, id).with_extension("pub"));
         let _ = remove_file_if_missing(&jail_snapshot_mem);
         let _ = remove_file_if_missing(&jail_snapshot_state);
     }
@@ -2529,6 +2644,9 @@ fn checkout_space(
             auto: true,
             full: false,
             base: None,
+            vcpus: entry.vcpus,
+            mem_mib: entry.mem_mib,
+            disk_mib: entry.disk_mib,
             note: auto_note,
             created_at: Utc::now(),
             snapshot_version: None,
@@ -2683,6 +2801,8 @@ fn remove_checkpoint(ctx: &Ctx<'_>, project: &str, id: Uuid) -> shinu::Result<Va
     remove_file_if_missing(&shinu::ckpt_image(ctx.root, id))?;
     remove_file_if_missing(&shinu::ckpt_mem(ctx.root, id))?;
     remove_file_if_missing(&shinu::ckpt_state(ctx.root, id))?;
+    remove_file_if_missing(&shinu::ckpt_key(ctx.root, id))?;
+    remove_file_if_missing(&shinu::ckpt_key(ctx.root, id).with_extension("pub"))?;
     Ok(json!({ "removed": id }))
 }
 
@@ -3122,6 +3242,8 @@ fn gc(ctx: &Ctx<'_>, project: &str, free_below: u64, dry_run: bool) -> shinu::Re
         remove_file_if_missing(&shinu::ckpt_image(ctx.root, id))?;
         remove_file_if_missing(&shinu::ckpt_mem(ctx.root, id))?;
         remove_file_if_missing(&shinu::ckpt_state(ctx.root, id))?;
+        remove_file_if_missing(&shinu::ckpt_key(ctx.root, id))?;
+        remove_file_if_missing(&shinu::ckpt_key(ctx.root, id).with_extension("pub"))?;
         reclaimed = reclaimed.saturating_add(exclusive);
         deleted.push(json!({ "id": id, "note": note, "exclusive": exclusive }));
     }
@@ -3586,7 +3708,7 @@ fn cancel_job(ctx: &Ctx<'_>, project: &str, id: Uuid) -> shinu::Result<Value> {
     let canceling = {
         let _state_guard = lock_state(ctx.registry);
         let connection = lock_db(ctx.db);
-        state::request_job_cancel(&connection, id, project)?
+        state::request_job_cancel(&connection, id, project, None)?
             .ok_or_else(|| shinu::Error::NotFound(id.to_string()))?
     };
     if canceling.state.is_terminal() {
@@ -3623,7 +3745,9 @@ fn cancel_job(ctx: &Ctx<'_>, project: &str, id: Uuid) -> shinu::Result<Value> {
             state::JobCompletion {
                 state: terminal,
                 exit_code,
-                error: None,
+                error: (terminal == state::JobState::Canceled)
+                    .then_some(canceling.error.as_deref())
+                    .flatten(),
                 log_bytes: log.len() as u64,
                 log_truncated: truncated,
             },
@@ -4623,6 +4747,13 @@ struct SshTarget {
 
 fn ssh_target_for_vm(root: &Path, space_id: Uuid) -> shinu::Result<SshTarget> {
     let vm_dir = shinu::vm_dir(root, space_id);
+    #[cfg(test)]
+    if vm_dir.join("test-ssh").is_file() {
+        return Ok(SshTarget {
+            vm_dir,
+            proxy: String::new(),
+        });
+    }
     let helper = shinu::vsock_helper()?;
     let proxy = format!(
         "ProxyCommand={} {} {}",
@@ -4784,7 +4915,11 @@ fn run_job_ssh(
     timeout: Duration,
     stdout_cap: usize,
 ) -> shinu::Result<JobCommandOutput> {
+    #[cfg(not(test))]
     let mut command = ssh_command(target, remote);
+    #[cfg(test)]
+    let mut command = tests::job_ssh_fixture_command(target, remote)
+        .unwrap_or_else(|| ssh_command(target, remote));
     command.process_group(0);
     let mut child = command
         .stdin(if stdin.is_some() {
@@ -7318,6 +7453,468 @@ mod tests {
         root
     }
 
+    pub(super) fn materialize_fork_fixture(
+        root: &std::path::Path,
+        checkpoint: &Ckpt,
+        id: Uuid,
+    ) -> shinu::Result<bool> {
+        if !root.join("test-fork-host").is_file() {
+            return Ok(false);
+        }
+        // Stand in only for privileged btrfs/VM host operations. Credential
+        // resolution and all authoritative state/quota checks remain real.
+        std::fs::create_dir_all(root.join("spaces"))?;
+        std::fs::copy(
+            shinu::ckpt_image(root, checkpoint.id),
+            shinu::space_image(root, id),
+        )?;
+        if checkpoint.full {
+            std::fs::create_dir_all(shinu::vm_dir(root, id))?;
+            std::fs::copy(
+                shinu::ckpt_mem(root, checkpoint.id),
+                super::space_snapshot_mem(root, id),
+            )?;
+            std::fs::copy(
+                shinu::ckpt_state(root, checkpoint.id),
+                super::space_snapshot_state(root, id),
+            )?;
+        }
+        Ok(true)
+    }
+
+    pub(super) fn job_ssh_fixture_command(
+        target: &super::SshTarget,
+        remote: &[String],
+    ) -> Option<Command> {
+        let fixture = target.vm_dir.join("test-ssh");
+        fixture.is_file().then(|| {
+            let mut command = Command::new("sh");
+            command.arg(fixture).arg(shinu::shell_quote(remote));
+            command
+        })
+    }
+
+    fn retained_checkpoint_fixture(root: &std::path::Path, checkpoint: &Ckpt) {
+        std::fs::write(root.join("test-fork-host"), b"privileged host boundary").unwrap();
+        std::fs::create_dir_all(root.join("ckpts")).unwrap();
+        let disk = std::fs::File::create(shinu::ckpt_image(root, checkpoint.id)).unwrap();
+        disk.set_len(7 * 1024 * 1024).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_fork_uses_retained_source_and_legacy_fallback_sizing() {
+        for (sizing, source_present, expected) in [
+            ((Some(3), Some(4096), Some(8)), false, (3, 4096, 8)),
+            ((None, None, None), true, (5, 2048, 9)),
+            ((Some(3), None, None), true, (3, 2048, 9)),
+            ((None, None, None), false, (1, 1, 7)),
+        ] {
+            let root = test_root("retained-checkpoint-fork");
+            let mut checkpoint = checkpoint_for_snapshot_gate(false, None);
+            (checkpoint.vcpus, checkpoint.mem_mib, checkpoint.disk_mib) = sizing;
+            let mut source = snapshot_test_space(checkpoint.space, Some(checkpoint.id));
+            (source.vcpus, source.mem_mib, source.disk_mib) = (Some(5), Some(2048), Some(9));
+            store_state(
+                &root,
+                &State {
+                    spaces: vec![source],
+                    ckpts: vec![checkpoint.clone()],
+                    templates: Vec::new(),
+                },
+            );
+            retained_checkpoint_fixture(&root, &checkpoint);
+            let db = test_db(&root);
+            let registry = registry();
+            let (vm_cfg, net_cfg) = test_configs();
+            let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+            if !source_present {
+                super::update_state(&db, &registry, |state| {
+                    state.spaces.clear();
+                    Ok(())
+                })
+                .unwrap();
+            }
+            let hidden = handle(
+                &ctx,
+                Req::Fork {
+                    ckpt: checkpoint.id,
+                    name: "hidden".into(),
+                    ttl_seconds: None,
+                },
+                "foreign",
+            );
+            assert!(matches!(hidden, Err(shinu::Error::NotFound(_))));
+            let forked = handle(
+                &ctx,
+                Req::Fork {
+                    ckpt: checkpoint.id,
+                    name: "forked".into(),
+                    ttl_seconds: Some(60),
+                },
+                "project-a",
+            )
+            .expect("fork without requiring source space");
+            let space: Space = serde_json::from_value(forked).unwrap();
+            assert_eq!(
+                (space.vcpus, space.mem_mib, space.disk_mib),
+                (Some(expected.0), Some(expected.1), Some(expected.2))
+            );
+            assert_eq!(
+                (space.parent, space.head),
+                (Some(checkpoint.id), Some(checkpoint.id))
+            );
+            assert!(space.expires_at.is_some());
+            assert_eq!(
+                state::find_space(&db.lock().unwrap(), "forked", "project-a").unwrap(),
+                Some(space)
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn memory_template_fork_retains_credentials_after_source_removal_and_unlinks_them() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = test_root("retained-memory-key");
+        let checkpoint = checkpoint_for_snapshot_gate(true, Some(shinu::FC_SNAPSHOT_VERSION));
+        store_state(
+            &root,
+            &State {
+                spaces: Vec::new(),
+                ckpts: vec![checkpoint.clone()],
+                templates: Vec::new(),
+            },
+        );
+        retained_checkpoint_fixture(&root, &checkpoint);
+        write_snapshot_test_files(&root, checkpoint.id);
+        let key = shinu::ckpt_key(&root, checkpoint.id);
+        std::fs::write(&key, b"archived private key").unwrap();
+        std::fs::write(key.with_extension("pub"), b"archived public key").unwrap();
+        let source_dir = shinu::vm_dir(&root, checkpoint.space);
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(vm::key_path(&source_dir), b"different source key").unwrap();
+        std::fs::write(
+            vm::key_path(&source_dir).with_extension("pub"),
+            b"different source public key",
+        )
+        .unwrap();
+        let db = test_db(&root);
+        let registry = registry();
+        let (vm_cfg, net_cfg) = test_configs();
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        handle(
+            &ctx,
+            Req::CreateTemplate {
+                name: "retained".into(),
+                checkpoint: checkpoint.id,
+            },
+            "project-a",
+        )
+        .unwrap();
+        for name in ["archived-first", "source-deleted"] {
+            let forked = handle(
+                &ctx,
+                Req::ForkTemplate {
+                    template: "retained".into(),
+                    name: name.into(),
+                    ttl_seconds: None,
+                },
+                "project-a",
+            )
+            .expect("memory template forks without source space");
+            let space: Space = serde_json::from_value(forked).unwrap();
+            let destination = vm::key_path(&shinu::vm_dir(&root, space.id));
+            assert_eq!(
+                std::fs::read(&destination).unwrap(),
+                b"archived private key"
+            );
+            assert_eq!(
+                std::fs::metadata(&destination)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            assert_eq!(
+                std::fs::read(destination.with_extension("pub")).unwrap(),
+                b"archived public key"
+            );
+            handle(&ctx, Req::Rm { space: name.into() }, "project-a").unwrap();
+            if source_dir.exists() {
+                std::fs::remove_dir_all(&source_dir).unwrap();
+            }
+        }
+        handle(
+            &ctx,
+            Req::DeleteTemplate {
+                name: "retained".into(),
+            },
+            "project-a",
+        )
+        .unwrap();
+        handle(
+            &ctx,
+            Req::RmCkpt {
+                ckpt: checkpoint.id,
+            },
+            "project-a",
+        )
+        .unwrap();
+        for path in [
+            shinu::ckpt_image(&root, checkpoint.id),
+            shinu::ckpt_mem(&root, checkpoint.id),
+            shinu::ckpt_state(&root, checkpoint.id),
+            key.clone(),
+            key.with_extension("pub"),
+        ] {
+            assert!(
+                !path.exists(),
+                "checkpoint asset remained: {}",
+                path.display()
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn memory_checkpoint_fork_requires_archived_or_source_credentials() {
+        for source_key_present in [true, false] {
+            let root = test_root("legacy-memory-key");
+            let checkpoint = checkpoint_for_snapshot_gate(true, Some(shinu::FC_SNAPSHOT_VERSION));
+            store_state(
+                &root,
+                &State {
+                    spaces: Vec::new(),
+                    ckpts: vec![checkpoint.clone()],
+                    templates: Vec::new(),
+                },
+            );
+            retained_checkpoint_fixture(&root, &checkpoint);
+            write_snapshot_test_files(&root, checkpoint.id);
+            if source_key_present {
+                let source_dir = shinu::vm_dir(&root, checkpoint.space);
+                std::fs::create_dir_all(&source_dir).unwrap();
+                std::fs::write(vm::key_path(&source_dir), b"legacy private key").unwrap();
+                std::fs::write(
+                    vm::key_path(&source_dir).with_extension("pub"),
+                    b"legacy public key",
+                )
+                .unwrap();
+            }
+            let db = test_db(&root);
+            let registry = registry();
+            let (vm_cfg, net_cfg) = test_configs();
+            let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+            let result = handle(
+                &ctx,
+                Req::Fork {
+                    ckpt: checkpoint.id,
+                    name: "legacy".into(),
+                    ttl_seconds: None,
+                },
+                "project-a",
+            );
+            if source_key_present {
+                let space: Space =
+                    serde_json::from_value(result.expect("legacy source key fallback")).unwrap();
+                assert_eq!(
+                    std::fs::read(vm::key_path(&shinu::vm_dir(&root, space.id))).unwrap(),
+                    b"legacy private key"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(shinu::Error::Invalid(message)) if message.contains("SSH key") && message.contains("unavailable"))
+                );
+                assert!(super::snapshot(&db, &registry).unwrap().spaces.is_empty());
+            }
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    fn wait_for_job_state(
+        runtime: &super::JobRuntime,
+        id: Uuid,
+        expected: state::JobState,
+    ) -> state::Job {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let job = state::get_job(&runtime.db.lock().unwrap(), id, "project-a")
+                .unwrap()
+                .unwrap();
+            if job.state == expected {
+                return job;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "job remained {:?}, expected {expected:?}",
+                job.state
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn detached_job_deadline_is_shortened_by_lease_and_finishes_canceled_after_fence() {
+        for max_secs in [3600, 0] {
+            let root = test_root("job-lease-deadline");
+            let (space_id, _, mut child) = running_state(&root, "project-a");
+            let db = Arc::new(test_db(&root));
+            let registry = Arc::new(registry());
+            let now = Utc::now();
+            let expiry = now - chrono::Duration::seconds(1);
+            super::update_state(&db, &registry, |state| {
+                state.spaces[0].expires_at = Some(expiry);
+                Ok(())
+            })
+            .unwrap();
+            let job = state::Job {
+                id: Uuid::new_v4(),
+                project: "project-a".into(),
+                space: space_id,
+                command: vec!["sleep".into(), "86400".into()],
+                state: state::JobState::Running,
+                created_at: now - chrono::Duration::seconds(60),
+                started_at: Some(now - chrono::Duration::seconds(59)),
+                finished_at: None,
+                exit_code: None,
+                error: None,
+                log_bytes: 0,
+                log_truncated: false,
+            };
+            state::insert_job(&db.lock().unwrap(), &job).unwrap();
+            let vm_dir = shinu::vm_dir(&root, space_id);
+            std::fs::write(vm_dir.join("fail-cancel"), b"retry the existing fence").unwrap();
+            let script = format!(
+                r#"dir=$(dirname "$0")
+case "$1" in
+  *mkdir*) [ ! -e "$dir/fail-cancel" ] || exit 1; touch "$dir/fenced" ;;
+  *capture-pane*) printf 'final output\n' ;;
+  *kill-session*) [ -f {} ] || exit 9; touch "$dir/cleaned" ;;
+  *) printf '143' ;;
+esac
+"#,
+                shinu::shell_quote_word(&shinu::job_log_path(&root, job.id).to_string_lossy())
+            );
+            std::fs::write(vm_dir.join("test-ssh"), script).unwrap();
+            let runtime = Arc::new(super::JobRuntime {
+                root: Arc::new(root.clone()),
+                db: Arc::clone(&db),
+                registry: Arc::clone(&registry),
+                monitors: Arc::new(Mutex::new(std::collections::HashSet::new())),
+                max_secs,
+            });
+            runtime.recover();
+            let canceling = wait_for_job_state(&runtime, job.id, state::JobState::Canceling);
+            assert!(canceling.error.as_deref().unwrap().contains("deadline"));
+            assert!(
+                state::claim_expired_space(&db.lock().unwrap(), space_id, "project-a", expiry, now)
+                    .unwrap()
+                    .is_none()
+            );
+            let (vm_cfg, net_cfg) = test_configs();
+            let mut ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+            ctx.jobs = Some(Arc::clone(&runtime));
+            let logs = handle(&ctx, Req::GetJobLogs { id: job.id }, "project-a").unwrap();
+            assert_eq!(logs["terminal"], false);
+            assert_eq!(
+                handle(&ctx, Req::GetJob { id: job.id }, "project-a").unwrap()["state"],
+                "canceling"
+            );
+            // Renewal cannot erase a durably requested deadline cancellation.
+            super::update_state(&db, &registry, |state| {
+                state.spaces[0].expires_at = Some(now + chrono::Duration::hours(1));
+                Ok(())
+            })
+            .unwrap();
+            std::fs::remove_file(vm_dir.join("fail-cancel")).unwrap();
+            let canceled = wait_for_job_state(&runtime, job.id, state::JobState::Canceled);
+            assert_eq!(canceled.error, canceling.error);
+            assert_eq!(canceled.exit_code, None);
+            assert_eq!(
+                std::fs::read(shinu::job_log_path(&root, job.id)).unwrap(),
+                b"final output\n"
+            );
+            assert!(vm_dir.join("fenced").is_file());
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !vm_dir.join("cleaned").is_file() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "guest cleanup did not follow archive"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            child.kill().unwrap();
+            child.wait().unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn detached_job_maximum_bounds_unleased_jobs_but_zero_disables_it() {
+        for (max_secs, expected) in [
+            (60, state::JobState::Canceled),
+            (0, state::JobState::Running),
+        ] {
+            let root = test_root("job-maximum-deadline");
+            let (space_id, _, mut child) = running_state(&root, "project-a");
+            let db = Arc::new(test_db(&root));
+            let registry = Arc::new(registry());
+            let job = state::Job {
+                id: Uuid::new_v4(),
+                project: "project-a".into(),
+                space: space_id,
+                command: vec!["sleep".into(), "86400".into()],
+                state: state::JobState::Running,
+                created_at: Utc::now() - chrono::Duration::seconds(120),
+                started_at: Some(Utc::now()),
+                finished_at: None,
+                exit_code: None,
+                error: None,
+                log_bytes: 0,
+                log_truncated: false,
+            };
+            state::insert_job(&db.lock().unwrap(), &job).unwrap();
+            let vm_dir = shinu::vm_dir(&root, space_id);
+            std::fs::write(
+                vm_dir.join("test-ssh"),
+                r#"case "$1" in
+  *mkdir*|*kill-session*) exit 0 ;;
+  *capture-pane*) printf 'still running\n' ;;
+  *) printf '__SHINU_NO_STATUS__' ;;
+esac
+"#,
+            )
+            .unwrap();
+            let runtime = super::JobRuntime {
+                root: Arc::new(root.clone()),
+                db: Arc::clone(&db),
+                registry: Arc::clone(&registry),
+                monitors: Arc::new(Mutex::new(std::collections::HashSet::new())),
+                max_secs,
+            };
+            let done = runtime.monitor_iteration(
+                job.id,
+                "project-a",
+                &mut std::time::Instant::now(),
+                Utc::now(),
+            );
+            assert_eq!(done, expected.is_terminal());
+            let observed = state::get_job(&db.lock().unwrap(), job.id, "project-a")
+                .unwrap()
+                .unwrap();
+            assert_eq!(observed.state, expected);
+            assert_eq!(
+                observed.error.is_some(),
+                expected == state::JobState::Canceled
+            );
+            child.kill().unwrap();
+            child.wait().unwrap();
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     #[test]
     fn detached_runner_kills_process_group_with_pipe_holding_descendant() {
         let mut command = Command::new("sh");
@@ -7398,6 +7995,9 @@ mod tests {
                     note: "old auto checkpoint".into(),
                     created_at: Utc::now() - chrono::Duration::days(30),
                     snapshot_version: None,
+                    vcpus: None,
+                    mem_mib: None,
+                    disk_mib: None,
                 }],
                 templates: Vec::new(),
             },
@@ -7571,6 +8171,9 @@ mod tests {
             base,
             note: "snapshot test".into(),
             created_at: Utc::now(),
+            vcpus: None,
+            mem_mib: None,
+            disk_mib: None,
             snapshot_version: snapshot_version.map(str::to_owned),
         }
     }
@@ -7872,6 +8475,9 @@ mod tests {
             base: Some(base_id),
             note: "diff".into(),
             created_at: Utc::now(),
+            vcpus: None,
+            mem_mib: None,
+            disk_mib: None,
             snapshot_version: Some(shinu::FC_SNAPSHOT_VERSION.into()),
         };
         let full = super::Ckpt {
@@ -7884,6 +8490,9 @@ mod tests {
             base: None,
             full: false,
             note: "disk".into(),
+            vcpus: None,
+            mem_mib: None,
+            disk_mib: None,
             snapshot_version: None,
             ..diff.clone()
         };
@@ -7912,6 +8521,9 @@ mod tests {
             base: None,
             note: "snapshot gate test".into(),
             created_at: Utc::now(),
+            vcpus: None,
+            mem_mib: None,
+            disk_mib: None,
             snapshot_version: snapshot_version.map(str::to_owned),
         }
     }
@@ -8353,6 +8965,11 @@ mod tests {
         let expiry = Utc.timestamp_opt(1_700_000_000, 0).single().unwrap();
         let root = test_root("lease-sweep");
         let id = Uuid::new_v4();
+        let mut checkpoint = checkpoint_for_snapshot_gate(true, Some(shinu::FC_SNAPSHOT_VERSION));
+        checkpoint.space = id;
+        checkpoint.vcpus = Some(2);
+        checkpoint.mem_mib = Some(2048);
+        checkpoint.disk_mib = Some(7);
         let state_value = State {
             spaces: vec![Space {
                 id,
@@ -8368,13 +8985,26 @@ mod tests {
                 expires_at: Some(expiry),
                 created_at: expiry - chrono::Duration::minutes(1),
             }],
-            ckpts: Vec::new(),
-            templates: Vec::new(),
+            ckpts: vec![checkpoint.clone()],
+            templates: vec![Template {
+                project: "project-a".into(),
+                name: "retained".into(),
+                checkpoint: checkpoint.id,
+                created_at: expiry,
+            }],
         };
         store_state(&root, &state_value);
+        retained_checkpoint_fixture(&root, &checkpoint);
+        write_snapshot_test_files(&root, checkpoint.id);
+        let key = shinu::ckpt_key(&root, checkpoint.id);
+        std::fs::write(&key, b"retained private key").unwrap();
+        std::fs::write(key.with_extension("pub"), b"retained public key").unwrap();
+        let source_dir = shinu::vm_dir(&root, id);
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::write(vm::key_path(&source_dir), b"source private key").unwrap();
         let db = test_db(&root);
         let registry = registry();
-        let (_vm_cfg, net_cfg) = test_configs();
+        let (vm_cfg, net_cfg) = test_configs();
         let grace_sweep = super::LeaseSweepContext {
             root: &root,
             db: &db,
@@ -8403,6 +9033,28 @@ mod tests {
             "post-grace cleanup should not fail: {result:?}"
         );
         assert!(super::snapshot(&db, &registry).unwrap().spaces.is_empty());
+        assert!(
+            !source_dir.exists(),
+            "mutable source VM assets must be deleted"
+        );
+        assert!(
+            key.is_file(),
+            "lease cleanup must retain checkpoint credentials"
+        );
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        let forked = handle(
+            &ctx,
+            Req::ForkTemplate {
+                template: "retained".into(),
+                name: "after-expiry".into(),
+                ttl_seconds: None,
+            },
+            "project-a",
+        )
+        .expect("template remains forkable after lease cleanup");
+        assert_eq!(forked["vcpus"], 2);
+        assert_eq!(forked["mem_mib"], 2048);
+        assert_eq!(forked["disk_mib"], 7);
         std::fs::remove_dir_all(root).expect("remove sweep test root");
     }
 
@@ -9173,6 +9825,9 @@ mod tests {
                 note: "before".into(),
                 created_at: Utc::now(),
                 snapshot_version: None,
+                vcpus: None,
+                mem_mib: None,
+                disk_mib: None,
             }],
             templates: Vec::new(),
         };
@@ -9616,6 +10271,9 @@ mod tests {
                 note: "full restore target".into(),
                 created_at: now - chrono::Duration::minutes(1),
                 snapshot_version: Some(shinu::FC_SNAPSHOT_VERSION.into()),
+                vcpus: None,
+                mem_mib: None,
+                disk_mib: None,
             }],
             templates: Vec::new(),
         };
@@ -9693,6 +10351,9 @@ mod tests {
                         note: "alpha".into(),
                         created_at: now,
                         snapshot_version: None,
+                        vcpus: None,
+                        mem_mib: None,
+                        disk_mib: None,
                     },
                     Ckpt {
                         id: beta_id,
@@ -9705,6 +10366,9 @@ mod tests {
                         note: "beta".into(),
                         created_at: now,
                         snapshot_version: None,
+                        vcpus: None,
+                        mem_mib: None,
+                        disk_mib: None,
                     },
                     Ckpt {
                         id: zeta_id,
@@ -9717,6 +10381,9 @@ mod tests {
                         note: "zeta".into(),
                         created_at: now,
                         snapshot_version: None,
+                        vcpus: None,
+                        mem_mib: None,
+                        disk_mib: None,
                     },
                     Ckpt {
                         id: foreign_id,
@@ -9729,6 +10396,9 @@ mod tests {
                         note: "foreign".into(),
                         created_at: now,
                         snapshot_version: None,
+                        vcpus: None,
+                        mem_mib: None,
+                        disk_mib: None,
                     },
                 ],
                 templates: vec![
@@ -9793,6 +10463,9 @@ mod tests {
                 note: "template target".into(),
                 created_at: now,
                 snapshot_version: None,
+                vcpus: None,
+                mem_mib: None,
+                disk_mib: None,
             }],
             templates: (0..super::TEMPLATE_PROJECT_CAP)
                 .map(|index| Template {
@@ -9868,6 +10541,9 @@ mod tests {
                     note: "old auto checkpoint".into(),
                     created_at: now - chrono::Duration::days(30),
                     snapshot_version: None,
+                    vcpus: None,
+                    mem_mib: None,
+                    disk_mib: None,
                 },
                 Ckpt {
                     id: foreign_checkpoint_id,
@@ -9880,6 +10556,9 @@ mod tests {
                     note: "foreign checkpoint".into(),
                     created_at: now,
                     snapshot_version: None,
+                    vcpus: None,
+                    mem_mib: None,
+                    disk_mib: None,
                 },
             ],
             templates: Vec::new(),
@@ -10051,6 +10730,9 @@ mod tests {
                 note: "base".into(),
                 created_at: Utc::now(),
                 snapshot_version: None,
+                vcpus: None,
+                mem_mib: None,
+                disk_mib: None,
             }],
             templates: Vec::new(),
         };
@@ -10094,6 +10776,9 @@ mod tests {
                 note: "private".into(),
                 created_at: Utc::now(),
                 snapshot_version: None,
+                vcpus: None,
+                mem_mib: None,
+                disk_mib: None,
             }],
             templates: Vec::new(),
         };
@@ -10238,6 +10923,9 @@ mod tests {
                 note: "target".into(),
                 created_at: Utc::now(),
                 snapshot_version: None,
+                vcpus: None,
+                mem_mib: None,
+                disk_mib: None,
             }],
             templates: Vec::new(),
         };
@@ -10297,6 +10985,9 @@ mod tests {
                     note: "before checkout".into(),
                     created_at: Utc::now(),
                     snapshot_version: None,
+                    vcpus: None,
+                    mem_mib: None,
+                    disk_mib: None,
                 },
                 Ckpt {
                     id: auto_id,
@@ -10309,6 +11000,9 @@ mod tests {
                     note: "auto before checkout".into(),
                     created_at: Utc::now(),
                     snapshot_version: None,
+                    vcpus: None,
+                    mem_mib: None,
+                    disk_mib: None,
                 },
             ],
             templates: Vec::new(),
@@ -10386,6 +11080,9 @@ mod tests {
                     note: "auto stale".into(),
                     created_at: Utc::now(),
                     snapshot_version: None,
+                    vcpus: None,
+                    mem_mib: None,
+                    disk_mib: None,
                 },
                 Ckpt {
                     id: raced_id,
@@ -10398,6 +11095,9 @@ mod tests {
                     note: "auto raced".into(),
                     created_at: Utc::now(),
                     snapshot_version: None,
+                    vcpus: None,
+                    mem_mib: None,
+                    disk_mib: None,
                 },
             ],
             templates: Vec::new(),

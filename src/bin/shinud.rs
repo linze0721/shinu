@@ -2772,7 +2772,7 @@ fn remove_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Val
     remove_space_files(ctx.root, id)?;
     Ok(json!({ "removed": resolved_name, "id": id }))
 }
-fn remove_checkpoint(ctx: &Ctx<'_>, project: &str, id: Uuid) -> shinu::Result<Value> {
+fn remove_checkpoint(ctx: &Ctx<'_>, project: &str, id: Uuid, detach: bool) -> shinu::Result<Value> {
     // Serialize the claim with every consumer that can read these files. The
     // row and its references are re-evaluated under state+DB locks, after the
     // checkpoint lock has excluded checkout, fork, GC, and other removals.
@@ -2780,21 +2780,29 @@ fn remove_checkpoint(ctx: &Ctx<'_>, project: &str, id: Uuid) -> shinu::Result<Va
     let _checkpoint_guard = checkpoint_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    update_state(ctx.db, ctx.registry, |state| {
+    let detached = update_state(ctx.db, ctx.registry, |state| {
         let checkpoint = state
             .ckpts
             .iter()
             .find(|checkpoint| checkpoint.id == id && checkpoint.project == project)
             .ok_or_else(|| shinu::Error::NotFound(id.to_string()))?;
-        let referenced = shinu::is_referenced(state, checkpoint.id);
+        // Every checkpoint image is an independent reflink, so `parent` edges
+        // are lineage only and may be detached. Heads, templates, and memory
+        // bases still read these files and always refuse.
+        let referenced = if detach {
+            shinu::blocking_references(state, checkpoint.id)
+        } else {
+            shinu::is_referenced(state, checkpoint.id)
+        };
         if !referenced.is_empty() {
             return Err(shinu::Error::Invalid(format!(
                 "checkpoint {id} is still referenced by: {}",
                 referenced.join(", ")
             )));
         }
+        let detached = detach.then(|| shinu::detach_children(state, id));
         state.ckpts.retain(|entry| entry.id != id);
-        Ok(())
+        Ok(detached)
     })?;
     // Keep the checkpoint lock through unlinking. A consumer that already
     // holds it finishes before the claim; later consumers see the missing row.
@@ -2803,7 +2811,11 @@ fn remove_checkpoint(ctx: &Ctx<'_>, project: &str, id: Uuid) -> shinu::Result<Va
     remove_file_if_missing(&shinu::ckpt_state(ctx.root, id))?;
     remove_file_if_missing(&shinu::ckpt_key(ctx.root, id))?;
     remove_file_if_missing(&shinu::ckpt_key(ctx.root, id).with_extension("pub"))?;
-    Ok(json!({ "removed": id }))
+    let mut response = json!({ "removed": id });
+    if let Some(detached) = detached {
+        response["detached"] = json!(detached);
+    }
+    Ok(response)
 }
 
 fn list_spaces(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
@@ -3845,7 +3857,7 @@ fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
             },
         ),
         Req::Rm { space } => remove_space(ctx, project, space),
-        Req::RmCkpt { ckpt } => remove_checkpoint(ctx, project, ckpt),
+        Req::RmCkpt { ckpt, detach } => remove_checkpoint(ctx, project, ckpt, detach),
         Req::Ls => list_spaces(ctx, project),
         Req::SubmitJob { space, cmd, stdin } => submit_job(ctx, project, space, cmd, stdin),
         Req::ListJobs => list_jobs(ctx, project),
@@ -4610,6 +4622,26 @@ fn gc_request(body: &[u8]) -> shinu::Result<Req> {
     })
 }
 
+/// An empty body keeps the refusing delete; `{"detach":true}` opts into
+/// clearing lineage-only `parent` edges instead.
+fn rmckpt_request(body: &[u8], ckpt: Uuid) -> shinu::Result<Req> {
+    if body.is_empty() {
+        return Ok(Req::RmCkpt {
+            ckpt,
+            detach: false,
+        });
+    }
+    let value = parse_body(body)?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| shinu::Error::Invalid("request body must be a JSON object".into()))?;
+    if let Some(key) = object.keys().find(|key| key.as_str() != "detach") {
+        return Err(shinu::Error::Invalid(format!("unknown body field: {key}")));
+    }
+    let detach = object.contains_key("detach") && value_bool(&value, "detach")?;
+    Ok(Req::RmCkpt { ckpt, detach })
+}
+
 fn parse_job_uuid(value: &str) -> shinu::Result<Uuid> {
     Uuid::parse_str(value)
         .map_err(|error| shinu::Error::Invalid(format!("invalid job id: {error}")))
@@ -4683,11 +4715,12 @@ fn request_for(
         )),
         Endpoint::Lease(space) => Ok((lease_request(body, space)?, 200)),
         Endpoint::RmCkpt(commit) => Ok((
-            Req::RmCkpt {
-                ckpt: Uuid::parse_str(&commit).map_err(|error| {
+            rmckpt_request(
+                body,
+                Uuid::parse_str(&commit).map_err(|error| {
                     shinu::Error::Invalid(format!("invalid commit id: {error}"))
                 })?,
-            },
+            )?,
             200,
         )),
         Endpoint::Gc => Ok((gc_request(body)?, 200)),
@@ -7658,6 +7691,7 @@ mod tests {
             &ctx,
             Req::RmCkpt {
                 ckpt: checkpoint.id,
+                detach: false,
             },
             "project-a",
         )
@@ -10663,6 +10697,7 @@ esac
             &ctx,
             Req::RmCkpt {
                 ckpt: checkpoint_id,
+                detach: false,
             },
             project,
         );
@@ -10689,6 +10724,7 @@ esac
             &ctx,
             Req::RmCkpt {
                 ckpt: checkpoint_id,
+                detach: false,
             },
             project,
         )
@@ -10748,6 +10784,7 @@ esac
             &ctx,
             Req::RmCkpt {
                 ckpt: checkpoint_id,
+                detach: false,
             },
             project,
         );
@@ -10757,6 +10794,279 @@ esac
         ));
         assert!(shinu::ckpt_image(&root, checkpoint_id).exists());
         std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    fn rmckpt_space(name: &str, parent: Option<Uuid>, head: Option<Uuid>) -> Space {
+        Space {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            project: "project-a".into(),
+            image: Image::Void,
+            vcpus: None,
+            mem_mib: None,
+            disk_mib: None,
+            network: None,
+            expires_at: None,
+            parent,
+            head,
+            created_at: Utc::now(),
+        }
+    }
+
+    fn rmckpt_ckpt(id: Uuid, parent: Option<Uuid>, base: Option<Uuid>) -> Ckpt {
+        Ckpt {
+            id,
+            space: Uuid::new_v4(),
+            project: "project-a".into(),
+            parent,
+            auto: false,
+            full: false,
+            base,
+            note: "lineage".into(),
+            created_at: Utc::now(),
+            snapshot_version: None,
+            vcpus: None,
+            mem_mib: None,
+            disk_mib: None,
+        }
+    }
+
+    fn short_id(id: Uuid) -> String {
+        id.simple().to_string()[..8].to_owned()
+    }
+
+    fn write_checkpoint_files(root: &std::path::Path, id: Uuid) -> Vec<PathBuf> {
+        std::fs::create_dir_all(root.join("ckpts")).expect("create checkpoint directory");
+        let paths = vec![
+            shinu::ckpt_image(root, id),
+            shinu::ckpt_mem(root, id),
+            shinu::ckpt_state(root, id),
+            shinu::ckpt_key(root, id),
+            shinu::ckpt_key(root, id).with_extension("pub"),
+        ];
+        for path in &paths {
+            std::fs::write(path, b"checkpoint").expect("write checkpoint file");
+        }
+        paths
+    }
+
+    #[test]
+    fn checkpoint_detach_clears_parent_links_and_deletes_files() {
+        let root = test_root("rmckpt-detach");
+        let project = "project-a";
+        let target = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let state = State {
+            spaces: vec![rmckpt_space("derived", Some(target), Some(child))],
+            ckpts: vec![
+                rmckpt_ckpt(target, None, None),
+                rmckpt_ckpt(child, Some(target), None),
+            ],
+            templates: Vec::new(),
+        };
+        store_state(&root, &state);
+        let target_files = write_checkpoint_files(&root, target);
+        let child_files = write_checkpoint_files(&root, child);
+        let (vm_cfg, net_cfg) = test_configs();
+        let registry = registry();
+        let db = test_db(&root);
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+
+        let removed = handle(
+            &ctx,
+            Req::RmCkpt {
+                ckpt: target,
+                detach: true,
+            },
+            project,
+        )
+        .expect("detaching delete succeeds");
+        assert_eq!(
+            removed,
+            serde_json::json!({ "removed": target, "detached": ["derived", short_id(child)] })
+        );
+
+        let after = super::snapshot(&db, &registry).expect("read state after detach");
+        assert!(after.ckpts.iter().all(|checkpoint| checkpoint.id != target));
+        let child_row = after
+            .ckpts
+            .iter()
+            .find(|checkpoint| checkpoint.id == child)
+            .expect("child checkpoint survives");
+        assert_eq!(child_row.parent, None);
+        assert_eq!(after.spaces[0].parent, None);
+        assert_eq!(after.spaces[0].head, Some(child));
+        assert!(target_files.iter().all(|path| !path.exists()));
+        assert!(child_files.iter().all(|path| path.exists()));
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn checkpoint_detach_still_refuses_heads_templates_and_memory_bases() {
+        let target = Uuid::new_v4();
+        let lineage_child = Uuid::new_v4();
+        let diff_child = Uuid::new_v4();
+        let cases = [
+            (
+                "head",
+                State {
+                    spaces: vec![
+                        rmckpt_space("checked-out", None, Some(target)),
+                        rmckpt_space("derived", Some(target), None),
+                    ],
+                    ckpts: vec![
+                        rmckpt_ckpt(target, None, None),
+                        rmckpt_ckpt(lineage_child, Some(target), None),
+                    ],
+                    templates: Vec::new(),
+                },
+                "checked-out".to_owned(),
+            ),
+            (
+                "template",
+                State {
+                    spaces: vec![rmckpt_space("derived", Some(target), None)],
+                    ckpts: vec![
+                        rmckpt_ckpt(target, None, None),
+                        rmckpt_ckpt(lineage_child, Some(target), None),
+                    ],
+                    templates: vec![Template {
+                        project: "project-a".into(),
+                        name: "release".into(),
+                        checkpoint: target,
+                        created_at: Utc::now(),
+                    }],
+                },
+                "release".to_owned(),
+            ),
+            (
+                "base",
+                State {
+                    spaces: vec![rmckpt_space("derived", Some(target), None)],
+                    ckpts: vec![
+                        rmckpt_ckpt(target, None, None),
+                        rmckpt_ckpt(lineage_child, Some(target), None),
+                        rmckpt_ckpt(diff_child, None, Some(target)),
+                    ],
+                    templates: Vec::new(),
+                },
+                short_id(diff_child),
+            ),
+        ];
+        for (label, state, blocker) in cases {
+            let root = test_root(&format!("rmckpt-detach-{label}"));
+            store_state(&root, &state);
+            let target_files = write_checkpoint_files(&root, target);
+            let (vm_cfg, net_cfg) = test_configs();
+            let registry = registry();
+            let db = test_db(&root);
+            let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+            let before = super::snapshot(&db, &registry).expect("read state before detach");
+
+            let result = handle(
+                &ctx,
+                Req::RmCkpt {
+                    ckpt: target,
+                    detach: true,
+                },
+                "project-a",
+            );
+            assert!(
+                matches!(
+                    &result,
+                    Err(shinu::Error::Invalid(message))
+                        if *message == format!("checkpoint {target} is still referenced by: {blocker}")
+                ),
+                "{label}: {result:?}"
+            );
+            assert_eq!(
+                super::snapshot(&db, &registry).expect("read state after refusal"),
+                before,
+                "{label}: refusal must not change state"
+            );
+            assert!(target_files.iter().all(|path| path.exists()), "{label}");
+            std::fs::remove_dir_all(root).expect("remove test root");
+        }
+    }
+
+    #[test]
+    fn checkpoint_deletion_without_detach_refuses_checkpoint_parent() {
+        let root = test_root("rmckpt-parent");
+        let target = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let state = State {
+            spaces: Vec::new(),
+            ckpts: vec![
+                rmckpt_ckpt(target, None, None),
+                rmckpt_ckpt(child, Some(target), None),
+            ],
+            templates: Vec::new(),
+        };
+        store_state(&root, &state);
+        let target_files = write_checkpoint_files(&root, target);
+        let (vm_cfg, net_cfg) = test_configs();
+        let registry = registry();
+        let db = test_db(&root);
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        let before = super::snapshot(&db, &registry).expect("read state before delete");
+
+        let result = handle(
+            &ctx,
+            Req::RmCkpt {
+                ckpt: target,
+                detach: false,
+            },
+            "project-a",
+        );
+        assert!(matches!(
+            result,
+            Err(shinu::Error::Invalid(message)) if message.contains(&short_id(child))
+        ));
+        assert_eq!(
+            super::snapshot(&db, &registry).expect("read state after refusal"),
+            before
+        );
+        assert!(target_files.iter().all(|path| path.exists()));
+        std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn rmckpt_request_accepts_empty_or_detach_body_only() {
+        let checkpoint = Uuid::new_v4();
+        let parse = |body: &[u8]| {
+            super::request_for(
+                super::route(&format!("/v1/commits/{checkpoint}")).expect("rmckpt route"),
+                "DELETE",
+                body,
+                None,
+                None,
+            )
+        };
+        for (body, expected) in [
+            (&b""[..], false),
+            (br"{}", false),
+            (br#"{"detach":false}"#, false),
+            (br#"{"detach":true}"#, true),
+        ] {
+            let (request, status) = parse(body).expect("valid rmckpt body");
+            assert_eq!(status, 200);
+            assert!(
+                matches!(request, Req::RmCkpt { ckpt, detach } if ckpt == checkpoint && detach == expected)
+            );
+        }
+        for body in [
+            &br#"{"detach":"true"}"#[..],
+            br#"{"detach":null}"#,
+            br#"{"detach":true,"force":true}"#,
+            br"[true]",
+            br#"{"detach":"#,
+        ] {
+            assert!(
+                matches!(parse(body), Err(shinu::Error::Invalid(_))),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
     }
 
     #[test]
@@ -10791,6 +11101,7 @@ esac
             &ctx,
             Req::RmCkpt {
                 ckpt: checkpoint_id,
+                detach: false,
             },
             "project-a",
         );
@@ -10798,6 +11109,16 @@ esac
             result,
             Err(shinu::Error::NotFound(message)) if message.contains(&checkpoint_id.to_string())
         ));
+        // Detaching never widens visibility across projects.
+        let detached = handle(
+            &ctx,
+            Req::RmCkpt {
+                ckpt: checkpoint_id,
+                detach: true,
+            },
+            "project-a",
+        );
+        assert!(matches!(detached, Err(shinu::Error::NotFound(_))));
         std::fs::remove_dir_all(root).expect("remove test root");
     }
 

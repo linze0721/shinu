@@ -14,7 +14,8 @@ pub use shinu_core::{
 pub use shinu_crypto::{auth, sha256_hex, token};
 
 pub use shinu_store::{
-    find, find_ckpt, is_referenced, log_chain, quota, reflog_entries, registry, state,
+    blocking_references, detach_children, find, find_ckpt, is_referenced, log_chain, quota,
+    reflog_entries, registry, state,
 };
 
 pub use shinu_image::{BaseConfig, ensure_assets, ensure_base, repair_base_resolv};

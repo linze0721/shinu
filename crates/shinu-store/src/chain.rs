@@ -72,12 +72,13 @@ pub fn reflog_entries<'a>(st: &'a state::State, space: &state::Space) -> Vec<&'a
     entries
 }
 
+fn short_id(id: Uuid) -> String {
+    let text = id.simple().to_string();
+    text[..8].to_owned()
+}
+
 /// Returns the names or short ids that keep a commit reachable.
 pub fn is_referenced(st: &state::State, ckpt: Uuid) -> Vec<String> {
-    let short_id = |id: Uuid| {
-        let text = id.simple().to_string();
-        text[..8].to_owned()
-    };
     let mut references = Vec::new();
     for space in &st.spaces {
         // A space that both derives from a commit and still points its head at
@@ -100,9 +101,51 @@ pub fn is_referenced(st: &state::State, ckpt: Uuid) -> Vec<String> {
     references
 }
 
+/// Returns the references that still need a commit's bytes: a space head, a
+/// template, or a diff checkpoint's memory base. `parent` edges are lineage
+/// only and are left out, so a detaching delete can clear them instead.
+pub fn blocking_references(st: &state::State, ckpt: Uuid) -> Vec<String> {
+    let mut references = Vec::new();
+    for space in &st.spaces {
+        if space.head == Some(ckpt) {
+            references.push(space.name.clone());
+        }
+    }
+    for template in &st.templates {
+        if template.checkpoint == ckpt {
+            references.push(template.name.clone());
+        }
+    }
+    for other in &st.ckpts {
+        if other.id != ckpt && other.base == Some(ckpt) {
+            references.push(short_id(other.id));
+        }
+    }
+    references
+}
+
+/// Clears every space and other checkpoint `parent` edge that points at a
+/// commit and returns the detached names or short ids.
+pub fn detach_children(st: &mut state::State, ckpt: Uuid) -> Vec<String> {
+    let mut detached = Vec::new();
+    for space in &mut st.spaces {
+        if space.parent == Some(ckpt) {
+            space.parent = None;
+            detached.push(space.name.clone());
+        }
+    }
+    for other in &mut st.ckpts {
+        if other.id != ckpt && other.parent == Some(ckpt) {
+            other.parent = None;
+            detached.push(short_id(other.id));
+        }
+    }
+    detached
+}
+
 #[cfg(test)]
 mod chain_tests {
-    use super::{is_referenced, log_chain, reflog_entries};
+    use super::{blocking_references, detach_children, is_referenced, log_chain, reflog_entries};
     use crate::state::{Ckpt, Space, State};
     use chrono::{TimeZone, Utc};
     use uuid::Uuid;
@@ -320,5 +363,45 @@ mod chain_tests {
         assert!(references.contains(&"checked-out".to_owned()));
         assert!(references.contains(&"20000000".to_owned()));
         assert!(references.contains(&"release".to_owned()));
+    }
+
+    #[test]
+    fn detach_splits_lineage_from_blocking_references() {
+        let target = id(0x1000_0000_0000_0000_0000_0000_0000_0001);
+        let child = id(0x2000_0000_0000_0000_0000_0000_0000_0002);
+        let diff = id(0x3000_0000_0000_0000_0000_0000_0000_0003);
+        let mut state = State {
+            spaces: vec![
+                space(id(41), "derived", Some(target), None),
+                space(id(42), "checked-out", None, Some(target)),
+            ],
+            ckpts: vec![
+                ckpt(target, id(43), None),
+                ckpt(child, id(43), Some(target)),
+                {
+                    let mut entry = ckpt(diff, id(43), None);
+                    entry.base = Some(target);
+                    entry
+                },
+            ],
+            templates: Vec::new(),
+        };
+
+        assert_eq!(
+            blocking_references(&state, target),
+            vec!["checked-out".to_owned(), "30000000".to_owned()]
+        );
+        assert_eq!(
+            detach_children(&mut state, target),
+            vec!["derived".to_owned(), "20000000".to_owned()]
+        );
+        assert_eq!(state.spaces[0].parent, None);
+        assert_eq!(state.spaces[1].head, Some(target));
+        assert_eq!(state.ckpts[1].parent, None);
+        assert_eq!(state.ckpts[2].base, Some(target));
+        assert_eq!(
+            is_referenced(&state, target),
+            vec!["checked-out".to_owned(), "30000000".to_owned()]
+        );
     }
 }

@@ -15,6 +15,7 @@ Changes are recorded in the Keep a Changelog format.
 - Per-project quotas, usage metering, and API rate limiting.
 - An MCP server and web console.
 - A VNC desktop bridge, guest HTTP proxying, and named networks.
+- `shinu rmckpt --detach` (`DELETE /v1/commits/{id}` with `{"detach":true}`) deletes a commit that other spaces or commits only name as `parent`, clearing those lineage links; space heads, templates, and diff memory bases still refuse.
 
 ### Fixed
 

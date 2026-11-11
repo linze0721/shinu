@@ -77,8 +77,12 @@ pub enum Req {
         space: String,
     },
     /// Removes one project-scoped commit when no space or commit derives from it.
+    /// With `detach`, space and checkpoint `parent` edges to it are cleared
+    /// instead of refusing; space heads, templates, and memory bases still refuse.
     RmCkpt {
         ckpt: Uuid,
+        #[serde(default)]
+        detach: bool,
     },
     Ls,
     /// Starts the space's VM if it is not running and reports whether it booted.

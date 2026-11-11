@@ -175,6 +175,9 @@ enum Command {
     #[command(name = "rmckpt")]
     RmCkpt {
         commit: Uuid,
+        /// Clear space and checkpoint parent links to this commit instead of refusing.
+        #[arg(long)]
+        detach: bool,
     },
     Gc {
         #[arg(long)]
@@ -1295,14 +1298,19 @@ fi"#
             )?)?;
             println!("expires_at: {}", expiry_text(data.get("expires_at")));
         }
-        Command::RmCkpt { commit } => {
+        Command::RmCkpt { commit, detach } => {
             let data = response_value(request_json(
                 client,
                 "DELETE",
                 &format!("/v1/commits/{commit}"),
-                None,
+                detach.then(|| json!({ "detach": true })),
             )?)?;
             println!("removed {}", field_text(&data, "removed"));
+            if let Some(detached) = data.get("detached").and_then(Value::as_array) {
+                for child in detached {
+                    println!("detached {}", child.as_str().unwrap_or_default());
+                }
+            }
         }
         Command::Gc {
             free_below,
@@ -2372,6 +2380,16 @@ mod tests {
             }
             _ => panic!("unexpected command parsed"),
         }
+    }
+
+    #[test]
+    fn parses_rmckpt_detach_flag() {
+        let commit = "00000000-0000-0000-0000-00000000002a";
+        let cli = Cli::try_parse_from(["shinu", "rmckpt", commit]).expect("parse rmckpt");
+        assert!(matches!(cli.command, Command::RmCkpt { detach: false, .. }));
+        let cli = Cli::try_parse_from(["shinu", "rmckpt", "--detach", commit])
+            .expect("parse rmckpt --detach");
+        assert!(matches!(cli.command, Command::RmCkpt { detach: true, .. }));
     }
 
     #[test]

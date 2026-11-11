@@ -125,7 +125,7 @@ Runtime layout (`crates/shinu-core/src/lib.rs:359-374` `init_layout`):
 ```sh
 cargo build                          # debug build
 cargo build --release                # release build expected by packaging/install.sh
-cargo test --workspace               # run full cargo workspace test suite (328 tests across 20 suites)
+cargo test --workspace               # run full cargo workspace test suite (334 tests across 20 suites)
 cargo clippy --all-targets           # check for lint issues against workspace posture
 cargo fmt --check                    # check formatting
 ```
@@ -181,6 +181,7 @@ shinu lease web --clear              # clear a space lease
 shinu stop web                       # stop microVM
 shinu rm web                         # delete space
 shinu rmckpt <commit-uuid>           # delete commit (refused if referenced)
+shinu rmckpt --detach <commit-uuid>  # delete commit, clearing parent links; heads/templates/bases still refuse
 shinu gc --free-below 10737418240    # run garbage collection
 shinu usage                          # show project resource usage summary
 shinu limits                         # show project resource quota limits
@@ -239,7 +240,7 @@ CLI Subcommand Surface (`src/bin/shinu.rs:33-177`):
 - `diff <source> [target] [--all] [--limit <n>]`
 - `checkout <space> <commit-uuid>`
 - `fork <commit-uuid> <name> [--ttl <duration>]`
-- `rmckpt <commit-uuid>`
+- `rmckpt [--detach] <commit-uuid>`
 - `template create <name> <checkpoint-uuid>`
 - `template ls`
 - `template rm <name>`
@@ -343,7 +344,7 @@ CLI Subcommand Surface (`src/bin/shinu.rs:33-177`):
 
 ## Testing & QA
 
-- Total test count: **328 tests across 20 suites**.
+- Total test count: **334 tests across 20 suites**.
 - **Test Execution Environment**:
   - Tests run via built-in `cargo test --workspace`.
   - Tests are hermetic: they run against temporary directories created via `std::env::temp_dir()`, use `NetConfig { enabled: false, .. }`, do not spawn real Firecracker VMs or Jailer sandboxes, do not perform btrfs reflink operations, and do not require root privileges.
@@ -373,7 +374,7 @@ CLI Subcommand Surface (`src/bin/shinu.rs:33-177`):
 8. **Atomically Claim Before Disk File Deletion** — State updates and record removals during deletions/GC must be completed inside the state lock before unlinking files from disk to prevent dangling references or race conditions.
 9. **Reflink or Fail** — Space and commit creation must use `cp --reflink=always`. Never fall back to plain file copy on non-CoW filesystems.
 10. **Reflog Preserves Explicit Commits** — Automatic cleanup (`gc`) or checkout reflogs must never auto-delete explicit user commits (`auto: false`).
-11. **DAG Integrity via Multi-Edge Check** — `is_referenced` MUST check `space.parent`, `space.head`, every commit's `ckpt.parent`, and also the dirty memory base `ckpt.base`. Deleting a commit with child dependencies breaks history chains.
+11. **DAG Integrity via Multi-Edge Check** — `is_referenced` MUST check `space.parent`, `space.head`, every commit's `ckpt.parent`, and also the dirty memory base `ckpt.base`. Deleting a commit with child dependencies breaks history chains. The opt-in `rmckpt --detach` (`{"detach":true}`) is the only exception: it refuses on `blocking_references` (`space.head`, template `checkpoint`, `ckpt.base`, which still read the bytes) and clears `parent` edges via `detach_children` inside the same state claim, because each checkpoint image is an independent reflink and `parent` is lineage only.
 12. **State Migration Preserves User Data** — SQLite migration (`migrate_from_json`) MUST NOT delete `state.json`. It renames `state.json` to `state.json.migrated` after successful insertion.
 13. **Binary Placement** — `shinu-vsock` MUST reside in the same directory as `shinu` (`current_exe()` resolution in `vsock_helper`).
 14. **SSH-Banner Readiness Over Vsock** — `wait_ready` checks for VM boot readiness by connecting to vsock port 2222, executing the handshake, and verifying both the `OK ` vsock bridge response and the `SSH-` daemon banner. The vsock CONNECT handshake alone is insufficient.

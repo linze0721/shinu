@@ -159,6 +159,8 @@ shinu network backend-lan
 
 # Delete an unreferenced commit (template references count as references)
 shinu rmckpt <commit-uuid>
+# Delete a commit and clear space/commit parent links to it; heads, templates, and memory bases still refuse
+shinu rmckpt --detach <commit-uuid>
 
 # Stop VM and flush disk writes
 shinu stop web
@@ -377,7 +379,7 @@ All API routes require authentication header: `Authorization: Bearer <token>`.
 | `GET` | `/v1/spaces/{name}/diff` | `?from=<id>&to=<id>&all=1&limit=N` | `200 OK` `{"entries":[...]}` | File tree diff comparing space HEAD or commits |
 | `POST` | `/v1/spaces/{name}/checkout` | `{"commit":"<id>"}` | `200 OK` `{"head":"...","auto_commit":"..."}` | Rewind space to commit (auto-commits state first) |
 | `POST` | `/v1/commits/{id}/fork` | `{"name":"web2","ttl_seconds":3600}` | `201 Created` | Fork space from existing commit with optional `ttl_seconds` |
-| `DELETE` | `/v1/commits/{id}` | — | `200 OK` `{"removed":"..."}` | Delete unreferenced commit |
+| `DELETE` | `/v1/commits/{id}` | — or `{"detach":true}` | `200 OK` `{"removed":"..."}` (with `detach`: plus `"detached":[...]`) | Delete unreferenced commit; `detach` clears lineage-only `parent` links instead of refusing |
 | `GET` | `/v1/images` | — | `200 OK` `{"images":[...]}` | List available guest images |
 | `GET` | `/v1/usage[?from=&to=]` | — | `200 OK` | Query usage summary metrics for project |
 | `GET` | `/v1/limits` | — | `200 OK` | Query project quota limits and current resource usage |
@@ -491,7 +493,7 @@ Shinu implements explicit version control semantics over guest ext4 image states
   - **Auto-Degradation & Cap**: `SHINU_FULL_EVERY` caps how many diffs may hang off one full base on the auto path. On exceeding the cap, the next auto commit becomes a new full base. The cap governs the auto path only; an explicit `--diff` bypasses it and errors only when no valid base exists. Auto-degradation only moves Full to Diff, never Diff to Full. Measured live: first Full 1.0 GiB exclusive, next degraded Diff 8.4 MiB (restored correctly). With `SHINU_FULL_EVERY=2`, the observed chain was c1 to the prior base, c2 promoted to a new base, then c3 and c4 hanging off c2. Note: diff size tracks guest activity rather than a fixed ratio; diffs taken after heavy guest memory activity measured 745 MiB to 1002 MiB in testing.
   - **Snapshot Format Version**: `snapshot_version` records the Firecracker snapshot data format version the guest memory state was captured with (`10.0.0` for the pinned v1.16.1 binaries). It is `null` for disk-only commits and for commits written before the field existed. Restoring a memory-carrying commit whose recorded version differs from the running binary is refused with **400 Bad Request** naming both versions; the commit's files are left on disk and its disk image stays usable.
   - **Memory Snapshot Credentials**: Full and diff commits archive the source SSH private key as `<root>/ckpts/<id>.key` and public key as `<id>.pub`, both mode `0600`. These survive mutable Space/lease cleanup and are unlinked with checkpoint assets by `rmckpt` and GC. A memory fork prefers archived credentials, then a surviving source keypair, and returns a clear **400 Bad Request** if neither remains; disk-only forks still install a fresh keypair.
-  - **Commit Deletion Guard**: A commit checkpoint cannot be deleted via `rmckpt` (or `DELETE /v1/commits/{id}`) if it is currently referenced as a parent of any space or checkpoint, as a `base` for any diff checkpoint, or as the target of a template reference.
+  - **Commit Deletion Guard**: A commit checkpoint cannot be deleted via `rmckpt` (or `DELETE /v1/commits/{id}`) if it is currently referenced as a parent of any space or checkpoint, as a `base` for any diff checkpoint, or as the target of a template reference. `rmckpt --detach` (body `{"detach":true}`) treats `parent` edges as lineage only: every checkpoint image is an independent reflink, so it clears those edges and deletes the commit, while a space `head`, a template, or a diff `base` still refuses.
   - **File Tree Diff (`shinu diff`)**: Entirely distinct from memory/diff snapshots, this is a *filesystem tree comparison* between loop-mounted read-only guest ext4 images. By default, it ignores standard guest runtime churn directories (such as `/dev`, `/proc`, `/run`, `/sys`, `/tmp`, `/var/log`, `/etc/machine-id`, `/etc/ssh/ssh_host_*`).
 - **`Template {name, checkpoint, created_at}`**: An immutable project-scoped reference to a concrete checkpoint UUID. `name` is 1–64 chars matching `[a-z0-9-]`; retained references are capped at 256 per project and 2048 globally, with list results bounded to 256 for the project. Creation over either cap returns 429. Duplicate or invalid names return 400, and missing or foreign checkpoint targets return 404.
   - `template fork` resolves the stored checkpoint UUID and creates a new `Space` with both `parent` and `head` set to that UUID; optional `ttl_seconds` applies to the destination. The source Space need not exist.
@@ -509,6 +511,7 @@ Shinu implements explicit version control semantics over guest ext4 image states
   - Resolves each sizing field from the checkpoint first, then a surviving same-project source Space, then the checkpoint image's logical size for disk or `SHINU_VCPUS` / `SHINU_MEM_MIB` defaults for CPU/memory. Missing source Space rows do not prevent fork; foreign checkpoints still return 404. Image kind and network metadata are inherited only while the source Space exists; otherwise the destination uses `void` metadata and no named network (the checkpoint disk contents are unchanged).
 - **`rmckpt` (`DELETE /v1/commits/{id}`)**:
   - Refuses deletion if the commit is currently referenced by any space's `parent`, any space's `head`, any other commit's `parent`, any other commit's `base`, or any template's `checkpoint` (`is_referenced` check). GC applies the same reference guard and removes only eligible checkpoint files.
+  - With `{"detach":true}` (`shinu rmckpt --detach`), only a space `head`, a template `checkpoint`, or another commit's `base` refuses, and the error lists just those. Otherwise every space and commit `parent` equal to the id is set to `null` in the same state claim, the row is removed, files are unlinked, and the response is `{"removed":"<id>","detached":["<space names or short commit ids>"]}`. Any other body field or a non-boolean `detach` returns **400 Bad Request**.
 ---
 
 ## Configuration

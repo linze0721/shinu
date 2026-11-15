@@ -1183,6 +1183,8 @@ pub fn start(
         return Ok((vsock, false));
     }
 
+    let memory_limit_bytes = crate::config::jailer_memory_limit_bytes(mem_mib)?;
+
     let image = shinu_core::space_image(root, id);
     if !image.exists() {
         return Err(Error::NotFound(format!("space image: {}", image.display())));
@@ -1267,7 +1269,7 @@ pub fn start(
         // the jailer a detached process while its child becomes the
         // Firecracker process we identify below.
         let log = std::fs::File::create(dir.join("console.log"))?;
-        let memory_limit = format!("memory.max={mem_mib}M");
+        let memory_limit = format!("memory.max={memory_limit_bytes}");
         let jailer = shinu_core::jailer_bin(root);
         let firecracker = shinu_core::firecracker_bin(root);
         let mut command = std::process::Command::new("setsid");
@@ -1664,9 +1666,15 @@ pub fn stop_with_peers(dir: &Path, cfg: &NetConfig, peers: &[String]) -> Result<
 /// writeback has settled; the reclaim marker avoids rescanning unchanged
 /// images. A missing `last_used` is treated as just used so a fresh VM is not
 /// reaped before its first command.
-pub fn sweep_idle(root: &Path, idle_secs: u64, cfg: &NetConfig) -> Result<Vec<PathBuf>> {
+pub fn sweep_idle(
+    root: &Path,
+    vm_cfg: &VmConfig,
+    cfg: &NetConfig,
+    space_lock: impl Fn(Uuid) -> std::sync::Arc<std::sync::Mutex<()>>,
+) -> Result<Vec<PathBuf>> {
     // Leave page-cache and working-set headroom for the next guest command.
     const KEEP_MIB: u64 = 128;
+    let idle_secs = vm_cfg.idle_secs;
     let mut stopped = Vec::new();
     let vm_root = root.join("vm");
     let entries = match std::fs::read_dir(&vm_root) {
@@ -1677,8 +1685,19 @@ pub fn sweep_idle(root: &Path, idle_secs: u64, cfg: &NetConfig) -> Result<Vec<Pa
     let now = now_secs();
     for entry in entries.flatten() {
         let dir = entry.path();
+        let Ok(id) = dir_id(&dir) else {
+            continue;
+        };
+        // Share the request handlers' lifecycle lock. A stopped-image check
+        // must remain true until e2fsck/discard has finished, not race a boot.
+        let lock = space_lock(id);
+        let _guard = match lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => continue,
+        };
         if !is_running(&dir) {
-            if let Ok(id) = dir_id(&dir) {
+            if vm_cfg.idle_reclaim {
                 reclaim_stopped_image(root, &dir, id);
             }
             continue;
@@ -1713,6 +1732,7 @@ mod jail_tests {
     struct JailEnv {
         uid: Option<OsString>,
         gid: Option<OsString>,
+        idle_reclaim: Option<OsString>,
     }
 
     impl JailEnv {
@@ -1720,6 +1740,7 @@ mod jail_tests {
             Self {
                 uid: std::env::var_os("SHINU_JAIL_UID"),
                 gid: std::env::var_os("SHINU_JAIL_GID"),
+                idle_reclaim: std::env::var_os("SHINU_IDLE_RECLAIM"),
             }
         }
     }
@@ -1734,6 +1755,10 @@ mod jail_tests {
                 match &self.gid {
                     Some(value) => std::env::set_var("SHINU_JAIL_GID", value),
                     None => std::env::remove_var("SHINU_JAIL_GID"),
+                }
+                match &self.idle_reclaim {
+                    Some(value) => std::env::set_var("SHINU_IDLE_RECLAIM", value),
+                    None => std::env::remove_var("SHINU_IDLE_RECLAIM"),
                 }
             }
         }
@@ -1776,8 +1801,9 @@ mod jail_tests {
         unsafe {
             std::env::remove_var("SHINU_JAIL_UID");
             std::env::remove_var("SHINU_JAIL_GID");
+            std::env::remove_var("SHINU_IDLE_RECLAIM");
         }
-        let config = VmConfig::from_env();
+        let config = VmConfig::from_env().expect("valid VM config");
         assert_eq!(config.jail_uid, 30_000);
         assert_eq!(config.jail_gid, 30_000);
     }
@@ -1789,10 +1815,48 @@ mod jail_tests {
         unsafe {
             std::env::set_var("SHINU_JAIL_UID", "40123");
             std::env::set_var("SHINU_JAIL_GID", "40124");
+            std::env::remove_var("SHINU_IDLE_RECLAIM");
         }
-        let config = VmConfig::from_env();
+        let config = VmConfig::from_env().expect("valid VM config");
         assert_eq!(config.jail_uid, 40_123);
         assert_eq!(config.jail_gid, 40_124);
+    }
+
+    #[test]
+    fn idle_reclaim_configuration_defaults_on_and_accepts_boolean_override() {
+        let _lock = ENV_LOCK.lock().expect("jail env lock");
+        let _env = JailEnv::capture();
+        unsafe { std::env::remove_var("SHINU_IDLE_RECLAIM") };
+        assert!(VmConfig::from_env().expect("default config").idle_reclaim);
+        for (value, expected) in [
+            ("0", false),
+            (" false ", false),
+            ("1", true),
+            ("TRUE", true),
+        ] {
+            unsafe { std::env::set_var("SHINU_IDLE_RECLAIM", value) };
+            assert_eq!(
+                VmConfig::from_env().expect("boolean config").idle_reclaim,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn idle_reclaim_configuration_rejects_invalid_startup_values() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let _lock = ENV_LOCK.lock().expect("jail env lock");
+        let _env = JailEnv::capture();
+        for value in ["", " ", "2", "-1", "disabled"] {
+            unsafe { std::env::set_var("SHINU_IDLE_RECLAIM", value) };
+            let error = VmConfig::from_env().expect_err("invalid reclaim config");
+            assert!(error.to_string().contains("SHINU_IDLE_RECLAIM"));
+        }
+        unsafe {
+            std::env::set_var("SHINU_IDLE_RECLAIM", OsString::from_vec(vec![0xff]));
+        }
+        assert!(VmConfig::from_env().is_err());
     }
 }
 #[cfg(test)]
@@ -1828,7 +1892,7 @@ mod asset_validation_tests {
 #[cfg(test)]
 mod reclaim_tests {
     use super::{e2fsck_ok, reclaim_due, reclaim_image, sweep_idle};
-    use crate::NetConfig;
+    use crate::{NetConfig, VmConfig};
     use shinu_core::{space_image, vm_dir};
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
@@ -1881,10 +1945,64 @@ mod reclaim_tests {
             allow: Vec::new(),
             host_allow: Vec::new(),
         };
-        let stopped = sweep_idle(&root, 0, &config).expect("sweep ignores reclaim errors");
+        let vm_config = VmConfig {
+            vcpus: 1,
+            mem_mib: 128,
+            idle_secs: 0,
+            idle_reclaim: true,
+            jail_uid: 30000,
+            jail_gid: 30000,
+        };
+        let lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let stopped = sweep_idle(&root, &vm_config, &config, |_| lock.clone())
+            .expect("sweep ignores reclaim errors");
 
         assert!(stopped.is_empty());
         std::fs::remove_dir_all(root).expect("test fixture cleanup");
+    }
+
+    #[test]
+    fn idle_reclaim_sweep_skips_an_inflight_lifecycle_operation() {
+        let root = std::env::temp_dir().join(format!("shinu-sweep-lock-{}", Uuid::new_v4()));
+        let id = Uuid::from_u128(0x5678);
+        std::fs::create_dir_all(vm_dir(&root, id)).expect("VM fixture");
+        let vm_config = VmConfig {
+            vcpus: 1,
+            mem_mib: 128,
+            idle_secs: 0,
+            idle_reclaim: false,
+            jail_uid: 30000,
+            jail_gid: 30000,
+        };
+        let config = NetConfig {
+            enabled: false,
+            base: [172, 31],
+            uplink: String::new(),
+            allow: Vec::new(),
+            host_allow: Vec::new(),
+        };
+        let lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let guard = lock.lock().expect("lifecycle lock");
+        let sweep_lock = lock.clone();
+        let sweep_root = root.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = sweep_idle(&sweep_root, &vm_config, &config, |found| {
+                assert_eq!(found, id);
+                sweep_lock.clone()
+            });
+            send.send(result).expect("send sweep result");
+        });
+        let result = receive.recv_timeout(std::time::Duration::from_secs(1));
+        drop(guard);
+        worker.join().expect("sweep worker");
+        assert!(
+            result
+                .expect("busy space must be skipped")
+                .expect("sweep")
+                .is_empty()
+        );
+        std::fs::remove_dir_all(root).expect("fixture cleanup");
     }
 }
 #[cfg(test)]

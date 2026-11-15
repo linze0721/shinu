@@ -15,5 +15,15 @@ Changes are recorded in the Keep a Changelog format.
 - Per-project quotas, usage metering, and API rate limiting.
 - An MCP server and web console.
 - A VNC desktop bridge, guest HTTP proxying, and named networks.
+- `shinu rmckpt --detach` (`DELETE /v1/commits/{id}` with `{"detach":true}`) deletes a commit that other spaces or commits only name as `parent`, clearing those lineage links; space heads, templates, and diff memory bases still refuse.
+- Opt-in exclusive-byte quota reservations, persisted per-space write caps with sweep enforcement, and `shinu compact` for stopped-image trim followed by Btrfs zstd recompression.
+
+### Fixed
+
+- Give jailed Firecracker processes a fixed 512 MiB host-memory allowance above guest RAM, configurable with `SHINU_VMM_OVERHEAD_MIB`, without changing guest sizing or project quotas. Invalid settings and MiB addition overflow reject new launches before jail or TAP setup.
+- Make automatic stopped-image repair/discard opt-out via startup-validated `SHINU_IDLE_RECLAIM=0`, and serialize idle reclamation with the same per-space lifecycle lock used by boot, stop, and checkpoint handlers.
+- Preserve checkpoint CPU, memory, and disk sizing with an idempotent legacy SQLite backfill; checkpoint and template forks no longer require the source Space row.
+- Retain full/diff snapshot SSH credentials with checkpoint assets so source Space or lease cleanup does not strand memory forks; remove archived keys with checkpoint GC/deletion.
+- Bound detached jobs by `SHINU_JOB_MAX_SECS` (default 3600 seconds, 0 disables the cap) and the host Space lease, reusing normal cancellation and final-log archival with a deadline-specific error.
 
 [Unreleased]: https://github.com/linze0721/shinu/compare/main...HEAD

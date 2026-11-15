@@ -170,6 +170,111 @@ pub mod btrfs {
         parse_du(&stdout)
     }
 
+    fn host_command(program: &str, args: &[&str]) -> crate::Result<std::process::Output> {
+        let output = std::process::Command::new(program)
+            .env("LC_ALL", "C")
+            .args(args)
+            .output()?;
+        if output.status.success() {
+            return Ok(output);
+        }
+        Err(crate::Error::Internal(format!(
+            "{program} failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
+    }
+
+    struct CompactMount<'a> {
+        mount: &'a Path,
+        device: String,
+        mounted: bool,
+    }
+
+    impl CompactMount<'_> {
+        fn close(&mut self) -> crate::Result<()> {
+            if self.mounted {
+                host_command("umount", &[s(self.mount)?])?;
+                self.mounted = false;
+            }
+            if !self.device.is_empty() {
+                host_command("losetup", &["--detach", &self.device])?;
+                self.device.clear();
+            }
+            std::fs::remove_dir(self.mount)?;
+            Ok(())
+        }
+    }
+
+    impl Drop for CompactMount<'_> {
+        fn drop(&mut self) {
+            // Retry only outstanding cleanup. Never detach a mounted loop.
+            if (self.mounted || !self.device.is_empty() || self.mount.exists())
+                && let Err(error) = self.close()
+            {
+                eprintln!("compact cleanup {}: {error}", self.mount.display());
+            }
+        }
+    }
+
+    /// Trim ext4 through a writable discard-capable loop, then recompress.
+    /// The caller must serialize image lifecycle and reject running guests.
+    /// Defragmentation breaks reflink sharing: publish only after compaction.
+    pub fn compact(image: &Path, mount: &Path) -> crate::Result<u64> {
+        use std::os::unix::fs::DirBuilderExt;
+        // Validate both paths before allocating host resources.
+        let image_text = s(image)?;
+        let mount_text = s(mount)?;
+        std::fs::DirBuilder::new().mode(0o700).create(mount)?;
+        let mut mounted = CompactMount {
+            mount,
+            device: String::new(),
+            mounted: false,
+        };
+        let loop_output = host_command("losetup", &["--find", "--show", image_text])?;
+        mounted.device = String::from_utf8(loop_output.stdout)
+            .map_err(|error| crate::Error::Internal(format!("invalid loop device: {error}")))?;
+        mounted.device.truncate(mounted.device.trim_end().len());
+        if !mounted.device.starts_with("/dev/loop") || mounted.device.contains(char::is_whitespace)
+        {
+            return Err(crate::Error::Internal(
+                "losetup returned an invalid device path".into(),
+            ));
+        }
+        host_command(
+            "mount",
+            &[
+                "-t",
+                "ext4",
+                "-o",
+                "rw,nosuid,nodev,noexec",
+                &mounted.device,
+                mount_text,
+            ],
+        )?;
+        mounted.mounted = true;
+        let output = host_command("fstrim", &["--verbose", mount_text])?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut previous = "";
+        let mut trimmed = None;
+        for word in stdout.split_whitespace() {
+            if word.trim_end_matches(')') == "bytes" {
+                trimmed = previous.trim_start_matches('(').parse::<u64>().ok();
+                break;
+            }
+            previous = word;
+        }
+        let trimmed = trimmed.ok_or_else(|| {
+            crate::Error::Internal(format!("invalid fstrim byte count: {stdout}"))
+        })?;
+        mounted.close()?;
+        // PUNCH_HOLE can inhibit compression of subsequent writes; force an
+        // explicit rewrite only after trim has completed and ext4 is unmounted.
+        run(&["filesystem", "defragment", "-czstd", "-f", image_text])?;
+        std::fs::File::open(image)?.sync_all()?;
+        Ok(trimmed)
+    }
+
     fn parse_du(out: &str) -> crate::Result<u64> {
         let line = out
             .lines()
@@ -328,6 +433,11 @@ pub fn ckpt_mem(root: &Path, id: Uuid) -> PathBuf {
 
 pub fn ckpt_state(root: &Path, id: Uuid) -> PathBuf {
     ckpt_path(root, id, "state")
+}
+
+/// SSH private key retained with a memory checkpoint; `.pub` holds its public key.
+pub fn ckpt_key(root: &Path, id: Uuid) -> PathBuf {
+    ckpt_path(root, id, "key")
 }
 
 /// `<root>/assets` — the firecracker binary and the guest kernel.

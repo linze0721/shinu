@@ -82,6 +82,12 @@ enum Command {
     Stop {
         space: String,
     },
+    /// Reclaim deleted ext4 blocks and recompress a stopped space image.
+    Compact {
+        space: String,
+        #[arg(long)]
+        json: bool,
+    },
     Desktop {
         space: String,
     },
@@ -158,6 +164,8 @@ enum Command {
         name: String,
         #[arg(long, value_name = "DURATION", value_parser = parse_ttl_duration)]
         ttl: Option<u64>,
+        #[arg(long, value_name = "MIB")]
+        write_cap_mib: Option<u64>,
     },
     #[command(group(
         clap::ArgGroup::new("lease-options")
@@ -175,6 +183,9 @@ enum Command {
     #[command(name = "rmckpt")]
     RmCkpt {
         commit: Uuid,
+        /// Clear space and checkpoint parent links to this commit instead of refusing.
+        #[arg(long)]
+        detach: bool,
     },
     Gc {
         #[arg(long)]
@@ -1277,14 +1288,46 @@ fi"#
                 short_id_value(data.get("auto_commit"))
             );
         }
-        Command::Fork { commit, name, ttl } => {
+        Command::Fork {
+            commit,
+            name,
+            ttl,
+            write_cap_mib,
+        } => {
             let data = response_value(request_json(
                 client,
                 "POST",
                 &format!("/v1/commits/{commit}/fork"),
-                Some(fork_space_body(&name, ttl)),
+                Some({
+                    let mut body = fork_space_body(&name, ttl);
+                    if let Some(cap) = write_cap_mib {
+                        body["write_cap_mib"] = json!(cap);
+                    }
+                    body
+                }),
             )?)?;
             print_space_summary(&data);
+        }
+        Command::Compact { space, json } => {
+            let response = request_json(
+                client,
+                "POST",
+                &format!("/v1/spaces/{}/compact", encode_path_segment(&space)),
+                None,
+            )?;
+            let body = successful_body(response)?;
+            if json {
+                print_raw_json(&body)?;
+            } else {
+                let data = response_value_from_body(&body)?;
+                println!(
+                    "compacted {space}: {} → {} bytes ({} bytes trimmed, {} ms)",
+                    data["physical_before_bytes"],
+                    data["physical_after_bytes"],
+                    data["trimmed_bytes"],
+                    data["elapsed_ms"]
+                );
+            }
         }
         Command::Lease { space, ttl, clear } => {
             let data = response_value(request_json(
@@ -1295,14 +1338,19 @@ fi"#
             )?)?;
             println!("expires_at: {}", expiry_text(data.get("expires_at")));
         }
-        Command::RmCkpt { commit } => {
+        Command::RmCkpt { commit, detach } => {
             let data = response_value(request_json(
                 client,
                 "DELETE",
                 &format!("/v1/commits/{commit}"),
-                None,
+                detach.then(|| json!({ "detach": true })),
             )?)?;
             println!("removed {}", field_text(&data, "removed"));
+            if let Some(detached) = data.get("detached").and_then(Value::as_array) {
+                for child in detached {
+                    println!("detached {}", child.as_str().unwrap_or_default());
+                }
+            }
         }
         Command::Gc {
             free_below,
@@ -2348,6 +2396,39 @@ mod tests {
     }
 
     #[test]
+    fn fork_write_cap_accepts_zero_and_compact_accepts_json() {
+        let cli = Cli::try_parse_from([
+            "shinu",
+            "fork",
+            "00000000-0000-0000-0000-000000000000",
+            "candidate",
+            "--write-cap-mib",
+            "0",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Fork {
+                write_cap_mib: Some(0),
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from(["shinu", "compact", "candidate", "--json"]).unwrap();
+        assert!(matches!(cli.command, Command::Compact { json: true, .. }));
+        assert!(
+            Cli::try_parse_from([
+                "shinu",
+                "fork",
+                "00000000-0000-0000-0000-000000000000",
+                "bad",
+                "--write-cap-mib",
+                "-1"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn lease_requires_exactly_one_ttl_or_clear_flag() {
         assert!(Cli::try_parse_from(["shinu", "lease", "dev"]).is_err());
         assert!(Cli::try_parse_from(["shinu", "lease", "dev", "--ttl", "1m", "--clear"]).is_err());
@@ -2372,6 +2453,16 @@ mod tests {
             }
             _ => panic!("unexpected command parsed"),
         }
+    }
+
+    #[test]
+    fn parses_rmckpt_detach_flag() {
+        let commit = "00000000-0000-0000-0000-00000000002a";
+        let cli = Cli::try_parse_from(["shinu", "rmckpt", commit]).expect("parse rmckpt");
+        assert!(matches!(cli.command, Command::RmCkpt { detach: false, .. }));
+        let cli = Cli::try_parse_from(["shinu", "rmckpt", "--detach", commit])
+            .expect("parse rmckpt --detach");
+        assert!(matches!(cli.command, Command::RmCkpt { detach: true, .. }));
     }
 
     #[test]

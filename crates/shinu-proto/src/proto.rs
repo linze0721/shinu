@@ -39,6 +39,9 @@ pub enum Req {
         /// Positive lifetime in seconds; omitted or null means no expiry.
         #[serde(default)]
         ttl_seconds: Option<u64>,
+        /// Omitted uses the daemon default; zero explicitly disables the cap.
+        #[serde(default)]
+        write_cap_mib: Option<u64>,
     },
     /// `hot: true` syncs a running guest without remounting read-only and
     /// is not crash-consistent; `hot: false` requires the space to be stopped.
@@ -77,8 +80,12 @@ pub enum Req {
         space: String,
     },
     /// Removes one project-scoped commit when no space or commit derives from it.
+    /// With `detach`, space and checkpoint `parent` edges to it are cleared
+    /// instead of refusing; space heads, templates, and memory bases still refuse.
     RmCkpt {
         ckpt: Uuid,
+        #[serde(default)]
+        detach: bool,
     },
     Ls,
     /// Starts the space's VM if it is not running and reports whether it booted.
@@ -87,6 +94,10 @@ pub enum Req {
     },
     /// Shuts the space's VM down. Idempotent.
     Stop {
+        space: String,
+    },
+    /// Offline hole reclamation and Btrfs recompression of a stopped space.
+    Compact {
         space: String,
     },
     /// Executes a command in the guest. Without `session`, each request is stateless;

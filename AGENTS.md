@@ -52,7 +52,7 @@ graph TD
 
 - **State Storage & Indexing** — SQLite in WAL mode (`<root>/shinu.db`, mode `0600`) manages state. Database schema (`crates/shinu-store/src/state.rs:139-231`) consists of ten tables:
   - `spaces`: microVM metadata, parent commit, current head, sizing (vcpus, mem_mib, disk_mib), network name, creation time, and optional `expires_at` (RFC3339 or `null`).
-  - `ckpts`: commit records, including auto-commits, full snapshot flag, parent/base commit UUIDs, and `snapshot_version`.
+  - `ckpts`: commit records, including auto-commits, full snapshot flag, parent/base commit UUIDs, `snapshot_version`, and nullable captured sizing (`vcpus INTEGER`, `mem_mib INTEGER`, `disk_mib INTEGER`). Schema migration backfills sizing once from surviving source spaces; orphan legacy rows remain NULL.
   - `projects`: project-scoped resource limit overrides.
   - `usage_events`: metered usages (disk_mib_hour, vm_seconds, api_call, space_created).
   - `users`: user emails, password hashes, and registration timestamps.
@@ -75,7 +75,7 @@ graph TD
   - `templates_project_checkpoint`
   - `spaces_project_expires`
 
-- **Space Lease Runtime** — `expires_at` is RFC3339 or `null`; existing spaces and spaces created without a TTL use `null` and never expire. Expired leases reject new starts, auto-starts, and jobs. The expiry sweep stops a VM at expiry and, after `SHINU_LEASE_GRACE_SECS`, deletes the mutable Space using claim-before-delete; active jobs postpone cleanup, renewal under the Space lock wins, and checkpoints and templates remain.
+- **Space Lease Runtime** — `expires_at` is RFC3339 or `null`; existing spaces and spaces created without a TTL use `null` and never expire. Expired leases reject new starts, auto-starts, and jobs. Detached-job deadlines are capped by the current lease, so active jobs postpone VM stopping and cleanup only through the existing bounded cancellation/final-log pipeline. After `SHINU_LEASE_GRACE_SECS`, the expiry sweep deletes the mutable Space using claim-before-delete; renewal under the Space lock wins. Checkpoints, their archived memory-snapshot SSH credentials, and templates remain usable without the source Space.
 
 - **Concurrency & Locking Discipline** — `shinud` uses thread-per-connection concurrency with `shinu_store::registry::Registry` (`crates/shinu-store/src/registry.rs`). Locking follows a multi-tier model:
   1. Per-space lock (`Arc<Mutex<()>>` via `Registry::space_lock`): serializes long-running VM and space-scoped job operations.
@@ -112,7 +112,7 @@ Runtime layout (`crates/shinu-core/src/lib.rs:359-374` `init_layout`):
 <root>/state.json.migrated         0600    backup of migrated legacy state JSON (if migrated)
 <root>/base-void.ext4              0644    golden base disk image for Void
 <root>/spaces/                     0700    dir; space CoW disk images (<id>.ext4)
-<root>/ckpts/                      0700    dir; immutable commit disk images (<id>.ext4, <id>.mem, <id>.state)
+<root>/ckpts/                      0700    dir; immutable commits (<id>.ext4, <id>.mem, <id>.state, <id>.key, <id>.pub; SSH credentials mode 0600)
 <root>/jobs/                      0700    root-owned detached-job log directory (<uuid>.log files mode 0600)
 <root>/vm/<uuid>/                  0700    dir; VM host-side assets: last_used, id_ed25519
 <root>/jail/firecracker/<uuid>/    0700    dir; jailer chroot root: root/ (fc.json, fc.sock, vsock.sock, firecracker.pid)
@@ -125,7 +125,7 @@ Runtime layout (`crates/shinu-core/src/lib.rs:359-374` `init_layout`):
 ```sh
 cargo build                          # debug build
 cargo build --release                # release build expected by packaging/install.sh
-cargo test --workspace               # run full cargo workspace test suite (314 tests across 20 suites)
+cargo test --workspace               # run full cargo workspace test suite (321 tests across 20 suites)
 cargo clippy --all-targets           # check for lint issues against workspace posture
 cargo fmt --check                    # check formatting
 ```
@@ -181,6 +181,7 @@ shinu lease web --clear              # clear a space lease
 shinu stop web                       # stop microVM
 shinu rm web                         # delete space
 shinu rmckpt <commit-uuid>           # delete commit (refused if referenced)
+shinu rmckpt --detach <commit-uuid>  # delete commit, clearing parent links; heads/templates/bases still refuse
 shinu gc --free-below 10737418240    # run garbage collection
 shinu usage                          # show project resource usage summary
 shinu limits                         # show project resource quota limits
@@ -239,7 +240,7 @@ CLI Subcommand Surface (`src/bin/shinu.rs:33-177`):
 - `diff <source> [target] [--all] [--limit <n>]`
 - `checkout <space> <commit-uuid>`
 - `fork <commit-uuid> <name> [--ttl <duration>]`
-- `rmckpt <commit-uuid>`
+- `rmckpt [--detach] <commit-uuid>`
 - `template create <name> <checkpoint-uuid>`
 - `template ls`
 - `template rm <name>`
@@ -258,6 +259,7 @@ CLI Subcommand Surface (`src/bin/shinu.rs:33-177`):
 - MCP: `shinu_run_job`, `shinu_list_jobs`, `shinu_job_status`, `shinu_job_logs`, and `shinu_cancel_job`.
 - Existing `exec` remains synchronous. Job states are `starting`, `running`, `canceling`, `exited`, `canceled`, and `lost`.
 - Jobs survive client disconnect and daemon restart only while the VM stays running. Active jobs refresh idle use and block space stop/remove; VM loss yields `lost`.
+- Job wall-clock deadlines are the earlier of `created_at + SHINU_JOB_MAX_SECS` (default `3600`, `0` disables this cap) and the current host Space lease expiry, if any. The job monitor requests durable `canceling`, then reuses fence → final capture → archive → cleanup; canceled jobs retain a deadline-specific `error`. Lease renewal/clear before cancellation affects the deadline but never revives a canceling job.
 - Logs are one terminal-rendered text stream capped at 1 MiB and archived at `<root>/jobs/<uuid>.log` (mode `0600`); the `jobs/` directory is root-owned and mode `0700`. The active cap is 64 jobs per project.
 - Detached commands accept at most 256 argv elements and 8192 total argument bytes.
 - Job retention caps are 64 active jobs per project, 1024 total jobs per project, and 8192 total jobs globally. `GET /v1/jobs` returns the newest 64 jobs and includes `truncated` when older jobs are omitted.
@@ -268,7 +270,7 @@ CLI Subcommand Surface (`src/bin/shinu.rs:33-177`):
 
 - **Quota Check Before Mutation Inside State Lock** — Space and disk quota calculations (`quota::check_space_limit` / `check_disk_limit`) MUST be evaluated atomically inside `update_state_with_quota` before applying database writes. Performing quota checks outside the state lock allows concurrent requests to race past tenant ceilings.
 - **Strict Separation of Disk Measurement Metrics** —
-  - Quota capacity enforcement uses `btrfs::exclusive` to calculate **instantaneous physical disk usage**.
+  - Quota capacity uses nominal space allocation unless `SHINU_SPACE_RESERVE_MIB` is set. Opt-in reserve accounting uses `max(sampled btrfs::exclusive MiB, reserve MiB)` per space and sampled exclusive bytes for checkpoints. Samples warm before request acceptance and refresh outside state/DB locks in the 30-second sweep; unknown samples conservatively use nominal capacity. Samples may lag by a sweep plus probe time, and busy lifecycle locks defer refresh/enforcement. A new image is measured once before its authoritative admission check. See README's "Exclusive storage accounting and offline compaction" for the interface and trade-off.
   - Usage billing tracking uses `disk_mib_hour` in `usage_events` as a **cumulative time series**.
   Do NOT use billing time-series totals for quota capacity checks; doing so causes long-running tenants with small disk footprints to be incorrectly rejected after accumulating historical hours.
 - **Indexed Single-Row Queries vs. Full State Snapshots** —
@@ -285,6 +287,7 @@ CLI Subcommand Surface (`src/bin/shinu.rs:33-177`):
   - `SHINU_ADMIN_TOKEN`: Deployment admin secret gating `/v1/projects/{project}/limits`; unset fails closed (`src/bin/shinud.rs:84-88`).
   - `SHINU_REFLOG_DAYS`: Reflog auto-commit retention in days (default `7`).
   - `SHINU_JOB_RETENTION_DAYS`: Archived detached-job log retention in days (default `7`).
+  - `SHINU_JOB_MAX_SECS`: Detached-job wall-clock cap from submission (default `3600`; `0` disables the cap, but Space lease expiry still applies).
   - `SHINU_SESSION_DAYS`: Console user session expiration in days (default `7`).
   - `SHINU_FULL_EVERY`: Per-base diff cap on the auto degradation path (default `8`, `0` disables).
   - `SHINU_VCPUS`: VM vCPU count (default `2`).
@@ -341,7 +344,7 @@ CLI Subcommand Surface (`src/bin/shinu.rs:33-177`):
 
 ## Testing & QA
 
-- Total test count: **314 tests across 20 suites**.
+- Total test count: **321 tests across 20 suites**.
 - **Test Execution Environment**:
   - Tests run via built-in `cargo test --workspace`.
   - Tests are hermetic: they run against temporary directories created via `std::env::temp_dir()`, use `NetConfig { enabled: false, .. }`, do not spawn real Firecracker VMs or Jailer sandboxes, do not perform btrfs reflink operations, and do not require root privileges.
@@ -364,14 +367,14 @@ CLI Subcommand Surface (`src/bin/shinu.rs:33-177`):
 1. **Jailer Sandbox Isolation is Non-Negotiable** — `vm::start` MUST execute microVMs through Firecracker's Jailer under an unprivileged UID/GID (default 30000). Direct `firecracker` execution on the host is prohibited.
 2. **Kernel and Rootfs Zero-Copy Hardlinking** — Assets linked into jail chroots (`<root>/jail/firecracker/<uuid>/root/`) MUST use hardlinks (`std::fs::hard_link`). Never fall back to copy operations, which consume 2 GiB per VM instance.
 3. **Atomic Quota Check Inside State Lock** — Space and disk usage checks MUST be executed inside `update_state_with_quota` under the global state lock prior to performing database writes.
-4. **Instantaneous vs. Cumulative Disk Measurement** — Disk quota capacity enforcement MUST use `btrfs::exclusive` instantaneous calculations. Billing time-series totals (`disk_mib_hour`) MUST NEVER be used for quota checks.
+4. **Capacity vs. Cumulative Disk Measurement** — Disk quota capacity MUST use the configured nominal/reserve policy and live-file exclusive-byte samples, never billing time-series totals (`disk_mib_hour`). With reserve accounting enabled, preserve conservative unknown-sample charging and off-lock sweep refresh; it deliberately trades instantaneous admission measurement for bounded request cost. Per-space caps are sampled safety stops, not kernel byte-hard limits; starts/auto-starts freshly measure capped images.
 5. **Project Tenant Isolation Never Leaks Existence** — Lookups filter strictly by token project name and return `NotFound` (404). A space or commit belonging to another project is indistinguishable from a nonexistent entity.
 6. **Tokens are Stored as Hashes & Compared in Constant Time** — Token plaintexts are never persisted; `<root>/tokens.json` stores SHA-256 hashes. Token validation uses `constant_time_eq` to prevent timing side-channel attacks.
 7. **Strict Multi-Tier Lock Order** — Space-scoped paths acquire space → optional job/checkpoint → state → database connection. Job-monitor paths acquire job → state → database connection. Lock hold time MUST be minimal; never wrap long disk CoW, VM execution, or network calls inside locks.
 8. **Atomically Claim Before Disk File Deletion** — State updates and record removals during deletions/GC must be completed inside the state lock before unlinking files from disk to prevent dangling references or race conditions.
 9. **Reflink or Fail** — Space and commit creation must use `cp --reflink=always`. Never fall back to plain file copy on non-CoW filesystems.
 10. **Reflog Preserves Explicit Commits** — Automatic cleanup (`gc`) or checkout reflogs must never auto-delete explicit user commits (`auto: false`).
-11. **DAG Integrity via Multi-Edge Check** — `is_referenced` MUST check `space.parent`, `space.head`, every commit's `ckpt.parent`, and also the dirty memory base `ckpt.base`. Deleting a commit with child dependencies breaks history chains.
+11. **DAG Integrity via Multi-Edge Check** — `is_referenced` MUST check `space.parent`, `space.head`, every commit's `ckpt.parent`, and also the dirty memory base `ckpt.base`. Deleting a commit with child dependencies breaks history chains. The opt-in `rmckpt --detach` (`{"detach":true}`) is the only exception: it refuses on `blocking_references` (`space.head`, template `checkpoint`, `ckpt.base`, which still read the bytes) and clears `parent` edges via `detach_children` inside the same state claim, because each checkpoint image is an independent reflink and `parent` is lineage only.
 12. **State Migration Preserves User Data** — SQLite migration (`migrate_from_json`) MUST NOT delete `state.json`. It renames `state.json` to `state.json.migrated` after successful insertion.
 13. **Binary Placement** — `shinu-vsock` MUST reside in the same directory as `shinu` (`current_exe()` resolution in `vsock_helper`).
 14. **SSH-Banner Readiness Over Vsock** — `wait_ready` checks for VM boot readiness by connecting to vsock port 2222, executing the handshake, and verifying both the `OK ` vsock bridge response and the `SSH-` daemon banner. The vsock CONNECT handshake alone is insufficient.
@@ -384,6 +387,6 @@ CLI Subcommand Surface (`src/bin/shinu.rs:33-177`):
 21. **Free Page Reporting Does Not Replace Explicit Reclaim** — Cold boot enables `free_page_reporting` in the `fc.json` balloon object. Measured on a v1.16.1 host: a guest that allocated 500 MiB then freed it drove firecracker RSS 102.7 MiB → 596.9 MiB → 105.0 MiB within 5 seconds with no balloon inflate issued, so reporting does work for the anonymous mappings shinu boots with. `vm::reclaim`'s periodic explicit inflate MUST still be kept: reporting only returns pages the guest kernel puts on its free list, so it does nothing for memory held in guest page cache, which is exactly what the idle sweep's inflate targets via `available_memory`. Reporting is an optimisation layered on the inflate, not a replacement for it.
 22. **Data-Sized VM API Calls Get Their Own Deadline** — `vm::api` applies `API_TIMEOUT_SECS` (5s) because a control-plane request that does not answer promptly means a wedged VMM. Snapshot creation is not a control-plane request: its duration scales with guest RAM and disk speed, measured at 5.4s for a 1 GiB guest on NVMe, which sat directly on the old shared deadline and made `commit --full` fail with HTTP 500 while Firecracker went on to write the snapshot successfully. `vm::snapshot` MUST therefore use `api_with_timeout` with `SNAPSHOT_TIMEOUT_SECS`. Any future endpoint whose cost scales with guest size, not VMM latency, MUST do the same rather than widening the shared timeout.
 23. **Dirty-Page Tracking on Snapshot Restore** — A snapshot restore MUST send `"track_dirty_pages": true` in the `PUT /snapshot/load` body because Firecracker rebuilds the dirty-page bitmap from the load request and does not inherit it from the snapshot; cold boot sets the same flag in `fc.json` via `crates/shinu-vm/src/config.rs`. Omitting it silently leaves a restored VM with no dirty tracking so every later diff becomes a full memory dump (measured 268.2 / 270.1 / 267.8 MiB on an idle restored guest, versus 8.2 and 8.0 MiB after the fix). The first diff after a restore is legitimately large (measured 269.5 MiB) because the bitmap starts empty and every page touched during restore counts dirty, converging from the second diff on. Firecracker's `SnapshotLoadParams` exposes `track_dirty_pages` with `enable_diff_snapshots` as its deprecated alias; shinu uses the current name.
-24. **Detached Job Lifetime and Output** — Existing `exec` is synchronous. Detached jobs survive client disconnect and daemon restart only while the VM stays running; active jobs refresh idle use and prevent space stop/remove; VM loss yields `lost`. `GET /v1/jobs/{id}/logs` returns a JSON envelope whose `data` field contains one terminal-rendered log capped at 1 MiB; archived logs use mode `0600` under `<root>/jobs/`. There is no follow/raw mode, force-stop, reboot survival, artifact store, or console control. Automatic and manual VM stops flush guest durability with a finite 60-second process-group deadline before Firecracker receives TERM then KILL.
-25. **Space Lease Expiry and Cleanup** — `expires_at` is RFC3339 or `null`; existing and no-TTL spaces never expire. Expired leases reject new start, auto-start, and job requests. The sweep stops at expiry, waits `SHINU_LEASE_GRACE_SECS` (default `300`) before claim-before-delete cleanup of the mutable Space, postpones cleanup while active jobs run, and lets a renewal under the Space lock win. Checkpoints and templates remain.
-26. **Immutable Project-Scoped Template References** — A Template is exactly `{name, checkpoint, created_at}` plus project scope. Names MUST be 1–64 lowercase ASCII characters matching `[a-z0-9-]`; invalid or duplicate names return HTTP 400, and missing or foreign checkpoint targets return HTTP 404. Retained references MUST be capped at 256 per project and 2048 globally; listing MUST be bounded to the project's 256-reference cap, and creation over either cap returns HTTP 429. `template fork` MUST resolve the stored concrete checkpoint UUID and set the destination Space `parent` and `head` to that UUID, with optional TTL support. `rmckpt` and GC MUST treat template checkpoint references as live; deleting a template removes only the reference and never checkpoint files. Templates have no tags, updates, renames, sharing, catalogs, or console UI.
+24. **Detached Job Lifetime and Output** — Existing `exec` is synchronous. Detached jobs survive client disconnect and daemon restart only while the VM stays running; active jobs refresh idle use and prevent space stop/remove; VM loss yields `lost`. Jobs MUST have a wall-clock deadline at the earlier of submission plus `SHINU_JOB_MAX_SECS` (default `3600`, `0` disables this cap) and the current Space lease expiry. Deadline expiry MUST durably request `canceling` and use the existing cancellation fence, final capture, archive, and cleanup, retaining a deadline-specific `error` when terminal `canceled`; it MUST NOT introduce a parallel kill path. `GET /v1/jobs/{id}/logs` returns a JSON envelope whose `data` field contains one terminal-rendered log capped at 1 MiB; archived logs use mode `0600` under `<root>/jobs/`. There is no follow/raw mode, force-stop, reboot survival, artifact store, or console control. Automatic and manual VM stops flush guest durability with a finite 60-second process-group deadline before Firecracker receives TERM then KILL.
+25. **Space Lease Expiry and Cleanup** — `expires_at` is RFC3339 or `null`; existing and no-TTL spaces never expire. Expired leases reject new start, auto-start, and job requests. Active jobs MUST postpone VM stopping and mutable-space cleanup until their lease-capped cancellation pipeline completes, rather than extending a lease with unbounded guest work. After `SHINU_LEASE_GRACE_SECS` (default `300`), cleanup MUST claim-before-delete only the mutable Space, and a renewal under the Space lock wins. Checkpoints, captured sizing, archived memory-snapshot SSH credentials, and templates MUST remain available for same-project fork after source Space deletion; legacy memory checkpoints without either archived or surviving source keys MUST fail explicitly with HTTP 400.
+26. **Immutable Project-Scoped Template References** — A Template is exactly `{name, checkpoint, created_at}` plus project scope. Names MUST be 1–64 lowercase ASCII characters matching `[a-z0-9-]`; invalid or duplicate names return HTTP 400, and missing or foreign checkpoint targets return HTTP 404. Retained references MUST be capped at 256 per project and 2048 globally; listing MUST be bounded to the project's 256-reference cap, and creation over either cap returns HTTP 429. `template fork` MUST resolve the stored concrete checkpoint UUID and set the destination Space `parent` and `head` to that UUID, with optional TTL support, without requiring the checkpoint's source Space to exist. Fork sizing MUST resolve each checkpoint column first, then a surviving same-project source Space, then image logical size for disk and environment defaults for CPU/memory. Memory forks MUST prefer checkpoint-owned SSH keys, falling back only to surviving source credentials; disk-only forks retain fresh-key authorization. `rmckpt` and GC MUST treat template checkpoint references as live and unlink archived keys with other checkpoint assets only after claiming an unreferenced checkpoint; deleting a template removes only the reference and never checkpoint files. Templates have no tags, updates, renames, sharing, catalogs, or console UI.

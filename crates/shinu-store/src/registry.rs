@@ -22,6 +22,7 @@ pub struct Registry {
     spaces: Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
     checkpoints: Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
     jobs: Mutex<HashMap<Uuid, Arc<Mutex<()>>>>,
+    pub storage: crate::quota::StorageAccounting,
 }
 
 impl Registry {
@@ -31,6 +32,7 @@ impl Registry {
             spaces: Mutex::new(HashMap::new()),
             checkpoints: Mutex::new(HashMap::new()),
             jobs: Mutex::new(HashMap::new()),
+            storage: crate::quota::StorageAccounting::default(),
         }
     }
 

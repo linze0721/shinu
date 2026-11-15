@@ -3,8 +3,8 @@
 pub use shinu_core::{
     DEFAULT_ROOT, Error, FC_SNAPSHOT_VERSION, FC_URL, FC_VERSION, GUEST_BLOCKED_CIDRS, Image,
     KERNEL_URL, MAX_UPLOAD_BYTES, Result, USAGE_SAMPLE_SECS, VSOCK_SSH_PORT, VSOCK_VNC_PORT,
-    assets_dir, avail_bytes, base_path, btrfs, cache_dir, chown_tree, ckpt_image, ckpt_mem,
-    ckpt_state, env_u32, firecracker_bin, init_daemon_layout, init_layout,
+    assets_dir, avail_bytes, base_path, btrfs, cache_dir, chown_tree, ckpt_image, ckpt_key,
+    ckpt_mem, ckpt_state, env_u32, firecracker_bin, init_daemon_layout, init_layout,
     is_blocked_guest_destination, is_rfc1918, jailer_bin, job_log_path, jobs_dir, kernel_path,
     migrate_base, parse_ipv4, parse_ipv4_cidr, parse_net_base, resolve_root, shell_quote,
     shell_quote_word, space_image, vm_dir, vsock_helper,
@@ -14,7 +14,8 @@ pub use shinu_core::{
 pub use shinu_crypto::{auth, sha256_hex, token};
 
 pub use shinu_store::{
-    find, find_ckpt, is_referenced, log_chain, quota, reflog_entries, registry, state,
+    blocking_references, detach_children, find, find_ckpt, is_referenced, log_chain, quota,
+    reflog_entries, registry, state,
 };
 
 pub use shinu_image::{BaseConfig, ensure_assets, ensure_base, repair_base_resolv};

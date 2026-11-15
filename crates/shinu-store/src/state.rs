@@ -40,6 +40,11 @@ pub struct Space {
     pub network: Option<String>,
     #[serde(default)]
     pub expires_at: Option<DateTime<Utc>>,
+    /// Zero means uncapped; existing rows migrate to zero.
+    #[serde(default)]
+    pub write_cap_mib: u64,
+    #[serde(default)]
+    pub stopped_reason: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -59,6 +64,12 @@ pub struct Ckpt {
     /// Memory state this checkpoint overlays; `None` means no memory base is required.
     #[serde(default)]
     pub base: Option<Uuid>,
+    #[serde(default)]
+    pub vcpus: Option<u32>,
+    #[serde(default)]
+    pub mem_mib: Option<u32>,
+    #[serde(default)]
+    pub disk_mib: Option<u64>,
     /// Firecracker snapshot data format version the memory state was captured
     /// with; `None` for disk-only checkpoints and for checkpoints written before
     /// this was recorded.
@@ -159,6 +170,8 @@ const SCHEMA: &str = r#"
         disk_mib INTEGER,
         network TEXT,
         expires_at TEXT,
+        write_cap_mib INTEGER NOT NULL DEFAULT 0,
+        stopped_reason TEXT,
         created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS ckpts (
@@ -171,7 +184,10 @@ const SCHEMA: &str = r#"
         created_at TEXT NOT NULL,
         full INTEGER NOT NULL DEFAULT 0,
         base TEXT,
-        snapshot_version TEXT
+        snapshot_version TEXT,
+        vcpus INTEGER,
+        mem_mib INTEGER,
+        disk_mib INTEGER
     );
     CREATE TABLE IF NOT EXISTS templates (
         project TEXT NOT NULL,
@@ -249,6 +265,8 @@ fn migrate_space_columns(conn: &Connection) -> Result<()> {
         ("disk_mib", "INTEGER"),
         ("network", "TEXT"),
         ("expires_at", "TEXT"),
+        ("write_cap_mib", "INTEGER NOT NULL DEFAULT 0"),
+        ("stopped_reason", "TEXT"),
     ] {
         let present: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('spaces') WHERE name = ?1",
@@ -301,20 +319,30 @@ pub fn validate_template_name(name: &str) -> Result<()> {
 }
 
 fn migrate_ckpt_columns(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
     for (name, definition) in [
         ("full", "INTEGER NOT NULL DEFAULT 0"),
         ("base", "TEXT"),
         ("snapshot_version", "TEXT"),
+        ("vcpus", "INTEGER"),
+        ("mem_mib", "INTEGER"),
+        ("disk_mib", "INTEGER"),
     ] {
-        let present: i64 = conn.query_row(
+        let present: i64 = tx.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('ckpts') WHERE name = ?1",
             params![name],
             |row| row.get(0),
         )?;
         if present == 0 {
-            conn.execute_batch(&format!("ALTER TABLE ckpts ADD COLUMN {name} {definition}"))?;
+            tx.execute_batch(&format!("ALTER TABLE ckpts ADD COLUMN {name} {definition}"))?;
+            if matches!(name, "vcpus" | "mem_mib" | "disk_mib") {
+                tx.execute_batch(&format!(
+                    "UPDATE ckpts SET {name} = (SELECT {name} FROM spaces WHERE spaces.id = ckpts.space)"
+                ))?;
+            }
         }
     }
+    tx.commit()?;
     Ok(())
 }
 
@@ -448,6 +476,8 @@ fn space_from_row(row: &Row<'_>) -> rusqlite::Result<Space> {
         network: row.get(9)?,
         expires_at: parse_optional_datetime(row.get(10)?, 10)?,
         created_at: parse_datetime(row.get(11)?, 11)?,
+        write_cap_mib: row.get(12)?,
+        stopped_reason: row.get(13)?,
     })
 }
 
@@ -463,6 +493,9 @@ fn ckpt_from_row(row: &Row<'_>) -> rusqlite::Result<Ckpt> {
         snapshot_version: row.get(7)?,
         note: row.get(8)?,
         created_at: parse_datetime(row.get(9)?, 9)?,
+        vcpus: row.get(10)?,
+        mem_mib: row.get(11)?,
+        disk_mib: row.get(12)?,
     })
 }
 
@@ -498,7 +531,7 @@ fn job_from_row(row: &Row<'_>) -> rusqlite::Result<Job> {
 
 fn insert_space(tx: &Transaction<'_>, space: &Space) -> rusqlite::Result<usize> {
     tx.execute(
-        "INSERT INTO spaces (id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        "INSERT INTO spaces (id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at, write_cap_mib, stopped_reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             space.id.to_string(),
             space.name,
@@ -512,13 +545,15 @@ fn insert_space(tx: &Transaction<'_>, space: &Space) -> rusqlite::Result<usize> 
             space.network,
             space.expires_at.map(|at| at.to_rfc3339()),
             space.created_at.to_rfc3339(),
+            space.write_cap_mib,
+            space.stopped_reason,
         ],
     )
 }
 
 fn insert_ckpt(tx: &Transaction<'_>, ckpt: &Ckpt) -> rusqlite::Result<usize> {
     tx.execute(
-        "INSERT INTO ckpts (id, space, project, parent, auto, full, base, snapshot_version, note, created_at) VALUES (?1, ?2, ?3, NULLIF(?4, ''), ?5, ?6, NULLIF(?7, ''), NULLIF(?8, ''), ?9, ?10)",
+        "INSERT INTO ckpts (id, space, project, parent, auto, full, base, snapshot_version, note, created_at, vcpus, mem_mib, disk_mib) VALUES (?1, ?2, ?3, NULLIF(?4, ''), ?5, ?6, NULLIF(?7, ''), NULLIF(?8, ''), ?9, ?10, ?11, ?12, ?13)",
         params![
             ckpt.id.to_string(),
             ckpt.space.to_string(),
@@ -530,6 +565,9 @@ fn insert_ckpt(tx: &Transaction<'_>, ckpt: &Ckpt) -> rusqlite::Result<usize> {
             ckpt.snapshot_version.as_deref().unwrap_or_default(),
             ckpt.note.as_str(),
             ckpt.created_at.to_rfc3339(),
+            ckpt.vcpus,
+            ckpt.mem_mib,
+            ckpt.disk_mib,
         ],
     )
 }
@@ -599,7 +637,7 @@ pub fn migrate_from_json(root: &Path, conn: &Connection) -> Result<bool> {
 pub fn load(conn: &Connection) -> Result<State> {
     let spaces = {
         let mut statement = conn.prepare(
-            "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at FROM spaces ORDER BY rowid",
+            "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at, write_cap_mib, stopped_reason FROM spaces ORDER BY rowid",
         )?;
         statement
             .query_map([], space_from_row)?
@@ -607,7 +645,7 @@ pub fn load(conn: &Connection) -> Result<State> {
     };
     let ckpts = {
         let mut statement = conn.prepare(
-            "SELECT id, space, project, parent, auto, full, base, snapshot_version, note, created_at FROM ckpts ORDER BY rowid",
+            "SELECT id, space, project, parent, auto, full, base, snapshot_version, note, created_at, vcpus, mem_mib, disk_mib FROM ckpts ORDER BY rowid",
         )?;
         statement
             .query_map([], ckpt_from_row)?
@@ -674,7 +712,7 @@ pub fn store(conn: &Connection, state: &State) -> Result<()> {
 pub fn find_space(conn: &Connection, name: &str, project: &str) -> Result<Option<Space>> {
     let by_name = conn
         .query_row(
-            "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at FROM spaces WHERE project = ?1 AND name = ?2 LIMIT 1",
+            "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at, write_cap_mib, stopped_reason FROM spaces WHERE project = ?1 AND name = ?2 LIMIT 1",
             params![project, name],
             space_from_row,
         )
@@ -685,8 +723,12 @@ pub fn find_space(conn: &Connection, name: &str, project: &str) -> Result<Option
     let Ok(id) = Uuid::parse_str(name) else {
         return Ok(None);
     };
+    find_space_by_id(conn, id, project)
+}
+
+pub fn find_space_by_id(conn: &Connection, id: Uuid, project: &str) -> Result<Option<Space>> {
     conn.query_row(
-        "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at FROM spaces WHERE project = ?1 AND id = ?2 LIMIT 1",
+        "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at, write_cap_mib, stopped_reason FROM spaces WHERE project = ?1 AND id = ?2 LIMIT 1",
         params![project, id.to_string()],
         space_from_row,
     )
@@ -696,7 +738,7 @@ pub fn find_space(conn: &Connection, name: &str, project: &str) -> Result<Option
 
 pub fn find_ckpt(conn: &Connection, id: Uuid, project: &str) -> Result<Option<Ckpt>> {
     conn.query_row(
-        "SELECT id, space, project, parent, auto, full, base, snapshot_version, note, created_at FROM ckpts WHERE project = ?1 AND id = ?2 LIMIT 1",
+        "SELECT id, space, project, parent, auto, full, base, snapshot_version, note, created_at, vcpus, mem_mib, disk_mib FROM ckpts WHERE project = ?1 AND id = ?2 LIMIT 1",
         params![project, id.to_string()],
         ckpt_from_row,
     )
@@ -754,7 +796,7 @@ pub fn claim_expired_space(
     let tx = conn.unchecked_transaction()?;
     let space = tx
         .query_row(
-            "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at FROM spaces WHERE project = ?1 AND id = ?2 LIMIT 1",
+            "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at, write_cap_mib, stopped_reason FROM spaces WHERE project = ?1 AND id = ?2 LIMIT 1",
             params![project, id.to_string()],
             space_from_row,
         )
@@ -1091,11 +1133,16 @@ pub fn set_job_running(conn: &Connection, id: Uuid, project: &str) -> Result<Opt
 
 /// Requests cancellation with a compare-and-set transition. Repeating the
 /// request for a canceling or terminal job returns its authoritative row.
-pub fn request_job_cancel(conn: &Connection, id: Uuid, project: &str) -> Result<Option<Job>> {
+pub fn request_job_cancel(
+    conn: &Connection,
+    id: Uuid,
+    project: &str,
+    reason: Option<&str>,
+) -> Result<Option<Job>> {
     let tx = conn.unchecked_transaction()?;
     tx.execute(
-        "UPDATE jobs SET state = 'canceling' WHERE project = ?1 AND id = ?2 AND state IN ('starting', 'running')",
-        params![project, id.to_string()],
+        "UPDATE jobs SET state = 'canceling', error = ?3 WHERE project = ?1 AND id = ?2 AND state IN ('starting', 'running')",
+        params![project, id.to_string(), reason],
     )?;
     let result = tx
         .query_row(
@@ -1493,6 +1540,30 @@ mod db_tests {
         root
     }
 
+    #[test]
+    fn storage_metadata_migrates_and_survives_reopen_and_state_updates() {
+        let root = root();
+        let conn = open(&root).unwrap();
+        let (mut state, space, _) = sample_state("project-a");
+        store(&conn, &state).unwrap();
+        conn.execute_batch("ALTER TABLE spaces DROP COLUMN write_cap_mib; ALTER TABLE spaces DROP COLUMN stopped_reason;").unwrap();
+        drop(conn);
+        let conn = open(&root).unwrap();
+        let migrated = find_space_by_id(&conn, space.id, "project-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(migrated.write_cap_mib, 0);
+        assert_eq!(migrated.stopped_reason, None);
+        state.spaces[0].write_cap_mib = 20_480;
+        state.spaces[0].stopped_reason = Some("write_cap_exceeded".into());
+        store(&conn, &state).unwrap();
+        drop(conn);
+        let conn = open(&root).unwrap();
+        assert_eq!(load(&conn).unwrap(), state);
+        assert_eq!(find_space_by_id(&conn, space.id, "foreign").unwrap(), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn sample_state(project: &str) -> (State, Space, Ckpt) {
         let space_id = Uuid::new_v4();
         let ckpt_id = Uuid::new_v4();
@@ -1511,6 +1582,8 @@ mod db_tests {
             expires_at: None,
 
             created_at,
+            write_cap_mib: 0,
+            stopped_reason: None,
         };
         let ckpt = Ckpt {
             id: ckpt_id,
@@ -1520,6 +1593,9 @@ mod db_tests {
             auto: false,
             full: false,
             base: None,
+            vcpus: space.vcpus,
+            mem_mib: space.mem_mib,
+            disk_mib: space.disk_mib,
             snapshot_version: None,
             note: "initial".into(),
             created_at,
@@ -1684,6 +1760,92 @@ mod db_tests {
         assert!(!state.ckpts[0].full);
         assert_eq!(state.ckpts[0].base, None);
         assert_eq!(state.ckpts[0].snapshot_version, None);
+    }
+
+    #[test]
+    fn legacy_checkpoint_sizing_is_backfilled_once_and_outlives_source_space() {
+        let root = root();
+        let space_id = Uuid::new_v4();
+        let checkpoint_id = Uuid::new_v4();
+        let orphan_id = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339();
+        let legacy = Connection::open(root.join("shinu.db")).expect("open legacy database");
+        legacy.execute_batch(
+            "CREATE TABLE spaces (id TEXT PRIMARY KEY, name TEXT NOT NULL, project TEXT NOT NULL, parent TEXT, head TEXT, vcpus INTEGER, mem_mib INTEGER, disk_mib INTEGER, created_at TEXT NOT NULL);
+             CREATE TABLE ckpts (id TEXT PRIMARY KEY, space TEXT NOT NULL, project TEXT NOT NULL, parent TEXT, auto INTEGER NOT NULL, note TEXT NOT NULL, created_at TEXT NOT NULL);",
+        ).expect("create old schema");
+        legacy.execute(
+            "INSERT INTO spaces VALUES (?1, 'source', 'project', NULL, NULL, 4, 2048, 8192, ?2)",
+            params![space_id.to_string(), now],
+        ).expect("insert sized source");
+        for (id, source) in [(checkpoint_id, space_id), (orphan_id, Uuid::new_v4())] {
+            legacy
+                .execute(
+                    "INSERT INTO ckpts VALUES (?1, ?2, 'project', NULL, 0, 'retained', ?3)",
+                    params![id.to_string(), source.to_string(), now],
+                )
+                .expect("insert legacy checkpoint");
+        }
+        drop(legacy);
+
+        let conn = open(&root).expect("migrate real database");
+        let checkpoint = find_ckpt(&conn, checkpoint_id, "project").unwrap().unwrap();
+        assert_eq!(
+            (checkpoint.vcpus, checkpoint.mem_mib, checkpoint.disk_mib),
+            (Some(4), Some(2048), Some(8192))
+        );
+        let orphan = find_ckpt(&conn, orphan_id, "project").unwrap().unwrap();
+        assert_eq!(
+            (orphan.vcpus, orphan.mem_mib, orphan.disk_mib),
+            (None, None, None)
+        );
+        conn.execute(
+            "UPDATE spaces SET vcpus = 8, mem_mib = 4096, disk_mib = 16384",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let conn = open(&root).expect("reapply migration without overwriting captured sizing");
+        assert_eq!(
+            find_ckpt(&conn, checkpoint_id, "project").unwrap(),
+            Some(checkpoint.clone())
+        );
+        conn.execute("DELETE FROM spaces", []).unwrap();
+        drop(conn);
+        let conn = open(&root).expect("reopen without source");
+        assert_eq!(
+            find_ckpt(&conn, checkpoint_id, "project").unwrap(),
+            Some(checkpoint)
+        );
+        assert_eq!(
+            find_ckpt(&conn, orphan_id, "project").unwrap(),
+            Some(orphan)
+        );
+        assert_eq!(find_ckpt(&conn, checkpoint_id, "foreign").unwrap(), None);
+        drop(conn);
+        fs::remove_dir_all(root).expect("remove migration root");
+    }
+
+    #[test]
+    fn deadline_cancellation_reason_survives_repeated_cancel_and_reopen() {
+        let root = root();
+        let conn = open(&root).unwrap();
+        let job = sample_job("project", Uuid::new_v4(), Uuid::new_v4(), JobState::Running);
+        insert_job(&conn, &job).unwrap();
+        let canceling = request_job_cancel(&conn, job.id, "project", Some("deadline exceeded"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(canceling.state, JobState::Canceling);
+        assert_eq!(
+            request_job_cancel(&conn, job.id, "project", None).unwrap(),
+            Some(canceling.clone())
+        );
+        drop(conn);
+        let conn = open(&root).unwrap();
+        assert_eq!(get_job(&conn, job.id, "project").unwrap(), Some(canceling));
+        drop(conn);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2057,7 +2219,7 @@ mod db_tests {
         assert_eq!(running.state, JobState::Running);
         assert!(running.started_at.is_some());
         assert!(finish_job(&conn, transition.id, "alpha", JobState::Running, None, None).is_err());
-        let canceling = request_job_cancel(&conn, transition.id, "alpha")
+        let canceling = request_job_cancel(&conn, transition.id, "alpha", None)
             .expect("request cancellation")
             .expect("transition job");
         assert_eq!(canceling.state, JobState::Canceling);

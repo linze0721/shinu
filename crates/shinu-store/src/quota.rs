@@ -14,6 +14,104 @@ const DEFAULT_MAX_VCPUS: u32 = 16;
 const DEFAULT_MAX_MEM_MIB: u32 = 32 * 1024;
 const WINDOW: Duration = Duration::from_mins(1);
 
+/// Daemon-wide storage policy, validated once before accepting requests.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StoragePolicy {
+    pub reserve_mib: Option<u64>,
+    pub default_write_cap_mib: u64,
+}
+
+impl StoragePolicy {
+    pub fn from_env() -> Result<Self> {
+        let read = |key| match std::env::var(key) {
+            Ok(value) => Ok(Some(value)),
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Err(error) => Err(Error::Invalid(format!("{key}: {error}"))),
+        };
+        let reserve = read("SHINU_SPACE_RESERVE_MIB")?;
+        let cap = read("SHINU_SPACE_WRITE_CAP_MIB")?;
+        Self::from_values(reserve.as_deref(), cap.as_deref())
+    }
+
+    pub fn from_values(reserve: Option<&str>, cap: Option<&str>) -> Result<Self> {
+        let parse = |key, value: &str| {
+            let value = value.trim();
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(Error::Invalid(format!(
+                    "{key} must be unsigned decimal MiB"
+                )));
+            }
+            value
+                .parse::<u64>()
+                .ok()
+                .filter(|value| i64::try_from(*value).is_ok())
+                .ok_or_else(|| Error::Invalid(format!("{key} exceeds signed 64-bit MiB")))
+        };
+        Ok(Self {
+            reserve_mib: reserve
+                .map(|value| parse("SHINU_SPACE_RESERVE_MIB", value))
+                .transpose()?,
+            default_write_cap_mib: cap
+                .map(|value| parse("SHINU_SPACE_WRITE_CAP_MIB", value))
+                .transpose()?
+                .unwrap_or(0),
+        })
+    }
+
+    /// Unknown samples reserve the nominal allocation until the next sweep.
+    pub fn charge_mib(self, nominal: u64, exclusive: Option<u64>) -> u64 {
+        self.reserve_mib
+            .map_or(nominal, |reserve| exclusive.unwrap_or(nominal).max(reserve))
+    }
+
+    pub fn write_cap(self, explicit: Option<u64>) -> Result<u64> {
+        let cap = explicit.unwrap_or(self.default_write_cap_mib);
+        if i64::try_from(cap).is_err() {
+            return Err(Error::Invalid(
+                "write_cap_mib exceeds signed 64-bit MiB".into(),
+            ));
+        }
+        Ok(cap)
+    }
+}
+
+/// Sampled exclusive bytes; requests never walk every retained file's extents.
+#[derive(Default)]
+pub struct StorageAccounting {
+    pub policy: StoragePolicy,
+    samples: Mutex<HashMap<uuid::Uuid, u64>>,
+}
+
+impl StorageAccounting {
+    pub fn exclusive(&self, id: uuid::Uuid) -> Option<u64> {
+        self.samples
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&id)
+            .copied()
+    }
+
+    pub fn record(&self, id: uuid::Uuid, bytes: u64) {
+        self.samples
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(id, bytes);
+    }
+
+    pub fn retain(&self, state: &crate::state::State) {
+        let live: std::collections::HashSet<_> = state
+            .spaces
+            .iter()
+            .map(|space| space.id)
+            .chain(state.ckpts.iter().map(|checkpoint| checkpoint.id))
+            .collect();
+        self.samples
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|id, _| live.contains(id));
+    }
+}
+
 /// Resource ceilings applied to a project. The global environment provides `SaaS`
 /// defaults and rejects zero; a zero is unlimited only when an individual
 /// project row explicitly grants it, never through the environment.
@@ -391,5 +489,34 @@ mod quota_tests {
             .unwrap_or_else(|error| error.into_inner());
         assert!(!requests.contains_key("stale"));
         assert_eq!(requests.get("active").map(|times| times.len()), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::StoragePolicy;
+
+    #[test]
+    fn reserve_accounting_preserves_nominal_when_unset() {
+        let legacy = StoragePolicy::from_values(None, None).unwrap();
+        assert_eq!(legacy.charge_mib(102_400, Some(150)), 102_400);
+        let reserved = StoragePolicy::from_values(Some("20480"), Some("20480")).unwrap();
+        assert_eq!(reserved.charge_mib(102_400, Some(150)), 20_480);
+        assert_eq!(reserved.charge_mib(102_400, Some(30_000)), 30_000);
+        assert_eq!(reserved.charge_mib(102_400, None), 102_400);
+    }
+
+    #[test]
+    fn cap_defaults_and_explicit_zero_are_distinct() {
+        let legacy = StoragePolicy::from_values(None, None).unwrap();
+        assert_eq!(legacy.write_cap(None).unwrap(), 0);
+        let policy = StoragePolicy::from_values(Some(" 0 "), Some("20480")).unwrap();
+        assert_eq!(policy.write_cap(None).unwrap(), 20_480);
+        assert_eq!(policy.write_cap(Some(0)).unwrap(), 0);
+        assert_eq!(policy.write_cap(Some(42)).unwrap(), 42);
+        for invalid in ["", "-1", "+1", "1MiB", "1.5", "18446744073709551615"] {
+            assert!(StoragePolicy::from_values(Some(invalid), None).is_err());
+            assert!(StoragePolicy::from_values(None, Some(invalid)).is_err());
+        }
     }
 }

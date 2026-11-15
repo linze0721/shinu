@@ -1,5 +1,5 @@
 use crate::net::NetSpec;
-use shinu_core::{Image, env_u32};
+use shinu_core::{Error, Image, Result, env_u32};
 use std::path::Path;
 
 /// Per-VM sizing, jail identity, and lifetime, read from the environment.
@@ -12,6 +12,8 @@ pub struct VmConfig {
     /// `SHINU_IDLE_SECS` — a VM with no `Touch` for this long is shut down.
     /// The default leaves detached guest work alive across caller pauses.
     pub idle_secs: u64,
+    /// `SHINU_IDLE_RECLAIM` — automatically repair/discard stopped images.
+    pub idle_reclaim: bool,
     /// `SHINU_JAIL_UID` — non-root uid used by Firecracker inside the jail.
     pub jail_uid: u32,
     /// `SHINU_JAIL_GID` — non-root gid used by Firecracker inside the jail.
@@ -19,15 +21,60 @@ pub struct VmConfig {
 }
 
 impl VmConfig {
-    pub fn from_env() -> Self {
-        Self {
+    pub fn from_env() -> Result<Self> {
+        let invalid = || Error::Invalid("SHINU_IDLE_RECLAIM must be 0/false or 1/true".to_owned());
+        let idle_reclaim = match std::env::var("SHINU_IDLE_RECLAIM") {
+            Ok(value) => {
+                let value = value.trim();
+                if value == "0" || value.eq_ignore_ascii_case("false") {
+                    false
+                } else if value == "1" || value.eq_ignore_ascii_case("true") {
+                    true
+                } else {
+                    return Err(invalid());
+                }
+            }
+            Err(std::env::VarError::NotPresent) => true,
+            Err(std::env::VarError::NotUnicode(_)) => return Err(invalid()),
+        };
+        Ok(Self {
             vcpus: env_u32("SHINU_VCPUS", 2),
             mem_mib: env_u32("SHINU_MEM_MIB", 1024),
             idle_secs: u64::from(env_u32("SHINU_IDLE_SECS", 3600)),
+            idle_reclaim,
             jail_uid: env_u32("SHINU_JAIL_UID", 30_000),
             jail_gid: env_u32("SHINU_JAIL_GID", 30_000),
-        }
+        })
     }
+}
+
+/// Host cgroup memory ceiling in bytes; guest sizing and quotas stay unchanged.
+/// `SHINU_VMM_OVERHEAD_MIB` defaults to 512 only when absent; explicit 0 opts out.
+pub fn jailer_memory_limit_bytes(mem_mib: u32) -> Result<u64> {
+    let invalid = || {
+        Error::Invalid(
+            "SHINU_VMM_OVERHEAD_MIB must be an unsigned decimal MiB value in 0..=4294967295 (0 explicitly disables the VMM allowance)"
+                .to_owned(),
+        )
+    };
+    let overhead_mib = match std::env::var("SHINU_VMM_OVERHEAD_MIB") {
+        Ok(value) => {
+            let value = value.trim();
+            if value.starts_with('+') {
+                return Err(invalid());
+            }
+            value.parse::<u32>().map_err(|_| invalid())?
+        }
+        Err(std::env::VarError::NotPresent) => 512,
+        Err(std::env::VarError::NotUnicode(_)) => return Err(invalid()),
+    };
+    let total_mib = mem_mib.checked_add(overhead_mib).ok_or_else(|| {
+        Error::Invalid(format!(
+            "guest memory ({mem_mib} MiB) plus SHINU_VMM_OVERHEAD_MIB ({overhead_mib} MiB) overflows the u32 MiB range (maximum 4294967295 MiB)"
+        ))
+    })?;
+    // The checked u32 MiB sum fits in u64 bytes without multiplication overflow.
+    Ok(u64::from(total_mib) * 1024 * 1024)
 }
 
 /// Firecracker's `--config-file` body. The init path follows the selected
@@ -87,4 +134,117 @@ pub fn vm_config_json(
         }]);
     }
     config.to_string()
+}
+
+#[cfg(test)]
+mod memory_limit_tests {
+    use super::{jailer_memory_limit_bytes, vm_config_json};
+    use shinu_core::Image;
+    use std::ffi::OsString;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    const OVERHEAD_ENV: &str = "SHINU_VMM_OVERHEAD_MIB";
+
+    struct OverheadEnv(Option<OsString>);
+
+    impl OverheadEnv {
+        fn set(value: Option<&std::ffi::OsStr>) -> Self {
+            let saved = Self(std::env::var_os(OVERHEAD_ENV));
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(OVERHEAD_ENV, value),
+                    None => std::env::remove_var(OVERHEAD_ENV),
+                }
+            }
+            saved
+        }
+    }
+
+    impl Drop for OverheadEnv {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.0 {
+                    Some(value) => std::env::set_var(OVERHEAD_ENV, value),
+                    None => std::env::remove_var(OVERHEAD_ENV),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn jailer_memory_limit_defaults_to_fixed_overhead_without_resizing_guest() {
+        let _lock = ENV_LOCK.lock().expect("overhead env lock");
+        let _env = OverheadEnv::set(None);
+        assert_eq!(
+            jailer_memory_limit_bytes(14_336).expect("default memory limit"),
+            15_569_256_448
+        );
+        let config: serde_json::Value = serde_json::from_str(&vm_config_json(
+            Path::new("/kernel"),
+            Path::new("/rootfs"),
+            Image::Void,
+            Path::new("/vsock"),
+            2,
+            14_336,
+            None,
+        ))
+        .expect("guest config");
+        assert_eq!(config["machine-config"]["mem_size_mib"], 14_336);
+    }
+
+    #[test]
+    fn jailer_memory_limit_accepts_explicit_allowance_and_zero() {
+        let _lock = ENV_LOCK.lock().expect("overhead env lock");
+        for (value, expected) in [
+            ("1024", 16_106_127_360),
+            (" 512 ", 15_569_256_448),
+            ("0", 15_032_385_536),
+        ] {
+            let _env = OverheadEnv::set(Some(value.as_ref()));
+            assert_eq!(
+                jailer_memory_limit_bytes(14_336).expect("configured memory limit"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn jailer_memory_limit_rejects_invalid_environment() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let _lock = ENV_LOCK.lock().expect("overhead env lock");
+        for value in ["", " ", "-1", "+1", "1.5", "512MiB", "4294967296"] {
+            let _env = OverheadEnv::set(Some(value.as_ref()));
+            let error = jailer_memory_limit_bytes(14_336).expect_err("invalid overhead");
+            assert!(matches!(error, shinu_core::Error::Invalid(_)));
+            assert!(error.to_string().contains(OVERHEAD_ENV));
+        }
+        let non_unicode = OsString::from_vec(vec![0xff]);
+        let _env = OverheadEnv::set(Some(&non_unicode));
+        let error = jailer_memory_limit_bytes(14_336).expect_err("non-Unicode overhead");
+        assert!(matches!(error, shinu_core::Error::Invalid(_)));
+        assert!(error.to_string().contains(OVERHEAD_ENV));
+    }
+
+    #[test]
+    fn jailer_memory_limit_checks_sum_before_converting_to_bytes() {
+        let _lock = ENV_LOCK.lock().expect("overhead env lock");
+        let env_guard = OverheadEnv::set(Some("4294967295".as_ref()));
+        let error = jailer_memory_limit_bytes(1).expect_err("MiB addition overflow");
+        assert!(error.to_string().contains(OVERHEAD_ENV));
+        assert!(error.to_string().contains("overflows"));
+        drop(env_guard);
+
+        let env_guard = OverheadEnv::set(None);
+        assert!(jailer_memory_limit_bytes(u32::MAX).is_err());
+        drop(env_guard);
+
+        let _env = OverheadEnv::set(Some("4294967294".as_ref()));
+        assert_eq!(
+            jailer_memory_limit_bytes(1).expect("largest supported MiB sum"),
+            4_503_599_626_321_920
+        );
+    }
 }

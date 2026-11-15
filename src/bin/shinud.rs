@@ -1526,6 +1526,7 @@ fn checkpoint_exclusive(root: &Path, id: Uuid) -> shinu::Result<u64> {
         shinu::ckpt_state(root, id),
         shinu::ckpt_key(root, id),
         shinu::ckpt_key(root, id).with_extension("pub"),
+        checkpoint_metadata_path(root, id),
     ] {
         total = total.saturating_add(shinu::btrfs::exclusive(&path)?);
     }
@@ -1997,6 +1998,86 @@ fn ensure_snapshot_loadable(ckpt: &state::Ckpt) -> shinu::Result<()> {
     )))
 }
 
+fn checkpoint_for_restore(mut checkpoint: Ckpt) -> Ckpt {
+    if let Err(error) = ensure_snapshot_loadable(&checkpoint) {
+        eprintln!("{error}; cold-booting checkpoint disk without memory state");
+        checkpoint.full = false;
+        checkpoint.base = None;
+    }
+    checkpoint
+}
+
+fn checkpoint_metadata_path(root: &Path, id: Uuid) -> PathBuf {
+    shinu::ckpt_image(root, id).with_extension("json")
+}
+
+fn running_fc_build_id(dir: &Path) -> shinu::Result<String> {
+    let pid = shinu::vm::running_pid(dir)
+        .ok_or_else(|| shinu::Error::Invalid("snapshot VM is no longer running".into()))?;
+    // /proc retains the executable inode even after an asset is replaced.
+    let output = Command::new("sha256sum")
+        .arg(format!("/proc/{pid}/exe"))
+        .output()?;
+    if !output.status.success() {
+        return Err(shinu::Error::Internal(format!(
+            "sha256sum /proc/{pid}/exe failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .filter(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(str::to_owned)
+        .ok_or_else(|| shinu::Error::Internal("invalid running Firecracker digest".into()))
+}
+
+fn write_checkpoint_metadata(root: &Path, id: Uuid, metadata: &Value) -> shinu::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(checkpoint_metadata_path(root, id))?;
+    file.write_all(&serde_json::to_vec_pretty(metadata)?)?;
+    file.sync_all()?;
+    File::open(root.join("ckpts"))?.sync_all()?;
+    Ok(())
+}
+
+fn checkpoint_metadata(
+    id: Uuid,
+    parent: Option<Uuid>,
+    capture: Option<&shinu::vm::SnapshotCapture>,
+    fc_build_id: &str,
+) -> Value {
+    let created_unix_ns = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+    json!({
+        "generation": id,
+        "disk_root": format!("{id}.ext4"),
+        "vmstate": capture.and_then(|capture| capture.memory.as_ref()).map(|_| format!("{id}.state")),
+        "memory": capture.and_then(|capture| capture.memory.as_ref()).map(|_| format!("{id}.mem")),
+        "fc_build_id": fc_build_id,
+        "snapshot_format": shinu::FC_SNAPSHOT_VERSION,
+        "parent_generation": parent,
+        "consistency": if capture.is_some() { "application" } else { "crash" },
+        "created_unix_ns": created_unix_ns,
+        "pause_ms": capture.map_or(0, |capture| capture.pause_ms),
+        "freeze_ms": capture.map_or(0, |capture| capture.freeze_ms),
+        "thaw_ms": capture.map_or(0, |capture| capture.thaw_ms),
+    })
+}
+
+fn dirty_generation_path(root: &Path, space: Uuid) -> PathBuf {
+    shinu::vm_dir(root, space).join("snapshot-generation")
+}
+
+fn dirty_base_matches(root: &Path, space: &Space, base: &Ckpt) -> bool {
+    // FC resets dirty logging at every successful create, even if disk cut or
+    // publication then fails. A durable marker is invalidated before capture.
+    std::fs::read_to_string(dirty_generation_path(root, space.id))
+        .is_ok_and(|id| id.trim() == base.id.to_string())
+}
+
 /// The checkpoint metadata needed when appending a state transition.
 struct CkptFlags {
     /// Written by the daemon itself rather than requested by a caller.
@@ -2110,6 +2191,9 @@ fn resolve_snapshot_mode(
             let Some((base, diff_count)) = latest_usable_full_checkpoint(root, state, space) else {
                 return Ok((SnapshotMode::Full, None));
             };
+            if !dirty_base_matches(root, space, &base) {
+                return Ok((SnapshotMode::Full, None));
+            }
             if full_every > 0 && diff_count < full_every {
                 Ok((SnapshotMode::Diff, Some(base)))
             } else {
@@ -2123,6 +2207,9 @@ fn resolve_snapshot_mode(
                         .into(),
                 ));
             };
+            if !dirty_base_matches(root, space, &base) {
+                return Ok((SnapshotMode::Full, None));
+            }
             Ok((SnapshotMode::Diff, Some(base)))
         }
     }
@@ -2393,7 +2480,7 @@ fn fork_space(
             .find(|checkpoint| checkpoint.id == ckpt && checkpoint.project == project)
             .cloned()
             .ok_or_else(|| shinu::Error::NotFound(ckpt.to_string()))?;
-        ensure_snapshot_loadable(&checkpoint)?;
+        let checkpoint = checkpoint_for_restore(checkpoint);
         if let Some(base_id) = checkpoint.base {
             let base = state
                 .ckpts
@@ -2708,21 +2795,12 @@ fn commit_space(
             "stop the space before checkpointing it: {space_name}"
         )));
     }
-    if running {
-        // A hot commit flushes once, but writes after sync and before reflink
-        // completion remain outside the image by design.
-        let status = shinu::exec_in_vm(
-            &shinu::vm::vsock_path(&vm_dir),
-            &shinu::vm::key_path(&vm_dir),
-            shinu::VSOCK_SSH_PORT,
-            &["sync".to_owned()],
-        )?;
-        if status != 0 {
-            return Err(shinu::Error::Invalid(format!(
-                "sync failed for running space {space_name} (exit status {status})"
-            )));
-        }
-    }
+    let current_space = revalidate_space(ctx, project, space_id, &space_name)?;
+    let fc_build_id = if running {
+        running_fc_build_id(&vm_dir)?
+    } else {
+        "none".to_owned()
+    };
     let id = Uuid::new_v4();
     let snapshot_limits = has_snapshot
         .then(|| effective_limits(ctx, project))
@@ -2731,14 +2809,27 @@ fn commit_space(
     let jail_snapshot_mem = shinu::vm::jail_root(ctx.root, space_id).join("snap.mem");
     let jail_snapshot_state = shinu::vm::jail_root(ctx.root, space_id).join("snap.state");
     let result = (|| -> shinu::Result<Value> {
-        shinu::btrfs::clone_for(&shinu::space_image(ctx.root, space_id), &image, 0, 0)?;
+        // Invalidating before create also covers timeouts and publication
+        // failures. An uncertain dirty epoch must never produce another Diff.
         if has_snapshot {
+            remove_file_if_missing(&dirty_generation_path(ctx.root, space_id))?;
+        }
+        let capture = if running {
             let kind = match mode {
-                SnapshotMode::Full => shinu::vm::SnapshotKind::Full,
-                SnapshotMode::Diff => shinu::vm::SnapshotKind::Diff,
-                SnapshotMode::None => unreachable!(),
+                SnapshotMode::Full => Some(shinu::vm::SnapshotKind::Full),
+                SnapshotMode::Diff => Some(shinu::vm::SnapshotKind::Diff),
+                SnapshotMode::None => None,
             };
-            let (snapshot_mem, snapshot_state) = shinu::vm::snapshot(&vm_dir, kind)?;
+            Some(shinu::vm::snapshot(&vm_dir, kind, || {
+                shinu::btrfs::clone_for(&shinu::space_image(ctx.root, space_id), &image, 0, 0)
+            })?)
+        } else {
+            shinu::btrfs::clone_for(&shinu::space_image(ctx.root, space_id), &image, 0, 0)?;
+            None
+        };
+        if let Some((snapshot_mem, snapshot_state)) =
+            capture.as_ref().and_then(|capture| capture.memory.as_ref())
+        {
             std::fs::rename(snapshot_mem, shinu::ckpt_mem(ctx.root, id))?;
             std::fs::rename(snapshot_state, shinu::ckpt_state(ctx.root, id))?;
             copy_ssh_credentials(
@@ -2746,6 +2837,8 @@ fn commit_space(
                 &shinu::ckpt_key(ctx.root, id),
             )?;
         }
+        let metadata = checkpoint_metadata(id, current_space.head, capture.as_ref(), &fc_build_id);
+        write_checkpoint_metadata(ctx.root, id, &metadata)?;
         let new_checkpoint_mib =
             if has_snapshot || ctx.registry.storage.policy.reserve_mib.is_some() {
                 let bytes = checkpoint_exclusive(ctx.root, id)?;
@@ -2790,10 +2883,25 @@ fn commit_space(
                 },
             )
         })?;
-        checkpoint_json(&checkpoint)
+        if has_snapshot {
+            // Publication has succeeded: this is now the only known dirty epoch.
+            // Failure to write the marker is safe: the next capture becomes Full.
+            if let Err(error) =
+                std::fs::write(dirty_generation_path(ctx.root, space_id), id.to_string())
+            {
+                eprintln!("cannot record snapshot dirty epoch: {error}");
+            }
+        }
+        let mut response = checkpoint_json(&checkpoint)?;
+        response["consistency"] = metadata["consistency"].clone();
+        response["pause_ms"] = metadata["pause_ms"].clone();
+        response["freeze_ms"] = metadata["freeze_ms"].clone();
+        response["thaw_ms"] = metadata["thaw_ms"].clone();
+        Ok(response)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&image);
+        let _ = remove_file_if_missing(&checkpoint_metadata_path(ctx.root, id));
         let _ = remove_file_if_missing(&shinu::ckpt_mem(ctx.root, id));
         let _ = remove_file_if_missing(&shinu::ckpt_state(ctx.root, id));
         let _ = remove_file_if_missing(&shinu::ckpt_key(ctx.root, id));
@@ -2861,7 +2969,7 @@ fn checkout_space(
             entry.mem_mib,
         )
     };
-    ensure_snapshot_loadable(&target)?;
+    let target = checkpoint_for_restore(target);
     if let Some(base_id) = target.base {
         // `target` retains a reference to its base in state, so the base's
         // files cannot be claimed while the target checkpoint lock is held.
@@ -2888,6 +2996,12 @@ fn checkout_space(
     let auto_id = Uuid::new_v4();
     let auto_image = shinu::ckpt_image(ctx.root, auto_id);
     shinu::btrfs::clone_for(&shinu::space_image(ctx.root, space_id), &auto_image, 0, 0)?;
+    let metadata = checkpoint_metadata(auto_id, current_head, None, "none");
+    if let Err(error) = write_checkpoint_metadata(ctx.root, auto_id, &metadata) {
+        let _ = remove_file_if_missing(&auto_image);
+        let _ = remove_file_if_missing(&checkpoint_metadata_path(ctx.root, auto_id));
+        return Err(error);
+    }
     let short_id = commit.to_string().chars().take(8).collect::<String>();
     let auto_note = format!("auto before checkout {short_id}");
     let auto_checkpoint = update_state(ctx.db, ctx.registry, |state| {
@@ -2912,6 +3026,10 @@ fn checkout_space(
         };
         state.ckpts.push(checkpoint.clone());
         Ok(checkpoint)
+    })
+    .inspect_err(|_| {
+        let _ = remove_file_if_missing(&auto_image);
+        let _ = remove_file_if_missing(&checkpoint_metadata_path(ctx.root, auto_id));
     })?;
 
     // Keep the VM directory and keypair: changing that identity would
@@ -3066,6 +3184,7 @@ fn remove_checkpoint(ctx: &Ctx<'_>, project: &str, id: Uuid, detach: bool) -> sh
     // Keep the checkpoint lock through unlinking. A consumer that already
     // holds it finishes before the claim; later consumers see the missing row.
     remove_file_if_missing(&shinu::ckpt_image(ctx.root, id))?;
+    remove_file_if_missing(&checkpoint_metadata_path(ctx.root, id))?;
     remove_file_if_missing(&shinu::ckpt_mem(ctx.root, id))?;
     remove_file_if_missing(&shinu::ckpt_state(ctx.root, id))?;
     remove_file_if_missing(&shinu::ckpt_key(ctx.root, id))?;
@@ -3105,6 +3224,18 @@ fn list_spaces(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
             // listing must not wait behind a long-running materialization.
             let size = checkpoint_exclusive(ctx.root, checkpoint.id).unwrap_or(0);
             object.insert("exclusive".into(), Value::from(size));
+            let metadata = match std::fs::read(checkpoint_metadata_path(ctx.root, checkpoint.id)) {
+                Ok(bytes) => Some(serde_json::from_slice::<Value>(&bytes)?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            object.insert(
+                "consistency".into(),
+                metadata.as_ref().map_or_else(
+                    || json!("crash"),
+                    |metadata| metadata["consistency"].clone(),
+                ),
+            );
         }
         checkpoints.push(value);
     }
@@ -3145,10 +3276,12 @@ fn start_vm_with_pending_restore(
     if has_mem != has_state {
         remove_space_snapshot_files(ctx.root, id)?;
     }
-    let has_restore = has_mem && has_state;
-    if has_restore {
-        restore_checkpoint.map_or(Ok(()), ensure_snapshot_loadable)?;
+    let incompatible =
+        restore_checkpoint.is_some_and(|checkpoint| ensure_snapshot_loadable(checkpoint).is_err());
+    if incompatible {
+        remove_space_snapshot_files(ctx.root, id)?;
     }
+    let has_restore = has_mem && has_state && !incompatible;
     let restore = has_restore.then(|| shinu::vm::RestoreFiles {
         mem: &snapshot_mem,
         state: &snapshot_state,
@@ -3532,6 +3665,7 @@ fn gc(ctx: &Ctx<'_>, project: &str, free_below: u64, dry_run: bool) -> shinu::Re
             note
         };
         remove_file_if_missing(&shinu::ckpt_image(ctx.root, id))?;
+        remove_file_if_missing(&checkpoint_metadata_path(ctx.root, id))?;
         remove_file_if_missing(&shinu::ckpt_mem(ctx.root, id))?;
         remove_file_if_missing(&shinu::ckpt_state(ctx.root, id))?;
         remove_file_if_missing(&shinu::ckpt_key(ctx.root, id))?;
@@ -8744,6 +8878,12 @@ esac
             parent = id;
         }
         space.head = Some(parent);
+        std::fs::create_dir_all(shinu::vm_dir(root, space_id)).unwrap();
+        std::fs::write(
+            super::dirty_generation_path(root, space_id),
+            parent.to_string(),
+        )
+        .unwrap();
         (
             State {
                 spaces: vec![space],
@@ -8786,6 +8926,12 @@ esac
             Some(shinu::FC_SNAPSHOT_VERSION),
         );
         write_snapshot_test_files(&root, base_id);
+        std::fs::create_dir_all(shinu::vm_dir(&root, space_id)).unwrap();
+        std::fs::write(
+            super::dirty_generation_path(&root, space_id),
+            base_id.to_string(),
+        )
+        .unwrap();
         let state = State {
             spaces: vec![space.clone()],
             ckpts: vec![base],
@@ -8805,7 +8951,11 @@ esac
 
     #[test]
     fn full_snapshot_frequency_bounds_diffs_on_one_base() {
-        for (diff_count, expected_mode) in [(7, SnapshotMode::Diff), (8, SnapshotMode::Full)] {
+        for (diff_count, expected_mode) in [
+            (0, SnapshotMode::Diff),
+            (1, SnapshotMode::Full),
+            (8, SnapshotMode::Full),
+        ] {
             let root = test_root("full-frequency");
             let (state, base_id) = snapshot_test_chain(&root, diff_count);
             let space = &state.spaces[0];
@@ -8932,6 +9082,12 @@ esac
         );
         write_snapshot_test_files(&root, old_base_id);
         write_snapshot_test_files(&root, stale_base_id);
+        std::fs::create_dir_all(shinu::vm_dir(&root, space_id)).unwrap();
+        std::fs::write(
+            super::dirty_generation_path(&root, space_id),
+            old_base_id.to_string(),
+        )
+        .unwrap();
         let state = State {
             spaces: vec![space.clone()],
             ckpts: vec![old_base, stale_base],
@@ -12340,5 +12496,114 @@ esac
         assert_eq!(lines.len(), 3, "lines: {lines:?}");
         assert_eq!(lines[0], "before\n");
         assert_eq!(lines[2], "after\n");
+    }
+
+    #[test]
+    fn generation_metadata_binds_files_provenance_consistency_and_timings() {
+        let id = Uuid::nil();
+        let parent = Uuid::from_u128(1);
+        let capture = shinu::vm::SnapshotCapture {
+            memory: Some(("captured.mem".into(), "captured.state".into())),
+            pause_ms: 321,
+            freeze_ms: 12,
+            thaw_ms: 34,
+        };
+        let metadata = super::checkpoint_metadata(id, Some(parent), Some(&capture), "build-sha256");
+        assert_eq!(
+            metadata["generation"],
+            "00000000-0000-0000-0000-000000000000"
+        );
+        assert_eq!(
+            metadata["disk_root"],
+            "00000000-0000-0000-0000-000000000000.ext4"
+        );
+        assert_eq!(
+            metadata["vmstate"],
+            "00000000-0000-0000-0000-000000000000.state"
+        );
+        assert_eq!(
+            metadata["memory"],
+            "00000000-0000-0000-0000-000000000000.mem"
+        );
+        assert_eq!(metadata["fc_build_id"], "build-sha256");
+        assert_eq!(metadata["snapshot_format"], "12.0.0");
+        assert_eq!(metadata["parent_generation"], parent.to_string());
+        assert_eq!(metadata["consistency"], "application");
+        assert_eq!(metadata["pause_ms"], 321);
+        assert_eq!(metadata["freeze_ms"], 12);
+        assert_eq!(metadata["thaw_ms"], 34);
+        assert!(metadata["created_unix_ns"].as_i64().unwrap() > 0);
+        let cold = super::checkpoint_metadata(id, None, None, "none");
+        assert_eq!(cold["consistency"], "crash");
+        assert!(cold["memory"].is_null());
+        assert_eq!(cold["pause_ms"], 0);
+    }
+
+    #[test]
+    fn format_ten_memory_is_refused_but_checkpoint_can_boot_cold() {
+        let checkpoint = checkpoint_for_snapshot_gate(true, Some("10.0.0"));
+        assert!(super::ensure_snapshot_loadable(&checkpoint).is_err());
+        let id = checkpoint.id;
+        let cold = super::checkpoint_for_restore(checkpoint);
+        assert_eq!(cold.id, id);
+        assert!(!cold.full);
+        assert!(cold.base.is_none());
+    }
+
+    #[test]
+    fn failed_diff_capture_cannot_reuse_reset_dirty_epoch() {
+        let root = test_root("failed-diff-epoch");
+        let (state, _) = snapshot_test_chain(&root, 0);
+        let space = &state.spaces[0];
+        let first =
+            super::resolve_snapshot_mode(&root, &state, space, SnapshotMode::Diff, 8).unwrap();
+        assert_eq!(first.0, SnapshotMode::Diff);
+        std::fs::remove_file(super::dirty_generation_path(&root, space.id)).unwrap();
+        let retry =
+            super::resolve_snapshot_mode(&root, &state, space, SnapshotMode::Diff, 8).unwrap();
+        assert_eq!(retry.0, SnapshotMode::Full);
+        assert!(retry.1.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn consecutive_diff_requests_cannot_overlay_only_the_old_full() {
+        let root = test_root("consecutive-diff-epoch");
+        let (state, _) = snapshot_test_chain(&root, 1);
+        let result =
+            super::resolve_snapshot_mode(&root, &state, &state.spaces[0], SnapshotMode::Diff, 8)
+                .unwrap();
+        assert_eq!(result.0, SnapshotMode::Full);
+        assert!(result.1.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_listing_exposes_application_and_legacy_crash_consistency() {
+        let root = test_root("checkpoint-consistency-list");
+        let checkpoint = checkpoint_for_snapshot_gate(false, None);
+        store_state(
+            &root,
+            &State {
+                spaces: Vec::new(),
+                ckpts: vec![checkpoint.clone()],
+                templates: Vec::new(),
+            },
+        );
+        let db = test_db(&root);
+        let (vm_cfg, net_cfg) = test_configs();
+        let registry = registry();
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        let legacy = handle(&ctx, Req::Ls, "project-a").unwrap();
+        assert_eq!(legacy["ckpts"][0]["consistency"], "crash");
+        std::fs::create_dir_all(root.join("ckpts")).unwrap();
+        std::fs::write(
+            super::checkpoint_metadata_path(&root, checkpoint.id),
+            br#"{"consistency":"application"}"#,
+        )
+        .unwrap();
+        let listing = handle(&ctx, Req::Ls, "project-a").unwrap();
+        assert_eq!(listing["ckpts"][0]["consistency"], "application");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

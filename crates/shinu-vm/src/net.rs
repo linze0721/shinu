@@ -391,7 +391,9 @@ mod network_tests {
                 "drive_id": "rootfs",
                 "path_on_host": "/rootfs",
                 "is_root_device": true,
-                "is_read_only": false
+                "is_read_only": false,
+                "io_engine": "Sync",
+                "discard": true
             }],
             "vsock": { "vsock_id": "vsock0", "guest_cid": 3, "uds_path": "/vsock" },
             "balloon": { "amount_mib": 0, "deflate_on_oom": true, "stats_polling_interval_s": 1, "free_page_reporting": true },

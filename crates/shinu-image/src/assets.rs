@@ -489,6 +489,34 @@ fn verify_asset_digest(
     Ok(())
 }
 
+fn install_kernel(root: &Path) -> Result<()> {
+    let kernel = kernel_path(root);
+    let Some(source) = std::env::var_os("SHINU_KERNEL_FILE") else {
+        return curl_to_file(KERNEL_URL, &kernel);
+    };
+    let digest = std::env::var("SHINU_KERNEL_SHA256")
+        .ok()
+        .filter(|digest| valid_sha256_digest(digest))
+        .ok_or_else(|| {
+            Error::Invalid("SHINU_KERNEL_FILE requires a valid SHINU_KERNEL_SHA256".into())
+        })?;
+    let source = PathBuf::from(source);
+    // Local artifacts follow the same root ownership/no-symlink contract as
+    // installed assets. Verify the copied inode, not just its source path.
+    verify_asset_digest(&source, "local kernel", &digest, false)?;
+    let staged = unique_staging_path(&kernel);
+    let result = (|| {
+        fs::copy(&source, &staged)?;
+        fs::set_permissions(&staged, fs::Permissions::from_mode(0o644))?;
+        verify_asset_digest(&staged, "staged local kernel", &digest, false)?;
+        File::open(&staged)?.sync_all()?;
+        fs::rename(&staged, &kernel)?;
+        Ok(())
+    })();
+    let cleanup = remove_file_if_present(&staged);
+    result.and(cleanup)
+}
+
 fn reseed_assets(root: &Path) -> Result<AssetManifest> {
     if !KERNEL_URL.starts_with("https://") {
         return Err(Error::Invalid(format!(
@@ -498,13 +526,12 @@ fn reseed_assets(root: &Path) -> Result<AssetManifest> {
     let tarball = release_tarball(root)?;
     install_firecracker(&tarball, &firecracker_bin(root))?;
     install_jailer(&tarball, &jailer_bin(root))?;
-    // A kernel without a manifest has no provenance. Always fetch it afresh
-    // before recording the first baseline digest, even if a file is present.
-    let kernel = kernel_path(root);
-    curl_to_file(KERNEL_URL, &kernel)?;
+    // Both HTTPS and pinned local kernels establish provenance before the
+    // manifest is written; an unrecorded existing inode is never trusted.
+    install_kernel(root)?;
     let firecracker_sha256 = asset_digest(&firecracker_bin(root), "firecracker", true)?;
     let jailer_sha256 = asset_digest(&jailer_bin(root), "jailer", true)?;
-    let kernel_sha256 = asset_digest(&kernel, "kernel", false)?;
+    let kernel_sha256 = asset_digest(&kernel_path(root), "kernel", false)?;
     Ok(AssetManifest::current(
         firecracker_sha256,
         jailer_sha256,

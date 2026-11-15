@@ -5,18 +5,15 @@ use uuid::Uuid;
 
 pub const DEFAULT_ROOT: &str = "/var/lib/shinu";
 
-pub const FC_VERSION: &str = "v1.16.1";
+pub const FC_VERSION: &str = "v1.18.0";
 /// Firecracker snapshot data format expected by `PUT /snapshot/load`.
-/// Checkpoints record it so restore rejects incompatible memory state.
-pub const FC_SNAPSHOT_VERSION: &str = "10.0.0";
-pub const FC_URL: &str = "https://github.com/firecracker-microvm/firecracker/releases/download/v1.16.1/firecracker-v1.16.1-x86_64.tgz";
-/// Firecracker's CI kernel: an uncompressed 6.1.155 vmlinux with virtio-blk,
-/// virtio-vsock and ext4 built in (`=y`), which is what booting without an
-/// initrd requires. The host kernel cannot stand in for it — this host builds
-/// those as modules. No `firecracker-ci/v1.16` bucket is published, so the
-/// v1.15 kernel is used with the v1.16.1 binaries.
-pub const KERNEL_URL: &str =
-    "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/vmlinux-6.1.155";
+/// Old memory state is refused; its checkpoint disk can still boot cold.
+pub const FC_SNAPSHOT_VERSION: &str = "12.0.0";
+pub const FC_URL: &str = "https://github.com/firecracker-microvm/firecracker/releases/download/v1.18.0/firecracker-v1.18.0-x86_64.tgz";
+/// Newest published FC-CI kernel, pinned to an immutable dated artifact set.
+/// FC v1.18 tests support 6.18; virtio-blk, vsock, ext4 and overlayfs are built in.
+/// There is no published firecracker-ci/v1.18 prefix: devtool uses dated sets.
+pub const KERNEL_URL: &str = "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20261111-778a26c0594c-0/x86_64/vmlinux-6.18.62";
 /// Guest vsock port the in-VM socat bridge listens on; forwarded to sshd.
 pub const VSOCK_SSH_PORT: u16 = 2222;
 /// GUI VNC uses a separate vsock connection because each Firecracker vsock

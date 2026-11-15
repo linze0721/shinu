@@ -109,7 +109,9 @@ pub fn vm_config_json(
             "drive_id": "rootfs",
             "path_on_host": rootfs.to_string_lossy(),
             "is_root_device": true,
-            "is_read_only": false
+            "is_read_only": false,
+            "io_engine": "Sync",
+            "discard": true
         }],
         // Every VM has a private vsock UDS, so guest CID 3 is safe to reuse.
         "vsock": { "vsock_id": "vsock0", "guest_cid": 3, "uds_path": vsock_uds.to_string_lossy() },
@@ -171,6 +173,23 @@ mod memory_limit_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn writable_rootfs_negotiates_discard_with_sync_engine() {
+        let config: serde_json::Value = serde_json::from_str(&vm_config_json(
+            Path::new("/kernel"),
+            Path::new("/rootfs"),
+            Image::Ubuntu,
+            Path::new("/vsock"),
+            2,
+            4096,
+            None,
+        ))
+        .expect("guest config");
+        assert_eq!(config["drives"][0]["discard"], true);
+        assert_eq!(config["drives"][0]["io_engine"], "Sync");
+        assert_eq!(config["drives"][0]["is_read_only"], false);
     }
 
     #[test]

@@ -902,44 +902,204 @@ impl SnapshotKind {
     }
 }
 
-/// Captures guest RAM and vCPU state beside the disk image.
-///
-/// Firecracker resolves these paths inside the jailer's chroot, so the files
-/// land in the jail and must be moved out by the caller.
-pub fn snapshot(dir: &Path, kind: SnapshotKind) -> Result<(PathBuf, PathBuf)> {
-    release(dir);
-    if api(dir, "PATCH", "/vm", Some("{\"state\": \"Paused\"}")).is_none() {
-        return Err(Error::Internal(
-            "failed to pause VM for snapshot".to_owned(),
-        ));
+/// Captured files and application-freeze / VM-pause durations, in milliseconds.
+#[derive(Debug, Default)]
+pub struct SnapshotCapture {
+    pub memory: Option<(PathBuf, PathBuf)>,
+    pub pause_ms: u64,
+    pub freeze_ms: u64,
+    pub thaw_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotStep {
+    Freeze,
+    Pause,
+    Create,
+    Cut,
+    Resume,
+    Thaw,
+}
+
+fn elapsed_ms(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+// The transaction owns cleanup, not the caller. Even an ambiguous pause
+// transport failure must attempt resume before thawing the guest.
+fn snapshot_transaction(
+    memory: bool,
+    mut step: impl FnMut(SnapshotStep) -> Result<()>,
+) -> Result<SnapshotCapture> {
+    let mut capture = SnapshotCapture::default();
+    let freeze_start = Instant::now();
+    let frozen = step(SnapshotStep::Freeze);
+    capture.freeze_ms = elapsed_ms(freeze_start);
+    let mut result = frozen;
+    if result.is_ok() {
+        let pause_start = Instant::now();
+        result = (|| {
+            step(SnapshotStep::Pause)?;
+            if memory {
+                step(SnapshotStep::Create)?;
+            }
+            step(SnapshotStep::Cut)
+        })();
+        let resumed = step(SnapshotStep::Resume);
+        capture.pause_ms = elapsed_ms(pause_start);
+        result = combine_snapshot_results(result, resumed);
     }
-    let body = format!(
-        "{{\"snapshot_type\":\"{}\",\"snapshot_path\":\"snap.state\",\"mem_file_path\":\"snap.mem\"}}",
-        kind.firecracker_name()
+    let thaw_start = Instant::now();
+    let thawed = step(SnapshotStep::Thaw);
+    capture.thaw_ms = elapsed_ms(thaw_start);
+    combine_snapshot_results(result, thawed)?;
+    Ok(capture)
+}
+
+fn combine_snapshot_results(primary: Result<()>, cleanup: Result<()>) -> Result<()> {
+    match (primary, cleanup) {
+        (Err(primary), Err(cleanup)) => Err(Error::Internal(format!(
+            "{primary}; snapshot cleanup also failed: {cleanup}"
+        ))),
+        (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn guest_snapshot_script(dir: &Path, script: &str) -> Result<()> {
+    let helper = shinu_core::vsock_helper()?;
+    // The guest deadline terminates the remote script too; killing only SSH
+    // would allow a late fsfreeze to race the host's thaw attempt.
+    let command = [
+        "timeout".to_owned(),
+        "-k".to_owned(),
+        "5".to_owned(),
+        "240".to_owned(),
+        "flock".to_owned(),
+        "-w".to_owned(),
+        "115".to_owned(),
+        "/run/shinu-snapshot.lock".to_owned(),
+        "timeout".to_owned(),
+        "-k".to_owned(),
+        "5".to_owned(),
+        "110".to_owned(),
+        "sh".to_owned(),
+        "-c".to_owned(),
+        script.to_owned(),
+    ];
+    let ssh = ssh_command(
+        &helper,
+        &vsock_path(dir),
+        &key_path(dir),
+        shinu_core::VSOCK_SSH_PORT,
+        &command,
     );
-    if api_with_timeout(
-        dir,
-        "PUT",
-        "/snapshot/create",
-        Some(&body),
-        SNAPSHOT_TIMEOUT_SECS,
-    )
-    .is_none()
+    match run_process_group(ssh, Duration::from_secs(250)) {
+        Some(status) if status.success() => Ok(()),
+        status => Err(Error::Internal(format!(
+            "guest snapshot freeze/thaw failed or timed out: {status:?}"
+        ))),
+    }
+}
+
+/// Thaws a restored generation before exposing it to callers. The captured
+/// ledger makes this idempotent, including after partially completed cleanup.
+pub fn thaw_snapshot(dir: &Path) -> Result<()> {
+    let first = guest_snapshot_script(dir, include_str!("thaw.sh"));
+    match first {
+        Ok(()) => Ok(()),
+        Err(first) => guest_snapshot_script(dir, include_str!("thaw.sh"))
+            .map_err(|retry| Error::Internal(format!("{first}; thaw retry failed: {retry}"))),
+    }
+}
+
+/// Application-consistent capture: freeze, pause, drain/capture, cut disk,
+/// resume, thaw. The disk cut runs while paused and only after snapshot/create.
+/// Disk-only hot commits use the same transaction without creating RAM state.
+pub fn snapshot(
+    dir: &Path,
+    kind: Option<SnapshotKind>,
+    disk_cut: impl FnOnce() -> Result<()>,
+) -> Result<SnapshotCapture> {
+    let version = api(dir, "GET", "/version", None)
+        .ok_or_else(|| Error::Internal("cannot identify running Firecracker build".into()))?;
+    let version: serde_json::Value = serde_json::from_str(&version)?;
+    if version["firecracker_version"].as_str()
+        != Some(shinu_core::FC_VERSION.trim_start_matches('v'))
     {
-        // A failed create leaves Firecracker paused, so always make the best
-        // effort to restore normal VM operation before reporting the error.
-        let _ = api(dir, "PATCH", "/vm", Some("{\"state\": \"Resumed\"}"));
-        return Err(Error::Internal("failed to create VM snapshot".to_owned()));
+        return Err(Error::Invalid(format!(
+            "running Firecracker is {}, expected {}; cold restart this Space before capturing",
+            version["firecracker_version"],
+            shinu_core::FC_VERSION
+        )));
     }
-    if api(dir, "PATCH", "/vm", Some("{\"state\": \"Resumed\"}")).is_none() {
-        return Err(Error::Internal(
-            "failed to resume VM after snapshot".to_owned(),
-        ));
-    }
-    Ok((
-        jail_path(dir, JAIL_SNAP_MEM),
-        jail_path(dir, JAIL_SNAP_STATE),
-    ))
+    release(dir);
+    let mut disk_cut = Some(disk_cut);
+    let mut capture = snapshot_transaction(kind.is_some(), |step| match step {
+        SnapshotStep::Freeze => guest_snapshot_script(dir, include_str!("freeze.sh")),
+        SnapshotStep::Thaw => thaw_snapshot(dir),
+        SnapshotStep::Cut => disk_cut
+            .take()
+            .ok_or_else(|| Error::Internal("snapshot disk cut already consumed".into()))?(
+        ),
+        SnapshotStep::Pause | SnapshotStep::Resume => {
+            let state = if step == SnapshotStep::Pause {
+                "Paused"
+            } else {
+                "Resumed"
+            };
+            for _ in 0..3 {
+                if api(
+                    dir,
+                    "PATCH",
+                    "/vm",
+                    Some(&format!("{{\"state\":\"{state}\"}}")),
+                )
+                .is_some()
+                {
+                    return Ok(());
+                }
+                if step == SnapshotStep::Pause {
+                    break;
+                }
+                // A lost resume response is not evidence that vCPUs are paused.
+                if let Some(info) = api(dir, "GET", "/", None)
+                    .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+                    && info["state"] == "Running"
+                {
+                    return Ok(());
+                }
+            }
+            Err(Error::Internal(format!(
+                "failed snapshot VM transition: {state}"
+            )))
+        }
+        SnapshotStep::Create => {
+            let kind = kind.ok_or_else(|| Error::Internal("snapshot kind missing".into()))?;
+            let body = serde_json::json!({
+                "snapshot_type": kind.firecracker_name(),
+                "snapshot_path": JAIL_SNAP_STATE,
+                "mem_file_path": JAIL_SNAP_MEM,
+            })
+            .to_string();
+            api_with_timeout(
+                dir,
+                "PUT",
+                "/snapshot/create",
+                Some(&body),
+                SNAPSHOT_TIMEOUT_SECS,
+            )
+            .ok_or_else(|| Error::Internal("failed to create VM snapshot".to_owned()))?;
+            Ok(())
+        }
+    })?;
+    capture.memory = kind.map(|_| {
+        (
+            jail_path(dir, JAIL_SNAP_MEM),
+            jail_path(dir, JAIL_SNAP_STATE),
+        )
+    });
+    Ok(capture)
 }
 
 /// Firecracker diff snapshots are sparse: allocated extents are dirty pages
@@ -1182,6 +1342,11 @@ pub fn start(
         touch(&dir)?;
         return Ok((vsock, false));
     }
+    match std::fs::remove_file(dir.join("snapshot-generation")) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
 
     let memory_limit_bytes = crate::config::jailer_memory_limit_bytes(mem_mib)?;
 
@@ -1388,6 +1553,10 @@ pub fn start(
             )));
         }
         if restore.is_some() {
+            if let Err(error) = thaw_snapshot(&dir) {
+                let _ = stop(&dir, net_cfg);
+                return Err(error);
+            }
             // Firecracker restores the guest wall clock from snapshot time;
             // correcting it here keeps timers and certificate checks sane.
             let clock_command = [
@@ -2192,5 +2361,58 @@ mod snapshot_load_tests {
         assert!(!body.contains("network_overrides"));
         assert!(body.contains("\"snapshot_path\":\"snap.state\""));
         assert!(body.contains("\"backend_type\":\"File\""));
+    }
+}
+
+#[cfg(test)]
+mod hot_snapshot_tests {
+    use super::{SnapshotStep, snapshot_transaction};
+
+    #[test]
+    fn disk_cut_follows_create_and_precedes_resume_and_thaw() {
+        use SnapshotStep::{Create, Cut, Freeze, Pause, Resume, Thaw};
+        let mut observed = Vec::new();
+        snapshot_transaction(true, |step| {
+            observed.push(step);
+            Ok(())
+        })
+        .expect("capture");
+        assert_eq!(observed, [Freeze, Pause, Create, Cut, Resume, Thaw]);
+    }
+
+    #[test]
+    fn every_failure_attempts_thaw_and_never_publishes_success() {
+        use SnapshotStep::{Create, Cut, Freeze, Pause, Resume, Thaw};
+        for failed in [Freeze, Pause, Create, Cut, Resume, Thaw] {
+            let mut observed = Vec::new();
+            let result = snapshot_transaction(true, |step| {
+                observed.push(step);
+                if step == failed {
+                    Err(shinu_core::Error::Internal(format!("injected {step:?}")))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(result.is_err(), "failure at {failed:?}");
+            assert_eq!(observed.last(), Some(&Thaw));
+            if failed != Freeze {
+                assert!(observed.contains(&Resume), "failure at {failed:?}");
+            }
+            if matches!(failed, Freeze | Pause | Create) {
+                assert!(!observed.contains(&Cut));
+            }
+        }
+    }
+
+    #[test]
+    fn disk_only_hot_capture_still_freezes_pauses_and_thaws() {
+        use SnapshotStep::{Cut, Freeze, Pause, Resume, Thaw};
+        let mut observed = Vec::new();
+        snapshot_transaction(false, |step| {
+            observed.push(step);
+            Ok(())
+        })
+        .expect("disk capture");
+        assert_eq!(observed, [Freeze, Pause, Cut, Resume, Thaw]);
     }
 }

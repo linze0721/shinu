@@ -533,8 +533,8 @@ make -C /src O=/build LOCALVERSION=-shinu olddefconfig
 make -C /src O=/build LOCALVERSION=-shinu -j4 vmlinux
 ```
 
-Result: `vmlinux` SHA-256 `3f7808d10960bc05a1bfb107587ea1fca1d7810a2993631723637d898c0e82c8`;
-normalized config SHA-256 `d3ea50c7afcb808456c9da660de8e71b25e21dd03c2665e18a37073b52aa3ff8`.
+Result: `vmlinux` SHA-256 `423c1ddb2f265b460b7b7a6abd37f21d1b03acf5c0c07470247b75455f0675d4`;
+normalized config SHA-256 `8ab6cdca47da451376755a16bf0b659306126e9d8def6b3a8e5299369647e8c2`.
 Set `SHINU_KERNEL_FILE` to that vmlinux and `SHINU_KERNEL_SHA256` to its digest when seeding assets. This is a build fingerprint, not a claim of reproducibility across compiler/container updates. Runtime acceptance additionally requires guest NAT listing, comment/multiport/mark rule creation, Docker network/container connectivity, and the full LeapCore health inventory.
 
 

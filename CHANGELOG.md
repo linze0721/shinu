@@ -29,6 +29,8 @@ Changes are recorded in the Keep a Changelog format.
 - Retain full/diff snapshot SSH credentials with checkpoint assets so source Space or lease cleanup does not strand memory forks; remove archived keys with checkpoint GC/deletion.
 - Bound detached jobs by `SHINU_JOB_MAX_SECS` (default 3600 seconds, 0 disables the cap) and the host Space lease, reusing normal cancellation and final-log archival with a deadline-specific error.
 - Cold-boot incompatible memory checkpoints from their retained disk images instead of attempting to load old Firecracker state.
+- Reject stock/unapproved Firecracker builds for application snapshots: require the `v1.18.0-shinu.1` marker at asset admission and on the actual running executable; use a mandatory local patched archive rather than downloading stock.
+- Fail hot captures on block drain/flush errors, including an explicit backing-file fsync for disk-only hot cuts, while preserving resume/thaw cleanup.
 - Guard Diff creation with the actual live dirty epoch: failed captures, restarts and consecutive Diff requests force Full rather than dropping dirty pages from earlier captures.
 
 [Unreleased]: https://github.com/linze0721/shinu/compare/main...HEAD

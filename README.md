@@ -28,9 +28,12 @@ A **space** is an ext4 guest disk image cloned from a golden base via btrfs refl
 
 ### 1. Build and Install
 
+Build the fork archive described under “Firecracker v1.18 rollout” first. This branch requires the allowlisted `Firecracker v1.18.0-shinu.1` build, whose block flush failures abort snapshot creation; it never downloads stock Firecracker as a fallback.
+
 ```sh
 cargo build --release
 ./packaging/install.sh              # Default PREFIX=/usr/local
+install -D -m 0600 firecracker-v1.18.0-shinu.1-x86_64.tgz /var/lib/shinu/cache/firecracker-v1.18.0-shinu.1-x86_64.tgz
 ln -s /etc/sv/shinud /var/service/  # Enable runit service (or launch manually as root)
 ```
 
@@ -509,7 +512,7 @@ Shinu implements explicit version control semantics over guest ext4 image states
 
 Writable rootfs drives explicitly use `io_engine: "Sync"` and `discard: true`. Guest `fstrim /` punches holes in the backing sparse image; `fstrim`'s reported bytes are not reclaimed physical bytes (compare host `stat` allocated blocks). The default download is FC-CI `6.18.62` in immutable set `20261111-778a26c0594c-0`; there is no `firecracker-ci/v1.18` prefix. **Docker/LeapCore deployments must use the custom 6.18.62-shinu kernel built from `packaging/kernel-6.18.62.config`**, which supplements the FC-CI config with the existing 6.1.155 kernel's built-in netfilter feature set (nft inet/IPv6, masquerade, xt comment/mark/multiport, raw tables, IPVS and related dependencies). The stock CI kernel omits those capabilities; booting to SSH alone is not adequate compatibility proof.
 
-The fork build recipe is `docs/shinu-v1.18-build.md` on `linze0721/firecracker` branch `shinu/v1.18`. To use that exact local build rather than the upstream release, package the binaries and `SHA256SUMS` in the standard `release-v1.18.0-x86_64/` directory, then place its tarball at `<root>/cache/firecracker-v1.18.0-x86_64.tgz` as root, not group/world-writable, **before** first v1.18 daemon startup. For the custom kernel set `SHINU_KERNEL_FILE` to a root-owned, readable regular file (no symlink or group/world write), and `SHINU_KERNEL_SHA256` to its independently verified SHA-256. Reseeding copies and verifies that kernel before recording its digest. Without the override, only the default HTTPS kernel is downloaded. An already matching asset manifest is verified, not overwritten: stage the intended binaries/kernel and manifest during the maintenance window rather than changing live assets.
+The fork build recipe is `docs/shinu-v1.18-build.md` on `linze0721/firecracker` branch `shinu/v1.18`. Package the marked FC and jailer binaries plus `SHA256SUMS` in `release-v1.18.0-shinu.1-x86_64/`, then place its tarball at `<root>/cache/firecracker-v1.18.0-shinu.1-x86_64.tgz` as root, not group/world-writable, **before** daemon startup. Stock FC is never auto-downloaded: its snapshot prepare path suppresses block flush errors. Installation and matching-manifest verification require an allowlisted `--version` build label, and each hot capture repeats that check on `/proc/<running-pid>/exe`; replacing an asset cannot bless an old running binary. The fork propagates device-preparation failure through `Vmm::save_state` without changing format 12; shinu then resumes/thaws and rejects publication. Disk-only hot cuts explicitly fsync the paused Sync backing inode as they do not request FC memory capture. For the custom kernel set `SHINU_KERNEL_FILE` to a root-owned readable regular file (no symlink or group/world write) and `SHINU_KERNEL_SHA256` to its verified digest. An already matching manifest is verified, not overwritten; stage intended assets during the maintenance window.
 
 For 109, deploy only during a coordinated maintenance window: stop/cold-restart every Space (including the nightly candidate), install the new shinu binaries together with `shinu-vsock`, stage FC/jailer/kernel with verified hashes, update the nightly `SHINUD_LIFECYCLE_SHA256` pin to the deployed `shinud` SHA-256, and then restart the daemon. Keep old checkpoint disks; their old memory falls back to cold boot. Re-capture format-12 generations before expecting warm restores. No production rollout is performed by this change.
 

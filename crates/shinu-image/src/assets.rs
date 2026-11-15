@@ -255,35 +255,26 @@ fn write_manifest(path: &Path, manifest: &AssetManifest) -> Result<()> {
 }
 
 fn release_tarball(root: &Path) -> Result<PathBuf> {
-    let cache = cache_dir(root);
-    fs::create_dir_all(&cache)?;
-    let tarball = cache.join(format!("firecracker-{FC_VERSION}-x86_64.tgz"));
+    fs::create_dir_all(cache_dir(root))?;
+    let tarball = root.join(FC_URL);
     match fs::symlink_metadata(&tarball) {
         Ok(metadata)
             if metadata.file_type().is_file()
                 && metadata.uid() == 0
                 && metadata.mode() & 0o022 == 0 =>
         {
-            return Ok(tarball);
+            Ok(tarball)
         }
-        Ok(_) => {
-            return Err(Error::Invalid(format!(
-                "unsafe cached Firecracker release: {}",
-                tarball.display()
-            )));
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    curl_to_file(FC_URL, &tarball)?;
-    let metadata = fs::symlink_metadata(&tarball)?;
-    if !metadata.file_type().is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
-        return Err(Error::Invalid(format!(
-            "unsafe downloaded Firecracker release: {}",
+        Ok(_) => Err(Error::Invalid(format!(
+            "unsafe cached Firecracker release: {}",
             tarball.display()
-        )));
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(Error::Invalid(format!(
+            "patched {FC_VERSION} archive required at {}; stock Firecracker is not downloaded because it suppresses block snapshot flush errors",
+            tarball.display()
+        ))),
+        Err(error) => Err(error.into()),
     }
-    Ok(tarball)
 }
 fn install_from_tarball(tarball: &Path, member: &str, dst: &Path) -> Result<()> {
     let unpack = unique_staging_path(dst);
@@ -525,6 +516,7 @@ fn reseed_assets(root: &Path) -> Result<AssetManifest> {
     }
     let tarball = release_tarball(root)?;
     install_firecracker(&tarball, &firecracker_bin(root))?;
+    shinu_core::require_firecracker_build(&firecracker_bin(root))?;
     install_jailer(&tarball, &jailer_bin(root))?;
     // Both HTTPS and pinned local kernels establish provenance before the
     // manifest is written; an unrecorded existing inode is never trusted.
@@ -546,6 +538,7 @@ fn verify_assets(root: &Path, manifest: &AssetManifest) -> Result<()> {
         &manifest.firecracker_sha256,
         true,
     )?;
+    shinu_core::require_firecracker_build(&firecracker_bin(root))?;
     verify_asset_digest(&jailer_bin(root), "jailer", &manifest.jailer_sha256, true)?;
     verify_asset_digest(&kernel_path(root), "kernel", &manifest.kernel_sha256, false)
 }

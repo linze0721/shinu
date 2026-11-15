@@ -1038,10 +1038,18 @@ pub fn snapshot(
     let mut capture = snapshot_transaction(kind.is_some(), |step| match step {
         SnapshotStep::Freeze => guest_snapshot_script(dir, include_str!("freeze.sh")),
         SnapshotStep::Thaw => thaw_snapshot(dir),
-        SnapshotStep::Cut => disk_cut
-            .take()
-            .ok_or_else(|| Error::Internal("snapshot disk cut already consumed".into()))?(
-        ),
+        SnapshotStep::Cut => {
+            if kind.is_none() {
+                // Sync IO has no outstanding requests once paused. Disk-only
+                // captures do not call snapshot/create, so flush this inode
+                // explicitly and fail the same transaction on storage errors.
+                std::fs::File::open(jail_path(dir, JAIL_ROOTFS))?.sync_all()?;
+            }
+            disk_cut
+                .take()
+                .ok_or_else(|| Error::Internal("snapshot disk cut already consumed".into()))?(
+            )
+        }
         SnapshotStep::Pause | SnapshotStep::Resume => {
             let state = if step == SnapshotStep::Pause {
                 "Paused"

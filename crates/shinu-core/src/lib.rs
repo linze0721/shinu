@@ -5,11 +5,13 @@ use uuid::Uuid;
 
 pub const DEFAULT_ROOT: &str = "/var/lib/shinu";
 
-pub const FC_VERSION: &str = "v1.18.0";
+pub const FC_VERSION: &str = "v1.18.0-shinu.1";
 /// Firecracker snapshot data format expected by `PUT /snapshot/load`.
 /// Old memory state is refused; its checkpoint disk can still boot cold.
 pub const FC_SNAPSHOT_VERSION: &str = "12.0.0";
-pub const FC_URL: &str = "https://github.com/firecracker-microvm/firecracker/releases/download/v1.18.0/firecracker-v1.18.0-x86_64.tgz";
+/// Root-relative local archive; stock releases do not fail closed on block flush errors.
+pub const FC_URL: &str = "cache/firecracker-v1.18.0-shinu.1-x86_64.tgz";
+const FC_ALLOWED_BUILDS: &[&str] = &["Firecracker v1.18.0-shinu.1"];
 /// Newest published FC-CI kernel, pinned to an immutable dated artifact set.
 /// FC v1.18 tests support 6.18; virtio-blk, vsock, ext4 and overlayfs are built in.
 /// There is no published firecracker-ci/v1.18 prefix: devtool uses dated sets.
@@ -40,6 +42,32 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Require an allowlisted patched build before trusting snapshot consistency.
+/// Callers validate ownership before executing assets; `/proc/<pid>/exe` is
+/// permitted for the already-validated live VM process.
+pub fn require_firecracker_build(executable: &Path) -> Result<()> {
+    let output = std::process::Command::new(executable)
+        .arg("--version")
+        .output()?;
+    if !output.status.success() {
+        return Err(Error::Invalid(format!(
+            "{} --version failed: {}",
+            executable.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let version = String::from_utf8_lossy(&output.stdout);
+    let label = version.lines().next().unwrap_or_default().trim();
+    if FC_ALLOWED_BUILDS.contains(&label) {
+        return Ok(());
+    }
+    Err(Error::Invalid(format!(
+        "untrusted Firecracker build {label:?} from {} --version; application snapshots require {:?}; install the patched local archive and cold restart the Space",
+        executable.display(),
+        FC_ALLOWED_BUILDS
+    )))
+}
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -922,5 +950,36 @@ mod address_tests {
         assert!(!is_rfc1918("8.8.8.8"));
         assert!(!is_rfc1918("172.15.255.255"));
         assert!(!is_rfc1918("172.32.0.1"));
+    }
+}
+
+#[cfg(test)]
+mod firecracker_build_tests {
+    use super::require_firecracker_build;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn only_allowlisted_shinu_builds_can_claim_application_consistency() {
+        let program = std::env::temp_dir().join(format!("shinu-fc-build-{}", uuid::Uuid::new_v4()));
+        for (label, status, allowed) in [
+            ("Firecracker v1.18.0-shinu.1", 0, true),
+            ("Firecracker v1.18.0", 0, false),
+            ("Firecracker v1.18.0-shinu.2", 0, false),
+            ("Firecracker v1.18.0-shinu.1-unapproved", 0, false),
+            ("Firecracker v1.18.0-shinu.1", 1, false),
+        ] {
+            std::fs::write(
+                &program,
+                format!("#!/bin/sh\nprintf '%s\\n' '{label}'\nexit {status}\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(
+                require_firecracker_build(&program).is_ok(),
+                allowed,
+                "{label} / {status}"
+            );
+        }
+        std::fs::remove_file(program).unwrap();
     }
 }

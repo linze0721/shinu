@@ -2015,9 +2015,9 @@ fn running_fc_build_id(dir: &Path) -> shinu::Result<String> {
     let pid = shinu::vm::running_pid(dir)
         .ok_or_else(|| shinu::Error::Invalid("snapshot VM is no longer running".into()))?;
     // /proc retains the executable inode even after an asset is replaced.
-    let output = Command::new("sha256sum")
-        .arg(format!("/proc/{pid}/exe"))
-        .output()?;
+    let executable = PathBuf::from(format!("/proc/{pid}/exe"));
+    shinu::require_firecracker_build(&executable)?;
+    let output = Command::new("sha256sum").arg(&executable).output()?;
     if !output.status.success() {
         return Err(shinu::Error::Internal(format!(
             "sha256sum /proc/{pid}/exe failed: {}",

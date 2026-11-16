@@ -1210,8 +1210,15 @@ fn sync_network_hosts_with(
     cfg: &shinu::NetConfig,
     running_members: &[Space],
     all_members: &[Space],
+    deadline: Instant,
 ) {
     for member in running_members {
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_secs(30));
+        if remaining.is_zero() {
+            return;
+        }
         let Some(network) = member.network.as_deref() else {
             continue;
         };
@@ -1224,27 +1231,26 @@ fn sync_network_hosts_with(
         ) else {
             continue;
         };
-        match shinu::exec_in_vm(
-            &shinu::vm::vsock_path(&shinu::vm_dir(root, member.id)),
-            &shinu::vm::key_path(&shinu::vm_dir(root, member.id)),
-            shinu::VSOCK_SSH_PORT,
-            &command,
-        ) {
-            Ok(0) => {}
-            Ok(status) => eprintln!(
-                "failed to update /etc/hosts for network member {}: exit status {status}",
-                member.name
-            ),
-            Err(error) => eprintln!(
-                "failed to update /etc/hosts for network member {}: {error}",
-                member.name
+        let outcome = ssh_target_for_vm(root, member.id)
+            .and_then(|target| run_job_ssh(&target, &command, None, remaining, 1024));
+        match outcome {
+            Ok(output) if output.status.success() => {}
+            _ => eprintln!(
+                "failed to update /etc/hosts for network member {}: bounded setup failed",
+                member.id
             ),
         }
     }
 }
 
 fn sync_network_hosts(ctx: &Ctx<'_>, running_members: &[Space], all_members: &[Space]) {
-    sync_network_hosts_with(ctx.root, ctx.net_cfg, running_members, all_members);
+    sync_network_hosts_with(
+        ctx.root,
+        ctx.net_cfg,
+        running_members,
+        all_members,
+        Instant::now() + Duration::from_secs(30),
+    );
 }
 fn refresh_idle_networks(
     root: &Path,
@@ -1298,7 +1304,13 @@ fn refresh_idle_networks(
             Some(&network),
             &previous_running,
         )?;
-        sync_network_hosts_with(root, cfg, &current_running, &all_members);
+        sync_network_hosts_with(
+            root,
+            cfg,
+            &current_running,
+            &all_members,
+            Instant::now() + Duration::from_secs(30),
+        );
     }
     Ok(())
 }
@@ -1476,7 +1488,13 @@ fn sweep_expired_lease(
                 &previous_running,
             )?;
             let all_members = network_members(&state_before, project, space.network.as_deref());
-            sync_network_hosts_with(sweep.root, sweep.cfg, &current_running, &all_members);
+            sync_network_hosts_with(
+                sweep.root,
+                sweep.cfg,
+                &current_running,
+                &all_members,
+                Instant::now() + Duration::from_secs(30),
+            );
         }
         return Ok(());
     }
@@ -1509,7 +1527,13 @@ fn sweep_expired_lease(
         &previous_running,
     )?;
     let all_members = network_members(&state_after, project, space.network.as_deref());
-    sync_network_hosts_with(sweep.root, sweep.cfg, &current_running, &all_members);
+    sync_network_hosts_with(
+        sweep.root,
+        sweep.cfg,
+        &current_running,
+        &all_members,
+        Instant::now() + Duration::from_secs(30),
+    );
     remove_space_files(sweep.root, id)
 }
 fn checkpoint_exclusive(root: &Path, id: Uuid) -> shinu::Result<u64> {
@@ -1678,22 +1702,20 @@ fn space_start_state(
     project: &str,
     space: &Space,
     limits: &Limits,
-) -> shinu::Result<(bool, State, Vec<Space>)> {
+) -> shinu::Result<State> {
     let already_running = shinu::vm::is_running(&shinu::vm_dir(ctx.root, space.id));
     if already_running {
         ensure_write_cap(ctx, space)?;
     }
     // Keep the running-slot check under the state lock, but release it before
-    // vm::start waits for the guest's SSH service.
+    // vm::start waits for platform connectivity and application admission.
     let _state_guard = lock_state(ctx.registry);
     let connection = lock_db(ctx.db);
     let state = state::load(&connection)?;
-    let previous_running =
-        running_network_members(ctx.root, &state, project, space.network.as_deref());
     if !already_running {
         quota::check_running_limit(count_running(ctx.root, &state, project), limits)?;
     }
-    Ok((already_running, state, previous_running))
+    Ok(state)
 }
 
 fn record_sweep_usage(
@@ -1903,6 +1925,7 @@ fn sweep_write_caps(
             cfg,
             &current_running,
             &network_members(&state, &space.project, space.network.as_deref()),
+            Instant::now() + Duration::from_secs(30),
         );
     }
     Ok(())
@@ -2116,6 +2139,7 @@ fn append_checkpoint(
         vcpus: state.spaces[space_index].vcpus,
         mem_mib: state.spaces[space_index].mem_mib,
         disk_mib: state.spaces[space_index].disk_mib,
+        readiness: state.spaces[space_index].readiness.clone(),
         note,
         snapshot_version: flags.full.then(|| shinu::FC_SNAPSHOT_VERSION.to_owned()),
         created_at: Utc::now(),
@@ -2343,6 +2367,7 @@ struct SpaceSpec {
     disk_mib: Option<u64>,
     network: Option<String>,
     ttl_seconds: Option<u64>,
+    readiness: Option<shinu::ReadySpec>,
 }
 
 fn create_space(ctx: &Ctx<'_>, project: &str, spec: SpaceSpec) -> shinu::Result<Value> {
@@ -2354,12 +2379,16 @@ fn create_space(ctx: &Ctx<'_>, project: &str, spec: SpaceSpec) -> shinu::Result<
         disk_mib,
         network,
         ttl_seconds,
+        readiness,
     } = spec;
     state::validate_network_name(network.as_deref())?;
     ensure_positive_size("vcpus", vcpus.map(u64::from))?;
     ensure_positive_size("mem_mib", mem_mib.map(u64::from))?;
     ensure_positive_size("disk_mib", disk_mib)?;
     validate_ttl_seconds(ttl_seconds)?;
+    if let Some(spec) = &readiness {
+        spec.validate()?;
+    }
     let limits = effective_limits(ctx, project)?;
     check_vm_sizing(ctx, &limits, vcpus, mem_mib)?;
     let image = image.unwrap_or(Image::Void);
@@ -2433,6 +2462,7 @@ fn create_space(ctx: &Ctx<'_>, project: &str, spec: SpaceSpec) -> shinu::Result<
                     created_at,
                     write_cap_mib: ctx.registry.storage.policy.write_cap(None)?,
                     stopped_reason: None,
+                    readiness: readiness.clone(),
                 };
                 state.spaces.push(space.clone());
                 Ok(space)
@@ -2455,8 +2485,12 @@ fn fork_space(
     name: String,
     ttl_seconds: Option<u64>,
     write_cap_mib: Option<u64>,
+    readiness: Option<shinu::ReadySpec>,
 ) -> shinu::Result<Value> {
     validate_ttl_seconds(ttl_seconds)?;
+    if let Some(spec) = &readiness {
+        spec.validate()?;
+    }
     let write_cap_mib = ctx.registry.storage.policy.write_cap(write_cap_mib)?;
     let limits = effective_limits(ctx, project)?;
     let id = Uuid::new_v4();
@@ -2520,6 +2554,7 @@ fn fork_space(
         (checkpoint, image, network, vcpus, mem_mib, disk_mib)
     };
     let source = source_checkpoint.id;
+    let readiness = readiness.or_else(|| source_checkpoint.readiness.clone());
     let image_path = shinu::space_image(ctx.root, id);
     let mount = ctx.root.join(format!("authorize.{id}.mnt"));
     let result = (|| -> shinu::Result<Value> {
@@ -2552,6 +2587,7 @@ fn fork_space(
                     created_at,
                     write_cap_mib,
                     stopped_reason: None,
+                    readiness: readiness.clone(),
                 };
                 state.spaces.push(space.clone());
                 Ok(space)
@@ -2746,7 +2782,7 @@ fn fork_template(
             .map(|entry| entry.checkpoint)
             .ok_or_else(|| shinu::Error::NotFound(template.clone()))?
     };
-    fork_space(ctx, project, checkpoint, name, ttl_seconds, None)
+    fork_space(ctx, project, checkpoint, name, ttl_seconds, None, None)
 }
 
 fn commit_space(
@@ -3024,6 +3060,7 @@ fn checkout_space(
             note: auto_note,
             created_at: Utc::now(),
             snapshot_version: None,
+            readiness: entry.readiness.clone(),
         };
         state.ckpts.push(checkpoint.clone());
         Ok(checkpoint)
@@ -3062,20 +3099,15 @@ fn checkout_space(
     update_state(ctx.db, ctx.registry, |state| {
         shinu::find_ckpt(state, target.id, project)?;
         set_head(state, space_id, project, target.id)?;
+        let entry = state
+            .spaces
+            .iter_mut()
+            .find(|space| space.id == space_id && space.project == project)
+            .ok_or_else(|| shinu::Error::NotFound(space_id.to_string()))?;
+        entry.readiness.clone_from(&target.readiness);
         Ok(())
     })?;
     if target.full {
-        let (network, previous_running) = {
-            let state = snapshot(ctx.db, ctx.registry)?;
-            let network = state
-                .spaces
-                .iter()
-                .find(|space| space.id == space_id && space.project == project)
-                .and_then(|space| space.network.clone());
-            let previous_running =
-                running_network_members(ctx.root, &state, project, network.as_deref());
-            (network, previous_running)
-        };
         let _ = start_vm_with_pending_restore(
             ctx,
             space_id,
@@ -3084,11 +3116,6 @@ fn checkout_space(
             mem_mib,
             Some(&target),
         )?;
-        let state = snapshot(ctx.db, ctx.registry)?;
-        let current_running =
-            refresh_network_rules(ctx, &state, project, network.as_deref(), &previous_running)?;
-        let all_members = network_members(&state, project, network.as_deref());
-        sync_network_hosts(ctx, &current_running, &all_members);
     }
     Ok(json!({ "head": target.id, "auto_commit": auto_checkpoint.id }))
 }
@@ -3282,10 +3309,12 @@ fn start_vm_with_pending_restore(
     mem_mib: Option<u32>,
     restore_checkpoint: Option<&Ckpt>,
 ) -> shinu::Result<(PathBuf, bool)> {
-    let space = snapshot(ctx.db, ctx.registry)?
+    let before_start = snapshot(ctx.db, ctx.registry)?;
+    let space = before_start
         .spaces
-        .into_iter()
+        .iter()
         .find(|space| space.id == id)
+        .cloned()
         .ok_or_else(|| shinu::Error::NotFound(id.to_string()))?;
     ensure_write_cap(ctx, &space)?;
     let snapshot_mem = space_snapshot_mem(ctx.root, id);
@@ -3314,15 +3343,63 @@ fn start_vm_with_pending_restore(
         state: &snapshot_state,
         guest_snapshot_nonce: nonce.as_deref(),
     });
+    let previous_running = running_network_members(
+        ctx.root,
+        &before_start,
+        &space.project,
+        space.network.as_deref(),
+    );
+    let mut connected_members = Vec::new();
     let result = shinu::vm::start(
         ctx.root,
         id,
         image,
-        shinu::vm::Sizing { vcpus, mem_mib },
+        shinu::vm::StartOptions {
+            vcpus,
+            mem_mib,
+            restore: restore.as_ref(),
+            readiness: space.readiness.as_ref(),
+        },
         ctx.vm_cfg,
         ctx.net_cfg,
-        restore.as_ref(),
+        |deadline| {
+            let state = snapshot(ctx.db, ctx.registry)?;
+            let all_members = network_members(&state, &space.project, space.network.as_deref());
+            connected_members.clone_from(&all_members);
+            let current_running = refresh_network_rules(
+                ctx,
+                &state,
+                &space.project,
+                space.network.as_deref(),
+                &previous_running,
+            )?;
+            sync_network_hosts_with(
+                ctx.root,
+                ctx.net_cfg,
+                &current_running,
+                &all_members,
+                deadline,
+            );
+            Ok(())
+        },
     );
+    if result.is_err() && !connected_members.is_empty() {
+        // VM cleanup runs before this reconciliation. Remove its incoming
+        // peer exemptions too; never remove a live successor's connectivity.
+        let cleanup = snapshot(ctx.db, ctx.registry).and_then(|state| {
+            refresh_network_rules(
+                ctx,
+                &state,
+                &space.project,
+                space.network.as_deref(),
+                &connected_members,
+            )
+            .map(|_| ())
+        });
+        if let Err(error) = cleanup {
+            eprintln!("network cleanup after failed start: {error}");
+        }
+    }
     if has_restore {
         let cleanup = remove_space_snapshot_files(ctx.root, id);
         return match (result, cleanup) {
@@ -3348,33 +3425,19 @@ fn start_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Valu
     ensure_lease_active(&space, Utc::now())?;
     let limits = effective_limits(ctx, project)?;
     check_vm_sizing(ctx, &limits, space.vcpus, space.mem_mib)?;
-    let (already_running, state, previous_running) =
-        space_start_state(ctx, project, &space, &limits)?;
+    let state = space_start_state(ctx, project, &space, &limits)?;
     let restore_checkpoint = space
         .head
         .and_then(|head| state.ckpts.iter().find(|checkpoint| checkpoint.id == head));
-    let booted = if already_running {
-        false
-    } else {
-        start_vm_with_pending_restore(
-            ctx,
-            space.id,
-            space.image,
-            space.vcpus,
-            space.mem_mib,
-            restore_checkpoint,
-        )?
-        .1
-    };
-    let current_running = refresh_network_rules(
+    let booted = start_vm_with_pending_restore(
         ctx,
-        &state,
-        project,
-        space.network.as_deref(),
-        &previous_running,
-    )?;
-    let all_members = network_members(&state, project, space.network.as_deref());
-    sync_network_hosts(ctx, &current_running, &all_members);
+        space.id,
+        space.image,
+        space.vcpus,
+        space.mem_mib,
+        restore_checkpoint,
+    )?
+    .1;
     Ok(json!({ "booted": booted }))
 }
 fn stop_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value> {
@@ -3420,7 +3483,11 @@ fn resize_space(
     vcpus: Option<Option<u32>>,
     mem_mib: Option<Option<u32>>,
     disk_mib: Option<Option<u64>>,
+    readiness: Option<shinu::ReadySpec>,
 ) -> shinu::Result<Value> {
+    if let Some(spec) = &readiness {
+        spec.validate()?;
+    }
     let existing = find_space(ctx.db, &name, project)?;
     let limits = effective_limits(ctx, project)?;
     let space_guard = ctx.registry.space_lock(existing.id);
@@ -3431,6 +3498,20 @@ fn resize_space(
         return Err(shinu::Error::Invalid(format!(
             "stop the space before resizing it: {name}"
         )));
+    }
+    if vcpus.is_none() && mem_mib.is_none() && disk_mib.is_none() {
+        let updated = update_state(ctx.db, ctx.registry, |state| {
+            let space = state
+                .spaces
+                .iter_mut()
+                .find(|space| space.id == existing.id && space.project == project)
+                .ok_or_else(|| shinu::Error::NotFound(name.clone()))?;
+            if let Some(spec) = readiness {
+                space.readiness = Some(spec);
+            }
+            Ok(space.clone())
+        })?;
+        return Ok(serde_json::to_value(updated)?);
     }
     // The grow cannot hold the state lock: truncate, e2fsck and resize2fs run
     // for minutes on a multi-gigabyte image. So the allowance is checked twice
@@ -3530,6 +3611,9 @@ fn resize_space(
         space.vcpus = new_vcpus;
         space.mem_mib = new_mem_mib;
         space.disk_mib = new_disk_mib;
+        if let Some(spec) = &readiness {
+            space.readiness = Some(spec.clone());
+        }
         let updated = space.clone();
         // Only a grow reserves anything, matching the pre-check: a request that
         // just changes vcpus must not start failing because the project is
@@ -4222,6 +4306,7 @@ fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
             disk_mib,
             network,
             ttl_seconds,
+            readiness,
         } => create_space(
             ctx,
             project,
@@ -4233,6 +4318,7 @@ fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
                 disk_mib,
                 network,
                 ttl_seconds,
+                readiness,
             },
         ),
         Req::Resize {
@@ -4240,7 +4326,8 @@ fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
             vcpus,
             mem_mib,
             disk_mib,
-        } => resize_space(ctx, project, space, vcpus, mem_mib, disk_mib),
+            readiness,
+        } => resize_space(ctx, project, space, vcpus, mem_mib, disk_mib, readiness),
         Req::Images => Ok(list_images(ctx)),
         Req::CreateTemplate { name, checkpoint } => create_template(ctx, project, name, checkpoint),
         Req::ListTemplates => list_templates(ctx, project),
@@ -4255,7 +4342,16 @@ fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
             name,
             ttl_seconds,
             write_cap_mib,
-        } => fork_space(ctx, project, ckpt, name, ttl_seconds, write_cap_mib),
+            readiness,
+        } => fork_space(
+            ctx,
+            project,
+            ckpt,
+            name,
+            ttl_seconds,
+            write_cap_mib,
+            readiness,
+        ),
         Req::SetLease { space, ttl_seconds } => set_space_lease(ctx, project, space, ttl_seconds),
         Req::Commit {
             space,
@@ -4959,6 +5055,15 @@ fn value_patch_u64(value: &Value, field: &str) -> shinu::Result<Option<Option<u6
     }
 }
 
+fn value_readiness(value: &Value) -> shinu::Result<Option<shinu::ReadySpec>> {
+    match value.get("readiness") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(|error| shinu::Error::Invalid(format!("invalid readiness policy: {error}"))),
+    }
+}
+
 fn new_request(body: &[u8]) -> shinu::Result<Req> {
     let value = parse_body(body)?;
     let name = value
@@ -4994,6 +5099,7 @@ fn new_request(body: &[u8]) -> shinu::Result<Req> {
         disk_mib: value_optional_u64(&value, "disk_mib")?,
         network,
         ttl_seconds: value_optional_ttl(&value, "ttl_seconds")?,
+        readiness: value_readiness(&value)?,
     })
 }
 
@@ -5009,6 +5115,7 @@ fn resize_request(body: &[u8], space: String) -> shinu::Result<Req> {
         vcpus: value_patch_u32(&value, "vcpus")?,
         mem_mib: value_patch_u32(&value, "mem_mib")?,
         disk_mib: value_patch_u64(&value, "disk_mib")?,
+        readiness: value_readiness(&value)?,
     })
 }
 fn commit_request(body: &[u8], space: String) -> shinu::Result<Req> {
@@ -5031,6 +5138,7 @@ fn fork_request(body: &[u8], ckpt: Uuid) -> shinu::Result<Req> {
         name: value_string(&value, "name")?,
         ttl_seconds: value_optional_ttl(&value, "ttl_seconds")?,
         write_cap_mib: value_optional_u64(&value, "write_cap_mib")?,
+        readiness: value_readiness(&value)?,
     })
 }
 fn template_create_request(body: &[u8]) -> shinu::Result<Req> {
@@ -5256,30 +5364,18 @@ fn prepare_ssh_entry(ctx: &Ctx<'_>, project: &str, entry: &Space) -> shinu::Resu
     ensure_lease_active(entry, Utc::now())?;
     let limits = effective_limits(ctx, project)?;
     check_vm_sizing(ctx, &limits, entry.vcpus, entry.mem_mib)?;
-    let (already_running, state, previous_running) =
-        space_start_state(ctx, project, entry, &limits)?;
+    let state = space_start_state(ctx, project, entry, &limits)?;
     let restore_checkpoint = entry
         .head
         .and_then(|head| state.ckpts.iter().find(|checkpoint| checkpoint.id == head));
-    if !already_running {
-        start_vm_with_pending_restore(
-            ctx,
-            entry.id,
-            entry.image,
-            entry.vcpus,
-            entry.mem_mib,
-            restore_checkpoint,
-        )?;
-    }
-    let current_running = refresh_network_rules(
+    start_vm_with_pending_restore(
         ctx,
-        &state,
-        project,
-        entry.network.as_deref(),
-        &previous_running,
+        entry.id,
+        entry.image,
+        entry.vcpus,
+        entry.mem_mib,
+        restore_checkpoint,
     )?;
-    let all_members = network_members(&state, project, entry.network.as_deref());
-    sync_network_hosts(ctx, &current_running, &all_members);
     ssh_target_for_vm(ctx.root, entry.id)
 }
 
@@ -7910,6 +8006,7 @@ mod tests {
     use super::{CkptFlags, append_checkpoint, handle, read_stream, set_head};
     use chrono::{TimeZone, Utc};
     use rusqlite::Connection;
+    use serde_json::json;
     use shinu::{
         Image, NetConfig, VmConfig,
         proto::{Req, SnapshotMode},
@@ -8060,6 +8157,7 @@ mod tests {
                     name: name.into(),
                     ttl_seconds: None,
                     write_cap_mib: explicit,
+                    readiness: None,
                 },
                 "project-a",
             )
@@ -8189,6 +8287,143 @@ mod tests {
     }
 
     #[test]
+    fn readiness_request_objects_validate_and_round_trip_at_the_http_seam() {
+        let policy =
+            json!({"command":["/usr/local/bin/ready","one argument"],"timeout_seconds":90});
+        let checkpoint = Uuid::new_v4();
+        for (endpoint, method, body) in [
+            (
+                super::Endpoint::Spaces,
+                "POST",
+                json!({"name":"world","readiness":policy}),
+            ),
+            (
+                super::Endpoint::Fork(checkpoint.to_string()),
+                "POST",
+                json!({"name":"world","readiness":policy}),
+            ),
+            (
+                super::Endpoint::Rm("world".into()),
+                "PATCH",
+                json!({"readiness":policy}),
+            ),
+        ] {
+            let (request, _) = super::request_for(
+                endpoint,
+                method,
+                &serde_json::to_vec(&body).unwrap(),
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap()["readiness"], policy);
+        }
+        for readiness in [
+            json!({}),
+            json!({"command":["relative"],"timeout_seconds":1}),
+            json!({"command":["/bin/true"],"timeout_seconds":0}),
+            json!("bad"),
+        ] {
+            let body = serde_json::to_vec(&json!({"name":"world","readiness":readiness})).unwrap();
+            assert!(super::new_request(&body).is_err());
+            assert!(super::fork_request(&body, checkpoint).is_err());
+            assert!(super::resize_request(&body, "world".into()).is_err());
+        }
+    }
+
+    #[test]
+    fn policy_only_resize_is_persistent_without_touching_an_image_and_null_preserves_it() {
+        let root = test_root("readiness-resize");
+        let space = snapshot_test_space(Uuid::new_v4(), None);
+        store_state(
+            &root,
+            &State {
+                spaces: vec![space.clone()],
+                ckpts: Vec::new(),
+                templates: Vec::new(),
+            },
+        );
+        let db = test_db(&root);
+        let registry = registry();
+        let (vm_cfg, net_cfg) = test_configs();
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        let policy = json!({"command":["/usr/local/bin/ready"],"timeout_seconds":90});
+        let request = super::resize_request(
+            &serde_json::to_vec(&json!({"readiness":policy})).unwrap(),
+            space.name.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            handle(&ctx, request, "project-a").unwrap()["readiness"],
+            policy
+        );
+        let request = super::resize_request(br#"{"readiness":null}"#, space.name.clone()).unwrap();
+        assert_eq!(
+            handle(&ctx, request, "project-a").unwrap()["readiness"],
+            policy
+        );
+        assert!(!shinu::space_image(&root, space.id).exists());
+        let reopened = state::open(&root).unwrap();
+        let persisted = state::find_space_by_id(&reopened, space.id, "project-a")
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::to_value(persisted.readiness).unwrap(), policy);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checkpoint_fork_inherits_retained_readiness_without_source_and_explicit_policy_overrides() {
+        let root = test_root("readiness-fork");
+        let mut checkpoint = checkpoint_for_snapshot_gate(false, None);
+        let inherited = shinu::ReadySpec {
+            command: vec!["/usr/local/bin/inherited-ready".into()],
+            timeout_seconds: 90,
+        };
+        checkpoint.readiness = Some(inherited.clone());
+        store_state(
+            &root,
+            &State {
+                spaces: Vec::new(),
+                ckpts: vec![checkpoint.clone()],
+                templates: Vec::new(),
+            },
+        );
+        retained_checkpoint_fixture(&root, &checkpoint);
+        let db = test_db(&root);
+        let registry = registry();
+        let (vm_cfg, net_cfg) = test_configs();
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        let overridden = shinu::ReadySpec {
+            command: vec!["/usr/local/bin/override-ready".into()],
+            timeout_seconds: 30,
+        };
+        for (name, supplied, expected) in [
+            ("inherited", None, inherited),
+            ("overridden", Some(overridden.clone()), overridden),
+        ] {
+            let request = Req::Fork {
+                ckpt: checkpoint.id,
+                name: name.into(),
+                ttl_seconds: None,
+                write_cap_mib: None,
+                readiness: supplied,
+            };
+            let forked: Space =
+                serde_json::from_value(handle(&ctx, request, "project-a").unwrap()).unwrap();
+            assert_eq!(forked.readiness, Some(expected.clone()));
+            let reopened = state::open(&root).unwrap();
+            assert_eq!(
+                state::find_space(&reopened, name, "project-a")
+                    .unwrap()
+                    .unwrap()
+                    .readiness,
+                Some(expected)
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn checkpoint_fork_uses_retained_source_and_legacy_fallback_sizing() {
         for (sizing, source_present, expected) in [
             ((Some(3), Some(4096), Some(8)), false, (3, 4096, 8)),
@@ -8228,6 +8463,7 @@ mod tests {
                     name: "hidden".into(),
                     ttl_seconds: None,
                     write_cap_mib: None,
+                    readiness: None,
                 },
                 "foreign",
             );
@@ -8239,6 +8475,7 @@ mod tests {
                     name: "forked".into(),
                     ttl_seconds: Some(60),
                     write_cap_mib: None,
+                    readiness: None,
                 },
                 "project-a",
             )
@@ -8404,6 +8641,7 @@ mod tests {
                     name: "legacy".into(),
                     ttl_seconds: None,
                     write_cap_mib: None,
+                    readiness: None,
                 },
                 "project-a",
             );
@@ -8686,6 +8924,7 @@ esac
                     note: "old auto checkpoint".into(),
                     created_at: Utc::now() - chrono::Duration::days(30),
                     snapshot_version: None,
+                    readiness: None,
                     vcpus: None,
                     mem_mib: None,
                     disk_mib: None,
@@ -8754,6 +8993,7 @@ esac
                 created_at: Utc::now(),
                 write_cap_mib: 0,
                 stopped_reason: None,
+                readiness: None,
             }
         }
         let state = State {
@@ -8847,6 +9087,7 @@ esac
             created_at: Utc::now(),
             write_cap_mib: 0,
             stopped_reason: None,
+            readiness: None,
         }
     }
 
@@ -8871,6 +9112,7 @@ esac
             mem_mib: None,
             disk_mib: None,
             snapshot_version: snapshot_version.map(str::to_owned),
+            readiness: None,
         }
     }
 
@@ -9197,6 +9439,7 @@ esac
             mem_mib: None,
             disk_mib: None,
             snapshot_version: Some(shinu::FC_SNAPSHOT_VERSION.into()),
+            readiness: None,
         };
         let full = super::Ckpt {
             base: None,
@@ -9212,6 +9455,7 @@ esac
             mem_mib: None,
             disk_mib: None,
             snapshot_version: None,
+            readiness: None,
             ..diff.clone()
         };
         assert_eq!(
@@ -9243,6 +9487,7 @@ esac
             mem_mib: None,
             disk_mib: None,
             snapshot_version: snapshot_version.map(str::to_owned),
+            readiness: None,
         }
     }
 
@@ -9607,6 +9852,7 @@ esac
             created_at: now - chrono::Duration::minutes(1),
             write_cap_mib: 0,
             stopped_reason: None,
+            readiness: None,
         };
         assert!(super::ensure_lease_active(&expired, now).is_err());
         let mut old = expired;
@@ -9625,6 +9871,7 @@ esac
                 spaces: vec![Space {
                     write_cap_mib: 0,
                     stopped_reason: None,
+                    readiness: None,
                     id,
                     name: "leased".into(),
                     project: "project-a".into(),
@@ -9696,6 +9943,7 @@ esac
             spaces: vec![Space {
                 write_cap_mib: 0,
                 stopped_reason: None,
+                readiness: None,
                 id,
                 name: "swept".into(),
                 project: "project-a".into(),
@@ -10345,6 +10593,7 @@ esac
                 spaces: vec![Space {
                     write_cap_mib: 0,
                     stopped_reason: None,
+                    readiness: None,
                     id,
                     name: "one".into(),
                     project: "project-a".into(),
@@ -10477,6 +10726,7 @@ esac
                 spaces: vec![Space {
                     write_cap_mib: 0,
                     stopped_reason: None,
+                    readiness: None,
                     id: space_id,
                     name: "resizable".into(),
                     project: "project-a".into(),
@@ -10506,6 +10756,7 @@ esac
                 vcpus: None,
                 mem_mib: None,
                 disk_mib: Some(Some(99)),
+                readiness: None,
             },
             "project-a",
         );
@@ -10530,6 +10781,7 @@ esac
             spaces: vec![Space {
                 write_cap_mib: 0,
                 stopped_reason: None,
+                readiness: None,
                 id: space_id,
                 name: name.into(),
                 project: project.into(),
@@ -10555,6 +10807,7 @@ esac
                 note: "before".into(),
                 created_at: Utc::now(),
                 snapshot_version: None,
+                readiness: None,
                 vcpus: None,
                 mem_mib: None,
                 disk_mib: None,
@@ -10602,6 +10855,7 @@ esac
                 vcpus: Some(Some(2)),
                 mem_mib: None,
                 disk_mib: None,
+                readiness: None,
             },
             "project-a",
         );
@@ -10626,6 +10880,7 @@ esac
                 spaces: vec![Space {
                     write_cap_mib: 0,
                     stopped_reason: None,
+                    readiness: None,
                     id: space_id,
                     name: "web".into(),
                     project: project.into(),
@@ -10725,6 +10980,7 @@ esac
                 spaces: vec![Space {
                     write_cap_mib: 0,
                     stopped_reason: None,
+                    readiness: None,
                     id: space_id,
                     name: "swept".into(),
                     project: project.into(),
@@ -10798,6 +11054,7 @@ esac
             created_at: Utc::now(),
             write_cap_mib: 0,
             stopped_reason: None,
+            readiness: None,
         };
         store_state(
             &root,
@@ -10870,6 +11127,7 @@ esac
                     vcpus: None,
                     mem_mib: None,
                     disk_mib: Some(Some(30)),
+                    readiness: None,
                 },
                 project,
             )
@@ -10897,6 +11155,7 @@ esac
                 spaces: vec![Space {
                     write_cap_mib: 0,
                     stopped_reason: None,
+                    readiness: None,
                     id,
                     name: "doomed".into(),
                     project: project.to_owned(),
@@ -10987,6 +11246,7 @@ esac
             spaces: vec![Space {
                 write_cap_mib: 0,
                 stopped_reason: None,
+                readiness: None,
                 id: space_id,
                 name: "expired".into(),
                 project: project.into(),
@@ -11011,6 +11271,7 @@ esac
                 note: "full restore target".into(),
                 created_at: now - chrono::Duration::minutes(1),
                 snapshot_version: Some(shinu::FC_SNAPSHOT_VERSION.into()),
+                readiness: None,
                 vcpus: None,
                 mem_mib: None,
                 disk_mib: None,
@@ -11091,6 +11352,7 @@ esac
                         note: "alpha".into(),
                         created_at: now,
                         snapshot_version: None,
+                        readiness: None,
                         vcpus: None,
                         mem_mib: None,
                         disk_mib: None,
@@ -11106,6 +11368,7 @@ esac
                         note: "beta".into(),
                         created_at: now,
                         snapshot_version: None,
+                        readiness: None,
                         vcpus: None,
                         mem_mib: None,
                         disk_mib: None,
@@ -11121,6 +11384,7 @@ esac
                         note: "zeta".into(),
                         created_at: now,
                         snapshot_version: None,
+                        readiness: None,
                         vcpus: None,
                         mem_mib: None,
                         disk_mib: None,
@@ -11136,6 +11400,7 @@ esac
                         note: "foreign".into(),
                         created_at: now,
                         snapshot_version: None,
+                        readiness: None,
                         vcpus: None,
                         mem_mib: None,
                         disk_mib: None,
@@ -11203,6 +11468,7 @@ esac
                 note: "template target".into(),
                 created_at: now,
                 snapshot_version: None,
+                readiness: None,
                 vcpus: None,
                 mem_mib: None,
                 disk_mib: None,
@@ -11258,6 +11524,7 @@ esac
             spaces: vec![Space {
                 write_cap_mib: 0,
                 stopped_reason: None,
+                readiness: None,
                 id: space_id,
                 name: "web".into(),
                 project: project.into(),
@@ -11283,6 +11550,7 @@ esac
                     note: "old auto checkpoint".into(),
                     created_at: now - chrono::Duration::days(30),
                     snapshot_version: None,
+                    readiness: None,
                     vcpus: None,
                     mem_mib: None,
                     disk_mib: None,
@@ -11298,6 +11566,7 @@ esac
                     note: "foreign checkpoint".into(),
                     created_at: now,
                     snapshot_version: None,
+                    readiness: None,
                     vcpus: None,
                     mem_mib: None,
                     disk_mib: None,
@@ -11451,6 +11720,7 @@ esac
             spaces: vec![Space {
                 write_cap_mib: 0,
                 stopped_reason: None,
+                readiness: None,
                 id: child_id,
                 name: "child-space".into(),
                 project: project.into(),
@@ -11476,6 +11746,7 @@ esac
                 note: "base".into(),
                 created_at: Utc::now(),
                 snapshot_version: None,
+                readiness: None,
                 vcpus: None,
                 mem_mib: None,
                 disk_mib: None,
@@ -11522,6 +11793,7 @@ esac
             created_at: Utc::now(),
             write_cap_mib: 0,
             stopped_reason: None,
+            readiness: None,
         }
     }
 
@@ -11537,6 +11809,7 @@ esac
             note: "lineage".into(),
             created_at: Utc::now(),
             snapshot_version: None,
+            readiness: None,
             vcpus: None,
             mem_mib: None,
             disk_mib: None,
@@ -11798,6 +12071,7 @@ esac
                 note: "private".into(),
                 created_at: Utc::now(),
                 snapshot_version: None,
+                readiness: None,
                 vcpus: None,
                 mem_mib: None,
                 disk_mib: None,
@@ -11870,6 +12144,7 @@ esac
             spaces: vec![Space {
                 write_cap_mib: 0,
                 stopped_reason: None,
+                readiness: None,
                 id: space_id,
                 name: "web".into(),
                 project: project.into(),
@@ -11935,6 +12210,7 @@ esac
             spaces: vec![Space {
                 write_cap_mib: 0,
                 stopped_reason: None,
+                readiness: None,
                 id: space_id,
                 name: "web".into(),
                 project: project.into(),
@@ -11960,6 +12236,7 @@ esac
                 note: "target".into(),
                 created_at: Utc::now(),
                 snapshot_version: None,
+                readiness: None,
                 vcpus: None,
                 mem_mib: None,
                 disk_mib: None,
@@ -11998,6 +12275,7 @@ esac
             spaces: vec![Space {
                 write_cap_mib: 0,
                 stopped_reason: None,
+                readiness: None,
                 id: space_id,
                 name: "web".into(),
                 project: project.into(),
@@ -12024,6 +12302,7 @@ esac
                     note: "before checkout".into(),
                     created_at: Utc::now(),
                     snapshot_version: None,
+                    readiness: None,
                     vcpus: None,
                     mem_mib: None,
                     disk_mib: None,
@@ -12039,6 +12318,7 @@ esac
                     note: "auto before checkout".into(),
                     created_at: Utc::now(),
                     snapshot_version: None,
+                    readiness: None,
                     vcpus: None,
                     mem_mib: None,
                     disk_mib: None,
@@ -12094,6 +12374,7 @@ esac
             spaces: vec![Space {
                 write_cap_mib: 0,
                 stopped_reason: None,
+                readiness: None,
                 id: space_id,
                 name: "web".into(),
                 project: project.into(),
@@ -12121,6 +12402,7 @@ esac
                     note: "auto stale".into(),
                     created_at: Utc::now(),
                     snapshot_version: None,
+                    readiness: None,
                     vcpus: None,
                     mem_mib: None,
                     disk_mib: None,
@@ -12136,6 +12418,7 @@ esac
                     note: "auto raced".into(),
                     created_at: Utc::now(),
                     snapshot_version: None,
+                    readiness: None,
                     vcpus: None,
                     mem_mib: None,
                     disk_mib: None,

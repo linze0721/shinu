@@ -20,6 +20,7 @@ Changes are recorded in the Keep a Changelog format.
 - Firecracker v1.18.0 / snapshot format 12.0.0 with writable Sync virtio-blk discard and a pinned FC-CI 6.18.62 guest kernel.
 - Application-consistent hot snapshot generations with bounded guest hooks/fsfreeze, pause/create/reflink/resume/thaw ordering, restore-time thaw, generation provenance and freeze/pause/thaw timings; checkpoint listings expose consistency.
 - A tracked Docker-compatible `6.18.62-shinu` kernel config and checksum-pinned local kernel installation via `SHINU_KERNEL_FILE` / `SHINU_KERNEL_SHA256`, retaining the existing guest's built-in netfilter features.
+- Optional checkpoint-owned application readiness policies, configured with `new`, `fork`, or stopped-only `resize --readiness-json`; cold/hot starts and auto-starts require a fresh authenticated guest READY challenge before admission, with same-boot host-memory receipts and fail-closed cleanup.
 
 ### Fixed
 

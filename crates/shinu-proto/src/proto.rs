@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use shinu_core::Image;
+use shinu_core::{Image, ReadySpec};
 use uuid::Uuid;
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -25,12 +25,16 @@ pub enum Req {
         /// Positive lifetime in seconds; omitted or null means no expiry.
         #[serde(default)]
         ttl_seconds: Option<u64>,
+        #[serde(default)]
+        readiness: Option<ReadySpec>,
     },
     Resize {
         space: String,
         vcpus: Option<Option<u32>>,
         mem_mib: Option<Option<u32>>,
         disk_mib: Option<Option<u64>>,
+        #[serde(default)]
+        readiness: Option<ReadySpec>,
     },
     Images,
     Fork {
@@ -42,6 +46,9 @@ pub enum Req {
         /// Omitted uses the daemon default; zero explicitly disables the cap.
         #[serde(default)]
         write_cap_mib: Option<u64>,
+        /// Omitted inherits the checkpoint's readiness policy.
+        #[serde(default)]
+        readiness: Option<ReadySpec>,
     },
     /// `hot: true` syncs a running guest without remounting read-only and
     /// is not crash-consistent; `hot: false` requires the space to be stopped.

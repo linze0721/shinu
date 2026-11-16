@@ -43,6 +43,91 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Application readiness policy captured with each checkpoint generation.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(try_from = "ReadySpecJson")]
+pub struct ReadySpec {
+    pub command: Vec<String>,
+    pub timeout_seconds: u64,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadySpecJson {
+    command: Vec<String>,
+    timeout_seconds: u64,
+}
+
+impl TryFrom<ReadySpecJson> for ReadySpec {
+    type Error = Error;
+
+    fn try_from(value: ReadySpecJson) -> Result<Self> {
+        let spec = Self {
+            command: value.command,
+            timeout_seconds: value.timeout_seconds,
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+}
+
+impl ReadySpec {
+    /// Validate callers constructing a policy directly as well as JSON input.
+    pub fn validate(&self) -> Result<()> {
+        if self.command.is_empty()
+            || self.command.len() > 256
+            || !self.command[0].starts_with('/')
+            || self.command.iter().any(|arg| arg.contains('\0'))
+            || self.command.iter().map(String::len).sum::<usize>() > 8192
+            || !(1..=900).contains(&self.timeout_seconds)
+        {
+            return Err(Error::Invalid("readiness requires an absolute executable, 1..256 NUL-free argv elements totaling at most 8192 bytes, and timeout_seconds in 1..900".into()));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::ReadySpec;
+
+    #[test]
+    fn readiness_json_validates_the_public_policy_interface() {
+        let spec: ReadySpec =
+            serde_json::from_str(r#"{"command":["/bin/true",""],"timeout_seconds":900}"#).unwrap();
+        assert_eq!(spec.command, ["/bin/true", ""]);
+        for invalid in [
+            r#"{"command":[],"timeout_seconds":1}"#,
+            r#"{"command":["true"],"timeout_seconds":1}"#,
+            r#"{"command":["/bin/true"],"timeout_seconds":0}"#,
+            r#"{"command":["/bin/true"],"timeout_seconds":901}"#,
+            r#"{"command":["/bin/true","\u0000"],"timeout_seconds":1}"#,
+            r#"{"command":["/bin/true"],"timeout_seconds":1,"extra":true}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ReadySpec>(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(
+            ReadySpec {
+                command: vec!["/bin/true".into(); 257],
+                timeout_seconds: 1
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ReadySpec {
+                command: vec![format!("/{}", "x".repeat(8192))],
+                timeout_seconds: 1
+            }
+            .validate()
+            .is_err()
+        );
+    }
+}
+
 /// Require an allowlisted patched build before trusting snapshot consistency.
 /// Callers validate ownership before executing assets; `/proc/<pid>/exe` is
 /// permitted for the already-validated live VM process.

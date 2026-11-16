@@ -244,7 +244,8 @@ begin_case() {
     done
     guest_target="$(uname -m)-unknown-linux-musl"
     mkdir -p "$CASE_DIR/target/$guest_target/release"
-    cp "$CASE_DIR/target/release/shinu-vsock" "$CASE_DIR/target/$guest_target/release/shinu-snapshot-agent"
+    printf '#!/bin/sh\nprintf "%%s\\n" "SHINU-SNAPSHOT-1 READY-1"\n' > "$CASE_DIR/target/$guest_target/release/shinu-snapshot-agent"
+    chmod 0755 "$CASE_DIR/target/$guest_target/release/shinu-snapshot-agent"
     : > "$CASE_DIR/state/passwd"
     : > "$CASE_DIR/state/group"
     : > "$CASE_DIR/state/mutations"
@@ -472,4 +473,13 @@ for linkage in dynamic script; do
     assert_no_mutation
 done
 
-printf '%s\n' 'install matrix: 16 cases passed (hermetic artifact inspection, NSS and account mutators)'
+# A static old helper must not be installed as though it supported readiness.
+begin_case guest-helper-old-protocol
+seed_identity
+printf '#!/bin/sh\nprintf "%%s\\n" "SHINU-SNAPSHOT-1"\n' > "$CASE_DIR/target/$guest_target/release/shinu-snapshot-agent"
+run_install
+assert_equal 1 "$INSTALL_STATUS" "$CASE_NAME must reject the old protocol"
+assert_equal 'guest snapshot helper must support READY-1' "$(cat "$CASE_DIR/stderr")" "$CASE_NAME error"
+assert_no_mutation
+
+printf '%s\n' 'install matrix: 17 cases passed (hermetic artifact inspection, NSS and account mutators)'

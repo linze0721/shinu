@@ -1,9 +1,10 @@
-//! Guest-only, statically linked snapshot control. No shell input is accepted.
+//! Guest-only static snapshot control and authenticated, argv-only readiness.
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -21,6 +22,7 @@ unsafe extern "C" {
     fn ioctl(fd: i32, request: u64, ...) -> i32;
     fn alarm(seconds: u32) -> u32;
     fn poll(descriptors: *mut PollDescriptor, count: usize, timeout_ms: i32) -> i32;
+    fn kill(pid: i32, signal: i32) -> i32;
 }
 
 #[repr(C)]
@@ -422,6 +424,99 @@ fn read_timeout(stream: &File, seconds: i64) -> std::io::Result<()> {
     Ok(())
 }
 
+// A readiness transaction is never satisfied by resident/captured state. Each
+// authenticated request runs argv again and only that command can emit READY.
+fn readiness_request(
+    stream: &File,
+    paths: &SnapshotPaths<'_>,
+    request: &str,
+) -> std::io::Result<String> {
+    let mut words = request.splitn(4, ' ');
+    let action = words.next().unwrap_or_default();
+    let nonce = words.next().unwrap_or_default();
+    let _guard = lock(&paths.state.with_extension("lock"))?;
+    if !valid_nonce(nonce) || nonce != std::fs::read_to_string(paths.state.join("nonce"))? {
+        return Err(std::io::Error::other("ready-authentication"));
+    }
+    if action == "capabilities" && words.next().is_none() {
+        return Ok("READY-1".into());
+    }
+    let restore_id = words.next().unwrap_or_default();
+    let policy = words.next().unwrap_or_default();
+    if action != "ready" || !valid_nonce(restore_id) || restore_id == nonce {
+        return Err(std::io::Error::other("ready-request"));
+    }
+    let spec: shinu_core::ReadySpec =
+        serde_json::from_str(policy).map_err(|_| std::io::Error::other("ready-policy"))?;
+    if !matches!(
+        std::fs::read_to_string(paths.state.join("phase"))?.as_str(),
+        "thawed" | "ready"
+    ) {
+        return Err(std::io::Error::other("ready-before-thaw"));
+    }
+    let deadline = Instant::now() + Duration::from_secs(spec.timeout_seconds);
+    let mut child = Command::new(&spec.command[0])
+        .args(&spec.command[1..])
+        .env("SHINU_RESTORE_ID", restore_id)
+        .env_remove("SHINU_SNAPSHOT_NONCE")
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| std::io::Error::other("ready-spawn"))?;
+    let group = i32::try_from(child.id()).map_err(std::io::Error::other)?;
+    let result = (|| {
+        loop {
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::other("ready-timeout"));
+            }
+            let mut descriptor = PollDescriptor {
+                fd: stream.as_raw_fd(),
+                events: 1,
+                returned: 0,
+            };
+            // Any input/EOF/HUP before our reply cancels the transaction.
+            // SAFETY: descriptor points to one live Linux pollfd record.
+            let ready = unsafe { poll(&raw mut descriptor, 1, 0) };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            } else if ready != 0 {
+                return Err(std::io::Error::other("ready-disconnected"));
+            }
+            if let Some(status) = child.try_wait()? {
+                return if status.success() {
+                    Ok(format!("READY {restore_id}"))
+                } else {
+                    Err(std::io::Error::other("ready-command-failed"))
+                };
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    })();
+    // Fence descendants even when their direct parent exits zero. A daemonized
+    // application must be started through its supervisor, not escape this group.
+    // SAFETY: the child owns its new process group; a negative PID targets it.
+    let fenced = unsafe { kill(-group, 9) };
+    let fence_error = (fenced < 0)
+        .then(std::io::Error::last_os_error)
+        .filter(|error| error.raw_os_error() != Some(3));
+    let reaped = child.wait();
+    match result {
+        Err(error) => Err(error),
+        Ok(reply) => {
+            if let Some(error) = fence_error {
+                return Err(error);
+            }
+            reaped?;
+            Ok(reply)
+        }
+    }
+}
+
 fn serve(
     mut stream: File,
     paths: &SnapshotPaths<'_>,
@@ -437,8 +532,19 @@ fn read_request(
     mounts: &mut Vec<File>,
     held: bool,
 ) -> std::io::Result<Option<File>> {
-    let mut request = [0u8; 128];
+    let mut request = [0u8; 65536];
+    let deadline = Instant::now() + Duration::from_secs(5);
     for length in 0..request.len() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::other("request-timeout"));
+        }
+        let timeout = [
+            i64::try_from(remaining.as_secs()).unwrap_or(5),
+            i64::from(remaining.subsec_micros()).max(1),
+        ];
+        // SAFETY: timeout is a live 64-bit Linux timeval; stream owns its fd.
+        checked(unsafe { setsockopt(stream.as_raw_fd(), 1, 20, timeout.as_ptr(), 16) })?;
         stream.read_exact(&mut request[length..=length])?;
         if request[length] == b'\n' {
             return respond(stream, paths, mounts, &request[..length], held);
@@ -455,6 +561,16 @@ fn respond(
     request: &[u8],
     held: bool,
 ) -> std::io::Result<Option<File>> {
+    if !held && (request.starts_with(b"ready ") || request.starts_with(b"capabilities ")) {
+        match std::str::from_utf8(request)
+            .map_err(std::io::Error::other)
+            .and_then(|request| readiness_request(&stream, paths, request))
+        {
+            Ok(reply) => writeln!(stream, "{reply}")?,
+            Err(_) => stream.write_all(b"FAILED readiness\n")?,
+        }
+        return Ok(None);
+    }
     let result = std::str::from_utf8(request)
         .map_err(std::io::Error::other)
         .and_then(|request| operation(paths, request, mounts, held));
@@ -587,6 +703,10 @@ fn serve_connections(listener: &impl AsRawFd, paths: &SnapshotPaths<'_>) -> std:
 }
 
 fn main() -> std::io::Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--capabilities") {
+        println!("SHINU-SNAPSHOT-1 READY-1");
+        return Ok(());
+    }
     // SAFETY: these calls use Linux scalar arguments and valid fixed-size structs.
     let listener = unsafe {
         let limits = [u64::MAX; 2];
@@ -699,6 +819,166 @@ mod tests {
             std::fs::read_to_string(root.join("attempts")).unwrap(),
             "attempt\n"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn ready_fixture() -> (std::path::PathBuf, std::path::PathBuf, &'static str) {
+        let root = std::env::temp_dir().join(format!("shinu-ready-agent-{}", uuid::Uuid::new_v4()));
+        let state = root.join("agent");
+        std::fs::create_dir_all(&state).unwrap();
+        let nonce = "00000000-0000-4000-8000-000000000001";
+        std::fs::write(state.join("nonce"), nonce).unwrap();
+        std::fs::write(state.join("phase"), "thawed").unwrap();
+        (root, state, nonce)
+    }
+
+    #[test]
+    fn ready_protocol_authenticates_and_runs_exact_argv_with_fresh_environment() {
+        let (root, state, nonce) = ready_fixture();
+        let id = "00000000-0000-4000-8000-000000000002";
+        let policy = serde_json::json!({"command":["/bin/sh","-c","test \"$SHINU_RESTORE_ID\" = \"$1\" && test \"$2\" = 'one argument'","ready",id,"one argument"],"timeout_seconds":2});
+        assert_eq!(
+            request(&state, &format!("capabilities {nonce}"), &mut Vec::new()),
+            "SHINU-SNAPSHOT-1\nREADY-1\n"
+        );
+        assert_eq!(
+            request(
+                &state,
+                &format!("ready {nonce} {id} {policy}"),
+                &mut Vec::new()
+            ),
+            format!("SHINU-SNAPSHOT-1\nREADY {id}\n")
+        );
+        for invalid in [
+            format!("ready {id} {id} {policy}"),
+            format!("ready {nonce} {nonce} {policy}"),
+            format!("ready {nonce} invalid {policy}"),
+            format!("ready {nonce} {id} {{}}"),
+        ] {
+            assert!(request(&state, &invalid, &mut Vec::new()).ends_with("FAILED readiness\n"));
+        }
+        std::fs::write(state.join("phase"), "frozen").unwrap();
+        assert!(
+            request(
+                &state,
+                &format!("ready {nonce} {id} {policy}"),
+                &mut Vec::new()
+            )
+            .ends_with("FAILED readiness\n")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ready_never_accepts_nonzero_or_missing_command_or_shell_metacharacters() {
+        let (root, state, nonce) = ready_fixture();
+        let id = uuid::Uuid::new_v4();
+        let marker = root.join("not-a-shell");
+        for command in [
+            vec!["/bin/sh".to_owned(), "-c".into(), "exit 7".into()],
+            vec!["/not/a/command".into()],
+            vec![format!("/bin/true; touch {}", marker.display())],
+        ] {
+            let policy = serde_json::json!({"command":command,"timeout_seconds":2});
+            assert!(
+                request(
+                    &state,
+                    &format!("ready {nonce} {id} {policy}"),
+                    &mut Vec::new()
+                )
+                .ends_with("FAILED readiness\n")
+            );
+        }
+        assert!(!marker.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ready_timeout_fences_the_whole_process_group() {
+        let (root, state, nonce) = ready_fixture();
+        let marker = root.join("late-descendant");
+        let policy = serde_json::json!({"command":["/bin/sh","-c",format!("(sleep 1.3; touch '{}') & wait", marker.display())],"timeout_seconds":1});
+        let started = std::time::Instant::now();
+        assert!(
+            request(
+                &state,
+                &format!("ready {nonce} {} {policy}", uuid::Uuid::new_v4()),
+                &mut Vec::new()
+            )
+            .ends_with("FAILED readiness\n")
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            !marker.exists(),
+            "a timed-out descendant escaped the command group"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ready_success_fences_descendants_before_publishing_ready() {
+        let (root, state, nonce) = ready_fixture();
+        let marker = root.join("escaped-success");
+        let policy = serde_json::json!({"command":["/bin/sh","-c",format!("(sleep 0.2; touch '{}') & exit 0", marker.display())],"timeout_seconds":1});
+        let id = uuid::Uuid::new_v4();
+        assert!(
+            request(
+                &state,
+                &format!("ready {nonce} {id} {policy}"),
+                &mut Vec::new()
+            )
+            .ends_with(&format!("READY {id}\n"))
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!marker.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ready_disconnect_fences_command_and_cannot_publish_success() {
+        use std::io::Write;
+        let (root, state, nonce) = ready_fixture();
+        let marker = root.join("after-disconnect");
+        let policy = serde_json::json!({"command":["/bin/sh","-c",format!("sleep 0.2; touch '{}'", marker.display())],"timeout_seconds":2});
+        let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        writeln!(client, "ready {nonce} {} {policy}", uuid::Uuid::new_v4()).unwrap();
+        drop(client);
+        let fd: std::os::fd::OwnedFd = server.into();
+        let paths = super::SnapshotPaths {
+            state: &state,
+            proc_root: &root,
+            block_root: &root,
+        };
+        assert!(
+            super::read_request(std::fs::File::from(fd), &paths, &mut Vec::new(), false).is_err()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!marker.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ready_protocol_limits_the_complete_request_not_just_argv() {
+        use std::io::{Read, Write};
+        let (root, state, nonce) = ready_fixture();
+        let oversized = format!(
+            "ready {nonce} {} {}",
+            uuid::Uuid::new_v4(),
+            " ".repeat(65536)
+        );
+        let (mut client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        writeln!(client, "{oversized}").unwrap();
+        let fd: std::os::fd::OwnedFd = server.into();
+        let paths = super::SnapshotPaths {
+            state: &state,
+            proc_root: &root,
+            block_root: &root,
+        };
+        drop(super::serve(std::fs::File::from(fd), &paths, &mut Vec::new()).unwrap());
+        let mut response = [0; b"SHINU-SNAPSHOT-1\nFAILED\n".len()];
+        client.read_exact(&mut response).unwrap();
+        assert_eq!(&response, b"SHINU-SNAPSHOT-1\nFAILED\n");
         std::fs::remove_dir_all(root).unwrap();
     }
 

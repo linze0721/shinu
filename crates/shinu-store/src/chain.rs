@@ -171,6 +171,7 @@ mod chain_tests {
             created_at: Utc::now(),
             write_cap_mib: 0,
             stopped_reason: None,
+            readiness: None,
         }
     }
 
@@ -187,6 +188,7 @@ mod chain_tests {
             mem_mib: None,
             disk_mib: None,
             snapshot_version: None,
+            readiness: None,
             note: "note".to_owned(),
             created_at: Utc::now(),
         }

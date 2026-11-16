@@ -2,8 +2,9 @@ pub use crate::net::{egress_rules, peer_rules};
 
 use crate::config::VmConfig;
 use crate::net::NetConfig;
-use shinu_core::{Error, Image, Result};
+use shinu_core::{Error, Image, ReadySpec, Result};
 use std::io::Write;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -1039,6 +1040,7 @@ enum RestoreStep {
     Ready,
     Configure,
     Expose,
+    ApplicationReady,
 }
 
 fn restore_transaction(mut step: impl FnMut(RestoreStep) -> Result<()>) -> Result<()> {
@@ -1049,7 +1051,8 @@ fn restore_transaction(mut step: impl FnMut(RestoreStep) -> Result<()>) -> Resul
     combine_snapshot_results(loaded, thawed)?;
     step(RestoreStep::Ready)?;
     step(RestoreStep::Configure)?;
-    step(RestoreStep::Expose)
+    step(RestoreStep::Expose)?;
+    step(RestoreStep::ApplicationReady)
 }
 
 // The listener is captured in guest RAM, so restore can thaw without starting
@@ -1065,6 +1068,302 @@ fn snapshot_line<'a, const N: usize>(
         }
     }
     Err(std::io::Error::other("oversized snapshot worker reply"))
+}
+
+// Nonblocking transport enforces one host monotonic deadline, including the
+// Unix/vsock handshake and every byte of a slow or malicious guest response.
+struct ReadyTransport {
+    stream: std::os::unix::net::UnixStream,
+    deadline: Instant,
+    buffer: [u8; 256],
+}
+
+impl ReadyTransport {
+    fn connect(path: &Path, deadline: Instant) -> Result<Self> {
+        unsafe extern "C" {
+            fn socket(domain: i32, kind: i32, protocol: i32) -> i32;
+            fn connect(fd: i32, address: *const u8, length: u32) -> i32;
+        }
+        let bytes = path.as_os_str().as_encoded_bytes();
+        if bytes.len() >= 108 || bytes.contains(&0) {
+            return Err(Error::Invalid("readiness socket path is too long".into()));
+        }
+        let mut address = [0_u8; 110];
+        address[..2].copy_from_slice(&1_u16.to_ne_bytes());
+        address[2..2 + bytes.len()].copy_from_slice(bytes);
+        // SAFETY: Linux AF_UNIX, SOCK_STREAM | NONBLOCK | CLOEXEC, no pointers.
+        let fd = unsafe { socket(1, 1 | 0x800 | 0x80000, 0) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: socket returned a fresh uniquely owned descriptor.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        loop {
+            if Instant::now() >= deadline {
+                return Err(Error::Internal("readiness transport timeout".into()));
+            }
+            // SAFETY: address is a live Linux sockaddr_un, length fits its array.
+            if unsafe {
+                connect(
+                    fd.as_raw_fd(),
+                    address.as_ptr(),
+                    u32::try_from(3 + bytes.len()).unwrap(),
+                )
+            } == 0
+            {
+                return Ok(Self {
+                    stream: fd.into(),
+                    deadline,
+                    buffer: [0; 256],
+                });
+            }
+            let error = std::io::Error::last_os_error();
+            if !matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ) && error.raw_os_error() != Some(115)
+            {
+                return Err(error.into());
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    fn write(&mut self, mut bytes: &[u8]) -> Result<()> {
+        while !bytes.is_empty() {
+            self.check_deadline()?;
+            match self.stream.write(bytes) {
+                Ok(0) => return Err(Error::Internal("readiness transport disconnected".into())),
+                Ok(count) => bytes = &bytes[count..],
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    fn check_deadline(&self) -> Result<()> {
+        if Instant::now() >= self.deadline {
+            return Err(Error::Internal("readiness transport timeout".into()));
+        }
+        Ok(())
+    }
+
+    fn line(&mut self) -> Result<&str> {
+        use std::io::Read;
+        let mut length = 0;
+        while length < self.buffer.len() {
+            self.check_deadline()?;
+            let mut byte = [0];
+            match self.stream.read(&mut byte) {
+                Ok(0) => return Err(Error::Internal("readiness transport disconnected".into())),
+                Ok(_) if byte[0] == b'\n' => {
+                    return std::str::from_utf8(&self.buffer[..length])
+                        .map_err(|_| Error::Internal("invalid readiness response".into()));
+                }
+                Ok(_) => {
+                    self.buffer[length] = byte[0];
+                    length += 1;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(Error::Internal("oversized readiness response".into()))
+    }
+
+    fn guest(dir: &Path, deadline: Instant) -> Result<Self> {
+        let mut transport = Self::connect(&vsock_path(dir), deadline)?;
+        transport.write(b"CONNECT 2224\n")?;
+        if !transport.line()?.starts_with("OK ") || transport.line()? != "SHINU-SNAPSHOT-1" {
+            return Err(Error::Internal(
+                "unsupported readiness guest protocol".into(),
+            ));
+        }
+        Ok(transport)
+    }
+}
+
+fn ready_capability(dir: &Path, deadline: Instant) -> Result<()> {
+    let nonce = std::fs::read_to_string(dir.join("snapshot-worker-nonce"))?;
+    let mut transport =
+        ReadyTransport::guest(dir, deadline.min(Instant::now() + Duration::from_secs(2)))?;
+    transport.write(format!("capabilities {nonce}\n").as_bytes())?;
+    if transport.line()? != "READY-1" {
+        return Err(Error::Internal("guest lacks READY-1 capability".into()));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BootIdentity {
+    pid: u32,
+    starttime: u64,
+    host_boot_id: Uuid,
+}
+
+fn boot_identity(dir: &Path) -> Result<BootIdentity> {
+    let pid = running_pid(dir)
+        .ok_or_else(|| Error::Internal("readiness VM identity unavailable".into()))?;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let starttime = stat
+        .rsplit_once(')')
+        .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| Error::Internal("readiness VM starttime unavailable".into()))?;
+    let host_boot_id =
+        Uuid::parse_str(std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?.trim())
+            .map_err(|_| Error::Internal("readiness host boot identity unavailable".into()))?;
+    if running_pid(dir) != Some(pid) {
+        return Err(Error::Internal("readiness VM generation changed".into()));
+    }
+    Ok(BootIdentity {
+        pid,
+        starttime,
+        host_boot_id,
+    })
+}
+
+#[derive(Clone)]
+struct ReadyReceipt {
+    boot: BootIdentity,
+    policy: ReadySpec,
+}
+
+static READY_RECEIPTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<PathBuf, ReadyReceipt>>,
+> = std::sync::LazyLock::new(std::sync::Mutex::default);
+
+fn forget_readiness(dir: &Path) {
+    READY_RECEIPTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(dir);
+}
+
+fn admit_application(
+    dir: &Path,
+    spec: &ReadySpec,
+    boot: &BootIdentity,
+    network_ready: &mut impl FnMut(Instant) -> Result<()>,
+) -> Result<()> {
+    {
+        let mut receipts = READY_RECEIPTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if receipts
+            .get(dir)
+            .is_some_and(|receipt| receipt.boot == *boot && receipt.policy == *spec)
+        {
+            return Ok(());
+        }
+        receipts.remove(dir);
+    }
+    application_ready(dir, spec, boot, network_ready)?;
+    if boot_identity(dir)? != *boot {
+        return Err(Error::Internal(
+            "readiness VM generation changed before admission".into(),
+        ));
+    }
+    READY_RECEIPTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            dir.to_owned(),
+            ReadyReceipt {
+                boot: *boot,
+                policy: spec.clone(),
+            },
+        );
+    Ok(())
+}
+
+fn cleanup_boot(dir: &Path, cfg: &NetConfig, expected: &BootIdentity) -> Result<()> {
+    forget_readiness(dir);
+    if running_pid(dir).is_none()
+        || boot_identity(dir)
+            .as_ref()
+            .is_ok_and(|actual| actual == expected)
+    {
+        stop(dir, cfg)?;
+        return Ok(());
+    }
+    Err(Error::Internal(
+        "refusing cleanup of a different or unverified VM generation".into(),
+    ))
+}
+
+fn application_ready(
+    dir: &Path,
+    spec: &ReadySpec,
+    boot: &BootIdentity,
+    network_ready: &mut impl FnMut(Instant) -> Result<()>,
+) -> Result<()> {
+    let restore_id = Uuid::new_v4();
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(spec.timeout_seconds);
+    let vm_id = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| Uuid::parse_str(name).ok())
+        .map_or_else(|| "unknown".into(), |id| id.to_string());
+    eprintln!(
+        "event=guest_readiness vm_id={vm_id} restore_id={restore_id} stage=requested elapsed_ms=0"
+    );
+    let result = (|| {
+        spec.validate()?;
+        network_ready(deadline)?;
+        if Instant::now() >= deadline {
+            return Err(Error::Internal("readiness admission timeout".into()));
+        }
+        if ready_capability(dir, deadline).is_err() {
+            install_snapshot_worker(dir, Some(deadline))?;
+            ready_capability(dir, deadline)?;
+        }
+        let nonce = std::fs::read_to_string(dir.join("snapshot-worker-nonce"))?;
+        if nonce.len() != 36 || Uuid::parse_str(&nonce).is_err() {
+            return Err(Error::Internal(
+                "invalid readiness authentication identity".into(),
+            ));
+        }
+        let mut transport = ReadyTransport::guest(dir, deadline)?;
+        let frame = format!(
+            "ready {nonce} {restore_id} {}\n",
+            serde_json::to_string(spec)?
+        );
+        if frame.len() > 65536 {
+            return Err(Error::Invalid("oversized readiness request".into()));
+        }
+        transport.write(frame.as_bytes())?;
+        if transport.line()? != format!("READY {restore_id}") {
+            return Err(Error::Internal(
+                "guest readiness failed or restore identity mismatched".into(),
+            ));
+        }
+        if boot_identity(dir)? != *boot {
+            return Err(Error::Internal(
+                "readiness VM generation changed before READY".into(),
+            ));
+        }
+        Ok(())
+    })();
+    let stage = if result.is_ok() { "ready" } else { "failed" };
+    let code = if result.is_ok() {
+        "accepted"
+    } else {
+        "transaction_failed"
+    };
+    eprintln!(
+        "event=guest_readiness vm_id={vm_id} restore_id={restore_id} stage={stage} elapsed_ms={} code={code}",
+        started.elapsed().as_millis()
+    );
+    result
 }
 
 enum SnapshotCommand<'a> {
@@ -1165,13 +1464,23 @@ fn prepare_snapshot_worker(dir: &Path) -> Result<()> {
     ) {
         return Ok(());
     }
+    install_snapshot_worker(dir, None)
+}
+
+fn install_snapshot_worker(dir: &Path, deadline: Option<Instant>) -> Result<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(Error::Internal("readiness helper upgrade timeout".into()));
+    }
     let agent = shinu_core::vsock_helper()?.with_file_name("shinu-snapshot-agent");
     validate_vm_asset(&agent, "guest snapshot helper")?;
     let nonce = Uuid::new_v4().to_string();
-    store_snapshot_nonce(dir, &nonce)?;
     let mut script = String::from(
         "set -eu; [ \"$(findmnt -n -o FSTYPE --target /run)\" = tmpfs ]; mkdir -p -m 700 /run/shinu-snapshot; ",
     );
+    // Replace only after thaw, under the same guest flock as capture/thaw.
+    // Old helpers own port 2224: TERM the exact executable owner and prove it
+    // has exited before changing its nonce or launching the replacement.
+    script.push_str("phase=$(cat /run/shinu-snapshot/phase 2>/dev/null || printf thawed); case $phase in thawed|ready) ;; *) exit 1;; esac; for proc in /proc/[0-9]*; do exe=$(readlink \"$proc/exe\" 2>/dev/null || :); case $exe in /run/shinu-snapshot/agent|'/run/shinu-snapshot/agent (deleted)') pid=${proc##*/}; kill -TERM \"$pid\"; while [ \"$(readlink \"$proc/exe\" 2>/dev/null || :)\" = \"$exe\" ]; do sleep 0.02; done;; esac; done; ");
     script.push_str("IFS= read -r nonce; [ \"${#nonce}\" = 36 ]; printf %s \"$nonce\" > /run/shinu-snapshot/nonce; unset nonce; printf thawed > /run/shinu-snapshot/phase; ");
     for (name, body) in [
         ("freeze", include_str!("freeze.sh")),
@@ -1183,9 +1492,22 @@ fn prepare_snapshot_worker(dir: &Path) -> Result<()> {
         ));
     }
     script.push_str("cat > /run/shinu-snapshot/agent.next; chmod 700 /run/shinu-snapshot/agent.next; mv /run/shinu-snapshot/agent.next /run/shinu-snapshot/agent; nohup /run/shinu-snapshot/agent </dev/null >/dev/null 2>&1 &");
-    guest_snapshot_script(dir, &script, Some((nonce, std::fs::File::open(agent)?)))?;
+    guest_snapshot_script(
+        dir,
+        &script,
+        Some((nonce.clone(), std::fs::File::open(agent)?)),
+        deadline,
+    )?;
+    store_snapshot_nonce(dir, &nonce)?;
     for _ in 0..20 {
-        if let Some(result) = guest_snapshot_action(dir, SnapshotCommand::Status) {
+        if let Some(deadline) = deadline {
+            if Instant::now() >= deadline {
+                return Err(Error::Internal("readiness helper upgrade timeout".into()));
+            }
+            if ready_capability(dir, deadline).is_ok() {
+                return Ok(());
+            }
+        } else if let Some(result) = guest_snapshot_action(dir, SnapshotCommand::Status) {
             return result;
         }
         std::thread::sleep(PROCESS_GROUP_POLL_INTERVAL);
@@ -1214,6 +1536,7 @@ fn guest_snapshot_script(
     dir: &Path,
     script: &str,
     payload: Option<(String, std::fs::File)>,
+    deadline: Option<Instant>,
 ) -> Result<()> {
     let helper = shinu_core::vsock_helper()?;
     // The guest deadline terminates the remote script too; killing only SSH
@@ -1221,21 +1544,31 @@ fn guest_snapshot_script(
     // Setup must not leak the flock into its detached resident process. Thaw
     // retains it across nested hook groups, even if a timeout kills the shell.
     let flock_mode = if payload.is_some() { "-o" } else { "-F" };
+    let timeout = deadline.map_or(Duration::from_secs(250), |deadline| {
+        deadline.saturating_duration_since(Instant::now())
+    });
+    if timeout.is_zero() {
+        return Err(Error::Internal("guest setup deadline exceeded".into()));
+    }
+    let seconds = |cap| {
+        let millis = timeout.min(Duration::from_secs(cap)).as_millis().max(1);
+        format!("{}.{:03}", millis / 1000, millis % 1000)
+    };
     let command = [
         "timeout".to_owned(),
         "-k".to_owned(),
         "5".to_owned(),
-        "240".to_owned(),
+        seconds(240),
         "flock".to_owned(),
         flock_mode.to_owned(),
         "-w".to_owned(),
-        "115".to_owned(),
+        seconds(115),
         "/run/shinu-snapshot.lock".to_owned(),
         "timeout".to_owned(),
         "--foreground".to_owned(),
         "-k".to_owned(),
         "5".to_owned(),
-        "110".to_owned(),
+        seconds(110),
         "sh".to_owned(),
         "-c".to_owned(),
         script.to_owned(),
@@ -1247,7 +1580,7 @@ fn guest_snapshot_script(
         shinu_core::VSOCK_SSH_PORT,
         &command,
     );
-    match run_process_group(ssh, Duration::from_secs(250), payload) {
+    match run_process_group(ssh, timeout, payload) {
         Some(status) if status.success() => Ok(()),
         status => Err(Error::Internal(format!(
             "guest snapshot freeze/thaw failed or timed out: {status:?}"
@@ -1264,7 +1597,7 @@ pub fn thaw_snapshot(dir: &Path) -> Result<()> {
             // Banner readiness is advisory for cleanup: even when it fails,
             // execute the bounded SSH thaw rather than skipping the attempt.
             let _ = wait_ready(dir, &vsock_path(dir));
-            guest_snapshot_script(dir, include_str!("thaw.sh"), None)
+            guest_snapshot_script(dir, include_str!("thaw.sh"), None, None)
         }
     };
     let first = thaw();
@@ -1589,13 +1922,14 @@ fn wait_ready(dir: &Path, vsock: &Path) -> bool {
     false
 }
 
-/// Per-space CPU and memory, each falling back to the daemon default when
-/// the space stores nothing. `None` and a zero are different requests, so
-/// this replaces the older pair of zero-sentinel integers.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Sizing {
+/// Per-Space boot choices. Absent CPU/memory inherit the daemon defaults;
+/// readiness is always evaluated against the actual running VM generation.
+#[derive(Clone, Copy, Default)]
+pub struct StartOptions<'a> {
     pub vcpus: Option<u32>,
     pub mem_mib: Option<u32>,
+    pub restore: Option<&'a RestoreFiles<'a>>,
+    pub readiness: Option<&'a ReadySpec>,
 }
 
 /// Host-side snapshot files to load instead of a cold boot.
@@ -1622,26 +1956,49 @@ fn snapshot_load_body(tap: Option<&str>) -> String {
 }
 
 /// Boots the VM unless it is already up. Returns whether a boot happened.
+/// `network_ready` reconciles peer connectivity after thaw/base setup and TAP
+/// activation but before application admission, without holding state locks.
+/// The hook receives the shared monotonic admission deadline and is skipped
+/// when a verified same-generation receipt is reused.
 pub fn start(
     root: &Path,
     id: Uuid,
     image_kind: Image,
-    sizing: Sizing,
+    options: StartOptions<'_>,
     cfg: &VmConfig,
     net_cfg: &NetConfig,
-    restore: Option<&RestoreFiles>,
+    mut network_ready: impl FnMut(Instant) -> Result<()>,
 ) -> Result<(PathBuf, bool)> {
-    let vcpus = sizing.vcpus.unwrap_or(cfg.vcpus);
-    let mem_mib = sizing.mem_mib.unwrap_or(cfg.mem_mib);
+    let StartOptions {
+        vcpus,
+        mem_mib,
+        restore,
+        readiness,
+    } = options;
+    let vcpus = vcpus.unwrap_or(cfg.vcpus);
+    let mem_mib = mem_mib.unwrap_or(cfg.mem_mib);
     let dir = shinu_core::vm_dir(root, id);
     let vsock = vsock_path(&dir);
+    if let Some(spec) = readiness {
+        spec.validate()?;
+    }
     if is_running(&dir) {
         // The idle sweeper may have reclaimed this VM's memory; give it
         // back before the caller runs anything in it.
         release(&dir);
+        if let Some(spec) = readiness {
+            let boot = boot_identity(&dir).inspect_err(|_| forget_readiness(&dir))?;
+            if let Err(error) = admit_application(&dir, spec, &boot, &mut network_ready) {
+                if let Err(cleanup) = cleanup_boot(&dir, net_cfg, &boot) {
+                    eprintln!("readiness boot cleanup for {id}: {cleanup}");
+                }
+                return Err(error);
+            }
+        }
         touch(&dir)?;
         return Ok((vsock, false));
     }
+    forget_readiness(&dir);
     match std::fs::remove_file(dir.join("snapshot-generation")) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1688,6 +2045,7 @@ pub fn start(
         let _ = clean_jail(&dir);
         return Err(error);
     }
+    let mut attempted_boot = None;
     let result = (|| -> Result<(PathBuf, bool)> {
         let jail_kernel = jail.join(JAIL_KERNEL);
         let jail_rootfs = jail.join(JAIL_ROOTFS);
@@ -1819,6 +2177,7 @@ pub fn start(
         // Keep a deterministic pid file even if this is the scan fallback;
         // normal jailer launches have already created the same path.
         std::fs::write(pid_path(&dir), pid.to_string())?;
+        attempted_boot = Some(boot_identity(&dir)?);
 
         let ready = || {
             if wait_ready(&dir, &vsock) {
@@ -1883,28 +2242,56 @@ pub fn start(
                         ));
                     }
                     let command = ["sh".to_owned(), "-c".to_owned(), reconfigure];
-                    match exec_in_vm(
+                    let helper = shinu_core::vsock_helper()?;
+                    let ssh = ssh_command(
+                        &helper,
                         &vsock,
                         &key_path(&dir),
                         shinu_core::VSOCK_SSH_PORT,
                         &command,
-                    )? {
-                        0 => Ok(()),
-                        status => Err(Error::Internal(format!(
-                            "restored guest setup failed: exit {status}"
-                        ))),
+                    );
+                    match run_process_group(ssh, Duration::from_secs(30), None) {
+                        Some(status) if status.success() => Ok(()),
+                        _ => Err(Error::Internal(
+                            "restored guest setup failed or timed out".into(),
+                        )),
                     }
                 }
                 // This idempotent operation also reasserts the /30 address,
                 // forwarding/NAT and world-host INPUT allowance after thaw.
                 RestoreStep::Expose => configure_tap(id, net_cfg, &[], TapSetup::Existing),
+                RestoreStep::ApplicationReady => match readiness {
+                    Some(spec) => admit_application(
+                        &dir,
+                        spec,
+                        attempted_boot.as_ref().ok_or_else(|| {
+                            Error::Internal("readiness boot identity missing".into())
+                        })?,
+                        &mut network_ready,
+                    ),
+                    None => network_ready(Instant::now() + Duration::from_secs(30)),
+                },
             })?;
         } else {
             ready()?;
         }
-        // Preparation is outside the freeze window. Existing running guests
-        // are upgraded lazily by snapshot; cold boot remains usable if it fails.
-        if let Err(error) = prepare_snapshot_worker(&dir) {
+        if restore.is_none() {
+            match readiness {
+                Some(spec) => admit_application(
+                    &dir,
+                    spec,
+                    attempted_boot
+                        .as_ref()
+                        .ok_or_else(|| Error::Internal("readiness boot identity missing".into()))?,
+                    &mut network_ready,
+                )?,
+                None => network_ready(Instant::now() + Duration::from_secs(30))?,
+            }
+        }
+        if readiness.is_none()
+            && let Err(error) = prepare_snapshot_worker(&dir)
+        {
+            // Nonconfigured spaces retain their platform-only contract.
             eprintln!("snapshot worker preparation for {id}: {error}");
         }
 
@@ -1919,8 +2306,13 @@ pub fn start(
         Ok((vsock, true))
     })();
     if result.is_err() {
-        let _ = stop(&dir, net_cfg);
-        tap_down(id, net_cfg);
+        let cleanup = attempted_boot.as_ref().map_or_else(
+            || stop(&dir, net_cfg).map(|_| ()),
+            |boot| cleanup_boot(&dir, net_cfg, boot),
+        );
+        if let Err(error) = cleanup {
+            eprintln!("boot cleanup for {id}: {error}");
+        }
     }
     result
 }
@@ -2077,6 +2469,7 @@ pub fn stop(dir: &Path, cfg: &NetConfig) -> Result<bool> {
 }
 
 pub fn stop_with_peers(dir: &Path, cfg: &NetConfig, peers: &[String]) -> Result<bool> {
+    forget_readiness(dir);
     let id = dir_id(dir)?;
     let vsock = vsock_path(dir);
     let api_socket = api_path(dir);
@@ -2800,14 +3193,25 @@ mod restore_transaction_tests {
 
     #[test]
     fn restored_network_is_quarantined_until_thaw_and_configuration_succeed() {
-        use RestoreStep::{Configure, Expose, Load, Quarantine, Ready, Thaw};
+        use RestoreStep::{ApplicationReady, Configure, Expose, Load, Quarantine, Ready, Thaw};
         let mut observed = Vec::new();
         restore_transaction(|step| {
             observed.push(step);
             Ok(())
         })
         .unwrap();
-        assert_eq!(observed, [Quarantine, Load, Thaw, Ready, Configure, Expose]);
+        assert_eq!(
+            observed,
+            [
+                Quarantine,
+                Load,
+                Thaw,
+                Ready,
+                Configure,
+                Expose,
+                ApplicationReady
+            ]
+        );
     }
 
     #[test]
@@ -2834,5 +3238,25 @@ mod restore_transaction_tests {
                 assert!(!observed.contains(&Configure));
             }
         }
+    }
+
+    #[test]
+    fn application_failure_is_after_network_activation_but_never_success() {
+        use RestoreStep::{ApplicationReady, Expose, Thaw};
+        let mut observed = Vec::new();
+        let result = restore_transaction(|step| {
+            observed.push(step);
+            if step == ApplicationReady {
+                Err(shinu_core::Error::Internal("ready failed".into()))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_err());
+        assert!(
+            observed.iter().position(|step| *step == Thaw).unwrap()
+                < observed.iter().position(|step| *step == Expose).unwrap()
+        );
+        assert_eq!(&observed[observed.len() - 2..], [Expose, ApplicationReady]);
     }
 }

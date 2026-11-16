@@ -49,12 +49,14 @@ enum Command {
         network: Option<String>,
         #[arg(long, value_name = "DURATION", value_parser = parse_ttl_duration)]
         ttl: Option<u64>,
+        #[arg(long, value_name = "JSON", value_parser = parse_readiness_json)]
+        readiness_json: Option<shinu::ReadySpec>,
     },
     #[command(group(
         clap::ArgGroup::new("resize-options")
             .required(true)
             .multiple(true)
-            .args(["vcpus", "mem", "disk"])
+            .args(["vcpus", "mem", "disk", "readiness_json"])
     ))]
     Resize {
         space: String,
@@ -64,6 +66,8 @@ enum Command {
         mem: Option<u32>,
         #[arg(long, value_name = "MIB")]
         disk: Option<u64>,
+        #[arg(long, value_name = "JSON", value_parser = parse_readiness_json)]
+        readiness_json: Option<shinu::ReadySpec>,
     },
     Images,
     Ls {
@@ -166,6 +170,8 @@ enum Command {
         ttl: Option<u64>,
         #[arg(long, value_name = "MIB")]
         write_cap_mib: Option<u64>,
+        #[arg(long, value_name = "JSON", value_parser = parse_readiness_json)]
+        readiness_json: Option<shinu::ReadySpec>,
     },
     #[command(group(
         clap::ArgGroup::new("lease-options")
@@ -847,6 +853,10 @@ fn parse_ttl_duration(raw: &str) -> Result<u64, String> {
         .ok_or_else(|| "TTL duration is too large".to_owned())
 }
 
+fn parse_readiness_json(raw: &str) -> Result<shinu::ReadySpec, String> {
+    serde_json::from_str(raw).map_err(|error| format!("invalid readiness policy: {error}"))
+}
+
 fn create_space_body(
     name: &str,
     image: Option<String>,
@@ -908,8 +918,9 @@ fn resize_space_body(
     vcpus: Option<u32>,
     mem_mib: Option<u32>,
     disk_mib: Option<u64>,
+    readiness: Option<shinu::ReadySpec>,
 ) -> Result<Value, String> {
-    if vcpus.is_none() && mem_mib.is_none() && disk_mib.is_none() {
+    if vcpus.is_none() && mem_mib.is_none() && disk_mib.is_none() && readiness.is_none() {
         return Err("resize requires at least one of --vcpus, --mem, or --disk".to_string());
     }
     let mut object = serde_json::Map::new();
@@ -921,6 +932,9 @@ fn resize_space_body(
     }
     if let Some(disk_mib) = disk_mib {
         object.insert("disk_mib".to_owned(), Value::from(disk_mib));
+    }
+    if let Some(spec) = readiness {
+        object.insert("readiness".into(), json!(spec));
     }
     Ok(Value::Object(object))
 }
@@ -1052,14 +1066,19 @@ fn run_command(client: &Client, command: Command) -> Result<i32, String> {
             disk,
             network,
             ttl,
+            readiness_json,
         } => {
             let data = response_value(request_json(
                 client,
                 "POST",
                 "/v1/spaces",
-                Some(create_space_body(
-                    &name, image, vcpus, mem, disk, network, ttl,
-                )),
+                Some({
+                    let mut body = create_space_body(&name, image, vcpus, mem, disk, network, ttl);
+                    if let Some(spec) = readiness_json {
+                        body["readiness"] = json!(spec);
+                    }
+                    body
+                }),
             )?)?;
             print_space_summary(&data);
         }
@@ -1068,12 +1087,13 @@ fn run_command(client: &Client, command: Command) -> Result<i32, String> {
             vcpus,
             mem,
             disk,
+            readiness_json,
         } => {
             let data = response_value(request_json(
                 client,
                 "PATCH",
                 &format!("/v1/spaces/{}", encode_path_segment(&space)),
-                Some(resize_space_body(vcpus, mem, disk)?),
+                Some(resize_space_body(vcpus, mem, disk, readiness_json)?),
             )?)?;
             print_space_summary(&data);
         }
@@ -1293,6 +1313,7 @@ fi"#
             name,
             ttl,
             write_cap_mib,
+            readiness_json,
         } => {
             let data = response_value(request_json(
                 client,
@@ -1302,6 +1323,9 @@ fi"#
                     let mut body = fork_space_body(&name, ttl);
                     if let Some(cap) = write_cap_mib {
                         body["write_cap_mib"] = json!(cap);
+                    }
+                    if let Some(spec) = readiness_json {
+                        body["readiness"] = json!(spec);
                     }
                     body
                 }),
@@ -2227,6 +2251,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cli_parses_readiness_for_new_fork_and_policy_only_resize() {
+        let policy = r#"{"command":["/bin/true","one argument"],"timeout_seconds":90}"#;
+        for args in [
+            vec!["shinu", "new", "world", "--readiness-json", policy],
+            vec![
+                "shinu",
+                "fork",
+                "00000000-0000-4000-8000-000000000001",
+                "world",
+                "--readiness-json",
+                policy,
+            ],
+            vec!["shinu", "resize", "world", "--readiness-json", policy],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let spec = match cli.command {
+                Command::New { readiness_json, .. }
+                | Command::Fork { readiness_json, .. }
+                | Command::Resize { readiness_json, .. } => readiness_json.unwrap(),
+                _ => panic!("unexpected command"),
+            };
+            assert_eq!(spec.command, ["/bin/true", "one argument"]);
+            assert_eq!(spec.timeout_seconds, 90);
+        }
+        assert!(Cli::try_parse_from(["shinu", "new", "world", "--readiness-json", "{}"]).is_err());
+        assert!(
+            Cli::try_parse_from(["shinu", "new", "world", "--readiness-json", "null"]).is_err()
+        );
+        let spec = parse_readiness_json(policy).unwrap();
+        assert_eq!(
+            resize_space_body(None, None, None, Some(spec)).unwrap(),
+            json!({"readiness":{"command":["/bin/true","one argument"],"timeout_seconds":90}})
+        );
+    }
+
+    #[test]
     fn rejects_control_characters_in_endpoint_base_path() {
         assert!(Endpoint::parse("http://127.0.0.1:7878/base\r\nX-Injected: yes").is_err());
     }
@@ -2516,13 +2576,13 @@ mod tests {
 
     #[test]
     fn resize_body_rejects_no_flags() {
-        let error = resize_space_body(None, None, None).unwrap_err();
+        let error = resize_space_body(None, None, None, None).unwrap_err();
         assert!(error.contains("at least one"));
     }
 
     #[test]
     fn resize_body_includes_only_requested_fields() {
-        let body = resize_space_body(Some(2), None, Some(4096)).unwrap();
+        let body = resize_space_body(Some(2), None, Some(4096), None).unwrap();
         assert_eq!(body, json!({"vcpus": 2, "disk_mib": 4096}));
         assert!(body.get("mem_mib").is_none());
     }

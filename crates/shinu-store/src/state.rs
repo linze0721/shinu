@@ -6,7 +6,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use uuid::Uuid;
 
-use shinu_core::{Error, Image, Result};
+use shinu_core::{Error, Image, ReadySpec, Result};
 
 fn default_image() -> Image {
     Image::Void
@@ -45,6 +45,8 @@ pub struct Space {
     pub write_cap_mib: u64,
     #[serde(default)]
     pub stopped_reason: Option<String>,
+    #[serde(default)]
+    pub readiness: Option<ReadySpec>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -75,6 +77,8 @@ pub struct Ckpt {
     /// this was recorded.
     #[serde(default)]
     pub snapshot_version: Option<String>,
+    #[serde(default)]
+    pub readiness: Option<ReadySpec>,
     pub note: String,
     pub created_at: DateTime<Utc>,
 }
@@ -172,6 +176,7 @@ const SCHEMA: &str = r#"
         expires_at TEXT,
         write_cap_mib INTEGER NOT NULL DEFAULT 0,
         stopped_reason TEXT,
+        readiness TEXT,
         created_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS ckpts (
@@ -187,7 +192,8 @@ const SCHEMA: &str = r#"
         snapshot_version TEXT,
         vcpus INTEGER,
         mem_mib INTEGER,
-        disk_mib INTEGER
+        disk_mib INTEGER,
+        readiness TEXT
     );
     CREATE TABLE IF NOT EXISTS templates (
         project TEXT NOT NULL,
@@ -267,6 +273,7 @@ fn migrate_space_columns(conn: &Connection) -> Result<()> {
         ("expires_at", "TEXT"),
         ("write_cap_mib", "INTEGER NOT NULL DEFAULT 0"),
         ("stopped_reason", "TEXT"),
+        ("readiness", "TEXT"),
     ] {
         let present: i64 = conn.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('spaces') WHERE name = ?1",
@@ -327,6 +334,7 @@ fn migrate_ckpt_columns(conn: &Connection) -> Result<()> {
         ("vcpus", "INTEGER"),
         ("mem_mib", "INTEGER"),
         ("disk_mib", "INTEGER"),
+        ("readiness", "TEXT"),
     ] {
         let present: i64 = tx.query_row(
             "SELECT COUNT(*) FROM pragma_table_info('ckpts') WHERE name = ?1",
@@ -462,6 +470,25 @@ fn parse_u64(value: i64, column: usize) -> rusqlite::Result<u64> {
     })
 }
 
+fn readiness_from_row(row: &Row<'_>, column: usize) -> rusqlite::Result<Option<ReadySpec>> {
+    row.get::<_, Option<String>>(column)?
+        .map(|json| {
+            serde_json::from_str(&json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(column, Type::Text, Box::new(error))
+            })
+        })
+        .transpose()
+}
+
+fn readiness_json(spec: Option<&ReadySpec>) -> rusqlite::Result<Option<String>> {
+    spec.map(|spec| {
+        spec.validate()
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+        serde_json::to_string(spec)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+    })
+    .transpose()
+}
 fn space_from_row(row: &Row<'_>) -> rusqlite::Result<Space> {
     Ok(Space {
         id: parse_uuid(row.get(0)?, 0)?,
@@ -478,6 +505,7 @@ fn space_from_row(row: &Row<'_>) -> rusqlite::Result<Space> {
         created_at: parse_datetime(row.get(11)?, 11)?,
         write_cap_mib: row.get(12)?,
         stopped_reason: row.get(13)?,
+        readiness: readiness_from_row(row, 14)?,
     })
 }
 
@@ -496,6 +524,7 @@ fn ckpt_from_row(row: &Row<'_>) -> rusqlite::Result<Ckpt> {
         vcpus: row.get(10)?,
         mem_mib: row.get(11)?,
         disk_mib: row.get(12)?,
+        readiness: readiness_from_row(row, 13)?,
     })
 }
 
@@ -531,7 +560,7 @@ fn job_from_row(row: &Row<'_>) -> rusqlite::Result<Job> {
 
 fn insert_space(tx: &Transaction<'_>, space: &Space) -> rusqlite::Result<usize> {
     tx.execute(
-        "INSERT INTO spaces (id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at, write_cap_mib, stopped_reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        "INSERT INTO spaces (id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at, write_cap_mib, stopped_reason, readiness) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             space.id.to_string(),
             space.name,
@@ -547,13 +576,14 @@ fn insert_space(tx: &Transaction<'_>, space: &Space) -> rusqlite::Result<usize> 
             space.created_at.to_rfc3339(),
             space.write_cap_mib,
             space.stopped_reason,
+            readiness_json(space.readiness.as_ref())?,
         ],
     )
 }
 
 fn insert_ckpt(tx: &Transaction<'_>, ckpt: &Ckpt) -> rusqlite::Result<usize> {
     tx.execute(
-        "INSERT INTO ckpts (id, space, project, parent, auto, full, base, snapshot_version, note, created_at, vcpus, mem_mib, disk_mib) VALUES (?1, ?2, ?3, NULLIF(?4, ''), ?5, ?6, NULLIF(?7, ''), NULLIF(?8, ''), ?9, ?10, ?11, ?12, ?13)",
+        "INSERT INTO ckpts (id, space, project, parent, auto, full, base, snapshot_version, note, created_at, vcpus, mem_mib, disk_mib, readiness) VALUES (?1, ?2, ?3, NULLIF(?4, ''), ?5, ?6, NULLIF(?7, ''), NULLIF(?8, ''), ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             ckpt.id.to_string(),
             ckpt.space.to_string(),
@@ -568,6 +598,7 @@ fn insert_ckpt(tx: &Transaction<'_>, ckpt: &Ckpt) -> rusqlite::Result<usize> {
             ckpt.vcpus,
             ckpt.mem_mib,
             ckpt.disk_mib,
+            readiness_json(ckpt.readiness.as_ref())?,
         ],
     )
 }
@@ -637,7 +668,7 @@ pub fn migrate_from_json(root: &Path, conn: &Connection) -> Result<bool> {
 pub fn load(conn: &Connection) -> Result<State> {
     let spaces = {
         let mut statement = conn.prepare(
-            "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at, write_cap_mib, stopped_reason FROM spaces ORDER BY rowid",
+            "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at, write_cap_mib, stopped_reason, readiness FROM spaces ORDER BY rowid",
         )?;
         statement
             .query_map([], space_from_row)?
@@ -645,7 +676,7 @@ pub fn load(conn: &Connection) -> Result<State> {
     };
     let ckpts = {
         let mut statement = conn.prepare(
-            "SELECT id, space, project, parent, auto, full, base, snapshot_version, note, created_at, vcpus, mem_mib, disk_mib FROM ckpts ORDER BY rowid",
+            "SELECT id, space, project, parent, auto, full, base, snapshot_version, note, created_at, vcpus, mem_mib, disk_mib, readiness FROM ckpts ORDER BY rowid",
         )?;
         statement
             .query_map([], ckpt_from_row)?
@@ -712,7 +743,7 @@ pub fn store(conn: &Connection, state: &State) -> Result<()> {
 pub fn find_space(conn: &Connection, name: &str, project: &str) -> Result<Option<Space>> {
     let by_name = conn
         .query_row(
-            "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at, write_cap_mib, stopped_reason FROM spaces WHERE project = ?1 AND name = ?2 LIMIT 1",
+            "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at, write_cap_mib, stopped_reason, readiness FROM spaces WHERE project = ?1 AND name = ?2 LIMIT 1",
             params![project, name],
             space_from_row,
         )
@@ -728,7 +759,7 @@ pub fn find_space(conn: &Connection, name: &str, project: &str) -> Result<Option
 
 pub fn find_space_by_id(conn: &Connection, id: Uuid, project: &str) -> Result<Option<Space>> {
     conn.query_row(
-        "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at, write_cap_mib, stopped_reason FROM spaces WHERE project = ?1 AND id = ?2 LIMIT 1",
+        "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at, write_cap_mib, stopped_reason, readiness FROM spaces WHERE project = ?1 AND id = ?2 LIMIT 1",
         params![project, id.to_string()],
         space_from_row,
     )
@@ -738,7 +769,7 @@ pub fn find_space_by_id(conn: &Connection, id: Uuid, project: &str) -> Result<Op
 
 pub fn find_ckpt(conn: &Connection, id: Uuid, project: &str) -> Result<Option<Ckpt>> {
     conn.query_row(
-        "SELECT id, space, project, parent, auto, full, base, snapshot_version, note, created_at, vcpus, mem_mib, disk_mib FROM ckpts WHERE project = ?1 AND id = ?2 LIMIT 1",
+        "SELECT id, space, project, parent, auto, full, base, snapshot_version, note, created_at, vcpus, mem_mib, disk_mib, readiness FROM ckpts WHERE project = ?1 AND id = ?2 LIMIT 1",
         params![project, id.to_string()],
         ckpt_from_row,
     )
@@ -796,7 +827,7 @@ pub fn claim_expired_space(
     let tx = conn.unchecked_transaction()?;
     let space = tx
         .query_row(
-            "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at, write_cap_mib, stopped_reason FROM spaces WHERE project = ?1 AND id = ?2 LIMIT 1",
+            "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at, write_cap_mib, stopped_reason, readiness FROM spaces WHERE project = ?1 AND id = ?2 LIMIT 1",
             params![project, id.to_string()],
             space_from_row,
         )
@@ -1541,6 +1572,87 @@ mod db_tests {
     }
 
     #[test]
+    fn readiness_policy_round_trips_and_outlives_its_source_space() {
+        let root = root();
+        let conn = open(&root).unwrap();
+        let (mut state, _, checkpoint) = sample_state("project");
+        let policy = ReadySpec {
+            command: vec!["/usr/local/bin/ready".into(), "one argument".into()],
+            timeout_seconds: 90,
+        };
+        state.spaces[0].readiness = Some(policy.clone());
+        state.ckpts[0].readiness = Some(policy.clone());
+        store(&conn, &state).unwrap();
+        assert_eq!(
+            find_space(&conn, "demo", "project")
+                .unwrap()
+                .unwrap()
+                .readiness,
+            Some(policy.clone())
+        );
+        state.spaces.clear();
+        store(&conn, &state).unwrap();
+        drop(conn);
+        let reopened = open(&root).unwrap();
+        assert_eq!(
+            find_ckpt(&reopened, checkpoint.id, "project")
+                .unwrap()
+                .unwrap()
+                .readiness,
+            Some(policy)
+        );
+        assert!(load(&reopened).unwrap().spaces.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn old_json_and_nullable_sql_rows_remain_nonconfigured() {
+        let (state, _, _) = sample_state("project");
+        let mut json = serde_json::to_value(&state).unwrap();
+        json["spaces"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("readiness");
+        json["ckpts"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("readiness");
+        let legacy: State = serde_json::from_value(json).unwrap();
+        assert!(legacy.spaces[0].readiness.is_none());
+        assert!(legacy.ckpts[0].readiness.is_none());
+        let conn = db();
+        store(&conn, &legacy).unwrap();
+        assert_eq!(load(&conn).unwrap(), legacy);
+    }
+
+    #[test]
+    fn readiness_columns_migrate_idempotently_and_invalid_json_fails_closed() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE spaces (id TEXT PRIMARY KEY, name TEXT NOT NULL, project TEXT NOT NULL, parent TEXT, head TEXT, created_at TEXT NOT NULL); CREATE TABLE ckpts (id TEXT PRIMARY KEY, space TEXT NOT NULL, project TEXT NOT NULL, parent TEXT, auto INTEGER NOT NULL, note TEXT NOT NULL, created_at TEXT NOT NULL);").unwrap();
+        init_schema(&conn).unwrap();
+        init_schema(&conn).unwrap();
+        let (state, space, checkpoint) = sample_state("project");
+        store(&conn, &state).unwrap();
+        assert!(
+            find_space_by_id(&conn, space.id, "project")
+                .unwrap()
+                .unwrap()
+                .readiness
+                .is_none()
+        );
+        assert!(
+            find_ckpt(&conn, checkpoint.id, "project")
+                .unwrap()
+                .unwrap()
+                .readiness
+                .is_none()
+        );
+        conn.execute("UPDATE ckpts SET readiness = '{}'", [])
+            .unwrap();
+        assert!(find_ckpt(&conn, checkpoint.id, "project").is_err());
+    }
+
+    #[test]
     fn storage_metadata_migrates_and_survives_reopen_and_state_updates() {
         let root = root();
         let conn = open(&root).unwrap();
@@ -1584,6 +1696,7 @@ mod db_tests {
             created_at,
             write_cap_mib: 0,
             stopped_reason: None,
+            readiness: None,
         };
         let ckpt = Ckpt {
             id: ckpt_id,
@@ -1597,6 +1710,7 @@ mod db_tests {
             mem_mib: space.mem_mib,
             disk_mib: space.disk_mib,
             snapshot_version: None,
+            readiness: None,
             note: "initial".into(),
             created_at,
         };

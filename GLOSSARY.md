@@ -20,3 +20,6 @@ A saved instant at which configured applications and every writable guest filesy
 
 **Crash consistency**:
 A saved instant without evidence that applications completed their freeze protocol; a stopped Space alone is not evidence of application consistency.
+
+**Application readiness**:
+Admission of one running Space generation after its configured guest command completes successfully for a fresh host challenge. It is not a promise of continuing application health or external lease ownership.

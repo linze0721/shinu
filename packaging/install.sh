@@ -37,6 +37,10 @@ case "$(LC_ALL=C file -b "$GUEST_AGENT")" in
     'ELF '*'statically linked'*|'ELF '*'static-pie linked'*) ;;
     *) printf '%s\n' 'guest snapshot helper must be a statically linked ELF' >&2; exit 1 ;;
 esac
+if [ "$(timeout 5 "$GUEST_AGENT" --capabilities 2>/dev/null || :)" != 'SHINU-SNAPSHOT-1 READY-1' ]; then
+    printf '%s\n' 'guest snapshot helper must support READY-1' >&2
+    exit 1
+fi
 
 # The daemon passes these numeric ids to the jailer.  Keep the values
 # canonical so comparisons cannot depend on shell integer parsing.

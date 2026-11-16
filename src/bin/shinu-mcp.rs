@@ -229,6 +229,9 @@ impl Server {
                 if let Some(ttl_seconds) = optional_ttl_seconds(arguments, "ttl_seconds")? {
                     body.insert("ttl_seconds".to_owned(), ttl_seconds);
                 }
+                if let Some(readiness) = optional_readiness(arguments)? {
+                    body.insert("readiness".into(), readiness);
+                }
                 request_text(&client, "POST", &path, Some(Value::Object(body)))
             }
             "shinu_fork_template" => {
@@ -478,6 +481,31 @@ fn optional_network<'a>(
     Ok(value)
 }
 
+fn optional_readiness(arguments: &Map<String, Value>) -> Result<Option<Value>, String> {
+    match arguments.get("readiness") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => {
+            let spec: shinu::ReadySpec = serde_json::from_value(value.clone())
+                .map_err(|error| format!("invalid readiness policy: {error}"))?;
+            serde_json::to_value(spec)
+                .map(Some)
+                .map_err(|error| error.to_string())
+        }
+    }
+}
+
+fn readiness_schema() -> Value {
+    json!({
+        "type": ["object", "null"],
+        "properties": {
+            "command": {"type": "array", "minItems": 1, "maxItems": 256, "items": {"type": "string"}, "description": "Absolute executable and argv, at most 8192 aggregate UTF-8 bytes."},
+            "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 900}
+        },
+        "required": ["command", "timeout_seconds"],
+        "additionalProperties": false
+    })
+}
+
 fn create_space_body(name: &str, arguments: &Map<String, Value>) -> Result<Value, String> {
     let mut object = Map::new();
     object.insert("name".to_string(), Value::String(name.to_owned()));
@@ -499,6 +527,9 @@ fn create_space_body(name: &str, arguments: &Map<String, Value>) -> Result<Value
     if let Some(ttl_seconds) = optional_ttl_seconds(arguments, "ttl_seconds")? {
         object.insert("ttl_seconds".to_owned(), ttl_seconds);
     }
+    if let Some(readiness) = optional_readiness(arguments)? {
+        object.insert("readiness".into(), readiness);
+    }
     Ok(Value::Object(object))
 }
 
@@ -506,7 +537,8 @@ fn resize_space_body(arguments: &Map<String, Value>) -> Result<Value, String> {
     let vcpus = optional_positive_u64(arguments, "vcpus")?;
     let mem_mib = optional_positive_u64(arguments, "mem_mib")?;
     let disk_mib = optional_positive_u64(arguments, "disk_mib")?;
-    if vcpus.is_none() && mem_mib.is_none() && disk_mib.is_none() {
+    let readiness = optional_readiness(arguments)?;
+    if vcpus.is_none() && mem_mib.is_none() && disk_mib.is_none() && readiness.is_none() {
         return Err("resize requires at least one of vcpus, mem_mib, or disk_mib".to_string());
     }
     let mut object = Map::new();
@@ -518,6 +550,9 @@ fn resize_space_body(arguments: &Map<String, Value>) -> Result<Value, String> {
     }
     if let Some(disk_mib) = disk_mib {
         object.insert("disk_mib".to_string(), Value::from(disk_mib));
+    }
+    if let Some(readiness) = readiness {
+        object.insert("readiness".into(), readiness);
     }
     Ok(Value::Object(object))
 }
@@ -591,6 +626,7 @@ fn validate_arguments(name: &str, arguments: &Map<String, Value>) -> Result<(), 
             optional_positive_u64(arguments, "disk_mib")?;
             optional_network(arguments, "network")?;
             optional_ttl_seconds(arguments, "ttl_seconds")?;
+            optional_readiness(arguments)?;
             Ok(())
         }
         "shinu_resize_space" => {
@@ -648,6 +684,7 @@ fn validate_arguments(name: &str, arguments: &Map<String, Value>) -> Result<(), 
             required_string(arguments, "commit")?;
             required_string(arguments, "name")?;
             optional_ttl_seconds(arguments, "ttl_seconds")?;
+            optional_readiness(arguments)?;
             Ok(())
         }
         "shinu_fork_template" => {
@@ -838,24 +875,27 @@ fn tool_definitions() -> Vec<Value> {
                 "disk_mib": {"type": "integer", "minimum": 1, "description": "该 space 的磁盘容量，单位 MiB；省略时使用 daemon 默认值。"},
                 "network": {"type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[a-z0-9-]+$", "description": "可选的项目内网络名称；同名 space 才能互相访问。"},
                 "ttl_seconds": ttl_seconds_schema("可选的租约时长，单位秒；省略或 null 表示不过期。"),
+                "readiness": readiness_schema(),
             }), &["name"]),
         }),
         json!({
             "name": "shinu_resize_space",
-            "description": "调整 space 的 vCPU、内存或磁盘；space 必须处于 STOPPED 状态，先调用 shinu_stop。至少提供一个尺寸参数；磁盘只能增大、不能缩小，因为缩小会造成数据丢失。image 在创建时固定，不能通过 resize 更换。",
+            "description": "调整停止 space 的 vCPU、内存、磁盘或 application readiness；至少提供一个参数，磁盘只能增大。readiness 的 null/省略保留原策略。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "space": {"type": "string", "minLength": 1, "description": "要调整的 space。"},
                     "vcpus": {"type": "integer", "minimum": 1, "description": "新的 vCPU 数量。"},
                     "mem_mib": {"type": "integer", "minimum": 1, "description": "新的内存上限，单位 MiB。"},
-                    "disk_mib": {"type": "integer", "minimum": 1, "description": "新的磁盘容量，单位 MiB；只能增大，不能缩小。"}
+                    "disk_mib": {"type": "integer", "minimum": 1, "description": "新的磁盘容量，单位 MiB；只能增大，不能缩小。"},
+                    "readiness": readiness_schema()
                 },
                 "required": ["space"],
                 "anyOf": [
                     {"required": ["vcpus"]},
                     {"required": ["mem_mib"]},
-                    {"required": ["disk_mib"]}
+                    {"required": ["disk_mib"]},
+                    {"required": ["readiness"]}
                 ]
             },
         }),
@@ -937,6 +977,7 @@ fn tool_definitions() -> Vec<Value> {
                 "commit": {"type": "string", "minLength": 1, "description": "作为新 space 起点的 commit ID。"},
                 "name": {"type": "string", "minLength": 1, "description": "新 space 的名称。"},
                 "ttl_seconds": ttl_seconds_schema("可选的租约时长，单位秒；省略或 null 表示不过期。"),
+                "readiness": readiness_schema(),
             }), &["commit", "name"]),
         }),
         json!({
@@ -1474,6 +1515,46 @@ mod tests {
                 expected_body
             );
             assert_eq!(response["result"]["isError"], json!(false));
+        }
+    }
+
+    #[test]
+    fn readiness_tools_validate_and_serialize_the_actual_http_request() {
+        let policy =
+            json!({"command":["/usr/local/bin/ready","one argument"],"timeout_seconds":90});
+        let checkpoint = "00000000-0000-4000-8000-000000000001";
+        for (tool, args, expected_body) in [
+            (
+                "shinu_create_space",
+                json!({"name":"world","readiness":policy}),
+                json!({"name":"world","readiness":policy}),
+            ),
+            (
+                "shinu_resize_space",
+                json!({"space":"world","readiness":policy}),
+                json!({"readiness":policy}),
+            ),
+            (
+                "shinu_fork",
+                json!({"commit":checkpoint,"name":"branch","readiness":policy}),
+                json!({"name":"branch","readiness":policy}),
+            ),
+        ] {
+            let (response, request) = dispatch_with_json_server(tool, args, json!({"ok":true}));
+            let (_, body) = request.split_once("\r\n\r\n").unwrap();
+            assert_eq!(serde_json::from_str::<Value>(body).unwrap(), expected_body);
+            assert_eq!(response["result"]["isError"], false);
+        }
+        for tool in ["shinu_create_space", "shinu_resize_space", "shinu_fork"] {
+            assert!(
+                validate_arguments(
+                    tool,
+                    &arguments(
+                        json!({"name":"world","space":"world","commit":checkpoint,"readiness":{}})
+                    )
+                )
+                .is_err()
+            );
         }
     }
 

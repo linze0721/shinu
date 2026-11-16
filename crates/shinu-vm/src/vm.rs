@@ -479,7 +479,10 @@ fn configure_tap(id: Uuid, cfg: &NetConfig, peers: &[String], setup: TapSetup) -
         allow_file_exists("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"])?;
     }
     ensure_address_free(id, &tap, &host_cidr)?;
-    allow_file_exists("ip", &["addr", "add", &host_cidr, "dev", &tap])?;
+    match setup {
+        TapSetup::Create => allow_file_exists("ip", &["addr", "add", &host_cidr, "dev", &tap])?,
+        TapSetup::Existing => require_success("ip", &["addr", "replace", &host_cidr, "dev", &tap])?,
+    }
     ensure_address_free(id, &tap, &host_cidr)?;
     require_success("ip", &["link", "set", &tap, "up"])?;
 

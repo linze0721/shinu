@@ -26,6 +26,18 @@ for binary in shinu shinu-vsock shinud; do
     fi
 done
 
+# The guest helper must not depend on the host's glibc version.
+AGENT_TARGET="$(uname -m)-unknown-linux-musl"
+GUEST_AGENT="$SRC/target/$AGENT_TARGET/release/shinu-snapshot-agent"
+if [ ! -f "$GUEST_AGENT" ] || [ ! -x "$GUEST_AGENT" ]; then
+    printf 'missing static guest helper: run cargo build --release --target %s -p shinu-vm --bin shinu-snapshot-agent\n' "$AGENT_TARGET" >&2
+    exit 1
+fi
+case "$(LC_ALL=C file -b "$GUEST_AGENT")" in
+    'ELF '*'statically linked'*|'ELF '*'static-pie linked'*) ;;
+    *) printf '%s\n' 'guest snapshot helper must be a statically linked ELF' >&2; exit 1 ;;
+esac
+
 # The daemon passes these numeric ids to the jailer.  Keep the values
 # canonical so comparisons cannot depend on shell integer parsing.
 JAIL_UID="${SHINU_JAIL_UID:-30000}"
@@ -250,11 +262,12 @@ case "$GROUP_BY_NAME" in
         ;;
     *) fail_jail_identity 'shinu-jail group lookup failed' ;;
 esac
-# Install all three together; `shinu` resolves `shinu-vsock` beside itself.
+# Install transport and guest helpers beside the daemon that resolves them.
 install -d -m 0755 "$BIN"
 for binary in shinu shinu-vsock shinud; do
     install -m 0755 "$SRC/target/release/$binary" "$BIN/$binary"
 done
+install -m 0755 "$GUEST_AGENT" "$BIN/shinu-snapshot-agent"
 
 install -d -m 0755 "$SVDIR/shinud"
 RUN="$SVDIR/shinud/run"

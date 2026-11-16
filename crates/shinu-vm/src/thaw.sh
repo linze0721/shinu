@@ -1,7 +1,13 @@
 # The ledger is also captured in RAM: restored guests must execute this script.
 set -u
 export LC_ALL=C
-state=/run/shinu-freeze
+state=${1:-/run/shinu-freeze}
+# Cancel a monitor that has not acquired the lock yet, even if its freeze
+# ledger does not exist. The caller holds the same guest flock as the monitor.
+control=${state%/*}/shinu-snapshot
+if [ -d "$control" ]; then
+    printf thawed > "$control/phase" || exit 1
+fi
 [ -d "$state" ] || exit 0
 failed=0
 if [ -f "$state/mounts" ]; then

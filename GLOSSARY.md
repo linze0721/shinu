@@ -16,7 +16,7 @@ The disk, optional running memory and execution state, and provenance belonging 
 _Avoid_: memory snapshot (when referring to the entire generation)
 
 **Application consistency**:
-A saved instant at which every configured application freeze hook has succeeded and every writable guest filesystem has been frozen. It does not include independently hosted applications or external storage.
+A saved instant at which configured applications and every writable guest filesystem contributing persistent data are quiescent. It does not include independently hosted applications or external storage, and cannot describe a generation with unverified filesystem coverage.
 
 **Crash consistency**:
 A saved instant without evidence that applications completed their freeze protocol; a stopped Space alone is not evidence of application consistency.

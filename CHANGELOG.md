@@ -32,5 +32,9 @@ Changes are recorded in the Keep a Changelog format.
 - Reject stock/unapproved Firecracker builds for application snapshots: require the `v1.18.0-shinu.1` marker at asset admission and on the actual running executable; use a mandatory local patched archive rather than downloading stock.
 - Fail hot captures on block drain/flush errors, including an explicit backing-file fsync for disk-only hot cuts, while preserving resume/thaw cleanup.
 - Guard Diff creation with the actual live dirty epoch: failed captures, restarts and consecutive Diff requests force Full rather than dropping dirty pages from earlier captures.
+- Replace snapshot-time SSH reconnects with a memory-locked, nonce-authenticated resident guest helper; thaw restored guests through the same fixed protocol, retain SSH cleanup on helper failure, and batch restored clock/network setup into one SSH session.
+- Freeze each writable block-backed superblock visible in the initial guest mount namespace once, including bind mounts; refuse application consistency when a private namespace adds an uncovered writable block filesystem, while preserving reverse thaw/hook cleanup and the no-exposure-before-thaw gate.
+- Add opt-in `SHINU_SNAPSHOT_PRECONNECT=1` to park an authenticated thaw channel before pause; it remains off by default pending real-host comparison, and restored generations always establish a fresh connection.
+- Keep monitored guest scripts fenced across worker crashes and nested timeout groups, cancel pending scripts when cleanup wins, and stream setup nonces privately rather than exposing them in process arguments.
 
 [Unreleased]: https://github.com/linze0721/shinu/compare/main...HEAD

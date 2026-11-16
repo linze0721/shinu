@@ -2064,6 +2064,7 @@ fn checkpoint_metadata(
         "pause_ms": capture.map_or(0, |capture| capture.pause_ms),
         "freeze_ms": capture.map_or(0, |capture| capture.freeze_ms),
         "thaw_ms": capture.map_or(0, |capture| capture.thaw_ms),
+        "guest_snapshot_nonce": capture.and_then(|capture| capture.guest_snapshot_nonce.as_deref()),
     })
 }
 
@@ -3255,6 +3256,24 @@ fn list_images(ctx: &Ctx<'_>) -> Value {
     Value::Array(images)
 }
 
+fn checkpoint_snapshot_nonce(root: &Path, id: Uuid) -> shinu::Result<Option<String>> {
+    let bytes = match std::fs::read(checkpoint_metadata_path(root, id)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut metadata: serde_json::Map<String, Value> = serde_json::from_slice(&bytes)?;
+    match metadata.remove("guest_snapshot_nonce") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(nonce)) if nonce.len() == 36 && Uuid::parse_str(&nonce).is_ok() => {
+            Ok(Some(nonce))
+        }
+        _ => Err(shinu::Error::Invalid(
+            "invalid checkpoint snapshot nonce".into(),
+        )),
+    }
+}
+
 fn start_vm_with_pending_restore(
     ctx: &Ctx<'_>,
     id: Uuid,
@@ -3282,9 +3301,18 @@ fn start_vm_with_pending_restore(
         remove_space_snapshot_files(ctx.root, id)?;
     }
     let has_restore = has_mem && has_state && !incompatible;
+    let nonce = if has_restore {
+        restore_checkpoint
+            .map(|checkpoint| checkpoint_snapshot_nonce(ctx.root, checkpoint.id))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
     let restore = has_restore.then(|| shinu::vm::RestoreFiles {
         mem: &snapshot_mem,
         state: &snapshot_state,
+        guest_snapshot_nonce: nonce.as_deref(),
     });
     let result = shinu::vm::start(
         ctx.root,
@@ -12507,6 +12535,7 @@ esac
             pause_ms: 321,
             freeze_ms: 12,
             thaw_ms: 34,
+            guest_snapshot_nonce: Some("00000000-0000-4000-8000-000000000001".into()),
         };
         let metadata = super::checkpoint_metadata(id, Some(parent), Some(&capture), "build-sha256");
         assert_eq!(
@@ -12532,11 +12561,53 @@ esac
         assert_eq!(metadata["pause_ms"], 321);
         assert_eq!(metadata["freeze_ms"], 12);
         assert_eq!(metadata["thaw_ms"], 34);
+        assert_eq!(
+            metadata["guest_snapshot_nonce"],
+            "00000000-0000-4000-8000-000000000001"
+        );
         assert!(metadata["created_unix_ns"].as_i64().unwrap() > 0);
         let cold = super::checkpoint_metadata(id, None, None, "none");
         assert_eq!(cold["consistency"], "crash");
         assert!(cold["memory"].is_null());
         assert_eq!(cold["pause_ms"], 0);
+    }
+
+    #[test]
+    fn checkpoint_nonce_round_trips_and_rejects_invalid_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("shinu-nonce-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("ckpts")).unwrap();
+        let id = Uuid::new_v4();
+        let nonce = "00000000-0000-4000-8000-000000000001";
+        let capture = shinu::vm::SnapshotCapture {
+            guest_snapshot_nonce: Some(nonce.into()),
+            ..Default::default()
+        };
+        let metadata = super::checkpoint_metadata(id, None, Some(&capture), "test-build");
+        super::write_checkpoint_metadata(&root, id, &metadata).unwrap();
+        assert_eq!(
+            super::checkpoint_snapshot_nonce(&root, id)
+                .unwrap()
+                .as_deref(),
+            Some(nonce)
+        );
+        assert_eq!(
+            std::fs::metadata(super::checkpoint_metadata_path(&root, id))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(
+            super::checkpoint_snapshot_nonce(&root, Uuid::new_v4())
+                .unwrap()
+                .is_none()
+        );
+        let invalid = Uuid::new_v4();
+        std::fs::write(super::checkpoint_metadata_path(&root, invalid), b"[]").unwrap();
+        assert!(super::checkpoint_snapshot_nonce(&root, invalid).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

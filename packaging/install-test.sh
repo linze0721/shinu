@@ -21,6 +21,17 @@ trap cleanup 0 1 2 3 15
 FAKE_BIN=$TMP_ROOT/fake-bin
 mkdir -p "$FAKE_BIN"
 
+# file(1) is an external artifact-inspection adapter, kept fixture-local.
+cat > "$FAKE_BIN/file" <<'EOF_FILE'
+#!/bin/sh
+case "$(cat "$SHINU_TEST_STATE/helper-linkage" 2>/dev/null)" in
+    dynamic) printf '%s\n' 'ELF 64-bit LSB pie executable, dynamically linked' ;;
+    script) printf '%s\n' 'POSIX shell script, ASCII text executable' ;;
+    *) printf '%s\n' 'ELF 64-bit LSB pie executable, static-pie linked' ;;
+esac
+EOF_FILE
+chmod 0755 "$FAKE_BIN/file"
+
 # Fake getent implements only the two databases and lookup forms used by
 # install.sh. Records are fixture-local, so no host NSS state is consulted.
 cat > "$FAKE_BIN/getent" <<'EOF_GETENT'
@@ -231,6 +242,9 @@ begin_case() {
         printf '#!/bin/sh\nexit 0\n' > "$CASE_DIR/target/release/$binary"
         chmod 0755 "$CASE_DIR/target/release/$binary"
     done
+    guest_target="$(uname -m)-unknown-linux-musl"
+    mkdir -p "$CASE_DIR/target/$guest_target/release"
+    cp "$CASE_DIR/target/release/shinu-vsock" "$CASE_DIR/target/$guest_target/release/shinu-snapshot-agent"
     : > "$CASE_DIR/state/passwd"
     : > "$CASE_DIR/state/group"
     : > "$CASE_DIR/state/mutations"
@@ -319,6 +333,8 @@ assert_accepted() {
     assert_equal 0 "$INSTALL_STATUS" "$CASE_NAME must accept the identity"
     assert_equal '' "$(cat "$CASE_DIR/stderr")" "$CASE_NAME stderr"
 
+    [ -x "$expected_bin/shinu-snapshot-agent" ] || fail "$CASE_NAME did not install the executable guest helper"
+    cmp "$CASE_DIR/target/$guest_target/release/shinu-snapshot-agent" "$expected_bin/shinu-snapshot-agent" || fail "$CASE_NAME installed the wrong guest helper"
     run_file=$expected_svdir/shinud/run
     [ -f "$run_file" ] || fail "$CASE_NAME did not generate $run_file"
     [ -x "$run_file" ] || fail "$CASE_NAME generated a non-executable run script"
@@ -445,4 +461,15 @@ SVDIR_VALUE="$CASE_DIR/sv space\$and'quote\"double"
 run_install
 assert_accepted "$PREFIX_VALUE/bin" "$SVDIR_VALUE"
 
-printf '%s\n' 'install identity matrix: 14 cases passed (hermetic NSS and account mutators)'
+# 15-16. A musl-looking path is not proof of a static ELF artifact.
+for linkage in dynamic script; do
+    begin_case "guest-helper-$linkage"
+    seed_identity
+    printf '%s\n' "$linkage" > "$CASE_DIR/state/helper-linkage"
+    run_install
+    assert_equal 1 "$INSTALL_STATUS" "$CASE_NAME must reject a non-static artifact"
+    assert_equal 'guest snapshot helper must be a statically linked ELF' "$(cat "$CASE_DIR/stderr")" "$CASE_NAME error"
+    assert_no_mutation
+done
+
+printf '%s\n' 'install matrix: 16 cases passed (hermetic artifact inspection, NSS and account mutators)'

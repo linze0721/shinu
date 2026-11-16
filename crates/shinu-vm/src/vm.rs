@@ -157,40 +157,89 @@ fn kill_process_group(pgid: u32) {
 fn run_process_group(
     mut command: std::process::Command,
     timeout: Duration,
+    input: Option<(String, std::fs::File)>,
 ) -> Option<std::process::ExitStatus> {
-    // A zero process group asks the kernel to use the new process's pid. The
-    // SSH child and its ProxyCommand descendants inherit this group.
+    // The SSH client, proxy and optional stdin producer share one killable
+    // group. Keep the deadline until both client and producer have finished.
     command.process_group(0);
+    if input.is_some() {
+        command.stdin(std::process::Stdio::piped());
+    }
     let Ok(mut child) = command.spawn() else {
         return None;
     };
     let pgid = child.id();
     let deadline = Instant::now() + timeout;
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Some(status),
-            Ok(Some(status)) => {
-                kill_process_group(pgid);
-                let _ = child.wait();
-                return Some(status);
-            }
-            Ok(None) => {}
+    let mut producer = if let Some((prefix, payload)) = input {
+        let Some(stdin) = child.stdin.take() else {
+            kill_process_group(pgid);
+            let _ = child.wait();
+            return None;
+        };
+        let output: std::os::fd::OwnedFd = stdin.into();
+        let mut source = std::process::Command::new("sh");
+        source.args(["-c", "printf '%s\\n' \"$SHINU_SNAPSHOT_SETUP_NONCE\"; unset SHINU_SNAPSHOT_SETUP_NONCE; exec cat"])
+            .env("SHINU_SNAPSHOT_SETUP_NONCE", prefix)
+            .stdin(payload).stdout(std::process::Stdio::from(output)).process_group(pgid.cast_signed());
+        let spawned = source.spawn();
+        // Command retains configured descriptors for reuse; closing its copy
+        // here is essential so producer exit really sends EOF to SSH.
+        drop(source);
+        match spawned {
+            Ok(source) => Some(source),
             Err(_) => {
                 kill_process_group(pgid);
                 let _ = child.wait();
                 return None;
             }
         }
-
+    } else {
+        None
+    };
+    let mut status = None;
+    let mut input_finished = producer.is_none();
+    let result = loop {
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(Some(done)) => {
+                    status = Some(done);
+                    if !done.success() {
+                        kill_process_group(pgid);
+                        break status;
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    kill_process_group(pgid);
+                    break None;
+                }
+            }
+        }
+        if !input_finished && let Some(source) = producer.as_mut() {
+            match source.try_wait() {
+                Ok(Some(done)) if done.success() => input_finished = true,
+                Ok(Some(_)) | Err(_) => {
+                    kill_process_group(pgid);
+                    break None;
+                }
+                Ok(None) => {}
+            }
+        }
+        if status.is_some() && input_finished {
+            break status;
+        }
         let now = Instant::now();
         if now >= deadline {
             kill_process_group(pgid);
-            let _ = child.wait();
-            return None;
+            break None;
         }
         std::thread::sleep(PROCESS_GROUP_POLL_INTERVAL.min(deadline.duration_since(now)));
+    };
+    let _ = child.wait();
+    if let Some(mut source) = producer {
+        let _ = source.wait();
     }
+    result
 }
 
 fn run_guest_flush(vsock_uds: &Path, key: &Path) -> Option<std::process::ExitStatus> {
@@ -207,7 +256,7 @@ fn run_guest_flush(vsock_uds: &Path, key: &Path) -> Option<std::process::ExitSta
         shinu_core::VSOCK_SSH_PORT,
         &command,
     );
-    run_process_group(ssh, GUEST_FLUSH_TIMEOUT)
+    run_process_group(ssh, GUEST_FLUSH_TIMEOUT, None)
 }
 
 /// Whether an asset's no-follow metadata satisfies the root-executed trust
@@ -398,7 +447,16 @@ pub fn tap_up(id: Uuid, cfg: &NetConfig) -> Result<()> {
     tap_up_with_peers(id, cfg, &[])
 }
 
+enum TapSetup {
+    Create,
+    Existing,
+}
+
 pub fn tap_up_with_peers(id: Uuid, cfg: &NetConfig, peers: &[String]) -> Result<()> {
+    configure_tap(id, cfg, peers, TapSetup::Create)
+}
+
+fn configure_tap(id: Uuid, cfg: &NetConfig, peers: &[String], setup: TapSetup) -> Result<()> {
     if !cfg.enabled {
         return Ok(());
     }
@@ -416,7 +474,10 @@ pub fn tap_up_with_peers(id: Uuid, cfg: &NetConfig, peers: &[String]) -> Result<
     let network_cidr = format!("{network}/30");
 
     ensure_address_free(id, &tap, &host_cidr)?;
-    allow_file_exists("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"])?;
+    // A restored VMM already owns its TAP fd; TUNSETIFF would return EBUSY.
+    if matches!(setup, TapSetup::Create) {
+        allow_file_exists("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"])?;
+    }
     ensure_address_free(id, &tap, &host_cidr)?;
     allow_file_exists("ip", &["addr", "add", &host_cidr, "dev", &tap])?;
     ensure_address_free(id, &tap, &host_cidr)?;
@@ -909,6 +970,7 @@ pub struct SnapshotCapture {
     pub pause_ms: u64,
     pub freeze_ms: u64,
     pub thaw_ms: u64,
+    pub guest_snapshot_nonce: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -966,20 +1028,208 @@ fn combine_snapshot_results(primary: Result<()>, cleanup: Result<()>) -> Result<
     }
 }
 
-fn guest_snapshot_script(dir: &Path, script: &str) -> Result<()> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RestoreStep {
+    Quarantine,
+    Load,
+    Thaw,
+    Ready,
+    Configure,
+    Expose,
+}
+
+fn restore_transaction(mut step: impl FnMut(RestoreStep) -> Result<()>) -> Result<()> {
+    step(RestoreStep::Quarantine)?;
+    let loaded = step(RestoreStep::Load);
+    // A failed/lost load reply can still leave live frozen vCPUs behind.
+    let thawed = step(RestoreStep::Thaw);
+    combine_snapshot_results(loaded, thawed)?;
+    step(RestoreStep::Ready)?;
+    step(RestoreStep::Configure)?;
+    step(RestoreStep::Expose)
+}
+
+// The listener is captured in guest RAM, so restore can thaw without starting
+// sshd/PAM under a frozen root or competing with application timer catch-up.
+fn snapshot_line<'a, const N: usize>(
+    reader: &mut impl std::io::Read,
+    buffer: &'a mut [u8; N],
+) -> std::io::Result<&'a [u8]> {
+    for length in 0..buffer.len() {
+        reader.read_exact(&mut buffer[length..=length])?;
+        if buffer[length] == b'\n' {
+            return Ok(&buffer[..length]);
+        }
+    }
+    Err(std::io::Error::other("oversized snapshot worker reply"))
+}
+
+enum SnapshotCommand<'a> {
+    Status,
+    Rotate(&'a str),
+    Freeze,
+    Thaw,
+    Hold,
+}
+
+struct SnapshotConnection {
+    stream: std::os::unix::net::UnixStream,
+    nonce: String,
+}
+
+impl SnapshotConnection {
+    // None identifies a legacy/unavailable worker, not a successful thaw.
+    fn connect(dir: &Path) -> Option<Result<Self>> {
+        let nonce = std::fs::read_to_string(dir.join("snapshot-worker-nonce")).ok()?;
+        if Uuid::parse_str(&nonce).is_err() || nonce.len() != 36 {
+            return Some(Err(Error::Internal("invalid snapshot worker nonce".into())));
+        }
+        let mut stream = std::os::unix::net::UnixStream::connect(vsock_path(dir)).ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(1)))
+            .ok()?;
+        stream.write_all(b"CONNECT 2224\n").ok()?;
+        let mut buffer = [0u8; 64];
+        if !snapshot_line(&mut stream, &mut buffer)
+            .ok()?
+            .starts_with(b"OK ")
+        {
+            return None;
+        }
+        if snapshot_line(&mut stream, &mut buffer).ok()? != b"SHINU-SNAPSHOT-1" {
+            return Some(Err(Error::Internal("unknown guest snapshot worker".into())));
+        }
+        Some(Ok(Self { stream, nonce }))
+    }
+
+    fn request(&mut self, dir: &Path, command: SnapshotCommand<'_>) -> Result<()> {
+        let (action, argument) = match command {
+            SnapshotCommand::Status => ("status", None),
+            SnapshotCommand::Rotate(next) => {
+                // Persist before sending: losing the acknowledgement must not
+                // strand cleanup or the next capture with the obsolete nonce.
+                store_snapshot_nonce(dir, next)?;
+                ("status", Some(next))
+            }
+            SnapshotCommand::Freeze => ("freeze", None),
+            SnapshotCommand::Thaw => ("thaw", None),
+            SnapshotCommand::Hold => ("status", Some("hold")),
+        };
+        self.stream
+            .set_read_timeout(Some(Duration::from_secs(250)))?;
+        self.stream.write_all(action.as_bytes())?;
+        self.stream.write_all(b" ")?;
+        self.stream.write_all(self.nonce.as_bytes())?;
+        if let Some(argument) = argument {
+            self.stream.write_all(b" ")?;
+            self.stream.write_all(argument.as_bytes())?;
+        }
+        self.stream.write_all(b"\n")?;
+        let mut buffer = [0u8; 256];
+        let reply = snapshot_line(&mut self.stream, &mut buffer)?;
+        if reply != b"OK" {
+            return Err(Error::Internal(format!(
+                "guest snapshot {action} failed: {}",
+                String::from_utf8_lossy(reply)
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn guest_snapshot_action(dir: &Path, command: SnapshotCommand<'_>) -> Option<Result<()>> {
+    Some(
+        SnapshotConnection::connect(dir)?
+            .and_then(|mut connection| connection.request(dir, command)),
+    )
+}
+
+fn snapshot_preconnect_enabled() -> Result<bool> {
+    let invalid = || Error::Invalid("SHINU_SNAPSHOT_PRECONNECT must be 0/false or 1/true".into());
+    match std::env::var("SHINU_SNAPSHOT_PRECONNECT") {
+        Ok(value) if value.trim() == "0" || value.trim().eq_ignore_ascii_case("false") => Ok(false),
+        Ok(value) if value.trim() == "1" || value.trim().eq_ignore_ascii_case("true") => Ok(true),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Ok(_) | Err(std::env::VarError::NotUnicode(_)) => Err(invalid()),
+    }
+}
+
+fn prepare_snapshot_worker(dir: &Path) -> Result<()> {
+    if matches!(
+        guest_snapshot_action(dir, SnapshotCommand::Status),
+        Some(Ok(()))
+    ) {
+        return Ok(());
+    }
+    let agent = shinu_core::vsock_helper()?.with_file_name("shinu-snapshot-agent");
+    validate_vm_asset(&agent, "guest snapshot helper")?;
+    let nonce = Uuid::new_v4().to_string();
+    store_snapshot_nonce(dir, &nonce)?;
+    let mut script = String::from(
+        "set -eu; [ \"$(findmnt -n -o FSTYPE --target /run)\" = tmpfs ]; mkdir -p -m 700 /run/shinu-snapshot; ",
+    );
+    script.push_str("IFS= read -r nonce; [ \"${#nonce}\" = 36 ]; printf %s \"$nonce\" > /run/shinu-snapshot/nonce; unset nonce; printf thawed > /run/shinu-snapshot/phase; ");
+    for (name, body) in [
+        ("freeze", include_str!("freeze.sh")),
+        ("thaw", include_str!("thaw.sh")),
+    ] {
+        script.push_str(&format!(
+            "printf %s {} > /run/shinu-snapshot/{name}.sh; chmod 700 /run/shinu-snapshot/{name}.sh; ",
+            shinu_core::shell_quote_word(body)
+        ));
+    }
+    script.push_str("cat > /run/shinu-snapshot/agent.next; chmod 700 /run/shinu-snapshot/agent.next; mv /run/shinu-snapshot/agent.next /run/shinu-snapshot/agent; nohup /run/shinu-snapshot/agent </dev/null >/dev/null 2>&1 &");
+    guest_snapshot_script(dir, &script, Some((nonce, std::fs::File::open(agent)?)))?;
+    for _ in 0..20 {
+        if let Some(result) = guest_snapshot_action(dir, SnapshotCommand::Status) {
+            return result;
+        }
+        std::thread::sleep(PROCESS_GROUP_POLL_INTERVAL);
+    }
+    Err(Error::Internal(
+        "guest snapshot worker did not start".into(),
+    ))
+}
+
+fn store_snapshot_nonce(dir: &Path, nonce: &str) -> Result<()> {
+    if Uuid::parse_str(nonce).is_err() || nonce.len() != 36 {
+        return Err(Error::Invalid("invalid snapshot worker nonce".into()));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(dir.join("snapshot-worker-nonce"))?;
+    file.write_all(nonce.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn guest_snapshot_script(
+    dir: &Path,
+    script: &str,
+    payload: Option<(String, std::fs::File)>,
+) -> Result<()> {
     let helper = shinu_core::vsock_helper()?;
     // The guest deadline terminates the remote script too; killing only SSH
     // would allow a late fsfreeze to race the host's thaw attempt.
+    // Setup must not leak the flock into its detached resident process. Thaw
+    // retains it across nested hook groups, even if a timeout kills the shell.
+    let flock_mode = if payload.is_some() { "-o" } else { "-F" };
     let command = [
         "timeout".to_owned(),
         "-k".to_owned(),
         "5".to_owned(),
         "240".to_owned(),
         "flock".to_owned(),
+        flock_mode.to_owned(),
         "-w".to_owned(),
         "115".to_owned(),
         "/run/shinu-snapshot.lock".to_owned(),
         "timeout".to_owned(),
+        "--foreground".to_owned(),
         "-k".to_owned(),
         "5".to_owned(),
         "110".to_owned(),
@@ -994,7 +1244,7 @@ fn guest_snapshot_script(dir: &Path, script: &str) -> Result<()> {
         shinu_core::VSOCK_SSH_PORT,
         &command,
     );
-    match run_process_group(ssh, Duration::from_secs(250)) {
+    match run_process_group(ssh, Duration::from_secs(250), payload) {
         Some(status) if status.success() => Ok(()),
         status => Err(Error::Internal(format!(
             "guest snapshot freeze/thaw failed or timed out: {status:?}"
@@ -1005,11 +1255,21 @@ fn guest_snapshot_script(dir: &Path, script: &str) -> Result<()> {
 /// Thaws a restored generation before exposing it to callers. The captured
 /// ledger makes this idempotent, including after partially completed cleanup.
 pub fn thaw_snapshot(dir: &Path) -> Result<()> {
-    let first = guest_snapshot_script(dir, include_str!("thaw.sh"));
+    let thaw = || match guest_snapshot_action(dir, SnapshotCommand::Thaw) {
+        Some(Ok(())) => Ok(()),
+        Some(Err(_)) | None => {
+            // Banner readiness is advisory for cleanup: even when it fails,
+            // execute the bounded SSH thaw rather than skipping the attempt.
+            let _ = wait_ready(dir, &vsock_path(dir));
+            guest_snapshot_script(dir, include_str!("thaw.sh"), None)
+        }
+    };
+    let first = thaw();
     match first {
         Ok(()) => Ok(()),
-        Err(first) => guest_snapshot_script(dir, include_str!("thaw.sh"))
-            .map_err(|retry| Error::Internal(format!("{first}; thaw retry failed: {retry}"))),
+        Err(first) => {
+            thaw().map_err(|retry| Error::Internal(format!("{first}; thaw retry failed: {retry}")))
+        }
     }
 }
 
@@ -1021,6 +1281,8 @@ pub fn snapshot(
     kind: Option<SnapshotKind>,
     disk_cut: impl FnOnce() -> Result<()>,
 ) -> Result<SnapshotCapture> {
+    let preconnect = snapshot_preconnect_enabled()?;
+    let mut thaw_connection = None;
     let version = api(dir, "GET", "/version", None)
         .ok_or_else(|| Error::Internal("cannot identify running Firecracker build".into()))?;
     let version: serde_json::Value = serde_json::from_str(&version)?;
@@ -1036,8 +1298,32 @@ pub fn snapshot(
     release(dir);
     let mut disk_cut = Some(disk_cut);
     let mut capture = snapshot_transaction(kind.is_some(), |step| match step {
-        SnapshotStep::Freeze => guest_snapshot_script(dir, include_str!("freeze.sh")),
-        SnapshotStep::Thaw => thaw_snapshot(dir),
+        SnapshotStep::Freeze => {
+            prepare_snapshot_worker(dir)?;
+            let nonce = Uuid::new_v4().to_string();
+            guest_snapshot_action(dir, SnapshotCommand::Rotate(&nonce))
+                .ok_or_else(|| Error::Internal("guest snapshot worker disappeared".into()))??;
+            guest_snapshot_action(dir, SnapshotCommand::Freeze)
+                .ok_or_else(|| Error::Internal("guest snapshot worker disappeared".into()))??;
+            if preconnect {
+                let mut connection = SnapshotConnection::connect(dir)
+                    .ok_or_else(|| Error::Internal("guest snapshot worker disappeared".into()))??;
+                connection.request(dir, SnapshotCommand::Hold)?;
+                thaw_connection = Some(connection);
+            }
+            Ok(())
+        }
+        SnapshotStep::Thaw => {
+            if let Some(mut connection) = thaw_connection.take() {
+                let result = connection.request(dir, SnapshotCommand::Thaw);
+                // Release a broken held connection before attempting a new one.
+                drop(connection);
+                if result.is_ok() {
+                    return result;
+                }
+            }
+            thaw_snapshot(dir)
+        }
         SnapshotStep::Cut => {
             if kind.is_none() {
                 // Sync IO has no outstanding requests once paused. Disk-only
@@ -1107,6 +1393,8 @@ pub fn snapshot(
             jail_path(dir, JAIL_SNAP_STATE),
         )
     });
+    capture.guest_snapshot_nonce =
+        Some(std::fs::read_to_string(dir.join("snapshot-worker-nonce"))?);
     Ok(capture)
 }
 
@@ -1311,6 +1599,7 @@ pub struct Sizing {
 pub struct RestoreFiles<'a> {
     pub mem: &'a Path,
     pub state: &'a Path,
+    pub guest_snapshot_nonce: Option<&'a str>,
 }
 
 /// Builds the `PUT /snapshot/load` request body.
@@ -1375,6 +1664,15 @@ pub fn start(
     let _ = std::fs::remove_file(&vsock);
     let _ = std::fs::remove_file(api_path(&dir));
     std::fs::create_dir_all(&dir)?;
+    if let Some(nonce) = restore.and_then(|files| files.guest_snapshot_nonce) {
+        store_snapshot_nonce(&dir, nonce)?;
+    } else {
+        match std::fs::remove_file(dir.join("snapshot-worker-nonce")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
     clean_jail(&dir)?;
     let jail = jail_root(root, id);
     let mut jail_builder = std::fs::DirBuilder::new();
@@ -1519,6 +1817,20 @@ pub fn start(
         // normal jailer launches have already created the same path.
         std::fs::write(pid_path(&dir), pid.to_string())?;
 
+        let ready = || {
+            if wait_ready(&dir, &vsock) {
+                return Ok(());
+            }
+            Err(Error::Internal(format!(
+                "vm did not come up: {}",
+                console_tail(&dir)
+                    .lines()
+                    .rev()
+                    .take(5)
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            )))
+        };
         if restore.is_some() {
             let mut api_ready = false;
             for _ in 0..100 {
@@ -1539,79 +1851,58 @@ pub fn start(
                     "snapshot restore API socket did not appear".to_owned(),
                 ));
             }
-            let body = snapshot_load_body(net.as_ref().map(|spec| spec.tap.as_str()));
-            if api(&dir, "PUT", "/snapshot/load", Some(&body)).is_none() {
-                let _ = stop(&dir, net_cfg);
-                let _ = std::fs::remove_file(jail.join(JAIL_SNAP_MEM));
-                let _ = std::fs::remove_file(jail.join(JAIL_SNAP_STATE));
-                return Err(Error::Internal("failed to load VM snapshot".to_owned()));
-            }
-        }
-
-        if !wait_ready(&dir, &vsock) {
-            let _ = stop(&dir, net_cfg);
-            return Err(Error::Internal(format!(
-                "vm did not come up: {}",
-                console_tail(&dir)
-                    .lines()
-                    .rev()
-                    .take(5)
-                    .collect::<Vec<_>>()
-                    .join(" | ")
-            )));
-        }
-        if restore.is_some() {
-            if let Err(error) = thaw_snapshot(&dir) {
-                let _ = stop(&dir, net_cfg);
-                return Err(error);
-            }
-            // Firecracker restores the guest wall clock from snapshot time;
-            // correcting it here keeps timers and certificate checks sane.
-            let clock_command = [
-                "date".to_owned(),
-                "-u".to_owned(),
-                "-s".to_owned(),
-                format!("@{}", now_secs()),
-            ];
-            match exec_in_vm(
-                &vsock,
-                &key_path(&dir),
-                shinu_core::VSOCK_SSH_PORT,
-                &clock_command,
-            ) {
-                Ok(0) => {}
-                Ok(status) => eprintln!(
-                    "failed to correct restored guest clock for {id}: exit status {status}"
-                ),
-                Err(error) => {
-                    eprintln!("failed to correct restored guest clock for {id}: {error}");
+            restore_transaction(|step| match step {
+                RestoreStep::Quarantine => {
+                    if let Some(spec) = net.as_ref() {
+                        require_success("ip", &["link", "set", &spec.tap, "down"])?;
+                    }
+                    Ok(())
                 }
-            }
-            // The snapshot also carries the source space's address. Each space
-            // owns a distinct /30, so a fork resumes holding an IP that does
-            // not belong to its tap; exec still works because it rides vsock,
-            // which is how this stayed invisible until egress was tried.
-            if let Some(spec) = net.as_ref() {
-                let reconfigure = format!(
-                    "ip addr flush dev eth0; ip addr add {} dev eth0; ip link set eth0 up; ip route add default via {} 2>/dev/null; true",
-                    spec.guest_cidr, spec.gateway
-                );
-                let net_command = ["sh".to_owned(), "-c".to_owned(), reconfigure];
-                match exec_in_vm(
-                    &vsock,
-                    &key_path(&dir),
-                    shinu_core::VSOCK_SSH_PORT,
-                    &net_command,
-                ) {
-                    Ok(0) => {}
-                    Ok(status) => eprintln!(
-                        "failed to reconfigure restored guest network for {id}: exit status {status}"
-                    ),
-                    Err(error) => {
-                        eprintln!("failed to reconfigure restored guest network for {id}: {error}");
+                RestoreStep::Load => {
+                    let body = snapshot_load_body(net.as_ref().map(|spec| spec.tap.as_str()));
+                    if api(&dir, "PUT", "/snapshot/load", Some(&body)).is_none() {
+                        let _ = std::fs::remove_file(jail.join(JAIL_SNAP_MEM));
+                        let _ = std::fs::remove_file(jail.join(JAIL_SNAP_STATE));
+                        return Err(Error::Internal("failed to load VM snapshot".to_owned()));
+                    }
+                    Ok(())
+                }
+                RestoreStep::Thaw => thaw_snapshot(&dir),
+                RestoreStep::Ready => ready(),
+                RestoreStep::Configure => {
+                    // Vsock does not depend on the quarantined TAP. Rebuild
+                    // the cloned address/MAC, routes and ARP only after thaw.
+                    let mut reconfigure = format!("set -eu; date -u -s @{}; ", now_secs());
+                    if let Some(spec) = net.as_ref() {
+                        reconfigure.push_str(&format!(
+                            "ip link set dev eth0 down; ip addr flush dev eth0; ip link set dev eth0 address {}; ip link set dev eth0 up; ip addr add {} dev eth0; ip route replace default via {} dev eth0; ip neigh flush dev eth0",
+                            spec.mac, spec.guest_cidr, spec.gateway
+                        ));
+                    }
+                    let command = ["sh".to_owned(), "-c".to_owned(), reconfigure];
+                    match exec_in_vm(
+                        &vsock,
+                        &key_path(&dir),
+                        shinu_core::VSOCK_SSH_PORT,
+                        &command,
+                    )? {
+                        0 => Ok(()),
+                        status => Err(Error::Internal(format!(
+                            "restored guest setup failed: exit {status}"
+                        ))),
                     }
                 }
-            }
+                // This idempotent operation also reasserts the /30 address,
+                // forwarding/NAT and world-host INPUT allowance after thaw.
+                RestoreStep::Expose => configure_tap(id, net_cfg, &[], TapSetup::Existing),
+            })?;
+        } else {
+            ready()?;
+        }
+        // Preparation is outside the freeze window. Existing running guests
+        // are upgraded lazily by snapshot; cold boot remains usable if it fails.
+        if let Err(error) = prepare_snapshot_worker(&dir) {
+            eprintln!("snapshot worker preparation for {id}: {error}");
         }
 
         // The jailer runs Firecracker as its configured non-root uid, but
@@ -2253,7 +2544,7 @@ mod process_group_tests {
             .arg("-c")
             .arg("test \"$(ps -o pgid= -p $$ | tr -d ' ')\" = \"$$\"");
 
-        let status = run_process_group(command, Duration::from_secs(1));
+        let status = run_process_group(command, Duration::from_secs(1), None);
 
         assert_eq!(status.and_then(|status| status.code()), Some(0));
     }
@@ -2271,13 +2562,88 @@ mod process_group_tests {
         command.arg("-c").arg(&script);
 
         let started = Instant::now();
-        let status = run_process_group(command, Duration::from_millis(50));
+        let status = run_process_group(command, Duration::from_millis(50), None);
 
         assert!(status.is_none());
         assert!(started.elapsed() < Duration::from_secs(2));
         std::thread::sleep(Duration::from_millis(500));
         assert!(!marker.exists());
         let _ = std::fs::remove_file(marker);
+    }
+
+    #[test]
+    fn private_payload_prefix_is_not_exposed_in_process_arguments() {
+        let root = std::env::temp_dir().join(format!("shinu-input-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let payload = root.join("source");
+        std::fs::write(&payload, b"binary\0\xffpayload").unwrap();
+        let mut command = Command::new("sh");
+        command.args(["-c", "tr '\\0' ' ' < /proc/$$/cmdline > \"$1/argv\"; IFS= read -r secret; printf %s \"$secret\" > \"$1/prefix\"; cat > \"$1/binary\"", "snapshot-setup"]).arg(&root);
+        let status = run_process_group(
+            command,
+            Duration::from_secs(1),
+            Some((
+                "private-token".into(),
+                std::fs::File::open(&payload).unwrap(),
+            )),
+        );
+        assert_eq!(status.and_then(|status| status.code()), Some(0));
+        assert_eq!(
+            std::fs::read(root.join("binary")).unwrap(),
+            b"binary\0\xffpayload"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("prefix")).unwrap(),
+            "private-token"
+        );
+        assert!(
+            !std::fs::read_to_string(root.join("argv"))
+                .unwrap()
+                .contains("private-token")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn blocked_payload_writer_cannot_escape_the_process_deadline() {
+        let path = std::env::temp_dir().join(format!("shinu-input-{}", Uuid::new_v4()));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(1024 * 1024).unwrap();
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 2"]);
+        let started = Instant::now();
+        assert!(
+            run_process_group(
+                command,
+                Duration::from_millis(50),
+                Some(("private-token".into(), std::fs::File::open(&path).unwrap()))
+            )
+            .is_none()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn successful_child_cannot_leave_a_blocked_payload_producer_unbounded() {
+        let path = std::env::temp_dir().join(format!("shinu-input-{}", Uuid::new_v4()));
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(1024 * 1024)
+            .unwrap();
+        let mut command = Command::new("sh");
+        command.args(["-c", "exec 3<&0; sleep 2 <&3 & exit 0"]);
+        let started = Instant::now();
+        assert!(
+            run_process_group(
+                command,
+                Duration::from_millis(50),
+                Some(("private-token".into(), std::fs::File::open(&path).unwrap()))
+            )
+            .is_none()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -2422,5 +2788,48 @@ mod hot_snapshot_tests {
         })
         .expect("disk capture");
         assert_eq!(observed, [Freeze, Pause, Cut, Resume, Thaw]);
+    }
+}
+
+#[cfg(test)]
+mod restore_transaction_tests {
+    use super::{RestoreStep, restore_transaction};
+
+    #[test]
+    fn restored_network_is_quarantined_until_thaw_and_configuration_succeed() {
+        use RestoreStep::{Configure, Expose, Load, Quarantine, Ready, Thaw};
+        let mut observed = Vec::new();
+        restore_transaction(|step| {
+            observed.push(step);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(observed, [Quarantine, Load, Thaw, Ready, Configure, Expose]);
+    }
+
+    #[test]
+    fn failed_restore_never_exposes_and_always_thaws_after_a_load_attempt() {
+        use RestoreStep::{Configure, Expose, Load, Quarantine, Ready, Thaw};
+        for failed in [Quarantine, Load, Thaw, Ready, Configure, Expose] {
+            let mut observed = Vec::new();
+            let result = restore_transaction(|step| {
+                observed.push(step);
+                if step == failed {
+                    Err(shinu_core::Error::Internal(format!("injected {step:?}")))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(result.is_err(), "{failed:?}");
+            if observed.contains(&Load) {
+                assert!(observed.contains(&Thaw), "{failed:?}");
+            }
+            if failed != Expose {
+                assert!(!observed.contains(&Expose), "{failed:?}");
+            }
+            if matches!(failed, Load | Thaw) {
+                assert!(!observed.contains(&Configure));
+            }
+        }
     }
 }

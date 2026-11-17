@@ -27,6 +27,7 @@ Changes are recorded in the Keep a Changelog format.
 
 ### Changed
 
+- Memory restores log `event=restore_substep` lines: one per `Ready` SSH probe (`ReadyProbe attempt=`) and the network hook, helper connection, READY request and guest reply inside `ApplicationReady`, at the same level as `restore_step`.
 - Lifecycle records carry the host boot id and are renamed into place without fsync. `resume` and direct restores no longer pay a synchronous flush before handout, and a successful resume no longer syncs the spaces directory before replying. A host crash invalidates every surviving record by boot id, so the never-reuse-run-memory contract holds without durability.
 - Restored guests get their clock and eth0 identity through the guest helper's authenticated `setup` action on vsock 2224 instead of an SSH session (SSH remains the fallback for helpers that predate it; hot capture upgrades such helpers). TAP firewall policy is reasserted while the guest thaws and the link only comes up at `Expose`.
 - `start --load-only` prefaults the paused VM's page-cache-resident guest memory with read-only `process_vm_readv` before reporting `loaded`, so handed-out VMs take far fewer host page faults; it never creates private memory and is best-effort (`event=prefault`): windows not page-cache resident when sampled are skipped, though a page evicted after sampling is still read back.

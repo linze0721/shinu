@@ -1282,9 +1282,24 @@ fn with_network_admission<T>(
     let network = space.network.as_deref();
     let mut connected_members = Vec::new();
     let result = transaction(&mut |deadline| {
+        // Same sanitized format as the VM's own `restore_substep` lines.
+        let substep = |step: &str, started: Instant, detail: String| {
+            eprintln!(
+                "event=restore_substep vm_id={} step={step} elapsed_ms={}{detail}",
+                space.id,
+                started.elapsed().as_millis()
+            );
+        };
+        let started = Instant::now();
         let state = snapshot(ctx.db, ctx.registry)?;
         let all_members = network_members(&state, &space.project, network);
         connected_members.clone_from(&all_members);
+        substep(
+            "NetworkState",
+            started,
+            format!(" members={}", all_members.len()),
+        );
+        let started = Instant::now();
         let current_running = reconcile_peer_rules(
             ctx.root,
             ctx.net_cfg,
@@ -1293,14 +1308,22 @@ fn with_network_admission<T>(
             &space.project,
             network,
             previous_running,
-        )?;
-        sync_network_hosts_with(
+        );
+        substep(
+            "PeerRules",
+            started,
+            format!(" ok={}", current_running.is_ok()),
+        );
+        let current_running = current_running?;
+        let started = Instant::now();
+        let synced = sync_network_hosts_with(
             ctx.root,
             ctx.net_cfg,
             &current_running,
             &all_members,
             deadline,
         );
+        substep("HostsSync", started, format!(" members_updated={synced}"));
         Ok(())
     });
     if result.is_err() && !connected_members.is_empty() {
@@ -1361,19 +1384,22 @@ printf '%s\n' {}
     Some(vec!["sh".to_owned(), "-c".to_owned(), script])
 }
 
+/// Rewrites the shinu block of `/etc/hosts` on each running member over SSH,
+/// returning how many members were attempted. Failures are logged only.
 fn sync_network_hosts_with(
     root: &Path,
     cfg: &shinu::NetConfig,
     running_members: &[Space],
     all_members: &[Space],
     deadline: Instant,
-) {
+) -> usize {
+    let mut attempted = 0;
     for member in running_members {
         let remaining = deadline
             .saturating_duration_since(Instant::now())
             .min(Duration::from_secs(30));
         if remaining.is_zero() {
-            return;
+            break;
         }
         let Some(network) = member.network.as_deref() else {
             continue;
@@ -1387,6 +1413,7 @@ fn sync_network_hosts_with(
         ) else {
             continue;
         };
+        attempted += 1;
         let outcome = ssh_target_for_vm(root, member.id)
             .and_then(|target| run_job_ssh(&target, &command, None, remaining, 1024));
         match outcome {
@@ -1397,6 +1424,7 @@ fn sync_network_hosts_with(
             ),
         }
     }
+    attempted
 }
 
 fn sync_network_hosts(ctx: &Ctx<'_>, running_members: &[Space], all_members: &[Space]) {

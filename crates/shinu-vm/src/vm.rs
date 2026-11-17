@@ -1572,15 +1572,32 @@ fn application_ready(
     eprintln!(
         "event=guest_readiness vm_id={vm_id} restore_id={restore_id} stage=requested elapsed_ms=0"
     );
+    // Sanitized per-substep timing, same level as `restore_step`; only names,
+    // durations and outcomes, never guest output or the policy argv.
+    let substep = |step: &str, started: Instant, ok: bool| {
+        eprintln!(
+            "event=restore_substep vm_id={vm_id} restore_id={restore_id} step={step} elapsed_ms={} ok={ok}",
+            started.elapsed().as_millis()
+        );
+    };
     let result = (|| {
         spec.validate()?;
-        network_ready(deadline)?;
+        let begun = Instant::now();
+        let networked = network_ready(deadline);
+        substep("NetworkReady", begun, networked.is_ok());
+        networked?;
         if Instant::now() >= deadline {
             return Err(Error::Internal("readiness admission timeout".into()));
         }
-        if ready_capability(dir, deadline).is_err() {
-            install_snapshot_worker(dir, Some(deadline))?;
-            ready_capability(dir, deadline)?;
+        let begun = Instant::now();
+        let capable = ready_capability(dir, deadline);
+        substep("HelperCapability", begun, capable.is_ok());
+        if capable.is_err() {
+            let begun = Instant::now();
+            let installed = install_snapshot_worker(dir, Some(deadline))
+                .and_then(|()| ready_capability(dir, deadline));
+            substep("HelperInstall", begun, installed.is_ok());
+            installed?;
         }
         let nonce = std::fs::read_to_string(dir.join("snapshot-worker-nonce"))?;
         if nonce.len() != 36 || Uuid::parse_str(&nonce).is_err() {
@@ -1588,7 +1605,10 @@ fn application_ready(
                 "invalid readiness authentication identity".into(),
             ));
         }
-        let mut transport = ReadyTransport::guest(dir, deadline)?;
+        let begun = Instant::now();
+        let transport = ReadyTransport::guest(dir, deadline);
+        substep("HelperConnect", begun, transport.is_ok());
+        let mut transport = transport?;
         let frame = format!(
             "ready {nonce} {restore_id} {}\n",
             serde_json::to_string(spec)?
@@ -1596,8 +1616,18 @@ fn application_ready(
         if frame.len() > 65536 {
             return Err(Error::Invalid("oversized readiness request".into()));
         }
-        transport.write(frame.as_bytes())?;
-        if transport.line()? != format!("READY {restore_id}") {
+        let begun = Instant::now();
+        let sent = transport.write(frame.as_bytes());
+        substep("ReadyRequestSent", begun, sent.is_ok());
+        sent?;
+        // From the request leaving the host to the guest's reply line: the
+        // guest command's own run time plus vsock delivery.
+        let begun = Instant::now();
+        let replied = transport
+            .line()
+            .map(|line| line == format!("READY {restore_id}"));
+        substep("ReadyReply", begun, matches!(replied, Ok(true)));
+        if !replied? {
             return Err(Error::Internal(
                 "guest readiness failed or restore identity mismatched".into(),
             ));
@@ -2408,9 +2438,26 @@ fn clean_jail(dir: &Path) -> Result<()> {
 }
 
 fn wait_ready(dir: &Path, vsock: &Path) -> bool {
+    wait_ready_observed(dir, vsock, |_, _, _| {})
+}
+
+/// `wait_ready` reporting each SSH banner probe (1-based attempt, duration,
+/// success); every probe makes the guest fork socat and sshd work.
+fn wait_ready_observed(
+    dir: &Path,
+    vsock: &Path,
+    mut probed: impl FnMut(usize, Duration, bool),
+) -> bool {
+    let mut attempt = 0;
     for _ in 0..600 {
-        if vsock.exists() && probe(vsock, shinu_core::VSOCK_SSH_PORT) {
-            return true;
+        if vsock.exists() {
+            attempt += 1;
+            let started = Instant::now();
+            let ready = probe(vsock, shinu_core::VSOCK_SSH_PORT);
+            probed(attempt, started.elapsed(), ready);
+            if ready {
+                return true;
+            }
         }
         if !is_running(dir) {
             break;
@@ -3098,7 +3145,13 @@ fn restore_step(
             combine_snapshot_results(thawed, policy)
         }),
         RestoreStep::Ready => {
-            if wait_ready(dir, vsock) {
+            let ready = wait_ready_observed(dir, vsock, |attempt, elapsed, ok| {
+                eprintln!(
+                    "event=restore_substep vm_id={id} step=ReadyProbe attempt={attempt} elapsed_ms={} ok={ok}",
+                    elapsed.as_millis()
+                );
+            });
+            if ready {
                 Ok(())
             } else {
                 Err(Error::Internal(

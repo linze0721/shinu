@@ -27,6 +27,7 @@ Changes are recorded in the Keep a Changelog format.
 
 ### Changed
 
+- The SSH readiness probe no longer drops an accepted vsock connection after 500 ms without a banner: it waits on that connection (up to 10 s, within the unchanged 30 s readiness budget) and only redials failed connections. On the test host 24 of 30 restores previously timed out the first probe at ~500 ms and paid a second socat/sshd fork.
 - Memory restores log `event=restore_substep` lines: one per `Ready` SSH probe (`ReadyProbe attempt=`) and the network hook, helper connection, READY request and guest reply inside `ApplicationReady`, at the same level as `restore_step`.
 - Lifecycle records carry the host boot id and are renamed into place without fsync. `resume` and direct restores no longer pay a synchronous flush before handout, and a successful resume no longer syncs the spaces directory before replying. A host crash invalidates every surviving record by boot id, so the never-reuse-run-memory contract holds without durability.
 - Restored guests get their clock and eth0 identity through the guest helper's authenticated `setup` action on vsock 2224 instead of an SSH session (SSH remains the fallback for helpers that predate it; hot capture upgrades such helpers). TAP firewall policy is reasserted while the guest thaws and the link only comes up at `Expose`.

@@ -2132,12 +2132,17 @@ fn signal(pid: u32, sig: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Total budget of one SSH readiness wait (the former 600 × 50 ms polls).
+const READY_WAIT: Duration = Duration::from_secs(30);
+/// Longest wait for the banner on a connection the guest already accepted.
+const PROBE_BANNER_WAIT: Duration = Duration::from_secs(10);
+
 /// True once the guest's sshd is ready to serve on `port`.
 ///
 /// A successful vsock CONNECT only proves that the bridge accepts a socket.
 /// Requiring the SSH identification line makes readiness match the service
 /// that execution actually uses.
-fn probe(uds: &Path, port: u16) -> bool {
+fn probe(uds: &Path, port: u16, deadline: Instant) -> bool {
     use std::io::{Read, Write};
     let Ok(mut stream) = std::os::unix::net::UnixStream::connect(uds) else {
         return false;
@@ -2168,6 +2173,14 @@ fn probe(uds: &Path, port: u16) -> bool {
         return false;
     };
     if !reply.starts_with(b"OK ") {
+        return false;
+    }
+    // The guest accepted: sshd is being forked for this very connection, so
+    // wait for its banner instead of dropping it and forking another.
+    let banner_wait = deadline
+        .saturating_duration_since(Instant::now())
+        .min(PROBE_BANNER_WAIT);
+    if banner_wait.is_zero() || stream.set_read_timeout(Some(banner_wait)).is_err() {
         return false;
     }
     line(&mut stream).is_some_and(|banner| banner.starts_with(b"SSH-"))
@@ -2442,18 +2455,21 @@ fn wait_ready(dir: &Path, vsock: &Path) -> bool {
 }
 
 /// `wait_ready` reporting each SSH banner probe (1-based attempt, duration,
-/// success); every probe makes the guest fork socat and sshd work.
+/// success); every probe makes the guest fork socat and sshd work. Only a
+/// failed connection (no socket yet, CONNECT refused, EOF) is retried, every
+/// 50 ms; an accepted one waits for its banner. All within `READY_WAIT`.
 fn wait_ready_observed(
     dir: &Path,
     vsock: &Path,
     mut probed: impl FnMut(usize, Duration, bool),
 ) -> bool {
+    let deadline = Instant::now() + READY_WAIT;
     let mut attempt = 0;
-    for _ in 0..600 {
+    while Instant::now() < deadline {
         if vsock.exists() {
             attempt += 1;
             let started = Instant::now();
-            let ready = probe(vsock, shinu_core::VSOCK_SSH_PORT);
+            let ready = probe(vsock, shinu_core::VSOCK_SSH_PORT, deadline);
             probed(attempt, started.elapsed(), ready);
             if ready {
                 return true;
@@ -4869,5 +4885,149 @@ mod lifecycle_ledger_tests {
         assert!(recorded < launched, "{events:#?}");
         assert!(!events.iter().any(|event| event.starts_with("api ")));
         assert!(!space.pending());
+    }
+}
+
+#[cfg(test)]
+mod ready_probe_tests {
+    //! The real readiness wait against a fake vsock bridge that counts
+    //! connections, so a dropped-and-redone sshd fork is visible.
+    use super::wait_ready_observed;
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+    use uuid::Uuid;
+
+    /// How the guest bridge treats one accepted connection.
+    #[derive(Clone, Copy)]
+    enum Guest {
+        /// Accepts CONNECT, then sends the SSH banner after this delay.
+        Banner(Duration),
+        /// Refuses CONNECT for the first `n` connections, then banners at once.
+        RefuseFirst(usize),
+    }
+
+    struct Bridge {
+        root: PathBuf,
+        dir: PathBuf,
+        vsock: PathBuf,
+        child: Child,
+        connections: Arc<AtomicUsize>,
+        stopped: Arc<AtomicBool>,
+        worker: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Bridge {
+        fn new(guest: Guest) -> Self {
+            let root = std::env::temp_dir()
+                .join(format!("rp-{}", &Uuid::new_v4().simple().to_string()[..8]));
+            let id = Uuid::new_v4();
+            let dir = shinu_core::vm_dir(&root, id);
+            std::fs::create_dir_all(&dir).unwrap();
+            // A live stand-in VMM recognised by the real process identity check.
+            let config = super::config_path(&dir);
+            std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+            std::fs::write(&config, "{}").unwrap();
+            let fake = root.join("firecracker");
+            std::os::unix::fs::symlink("/usr/bin/yes", &fake).unwrap();
+            let child = Command::new(&fake)
+                .arg(&config)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            std::fs::write(super::pid_path(&dir), child.id().to_string()).unwrap();
+            while !super::is_running(&dir) {
+                std::thread::yield_now();
+            }
+            let vsock = super::vsock_path(&dir);
+            let listener = UnixListener::bind(&vsock).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let connections = Arc::new(AtomicUsize::new(0));
+            let stopped = Arc::new(AtomicBool::new(false));
+            let worker = {
+                let connections = Arc::clone(&connections);
+                let stopped = Arc::clone(&stopped);
+                std::thread::spawn(move || {
+                    while !stopped.load(Ordering::SeqCst) {
+                        let Ok((mut stream, _)) = listener.accept() else {
+                            std::thread::sleep(Duration::from_millis(1));
+                            continue;
+                        };
+                        let index = connections.fetch_add(1, Ordering::SeqCst);
+                        std::thread::spawn(move || {
+                            stream.set_nonblocking(false).unwrap();
+                            let mut line = String::new();
+                            let _ =
+                                BufReader::new(stream.try_clone().unwrap()).read_line(&mut line);
+                            assert_eq!(line, "CONNECT 2222\n");
+                            match guest {
+                                Guest::RefuseFirst(refused) if index < refused => {}
+                                Guest::RefuseFirst(_) => {
+                                    let _ = stream.write_all(b"OK 1\nSSH-2.0-fake\n");
+                                }
+                                Guest::Banner(delay) => {
+                                    let _ = stream.write_all(b"OK 1\n");
+                                    std::thread::sleep(delay);
+                                    let _ = stream.write_all(b"SSH-2.0-fake\n");
+                                }
+                            }
+                        });
+                    }
+                })
+            };
+            Self {
+                root,
+                dir,
+                vsock,
+                child,
+                connections,
+                stopped,
+                worker: Some(worker),
+            }
+        }
+
+        fn wait(&self) -> (bool, Vec<(usize, bool)>) {
+            let mut probes = Vec::new();
+            let ready = wait_ready_observed(&self.dir, &self.vsock, |attempt, _, ok| {
+                probes.push((attempt, ok));
+            });
+            (ready, probes)
+        }
+    }
+
+    impl Drop for Bridge {
+        fn drop(&mut self) {
+            self.stopped.store(true, Ordering::SeqCst);
+            self.worker.take().unwrap().join().unwrap();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn a_slow_banner_on_an_accepted_connection_is_awaited_not_redialled() {
+        let bridge = Bridge::new(Guest::Banner(Duration::from_millis(800)));
+        let started = Instant::now();
+        let (ready, probes) = bridge.wait();
+        assert!(ready);
+        assert_eq!(probes, [(1, true)], "one sshd fork, no redial");
+        assert_eq!(bridge.connections.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() >= Duration::from_millis(800));
+    }
+
+    #[test]
+    fn refused_connects_are_still_retried_until_the_banner_arrives() {
+        let bridge = Bridge::new(Guest::RefuseFirst(3));
+        let (ready, probes) = bridge.wait();
+        assert!(ready);
+        assert_eq!(probes, [(1, false), (2, false), (3, false), (4, true)]);
+        assert_eq!(bridge.connections.load(Ordering::SeqCst), 4);
     }
 }

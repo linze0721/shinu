@@ -3372,7 +3372,7 @@ fn start_vm_with_pending_restore(
     let dir = shinu::vm_dir(ctx.root, id);
     // Settles pending memory first: only a current-boot never-run record
     // keeps it, so the files probed below are safe to load.
-    shinu::vm::recover_space(&dir, ctx.net_cfg)?;
+    shinu::vm::settle_before_start(&dir, ctx.net_cfg)?;
     if !shinu::vm::is_running(&shinu::vm_dir(ctx.root, id)) {
         ensure_capacity(ctx)?;
     }
@@ -8760,7 +8760,7 @@ mod tests {
             // the start-path recovery that settles stale generations.
             let fork_dir = shinu::vm_dir(&root, space.id);
             assert!(fork_dir.join("loaded.json").is_file());
-            vm::recover_space(&fork_dir, &net_cfg).unwrap();
+            vm::settle_before_start(&fork_dir, &net_cfg).unwrap();
             assert!(super::space_snapshot_mem(&root, space.id).exists());
             assert!(super::space_snapshot_state(&root, space.id).exists());
             let destination = vm::key_path(&fork_dir);

@@ -2644,29 +2644,37 @@ pub fn lifecycle_state(dir: &Path) -> Result<&'static str> {
     }
 }
 
-/// Stops an interrupted pool generation (which settles it) or settles a
-/// stopped space's pending memory without touching TAP or jail state. An
-/// admitted running VM is left alone.
-pub fn recover_space(dir: &Path, cfg: &NetConfig) -> Result<()> {
-    match (read_phase(dir)?, is_running(dir)) {
-        (PhaseRecord::Missing, true) => Ok(()),
-        (
-            PhaseRecord::Missing
-            | PhaseRecord::Present {
-                phase: "pending", ..
-            },
-            false,
-        ) => settle_pending(dir),
+/// Before a start: a live VMM (running, or a loaded/loading pool generation)
+/// is left to `start`'s own phase checks; a dead VMM with a record is stopped,
+/// which settles it; a stopped space only settles its pending memory, without
+/// touching TAP or jail state.
+pub fn settle_before_start(dir: &Path, cfg: &NetConfig) -> Result<()> {
+    if is_running(dir) {
+        return Ok(());
+    }
+    match read_phase(dir)? {
+        PhaseRecord::Missing
+        | PhaseRecord::Present {
+            phase: "pending", ..
+        } => settle_pending(dir),
         _ => stop(dir, cfg).map(|_| ()),
     }
 }
 
-/// Recovers every space before the daemon accepts requests.
+/// Recovers every space before the daemon accepts requests: interrupted pool
+/// generations, live or not, are stopped; stopped spaces are settled.
 pub fn recover_loaded(root: &Path, cfg: &NetConfig) -> Result<()> {
     for entry in std::fs::read_dir(root.join("vm"))? {
         let dir = entry?.path();
-        if dir_id(&dir).is_ok() {
-            recover_space(&dir, cfg)?;
+        if dir_id(&dir).is_err() {
+            continue;
+        }
+        match (read_phase(&dir)?, is_running(&dir)) {
+            (PhaseRecord::Missing, true) => {}
+            (_, false) => settle_before_start(&dir, cfg)?,
+            (_, true) => {
+                stop(&dir, cfg)?;
+            }
         }
     }
     Ok(())
@@ -4678,8 +4686,8 @@ mod lifecycle_ledger_tests {
     //! power loss could leave behind, then running the real recovery path. A
     //! fixed foreign boot id stands in for the boot before the crash.
     use super::{
-        host_boot_id, ledger_journal, mark_pending, recover_loaded, resume, settle_pending, start,
-        write_phase,
+        host_boot_id, ledger_journal, mark_pending, recover_loaded, resume, settle_before_start,
+        settle_pending, start, write_phase,
     };
     use crate::{NetConfig, VmConfig};
     use shinu_core::{Image, space_image, vm_dir};
@@ -4906,6 +4914,17 @@ mod lifecycle_ledger_tests {
             events,
             ["pending", "loading", "loaded", "resuming"].map(|phase| format!("rename {phase}"))
         );
+    }
+
+    #[test]
+    fn settling_before_a_start_leaves_a_live_pool_generation_alone() {
+        let mut space = Space::new();
+        space.spawn_vmm();
+        space.marker("loaded", &host_boot_id().unwrap().to_string());
+        settle_before_start(&space.dir, &net()).unwrap();
+        assert!(super::is_running(&space.dir));
+        assert_eq!(super::lifecycle_state(&space.dir).unwrap(), "loaded");
+        assert!(space.pending());
     }
 
     #[test]

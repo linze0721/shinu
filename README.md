@@ -253,6 +253,8 @@ For multi-tenant hosting, microVM sandboxes require strict isolation, host capac
  **cgroup v2 isolation**: Enforces a host memory ceiling of guest RAM plus `SHINU_VMM_OVERHEAD_MIB` (default 512 MiB) via `memory.max`, and process caps (`cgroup pids.max=512`). The allowance covers Firecracker/VMM overhead without changing guest RAM or project quotas.
  **Seccomp & Namespaces**: MicroVM runs in unshared PID, net, mount, and IPC namespaces.
 
+**TAP ownership and kernel upgrades**: TAP creation sets both `user SHINU_JAIL_UID` and `group SHINU_JAIL_GID`, so unprivileged Firecracker can attach under Linux 6.12.117's stricter `tun_permitted` rules. Fresh creation does not scan procfs. Only EEXIST/EBUSY collisions inspect sysfs owner/group and `/proc/*/fdinfo` holders; an unused mismatched legacy TAP is rebuilt, while an occupied TAP is left intact. A root-owned, nonblocking file claim at `/run/shinu-tap-locks/<tap>.lock` spans inspection, recreation, VMM attachment and failure cleanup across cooperating daemon processes; the existing per-Space lock still serializes lifecycle threads. Zero-byte lock files stay linked after release and Space removal to prevent split-inode locks. Loaded restore network reconfiguration never recreates the TAP already held by its VMM. TAP contention returns HTTP **409** with `code:"tap_busy"`; CLI start prints `shinu: tap_busy` and exits **73**, distinct from capacity-watermark exit 75.
+
 **Host Prerequisite**:
 Create the non-privileged jailer user and group (handled automatically by `./packaging/install.sh`):
 ```sh
@@ -431,6 +433,7 @@ Status Code Mapping (`http::status_for`):
 `400 Bad Request`: Invalid JSON body, malformed command, invalid request payload, invalid template name, or duplicate template name.
 `404 Not Found`: Target space, commit, or template does not exist within caller's project scope; a template's missing or foreign checkpoint target also returns 404.
  `405 Method Not Allowed`: Unrecognized HTTP verb for path.
+ `409 Conflict`: TAP ownership/attachment is busy (`{"code":"tap_busy","error":"tap_busy: ..."}`); the existing interface is not deleted.
  `429 Too Many Requests`: A physical capacity watermark (`code: capacity_watermark`), explicit request sizing/rate limit, or metadata retention limit rejects the request.
  `500 Internal Server Error`: Host I/O errors, btrfs reflink failure, or process execution failures.
 

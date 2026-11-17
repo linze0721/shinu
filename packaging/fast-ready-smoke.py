@@ -5,6 +5,7 @@ Requires root, KVM, btrfs, cgroup v2, approved assets and a prebuilt Void base.
 Never uses the source daemon/database; only clones immutable host assets.
 """
 import argparse
+import fcntl
 import hashlib
 import http.client
 import json
@@ -13,6 +14,7 @@ from pathlib import Path
 import shutil
 import socket
 import subprocess
+import struct
 import tempfile
 import threading
 import time
@@ -55,7 +57,7 @@ def main():
                SHINU_ENDPOINT=f"http://127.0.0.1:{port}", SHINU_NET_ENABLE="1", SHINU_NET_BASE="172.29",
                SHINU_IDLE_RECLAIM="0", SHINU_MEM_MIB="256", SHINU_VCPUS="1",
                SHINU_LIMIT_SPACES="1", SHINU_LIMIT_RUNNING="1", SHINU_LIMIT_DISK_MIB="1",
-               SHINU_SPACE_WRITE_CAP_MIB="20480")
+               SHINU_SPACE_WRITE_CAP_MIB="20480", SHINU_JAIL_UID="31003", SHINU_JAIL_GID="32007")
     cli = str(args.bin_dir.resolve() / "shinu")
 
     def request(method, path, body=None, expected=200):
@@ -113,7 +115,38 @@ def main():
         source = request("POST", "/v1/spaces", {"name": "source", "readiness": {"command": ["/bin/sh", "-c", "printf '%s' \"$SHINU_RESTORE_ID\" > /tmp/shinu-ready-id"], "timeout_seconds": 30}}, 201)
         assert source["write_cap_mib"] == 0
         spaces.add("source")
+        tap = "shinu" + source["id"].replace("-", "")[:10]
+        sys_tap = Path("/sys/class/net") / tap
+        # Intentionally model a pre-upgrade TAP; production creation must always
+        # specify the configured jail user AND group.
+        subprocess.run(["ip", "tuntap", "add", "dev", tap, "mode", "tap"], check=True)
+        old_index = (sys_tap / "ifindex").read_text()
+        holder = os.open("/dev/net/tun", os.O_RDWR | os.O_CLOEXEC)
+        try:
+            fcntl.ioctl(holder, 0x400454CA, struct.pack("16sH", tap.encode(), 0x1002))
+            busy = request("POST", "/v1/spaces/source/start", expected=409)
+            assert busy["code"] == "tap_busy"
+            rejected = subprocess.run([cli, "start", "source"], env=env, capture_output=True, text=True, timeout=30)
+            assert rejected.returncode == 73, rejected.returncode
+            assert rejected.stderr == "shinu: tap_busy\n"
+            assert (sys_tap / "ifindex").read_text() == old_index
+            assert (sys_tap / "owner").read_text().strip() == "-1"
+            assert (sys_tap / "group").read_text().strip() == "-1"
+        finally:
+            os.close(holder)
+        lock_path = Path("/run/shinu-tap-locks") / (tap + ".lock")
+        lock_inode = lock_path.stat().st_ino
+        with lock_path.open("r+b") as claim:
+            fcntl.flock(claim, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            busy = request("POST", "/v1/spaces/source/start", expected=409)
+            assert busy["code"] == "tap_busy"
+            assert (sys_tap / "ifindex").read_text() == old_index
+        assert lock_path.stat().st_ino == lock_inode
+        assert lock_path.stat().st_size == 0
         run_cli("start", "source")
+        assert (sys_tap / "ifindex").read_text() != old_index, "legacy TAP must be rebuilt"
+        assert (sys_tap / "owner").read_text().strip() == env["SHINU_JAIL_UID"]
+        assert (sys_tap / "group").read_text().strip() == env["SHINU_JAIL_GID"]
         source_ready_id = run_cli("exec", "source", "--", "cat", "/tmp/shinu-ready-id").strip()
         assert source_ready_id
         checkpoint = request("POST", "/v1/spaces/source/commits", {"note": "fast-ready-full", "hot": True, "snapshot": "full"}, 201)
@@ -210,7 +243,7 @@ def main():
         assert rejected.stderr == "shinu: capacity_watermark\n"
         for identifier in [child2["id"], child["id"], checkpoint_id]:
             run_cli("rmckpt", identifier)
-        print("PASS: Full inode sharing/read-only memory, cache cgroup, load-only/dirty flags, resume, hot capture, deletion guard, daemon recovery")
+        print("PASS: TAP jail uid/gid, legacy rebuild, occupied/locked TAP rejection, retained lock inode, Full sharing, cache cgroup, load/resume, READY, dirty flags, capture and recovery")
     finally:
         if daemon is not None and daemon.poll() is None:
             for name in sorted(spaces):

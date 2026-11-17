@@ -3,7 +3,7 @@ pub use crate::net::{egress_rules, peer_rules};
 use crate::config::VmConfig;
 use crate::net::NetConfig;
 use shinu_core::{Error, Image, ReadySpec, Result};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
@@ -441,11 +441,156 @@ fn ensure_forward_rule(rule: &[String], position: usize) -> Result<()> {
     ensure_iptables_rule(&check, &add)
 }
 
-/// Creates one tap, address, and forwarding/NAT rule set for this VM.
-/// Every add is preceded by an existence check so retries do not grow the
-/// host firewall, while the address check preserves /30 isolation.
-pub fn tap_up(id: Uuid, cfg: &NetConfig) -> Result<()> {
-    tap_up_with_peers(id, cfg, &[])
+fn claim_tap_file(path: &Path, tap: &str) -> Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(0o400000) // Linux O_NOFOLLOW.
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.mode() & 0o077 != 0 {
+        return Err(Error::Invalid(format!("unsafe TAP lock for {tap}")));
+    }
+    file.try_lock().map_err(|error| {
+        Error::TapBusy(format!(
+            "TAP {tap} is being configured by another shinud: {error}"
+        ))
+    })?;
+    Ok(file)
+}
+
+/// Serialize create-to-VMM-attachment across daemon processes. Lock files stay
+/// linked after release so every contender always locks the same inode.
+fn claim_tap(id: Uuid) -> Result<std::fs::File> {
+    let directory = Path::new("/run/shinu-tap-locks");
+    match std::fs::DirBuilder::new().mode(0o700).create(directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let metadata = std::fs::symlink_metadata(directory)?;
+    if !metadata.is_dir() || metadata.uid() != 0 || metadata.mode() & 0o077 != 0 {
+        return Err(Error::Invalid("unsafe TAP lock directory".into()));
+    }
+    let tap = crate::net::tap_name(id);
+    let file = claim_tap_file(&directory.join(format!("{tap}.lock")), &tap)?;
+    if file.metadata()?.uid() != 0 {
+        return Err(Error::Invalid(format!("unsafe TAP lock owner for {tap}")));
+    }
+    Ok(file)
+}
+
+fn tap_holder(tap: &str, proc_root: &Path) -> Result<Option<std::ffi::OsString>> {
+    let mut contents = String::new();
+    for process in std::fs::read_dir(proc_root)? {
+        let process = process?;
+        let pid = process.file_name();
+        if !pid.as_encoded_bytes().iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        let descriptors = match std::fs::read_dir(process.path().join("fdinfo")) {
+            Ok(descriptors) => descriptors,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(Error::Internal(format!(
+                    "cannot prove TAP {tap} unused: inspecting process {}: {error}",
+                    pid.to_string_lossy()
+                )));
+            }
+        };
+        for descriptor in descriptors {
+            let descriptor = descriptor?;
+            let mut file = match std::fs::File::open(descriptor.path()) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(Error::Internal(format!(
+                        "cannot prove TAP {tap} unused: {error}"
+                    )));
+                }
+            };
+            contents.clear();
+            match file.read_to_string(&mut contents) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(Error::Internal(format!(
+                        "cannot prove TAP {tap} unused: {error}"
+                    )));
+                }
+            }
+            if contents.lines().any(|line| {
+                line.strip_prefix("iff:")
+                    .is_some_and(|name| name.trim() == tap)
+            }) {
+                return Ok(Some(pid));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// The caller holds its TAP claim until the VMM owns the fd (or has stopped).
+/// Sysfs/proc roots and the ip command are the host adapter, shared with tests.
+fn prepare_tap(
+    tap: &str,
+    cfg: &VmConfig,
+    sys_net: &Path,
+    proc_root: &Path,
+    mut ip: impl FnMut(&[&str]) -> Result<std::process::Output>,
+) -> Result<()> {
+    let uid = cfg.jail_uid.to_string();
+    let gid = cfg.jail_gid.to_string();
+    let create = [
+        "tuntap", "add", "dev", tap, "mode", "tap", "user", &uid, "group", &gid,
+    ];
+    let output = ip(&create)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    // iproute2 uses IFF_TUN_EXCL. Existing TAPs can report EBUSY or EEXIST;
+    // neither permits changing ownership or deleting an attached interface.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.contains("File exists") && !stderr.contains("Device or resource busy") {
+        return Err(command_failure("ip", &create, &output));
+    }
+    let interface = sys_net.join(tap);
+    let attribute = |field| -> Result<i64> {
+        std::fs::read_to_string(interface.join(field))?
+            .trim()
+            .parse::<i64>()
+            .map_err(|_| Error::Invalid(format!("invalid TAP {tap} {field}")))
+    };
+    let owner = attribute("owner")?;
+    let group = attribute("group")?;
+    if let Some(pid) = tap_holder(tap, proc_root)? {
+        return Err(Error::TapBusy(format!(
+            "TAP {tap} is in use by process {}; refusing to reconfigure it",
+            pid.to_string_lossy()
+        )));
+    }
+    if owner == i64::from(cfg.jail_uid) && group == i64::from(cfg.jail_gid) {
+        return Ok(());
+    }
+    let delete = ["link", "delete", "dev", tap];
+    let output = ip(&delete)?;
+    if !output.status.success() {
+        return Err(command_failure("ip", &delete, &output));
+    }
+    let output = ip(&create)?;
+    if !output.status.success() {
+        return Err(command_failure("ip", &create, &output));
+    }
+    Ok(())
+}
+
+/// Creates a TAP for the jailed identity, then configures its network.
+/// A rejected pre-existing TAP is never cleaned up by this transaction.
+fn tap_up(id: Uuid, cfg: &NetConfig, vm_cfg: &VmConfig) -> Result<()> {
+    tap_up_with_peers(id, cfg, &[], vm_cfg)
 }
 
 enum TapSetup {
@@ -453,8 +598,28 @@ enum TapSetup {
     Existing,
 }
 
-pub fn tap_up_with_peers(id: Uuid, cfg: &NetConfig, peers: &[String]) -> Result<()> {
-    configure_tap(id, cfg, peers, TapSetup::Create)
+fn tap_up_with_peers(id: Uuid, cfg: &NetConfig, peers: &[String], vm_cfg: &VmConfig) -> Result<()> {
+    if !cfg.enabled {
+        return Ok(());
+    }
+    let tap = crate::net::tap_name(id);
+    prepare_tap(
+        &tap,
+        vm_cfg,
+        Path::new("/sys/class/net"),
+        Path::new("/proc"),
+        |args| {
+            Ok(std::process::Command::new("ip")
+                .env("LC_ALL", "C")
+                .args(args)
+                .output()?)
+        },
+    )?;
+    let result = configure_tap(id, cfg, peers, TapSetup::Create);
+    if result.is_err() {
+        tap_down_with_peers(id, cfg, peers);
+    }
+    result
 }
 
 fn configure_tap(id: Uuid, cfg: &NetConfig, peers: &[String], setup: TapSetup) -> Result<()> {
@@ -474,11 +639,6 @@ fn configure_tap(id: Uuid, cfg: &NetConfig, peers: &[String], setup: TapSetup) -
     let host_cidr = format!("{host}/30");
     let network_cidr = format!("{network}/30");
 
-    ensure_address_free(id, &tap, &host_cidr)?;
-    // A restored VMM already owns its TAP fd; TUNSETIFF would return EBUSY.
-    if matches!(setup, TapSetup::Create) {
-        allow_file_exists("ip", &["tuntap", "add", "dev", &tap, "mode", "tap"])?;
-    }
     ensure_address_free(id, &tap, &host_cidr)?;
     match setup {
         TapSetup::Create => allow_file_exists("ip", &["addr", "add", &host_cidr, "dev", &tap])?,
@@ -2177,8 +2337,14 @@ pub fn start(
     std::fs::set_permissions(&jail, std::fs::Permissions::from_mode(0o700))?;
 
     let net = crate::net::net_spec(id, net_cfg);
-    if let Err(error) = tap_up(id, net_cfg) {
-        tap_down(id, net_cfg);
+    // Keep the cross-process claim through launch/admission and all cleanup.
+    // An existing TAP rejected before prepare_tap succeeds is never ours to delete.
+    let _tap_claim = if net_cfg.enabled {
+        Some(claim_tap(id)?)
+    } else {
+        None
+    };
+    if let Err(error) = tap_up(id, net_cfg, cfg) {
         let _ = clean_jail(&dir);
         return Err(error);
     }
@@ -3461,5 +3627,187 @@ mod restore_transaction_tests {
                 < observed.iter().position(|step| *step == Expose).unwrap()
         );
         assert_eq!(&observed[observed.len() - 2..], [Expose, ApplicationReady]);
+    }
+}
+
+#[cfg(test)]
+mod tap_tests {
+    use super::{VmConfig, claim_tap_file, prepare_tap};
+    use std::os::unix::{fs::MetadataExt, process::ExitStatusExt};
+    use std::path::PathBuf;
+
+    const TAP: &str = "shinu0123456789";
+
+    struct Host {
+        root: PathBuf,
+        config: VmConfig,
+        commands: Vec<Vec<String>>,
+        collision: &'static str,
+    }
+
+    impl Host {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("shinu-tap-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(root.join("sys")).unwrap();
+            std::fs::create_dir_all(root.join("proc")).unwrap();
+            Self {
+                root,
+                config: VmConfig {
+                    vcpus: 1,
+                    mem_mib: 64,
+                    idle_secs: 60,
+                    idle_reclaim: false,
+                    jail_uid: 31003,
+                    jail_gid: 32007,
+                },
+                commands: Vec::new(),
+                collision: "Device or resource busy",
+            }
+        }
+
+        fn owners(&self, uid: i64, gid: i64) {
+            let tap = self.root.join("sys").join(TAP);
+            std::fs::create_dir_all(&tap).unwrap();
+            std::fs::write(tap.join("owner"), format!("{uid}\n")).unwrap();
+            std::fs::write(tap.join("group"), format!("{gid}\n")).unwrap();
+        }
+
+        fn hold(&self, tap: &str) {
+            let info = self.root.join("proc/42/fdinfo");
+            std::fs::create_dir_all(&info).unwrap();
+            std::fs::write(
+                info.join("7"),
+                format!("pos:\t0\nflags:\t0100002\niff:\t{tap}\n"),
+            )
+            .unwrap();
+        }
+
+        fn prepare(&mut self) -> shinu_core::Result<()> {
+            let sys = self.root.join("sys");
+            prepare_tap(TAP, &self.config, &sys, &self.root.join("proc"), |args| {
+                self.commands
+                    .push(args.iter().map(|arg| (*arg).to_owned()).collect());
+                let collision = args.starts_with(&["tuntap", "add"]) && sys.join(TAP).exists();
+                if args.starts_with(&["link", "delete"]) {
+                    std::fs::remove_dir_all(sys.join(TAP)).unwrap();
+                }
+                Ok(std::process::Output {
+                    status: std::process::ExitStatus::from_raw(if collision { 256 } else { 0 }),
+                    stdout: Vec::new(),
+                    stderr: if collision {
+                        self.collision.as_bytes().to_vec()
+                    } else {
+                        Vec::new()
+                    },
+                })
+            })
+        }
+    }
+
+    impl Drop for Host {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn fresh_tap_is_owned_by_configured_jail_identity() {
+        let mut host = Host::new();
+        std::fs::remove_dir(host.root.join("proc")).unwrap();
+        std::fs::write(host.root.join("proc"), b"new TAP must not inspect procfs").unwrap();
+        host.prepare().unwrap();
+        assert_eq!(
+            host.commands,
+            [vec![
+                "tuntap", "add", "dev", TAP, "mode", "tap", "user", "31003", "group", "32007"
+            ]]
+        );
+    }
+
+    #[test]
+    fn unused_legacy_tap_is_rebuilt_unless_both_owners_match() {
+        for (uid, gid) in [(-1, -1), (31003, -1), (-1, 32007), (123, 456)] {
+            let mut host = Host::new();
+            host.owners(uid, gid);
+            host.hold("other-tap");
+            host.prepare().unwrap();
+            assert_eq!(
+                host.commands,
+                [
+                    vec![
+                        "tuntap", "add", "dev", TAP, "mode", "tap", "user", "31003", "group",
+                        "32007"
+                    ],
+                    vec!["link", "delete", "dev", TAP],
+                    vec![
+                        "tuntap", "add", "dev", TAP, "mode", "tap", "user", "31003", "group",
+                        "32007"
+                    ]
+                ]
+            );
+        }
+        let mut host = Host::new();
+        host.owners(31003, 32007);
+        host.prepare().unwrap();
+        assert_eq!(host.commands.len(), 1);
+    }
+
+    #[test]
+    fn occupied_tap_is_rejected_without_mutation_even_with_matching_owners() {
+        for (uid, gid) in [(-1, -1), (31003, 32007)] {
+            let mut host = Host::new();
+            host.owners(uid, gid);
+            host.hold(TAP);
+            let error = host.prepare().unwrap_err();
+            assert!(error.to_string().contains("in use"), "{error}");
+            assert!(matches!(error, shinu_core::Error::TapBusy(_)));
+            assert_eq!(host.commands.len(), 1);
+        }
+    }
+
+    #[test]
+    fn incomplete_holder_inspection_cannot_delete_a_legacy_tap() {
+        let mut host = Host::new();
+        host.owners(-1, -1);
+        std::fs::create_dir_all(host.root.join("proc/42")).unwrap();
+        std::fs::write(
+            host.root.join("proc/42/fdinfo"),
+            b"not a readable directory",
+        )
+        .unwrap();
+        assert!(host.prepare().is_err());
+        assert_eq!(host.commands.len(), 1);
+    }
+
+    #[test]
+    fn file_exists_collision_rebuilds_an_unowned_tap() {
+        let mut host = Host::new();
+        host.collision = "File exists";
+        host.owners(-1, -1);
+        host.prepare().unwrap();
+        assert_eq!(host.commands.len(), 3);
+        assert_eq!(host.commands[1], ["link", "delete", "dev", TAP]);
+    }
+
+    #[test]
+    fn tap_claim_stays_linked_and_serializes_separate_open_file_descriptions() {
+        let host = Host::new();
+        let path = host.root.join("tap.lock");
+        let first = claim_tap_file(&path, TAP).unwrap();
+        let inode = first.metadata().unwrap().ino();
+        assert!(matches!(
+            claim_tap_file(&path, TAP),
+            Err(shinu_core::Error::TapBusy(_))
+        ));
+        drop(first);
+        assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+        let next = claim_tap_file(&path, TAP).unwrap();
+        assert_eq!(next.metadata().unwrap().ino(), inode);
+        assert_eq!(next.metadata().unwrap().len(), 0);
+        drop(next);
+        assert!(
+            path.exists(),
+            "releasing a claim must never unlink its lock inode"
+        );
     }
 }

@@ -303,6 +303,7 @@ fn reason_phrase(status: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
         _ => "Unknown",
@@ -445,6 +446,7 @@ pub fn status_for(error: &shinu_core::Error) -> u16 {
         shinu_core::Error::Invalid(_) => 400,
         shinu_core::Error::Quota(_) => 429,
         shinu_core::Error::CapacityWatermark(_) => 429,
+        shinu_core::Error::TapBusy(_) => 409,
         shinu_core::Error::Btrfs(_)
         | shinu_core::Error::Io(_)
         | shinu_core::Error::Json(_)
@@ -758,6 +760,7 @@ mod http_tests {
         assert_eq!(status_for(&shinu_core::Error::NotFound("gone".into())), 404);
         assert_eq!(status_for(&shinu_core::Error::Invalid("bad".into())), 400);
         assert_eq!(status_for(&shinu_core::Error::Quota("limit".into())), 429);
+        assert_eq!(status_for(&shinu_core::Error::TapBusy("held".into())), 409);
         assert_eq!(status_for(&shinu_core::Error::Btrfs("bad".into())), 500);
         assert_eq!(
             status_for(&shinu_core::Error::Io(std::io::Error::other("bad"))),
@@ -777,5 +780,6 @@ mod http_tests {
     fn reason_phrase_covers_quota_and_csrf_statuses() {
         assert_eq!(reason_phrase(403), "Forbidden");
         assert_eq!(reason_phrase(429), "Too Many Requests");
+        assert_eq!(reason_phrase(409), "Conflict");
     }
 }

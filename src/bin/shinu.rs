@@ -1697,6 +1697,12 @@ fn successful_body(response: Response) -> Result<Vec<u8>, String> {
     {
         return Err("capacity_watermark".into());
     }
+    if response.status == 409
+        && serde_json::from_slice::<Value>(&response.body)
+            .is_ok_and(|value| value["code"] == "tap_busy")
+    {
+        return Err("tap_busy".into());
+    }
     response
         .into_success()
         .map(|response| response.body)
@@ -2291,10 +2297,10 @@ fn main() {
         }
         Err(message) => {
             eprintln!("shinu: {message}");
-            std::process::exit(if message == "capacity_watermark" {
-                75
-            } else {
-                1
+            std::process::exit(match message.as_str() {
+                "capacity_watermark" => 75,
+                "tap_busy" => 73,
+                _ => 1,
             });
         }
     }

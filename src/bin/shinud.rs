@@ -7231,6 +7231,8 @@ fn delete_console_token(ctx: &Ctx<'_>, project: &str, prefix: &str) -> shinu::Re
 fn respond_error(stream: &mut impl Write, status: u16, error: &shinu::Error) -> shinu::Result<()> {
     let body = if matches!(error, shinu::Error::CapacityWatermark(_)) {
         json!({"error":error.to_string(),"code":"capacity_watermark"})
+    } else if matches!(error, shinu::Error::TapBusy(_)) {
+        json!({"error":error.to_string(),"code":"tap_busy"})
     } else if status >= 500 {
         eprintln!("{error}");
         json!({ "error": "internal server error" })

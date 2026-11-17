@@ -69,6 +69,12 @@ impl Guest {
                             stream.write_all(b"FAILED\n").unwrap();
                             continue;
                         }
+                        if action == "capabilities" {
+                            // A current helper: capture keeps it, no SSH reinstall.
+                            assert_eq!(words.next(), Some("setup"));
+                            stream.write_all(b"SETUP-1\n").unwrap();
+                            continue;
+                        }
                         if line.split_whitespace().nth(2) == Some("hold") {
                             events.lock().unwrap().push("hold".into());
                             stream.write_all(b"OK\n").unwrap();

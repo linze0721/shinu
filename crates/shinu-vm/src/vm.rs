@@ -623,6 +623,21 @@ fn tap_up_with_peers(id: Uuid, cfg: &NetConfig, peers: &[String], vm_cfg: &VmCon
 }
 
 fn configure_tap(id: Uuid, cfg: &NetConfig, peers: &[String], setup: TapSetup) -> Result<()> {
+    reassert_tap_policy(id, cfg, peers, setup)?;
+    expose_tap(id, cfg)
+}
+
+/// Brings a TAP up; callers first prove its address and firewall policy.
+fn expose_tap(id: Uuid, cfg: &NetConfig) -> Result<()> {
+    if !cfg.enabled {
+        return Ok(());
+    }
+    require_success("ip", &["link", "set", &crate::net::tap_name(id), "up"])
+}
+
+/// Asserts a TAP's address and firewall policy without changing link state,
+/// so a quarantined restore can do this while the guest is still thawing.
+fn reassert_tap_policy(id: Uuid, cfg: &NetConfig, peers: &[String], setup: TapSetup) -> Result<()> {
     if !cfg.enabled {
         return Ok(());
     }
@@ -645,7 +660,6 @@ fn configure_tap(id: Uuid, cfg: &NetConfig, peers: &[String], setup: TapSetup) -
         TapSetup::Existing => require_success("ip", &["addr", "replace", &host_cidr, "dev", &tap])?,
     }
     ensure_address_free(id, &tap, &host_cidr)?;
-    require_success("ip", &["link", "set", &tap, "up"])?;
 
     let nat_check = [
         "-t",
@@ -1361,6 +1375,83 @@ fn ready_capability(dir: &Path, deadline: Instant) -> Result<()> {
     Ok(())
 }
 
+enum SetupError {
+    /// No helper, or a helper predating `setup`: nothing was applied.
+    Unsupported,
+    Failed(Error),
+}
+
+/// One restored-generation identity frame: wall clock and, when networked,
+/// the eth0 MAC/address/gateway. The guest helper validates every field.
+fn guest_setup_frame(
+    nonce: &str,
+    now: SystemTime,
+    net: Option<&crate::net::NetSpec>,
+) -> Result<String> {
+    let clock = now
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| Error::Internal("host clock precedes the epoch".into()))?
+        .as_nanos();
+    Ok(net.map_or_else(
+        || format!("setup {nonce} {clock}\n"),
+        |spec| {
+            format!(
+                "setup {nonce} {clock} {} {} {}\n",
+                spec.mac, spec.guest_cidr, spec.gateway
+            )
+        },
+    ))
+}
+
+// Platform setup is a separate helper action, never a readiness request: it
+// runs no policy argv and its `SETUP-OK` cannot satisfy `READY <restore_id>`.
+fn guest_setup(
+    dir: &Path,
+    net: Option<&crate::net::NetSpec>,
+    deadline: Instant,
+) -> std::result::Result<(), SetupError> {
+    let Ok(nonce) = std::fs::read_to_string(dir.join("snapshot-worker-nonce")) else {
+        return Err(SetupError::Unsupported);
+    };
+    let frame = guest_setup_frame(&nonce, SystemTime::now(), net).map_err(SetupError::Failed)?;
+    let Ok(mut transport) = ReadyTransport::guest(dir, deadline) else {
+        return Err(SetupError::Unsupported);
+    };
+    transport
+        .write(frame.as_bytes())
+        .map_err(SetupError::Failed)?;
+    match transport.line().map_err(SetupError::Failed)? {
+        "SETUP-OK" => Ok(()),
+        "FAILED setup" => Err(SetupError::Failed(Error::Internal(
+            "restored guest setup failed".into(),
+        ))),
+        // Older helpers reject the unknown action without applying anything.
+        _ => Err(SetupError::Unsupported),
+    }
+}
+
+fn ssh_guest_setup(dir: &Path, vsock: &Path, net: Option<&crate::net::NetSpec>) -> Result<()> {
+    let mut reconfigure = format!("set -eu; date -u -s @{}; ", now_secs());
+    if let Some(spec) = net {
+        reconfigure.push_str(&format!("ip link set dev eth0 down; ip addr flush dev eth0; ip link set dev eth0 address {}; ip link set dev eth0 up; ip addr add {} dev eth0; ip route replace default via {} dev eth0; ip neigh flush dev eth0", spec.mac, spec.guest_cidr, spec.gateway));
+    }
+    let command = ["sh".to_owned(), "-c".to_owned(), reconfigure];
+    let helper = shinu_core::vsock_helper()?;
+    let ssh = ssh_command(
+        &helper,
+        vsock,
+        &key_path(dir),
+        shinu_core::VSOCK_SSH_PORT,
+        &command,
+    );
+    match run_process_group(ssh, Duration::from_secs(30), None) {
+        Some(status) if status.success() => Ok(()),
+        _ => Err(Error::Internal(
+            "restored guest setup failed or timed out".into(),
+        )),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BootIdentity {
     pid: u32,
@@ -1618,13 +1709,28 @@ fn snapshot_preconnect_enabled() -> Result<bool> {
 }
 
 fn prepare_snapshot_worker(dir: &Path) -> Result<()> {
+    // Capture time is where a helper predating `setup` is replaced, so that
+    // generations restored later can skip the SSH setup session.
     if matches!(
         guest_snapshot_action(dir, SnapshotCommand::Status),
         Some(Ok(()))
-    ) {
+    ) && setup_capability(dir, Instant::now() + Duration::from_secs(2))
+    {
         return Ok(());
     }
     install_snapshot_worker(dir, None)
+}
+
+fn setup_capability(dir: &Path, deadline: Instant) -> bool {
+    let Ok(nonce) = std::fs::read_to_string(dir.join("snapshot-worker-nonce")) else {
+        return false;
+    };
+    ReadyTransport::guest(dir, deadline)
+        .and_then(|mut transport| {
+            transport.write(format!("capabilities {nonce} setup\n").as_bytes())?;
+            Ok(transport.line()? == "SETUP-1")
+        })
+        .unwrap_or(false)
 }
 
 fn install_snapshot_worker(dir: &Path, deadline: Option<Instant>) -> Result<()> {
@@ -2069,6 +2175,208 @@ pub fn warm_checkpoint_memory(memory: &Path) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Remote-read stride. Each read fault maps the cached pages of its aligned
+/// window (Linux `fault_around_bytes`, 64 KiB by default); pages a coarser
+/// stride leaves unmapped simply fault on first guest touch as before.
+const PREFAULT_STRIDE: u64 = 64 * 1024;
+/// Linux `UIO_MAXIOV`: remote iovecs accepted by one `process_vm_readv`.
+const PREFAULT_BATCH: usize = 1024;
+
+/// One private mapping of the snapshot file and its file offset.
+#[derive(Debug, PartialEq, Eq)]
+struct MemoryRange {
+    start: u64,
+    end: u64,
+    offset: u64,
+}
+
+/// Guest RAM of a loaded VM: Firecracker's private mappings of the jailed
+/// snapshot file, which is unlinked from the jail right after load.
+fn snapshot_memory_ranges(maps: &str) -> Vec<MemoryRange> {
+    let target = format!("/{JAIL_SNAP_MEM}");
+    maps.lines()
+        .filter_map(|line| {
+            let mut fields = line.split_ascii_whitespace();
+            let (start, end) = fields.next()?.split_once('-')?;
+            let private = fields.next()?.ends_with('p');
+            let offset = fields.next()?;
+            let path = fields.nth(2)?;
+            let tail: Vec<&str> = fields.collect();
+            (private && path == target && matches!(tail.as_slice(), [] | ["(deleted)"]))
+                .then_some(())?;
+            Some(MemoryRange {
+                start: u64::from_str_radix(start, 16).ok()?,
+                end: u64::from_str_radix(end, 16).ok()?,
+                offset: u64::from_str_radix(offset, 16).ok()?,
+            })
+        })
+        .filter(|range| range.start < range.end)
+        .collect()
+}
+
+/// Page-cache residency of `file`, one byte per page (bit 0 = resident).
+/// Mapping the file without touching it reads nothing from disk.
+fn resident_pages(file: &std::fs::File, page: u64) -> Result<Vec<u8>> {
+    unsafe extern "C" {
+        fn mmap(
+            address: usize,
+            length: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            offset: i64,
+        ) -> usize;
+        fn munmap(address: usize, length: usize) -> i32;
+        fn mincore(address: usize, length: usize, vector: *mut u8) -> i32;
+    }
+    let length = usize::try_from(file.metadata()?.len())
+        .map_err(|_| Error::Internal("snapshot memory too large".into()))?;
+    if length == 0 {
+        return Ok(Vec::new());
+    }
+    // SAFETY: a fresh PROT_READ, MAP_SHARED mapping of a live descriptor.
+    let address = unsafe { mmap(0, length, 1, 1, file.as_raw_fd(), 0) };
+    if address == usize::MAX {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let mut vector = vec![0_u8; length.div_ceil(usize::try_from(page).unwrap_or(4096))];
+    // SAFETY: `vector` holds one byte per page of the live mapping above.
+    let result = unsafe { mincore(address, length, vector.as_mut_ptr()) };
+    let error = (result != 0).then(std::io::Error::last_os_error);
+    // SAFETY: unmaps exactly the mapping created above.
+    unsafe { munmap(address, length) };
+    error.map_or(Ok(vector), |error| Err(error.into()))
+}
+
+/// One remote address per stride window that already has a cached page: the
+/// read faults on that page and fault-around maps the window's other cached
+/// pages. Windows with nothing cached are skipped, so populate never reads
+/// the disk and its cost stays bounded when the checkpoint cache was evicted.
+fn prefault_targets(ranges: &[MemoryRange], resident: &[u8], page: u64) -> Vec<u64> {
+    let mut targets = Vec::new();
+    for range in ranges {
+        let mut window = range.start;
+        while window < range.end {
+            let limit = window.saturating_add(PREFAULT_STRIDE).min(range.end);
+            let mut address = window;
+            while address < limit {
+                let index = (range.offset + (address - range.start)) / page;
+                if usize::try_from(index)
+                    .ok()
+                    .and_then(|index| resident.get(index))
+                    .is_some_and(|state| state & 1 != 0)
+                {
+                    targets.push(address);
+                    break;
+                }
+                address += page;
+            }
+            window = limit;
+        }
+    }
+    targets
+}
+
+/// Maps already-cached snapshot pages into `pid`'s private file mappings by
+/// reading one byte at each target through `process_vm_readv`. Remote reads
+/// fault without `FOLL_WRITE`, so they install read-only page-cache PTEs and
+/// never copy-on-write or allocate anonymous memory; guest writes still do.
+fn populate_read(pid: u32, targets: &[u64]) -> Result<()> {
+    #[repr(C)]
+    struct IoVec {
+        base: usize,
+        len: usize,
+    }
+    unsafe extern "C" {
+        fn process_vm_readv(
+            pid: i32,
+            local: *const IoVec,
+            local_count: u64,
+            remote: *const IoVec,
+            remote_count: u64,
+            flags: u64,
+        ) -> isize;
+    }
+    let pid = i32::try_from(pid).map_err(|_| Error::Internal("invalid VMM pid".into()))?;
+    let mut sink = [0_u8; PREFAULT_BATCH];
+    let mut remote = Vec::with_capacity(PREFAULT_BATCH);
+    for batch in targets.chunks(PREFAULT_BATCH) {
+        remote.clear();
+        for &address in batch {
+            remote.push(IoVec {
+                base: usize::try_from(address)
+                    .map_err(|_| Error::Internal("invalid VMM address".into()))?,
+                len: 1,
+            });
+        }
+        let local = IoVec {
+            base: sink.as_mut_ptr() as usize,
+            len: remote.len(),
+        };
+        // SAFETY: one live local buffer of `local.len` bytes and a live
+        // array of remote descriptors; the kernel only writes `sink`.
+        let read = unsafe {
+            process_vm_readv(
+                pid,
+                &raw const local,
+                1,
+                remote.as_ptr(),
+                remote.len() as u64,
+                0,
+            )
+        };
+        if read < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if read.cast_unsigned() != remote.len() {
+            return Err(Error::Internal(format!(
+                "prefault stopped after {read} of {} pages",
+                remote.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn page_size() -> u64 {
+    unsafe extern "C" {
+        fn sysconf(name: i32) -> i64;
+    }
+    // SAFETY: _SC_PAGESIZE (30) takes no pointers.
+    u64::try_from(unsafe { sysconf(30) }).unwrap_or(4096)
+}
+
+/// Best-effort fill-time prefault of a loaded, paused VM. Failure is only
+/// logged: the VM stays correct and merely faults pages on first touch.
+fn prefault_loaded(dir: &Path, id: Uuid, memory: &Path) {
+    let started = Instant::now();
+    let result = (|| {
+        let pid =
+            running_pid(dir).ok_or_else(|| Error::Internal("loaded VMM is not running".into()))?;
+        let ranges = snapshot_memory_ranges(&std::fs::read_to_string(format!("/proc/{pid}/maps"))?);
+        if ranges.is_empty() {
+            return Err(Error::Internal("snapshot memory mapping not found".into()));
+        }
+        let page = page_size();
+        let resident = resident_pages(&std::fs::File::open(memory)?, page)?;
+        let targets = prefault_targets(&ranges, &resident, page);
+        populate_read(pid, &targets)?;
+        let mapped: u64 = ranges.iter().map(|range| range.end - range.start).sum();
+        Ok((mapped, targets.len() as u64 * PREFAULT_STRIDE))
+    })();
+    let elapsed_ms = started.elapsed().as_millis();
+    match result {
+        Ok((mapped, cached)) => eprintln!(
+            "event=prefault vm_id={id} mapped_mib={} cached_windows_mib={} elapsed_ms={elapsed_ms} ok=true",
+            mapped >> 20,
+            cached >> 20
+        ),
+        Err(error) => {
+            eprintln!("event=prefault vm_id={id} elapsed_ms={elapsed_ms} ok=false error={error}");
+        }
+    }
 }
 
 fn clean_jail(dir: &Path) -> Result<()> {
@@ -2552,6 +2860,10 @@ pub fn start(
                 if vsock.exists() {
                     std::fs::set_permissions(&vsock, std::fs::Permissions::from_mode(0o600))?;
                 }
+                // Pool fill only: the handout path never waits for this.
+                if let Some(files) = restore {
+                    prefault_loaded(&dir, id, files.mem);
+                }
                 persist_phase(&dir, "loaded")?;
                 touch(&dir)?;
                 return Ok((vsock, true));
@@ -2650,7 +2962,16 @@ fn restore_step(
 ) -> Result<()> {
     match step {
         RestoreStep::Quarantine | RestoreStep::Load => Ok(()),
-        RestoreStep::Thaw => thaw_snapshot(dir),
+        // The TAP stays down: its policy is reasserted while the guest thaws,
+        // leaving only the link flip on the critical path after Configure.
+        RestoreStep::Thaw => std::thread::scope(|scope| {
+            let policy = scope.spawn(|| reassert_tap_policy(id, net_cfg, &[], TapSetup::Existing));
+            let thawed = thaw_snapshot(dir);
+            let policy = policy
+                .join()
+                .unwrap_or_else(|_| Err(Error::Internal("TAP policy worker panicked".into())));
+            combine_snapshot_results(thawed, policy)
+        }),
         RestoreStep::Ready => {
             if wait_ready(dir, vsock) {
                 Ok(())
@@ -2661,27 +2982,14 @@ fn restore_step(
             }
         }
         RestoreStep::Configure => {
-            let mut reconfigure = format!("set -eu; date -u -s @{}; ", now_secs());
-            if let Some(spec) = net {
-                reconfigure.push_str(&format!("ip link set dev eth0 down; ip addr flush dev eth0; ip link set dev eth0 address {}; ip link set dev eth0 up; ip addr add {} dev eth0; ip route replace default via {} dev eth0; ip neigh flush dev eth0", spec.mac, spec.guest_cidr, spec.gateway));
-            }
-            let command = ["sh".to_owned(), "-c".to_owned(), reconfigure];
-            let helper = shinu_core::vsock_helper()?;
-            let ssh = ssh_command(
-                &helper,
-                vsock,
-                &key_path(dir),
-                shinu_core::VSOCK_SSH_PORT,
-                &command,
-            );
-            match run_process_group(ssh, Duration::from_secs(30), None) {
-                Some(status) if status.success() => Ok(()),
-                _ => Err(Error::Internal(
-                    "restored guest setup failed or timed out".into(),
-                )),
+            match guest_setup(dir, net, Instant::now() + Duration::from_secs(30)) {
+                Ok(()) => Ok(()),
+                // Pre-setup helpers and helper-less guests keep the SSH path.
+                Err(SetupError::Unsupported) => ssh_guest_setup(dir, vsock, net),
+                Err(SetupError::Failed(error)) => Err(error),
             }
         }
-        RestoreStep::Expose => configure_tap(id, net_cfg, &[], TapSetup::Existing),
+        RestoreStep::Expose => expose_tap(id, net_cfg),
         RestoreStep::ApplicationReady => match readiness {
             Some(spec) => admit_application(dir, spec, &boot_identity(dir)?, network_ready),
             None => network_ready(Instant::now() + Duration::from_secs(30)),
@@ -3665,6 +3973,224 @@ mod restore_transaction_tests {
                 < observed.iter().position(|step| *step == Expose).unwrap()
         );
         assert_eq!(&observed[observed.len() - 2..], [Expose, ApplicationReady]);
+    }
+}
+
+#[cfg(test)]
+mod guest_setup_tests {
+    use super::{SetupError, guest_setup, guest_setup_frame};
+    use crate::net::NetSpec;
+    use std::io::{BufRead, BufReader, Write};
+    use std::time::{Duration, Instant, UNIX_EPOCH};
+
+    const NONCE: &str = "00000000-0000-4000-8000-000000000001";
+
+    fn spec() -> NetSpec {
+        NetSpec {
+            tap: "shinu0123456789".into(),
+            mac: "06:00:ac:1d:00:02".into(),
+            guest_cidr: "172.29.0.2/30".into(),
+            gateway: "172.29.0.1".into(),
+        }
+    }
+
+    #[test]
+    fn setup_frame_is_a_platform_action_never_a_readiness_request() {
+        let now = UNIX_EPOCH + Duration::new(1_700_000_000, 5);
+        assert_eq!(
+            guest_setup_frame(NONCE, now, None).unwrap(),
+            format!("setup {NONCE} 1700000000000000005\n")
+        );
+        assert_eq!(
+            guest_setup_frame(NONCE, now, Some(&spec())).unwrap(),
+            format!(
+                "setup {NONCE} 1700000000000000005 06:00:ac:1d:00:02 172.29.0.2/30 172.29.0.1\n"
+            )
+        );
+    }
+
+    /// Fake guest helper behind the Firecracker vsock UDS handshake.
+    fn exchange(reply: &'static str) -> (std::result::Result<(), SetupError>, String) {
+        let dir = std::env::temp_dir().join(format!("shinu-setup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("snapshot-worker-nonce"), NONCE).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(dir.join("vsock.sock")).unwrap();
+        let guest = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "CONNECT 2224\n");
+            (&stream).write_all(b"OK 1\nSHINU-SNAPSHOT-1\n").unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            (&stream).write_all(reply.as_bytes()).unwrap();
+            line
+        });
+        let result = guest_setup(&dir, Some(&spec()), Instant::now() + Duration::from_secs(5));
+        let request = guest.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        (result, request)
+    }
+
+    #[test]
+    fn only_setup_ok_succeeds_and_legacy_helpers_fall_back() {
+        let (result, request) = exchange("SETUP-OK\n");
+        assert!(result.is_ok());
+        assert!(request.starts_with(&format!("setup {NONCE} ")), "{request}");
+        // A READY line, even one for some restore, never satisfies setup.
+        assert!(matches!(
+            exchange("READY 00000000-0000-4000-8000-000000000002\n").0,
+            Err(SetupError::Unsupported)
+        ));
+        assert!(matches!(
+            exchange("FAILED readiness\n").0,
+            Err(SetupError::Unsupported)
+        ));
+        assert!(matches!(
+            exchange("FAILED setup\n").0,
+            Err(SetupError::Failed(_))
+        ));
+    }
+
+    #[test]
+    fn missing_helper_identity_uses_the_ssh_fallback() {
+        let dir = std::env::temp_dir().join(format!("shinu-setup-{}", uuid::Uuid::new_v4()));
+        assert!(matches!(
+            guest_setup(&dir, None, Instant::now() + Duration::from_millis(50)),
+            Err(SetupError::Unsupported)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod prefault_tests {
+    use super::{
+        MemoryRange, PREFAULT_STRIDE, populate_read, prefault_targets, resident_pages,
+        snapshot_memory_ranges,
+    };
+
+    #[test]
+    fn only_private_snapshot_file_mappings_are_guest_memory() {
+        let maps = "\
+7f102da00000-7f116da00000 rw-p c0000000 00:1f 7497875                    /snap.mem (deleted)
+7f116da00000-7f122da00000 rw-p 00000000 00:1f 7497875                    /snap.mem (deleted)
+7f122da00000-7f122da01000 rw-s 00000000 00:1f 7497876                    /snap.mem
+7f122da01000-7f122da02000 r--p 00000000 00:1f 7497877                    /snap.mem.old
+7f122da02000-7f122da03000 rw-p 00000000 00:1f 7497878                    /x/snap.mem
+7f122da03000-7f122da04000 rw-p 00000000 00:00 0
+7f122da04000-7f122da05000 r--p 00001000 00:1f 7497879                    /snap.mem
+";
+        let range = |start, end, offset| MemoryRange { start, end, offset };
+        assert_eq!(
+            snapshot_memory_ranges(maps),
+            [
+                range(0x7f10_2da0_0000, 0x7f11_6da0_0000, 0xc000_0000),
+                range(0x7f11_6da0_0000, 0x7f12_2da0_0000, 0),
+                range(0x7f12_2da0_4000, 0x7f12_2da0_5000, 0x1000)
+            ]
+        );
+    }
+
+    #[test]
+    fn targets_follow_file_offsets_and_skip_uncached_windows() {
+        const PAGE: u64 = 4096;
+        let pages = usize::try_from(PREFAULT_STRIDE / PAGE).unwrap();
+        // File windows: 0 uncached, 1 cached at its third page, 2 cached.
+        let mut resident = vec![0_u8; pages * 3];
+        resident[pages + 2] = 1;
+        resident[pages * 2] = 1;
+        let base = 0x10_0000_0000;
+        let ranges = [
+            // Guest region mapping file windows 1..3 first, then window 0.
+            MemoryRange {
+                start: base,
+                end: base + 2 * PREFAULT_STRIDE,
+                offset: PREFAULT_STRIDE,
+            },
+            MemoryRange {
+                start: base + 4 * PREFAULT_STRIDE,
+                end: base + 5 * PREFAULT_STRIDE,
+                offset: 0,
+            },
+        ];
+        assert_eq!(
+            prefault_targets(&ranges, &resident, PAGE),
+            [base + 2 * PAGE, base + PREFAULT_STRIDE]
+        );
+        // A residency vector shorter than the mapping never indexes past it.
+        assert!(prefault_targets(&ranges, &[], PAGE).is_empty());
+    }
+
+    fn smaps_field(address: usize, field: &str) -> u64 {
+        let smaps = std::fs::read_to_string("/proc/self/smaps").unwrap();
+        let mut inside = false;
+        for line in smaps.lines() {
+            if let Some((range, _)) = line.split_once(' ')
+                && let Some((start, _)) = range.split_once('-')
+                && start.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                inside = usize::from_str_radix(start, 16) == Ok(address);
+            } else if inside && let Some(value) = line.strip_prefix(field) {
+                return value
+                    .trim_start_matches(':')
+                    .trim()
+                    .trim_end_matches(" kB")
+                    .parse()
+                    .unwrap();
+            }
+        }
+        panic!("mapping {address:#x} has no {field}");
+    }
+
+    #[test]
+    fn populate_maps_page_cache_read_only_without_private_memory() {
+        use std::os::fd::AsRawFd;
+        unsafe extern "C" {
+            fn mmap(
+                address: usize,
+                length: usize,
+                prot: i32,
+                flags: i32,
+                fd: i32,
+                offset: i64,
+            ) -> usize;
+            fn munmap(address: usize, length: usize) -> i32;
+        }
+        const LENGTH: usize = 8 << 20;
+        // A disk filesystem like the checkpoint store: tmpfs pages are always
+        // dirty, which smaps would report as Private_Dirty without any CoW.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!(".shinu-prefault-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, vec![7_u8; LENGTH]).unwrap();
+        std::fs::File::open(&path).unwrap().sync_all().unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        // SAFETY: fresh PROT_READ|PROT_WRITE MAP_PRIVATE mapping of a live file.
+        let address = unsafe { mmap(0, LENGTH, 1 | 2, 2, file.as_raw_fd(), 0) };
+        assert_ne!(address, usize::MAX);
+        assert_eq!(smaps_field(address, "Rss"), 0);
+        let page = super::page_size();
+        let resident = resident_pages(&file, page).unwrap();
+        assert!(resident.iter().all(|state| state & 1 != 0));
+        let range = MemoryRange {
+            start: address as u64,
+            end: (address + LENGTH) as u64,
+            offset: 0,
+        };
+        let targets = prefault_targets(&[range], &resident, page);
+        assert_eq!(targets.len() as u64, LENGTH as u64 / PREFAULT_STRIDE);
+        populate_read(std::process::id(), &targets).unwrap();
+        // Fault-around may stop at page-cache folio boundaries; most pages map.
+        assert!(smaps_field(address, "Rss") >= (LENGTH as u64 >> 10) / 2);
+        assert_eq!(smaps_field(address, "Anonymous"), 0);
+        assert_eq!(smaps_field(address, "Private_Dirty"), 0);
+        assert_eq!(
+            smaps_field(address, "Rss"),
+            smaps_field(address, "Private_Clean") + smaps_field(address, "Shared_Clean")
+        );
+        // SAFETY: unmaps exactly the mapping created above.
+        assert_eq!(unsafe { munmap(address, LENGTH) }, 0);
+        std::fs::remove_file(path).unwrap();
     }
 }
 

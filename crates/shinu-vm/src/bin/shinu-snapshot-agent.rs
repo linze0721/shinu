@@ -23,6 +23,7 @@ unsafe extern "C" {
     fn alarm(seconds: u32) -> u32;
     fn poll(descriptors: *mut PollDescriptor, count: usize, timeout_ms: i32) -> i32;
     fn kill(pid: i32, signal: i32) -> i32;
+    fn clock_settime(clock: i32, time: *const i64) -> i32;
 }
 
 #[repr(C)]
@@ -438,8 +439,12 @@ fn readiness_request(
     if !valid_nonce(nonce) || nonce != std::fs::read_to_string(paths.state.join("nonce"))? {
         return Err(std::io::Error::other("ready-authentication"));
     }
-    if action == "capabilities" && words.next().is_none() {
-        return Ok("READY-1".into());
+    if action == "capabilities" {
+        return match (words.next(), words.next()) {
+            (None, _) => Ok("READY-1".into()),
+            (Some("setup"), None) => Ok("SETUP-1".into()),
+            _ => Err(std::io::Error::other("ready-request")),
+        };
     }
     let restore_id = words.next().unwrap_or_default();
     let policy = words.next().unwrap_or_default();
@@ -517,6 +522,120 @@ fn readiness_request(
     }
 }
 
+/// Restored-generation identity: wall clock plus optional eth0 address.
+struct GuestSetup {
+    realtime_ns: u64,
+    /// `ip -batch` input built only from validated address fields.
+    network: Option<String>,
+}
+
+fn valid_mac(value: &str) -> bool {
+    value.len() == 17
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if index % 3 == 2 {
+                byte == b':'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+fn valid_cidr(value: &str) -> bool {
+    value.split_once('/').is_some_and(|(address, prefix)| {
+        address.parse::<std::net::Ipv4Addr>().is_ok()
+            && prefix.parse::<u8>().is_ok_and(|prefix| prefix <= 32)
+            && !prefix.starts_with('+')
+    })
+}
+
+// Platform setup is not readiness: it never runs a policy argv and never
+// replies READY, so it cannot satisfy an application readiness transaction.
+fn setup_request(
+    paths: &SnapshotPaths<'_>,
+    request: &str,
+    apply: impl FnOnce(&GuestSetup) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let invalid = || std::io::Error::other("setup-request");
+    let words: Vec<&str> = request.split(' ').collect();
+    let (nonce, clock, network) = match words.as_slice() {
+        ["setup", nonce, clock] => (*nonce, *clock, None),
+        ["setup", nonce, clock, mac, cidr, gateway] => {
+            if !valid_mac(mac)
+                || !valid_cidr(cidr)
+                || gateway.parse::<std::net::Ipv4Addr>().is_err()
+            {
+                return Err(invalid());
+            }
+            (
+                *nonce,
+                *clock,
+                Some(format!(
+                    "link set dev eth0 down\naddr flush dev eth0\nlink set dev eth0 address {mac}\nlink set dev eth0 up\naddr add {cidr} dev eth0\nroute replace default via {gateway} dev eth0\nneigh flush dev eth0\n"
+                )),
+            )
+        }
+        _ => return Err(invalid()),
+    };
+    let realtime_ns = clock.parse::<u64>().map_err(|_| invalid())?;
+    if !clock.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let _guard = lock(&paths.state.with_extension("lock"))?;
+    if !valid_nonce(nonce) || nonce != std::fs::read_to_string(paths.state.join("nonce"))? {
+        return Err(std::io::Error::other("setup-authentication"));
+    }
+    if !matches!(
+        std::fs::read_to_string(paths.state.join("phase"))?.as_str(),
+        "thawed" | "ready"
+    ) {
+        return Err(std::io::Error::other("setup-before-thaw"));
+    }
+    apply(&GuestSetup {
+        realtime_ns,
+        network,
+    })
+}
+
+fn apply_setup(setup: &GuestSetup) -> std::io::Result<()> {
+    let time = [
+        i64::try_from(setup.realtime_ns / 1_000_000_000).map_err(std::io::Error::other)?,
+        i64::try_from(setup.realtime_ns % 1_000_000_000).map_err(std::io::Error::other)?,
+    ];
+    // SAFETY: time is a live Linux timespec; CLOCK_REALTIME is 0.
+    checked(unsafe { clock_settime(0, time.as_ptr()) })?;
+    let Some(batch) = &setup.network else {
+        return Ok(());
+    };
+    let mut child = Command::new("ip")
+        .args(["-batch", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let written = child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("setup-stdin"))
+        .and_then(|mut stdin| stdin.write_all(batch.as_bytes()));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::other("setup-timeout"));
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    written?;
+    if !status.success() {
+        return Err(std::io::Error::other("setup-network"));
+    }
+    Ok(())
+}
+
 fn serve(
     mut stream: File,
     paths: &SnapshotPaths<'_>,
@@ -561,6 +680,16 @@ fn respond(
     request: &[u8],
     held: bool,
 ) -> std::io::Result<Option<File>> {
+    if !held && request.starts_with(b"setup ") {
+        match std::str::from_utf8(request)
+            .map_err(std::io::Error::other)
+            .and_then(|request| setup_request(paths, request, apply_setup))
+        {
+            Ok(()) => stream.write_all(b"SETUP-OK\n")?,
+            Err(_) => stream.write_all(b"FAILED setup\n")?,
+        }
+        return Ok(None);
+    }
     if !held && (request.starts_with(b"ready ") || request.starts_with(b"capabilities ")) {
         match std::str::from_utf8(request)
             .map_err(std::io::Error::other)
@@ -866,6 +995,81 @@ mod tests {
             )
             .ends_with("FAILED readiness\n")
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn setup_validates_every_field_and_never_runs_readiness_argv() {
+        let (root, state, nonce) = ready_fixture();
+        let paths = super::SnapshotPaths {
+            state: &state,
+            proc_root: &root,
+            block_root: &root,
+        };
+        let mut applied = Vec::new();
+        let valid =
+            format!("setup {nonce} 1700000000000000005 06:00:ac:1d:00:02 172.29.0.2/30 172.29.0.1");
+        super::setup_request(&paths, &valid, |setup| {
+            applied.push((setup.realtime_ns, setup.network.clone()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].0, 1_700_000_000_000_000_005);
+        let batch = applied[0].1.as_deref().unwrap();
+        assert!(batch.contains("link set dev eth0 address 06:00:ac:1d:00:02\n"));
+        assert!(batch.contains("addr add 172.29.0.2/30 dev eth0\n"));
+        assert!(batch.contains("route replace default via 172.29.0.1 dev eth0\n"));
+        super::setup_request(&paths, &format!("setup {nonce} 5"), |setup| {
+            assert!(setup.network.is_none());
+            Ok(())
+        })
+        .unwrap();
+        let other = "00000000-0000-4000-8000-000000000002";
+        for invalid in [
+            format!("setup {other} 5"),
+            format!("setup {nonce} +5"),
+            format!("setup {nonce} 5 06:00:ac:1d:00:02 172.29.0.2/30"),
+            format!("setup {nonce} 5 06:00:ac:1d:00:02;reboot 172.29.0.2/30 172.29.0.1"),
+            format!("setup {nonce} 5 06:00:ac:1d:00:02 172.29.0.2/30\nreboot 172.29.0.1"),
+            format!("setup {nonce} 5 06:00:ac:1d:00:02 172.29.0.2/33 172.29.0.1"),
+            format!("setup {nonce} 5 06:00:ac:1d:00:02 172.29.0.2/30 gateway"),
+            format!("setup  {nonce} 5"),
+        ] {
+            assert!(
+                super::setup_request(&paths, &invalid, |_| panic!("applied {invalid}")).is_err()
+            );
+        }
+        std::fs::write(state.join("phase"), "frozen").unwrap();
+        assert!(
+            super::setup_request(&paths, &format!("setup {nonce} 5"), |_| panic!("frozen"))
+                .is_err()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn setup_reply_cannot_be_mistaken_for_ready_and_capability_is_separate() {
+        let (root, state, nonce) = ready_fixture();
+        assert_eq!(
+            request(
+                &state,
+                &format!("capabilities {nonce} setup"),
+                &mut Vec::new()
+            ),
+            "SHINU-SNAPSHOT-1\nSETUP-1\n"
+        );
+        assert!(
+            request(
+                &state,
+                &format!("capabilities {nonce} other"),
+                &mut Vec::new()
+            )
+            .ends_with("FAILED readiness\n")
+        );
+        // The protocol answer to setup is a setup reply, never `READY <id>`.
+        let response = request(&state, &format!("setup {nonce} +1"), &mut Vec::new());
+        assert_eq!(response, "SHINU-SNAPSHOT-1\nFAILED setup\n");
         std::fs::remove_dir_all(root).unwrap();
     }
 

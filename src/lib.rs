@@ -31,11 +31,10 @@ pub use shinu_vm::{
 /// The reply is read one byte at a time because buffering can consume the
 /// first payload bytes that follow the newline.
 pub fn vsock_connect(uds: &std::path::Path, port: u16) -> Result<std::os::unix::net::UnixStream> {
-    use std::io::{Read, Write};
+    use std::io::Read;
 
     let mut stream = std::os::unix::net::UnixStream::connect(uds)?;
-    writeln!(stream, "CONNECT {port}")?;
-    stream.flush()?;
+    send_connect(&mut stream, port)?;
 
     let mut reply = [0u8; 64];
     let mut reply_len = 0;
@@ -72,9 +71,15 @@ pub fn vsock_connect(uds: &std::path::Path, port: u16) -> Result<std::os::unix::
     Ok(stream)
 }
 
+/// Firecracker parses `CONNECT <port>` from one nonblocking read and drops the
+/// connection when the line is still incomplete, so it must be a single write.
+fn send_connect(stream: &mut impl std::io::Write, port: u16) -> std::io::Result<()> {
+    stream.write_all(format!("CONNECT {port}\n").as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::vsock_connect;
+    use super::{send_connect, vsock_connect};
     use std::io::{BufRead, BufReader, Read, Write};
     use std::os::unix::net::UnixListener;
     use std::thread;
@@ -103,5 +108,22 @@ mod tests {
         assert_eq!(&payload, b"RFB 003.008\n");
         server.join().expect("join test vsock");
         std::fs::remove_file(path).expect("remove test vsock");
+    }
+
+    #[test]
+    fn connect_request_is_one_write_so_firecracker_never_sees_a_partial_line() {
+        struct Writes(Vec<Vec<u8>>);
+        impl Write for Writes {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.push(bytes.to_vec());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writes = Writes(Vec::new());
+        send_connect(&mut writes, 2222).unwrap();
+        assert_eq!(writes.0, [b"CONNECT 2222\n".to_vec()]);
     }
 }

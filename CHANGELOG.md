@@ -27,6 +27,7 @@ Changes are recorded in the Keep a Changelog format.
 
 ### Changed
 
+- Restores whose guest helper answers `SETUP-1` overlap the SSH readiness wait (`Ready`) with `Configure` → `Expose` → `ApplicationReady` and join it before returning, so the slow first sshd fork after thaw is off the admission critical path; helper-less restores keep the serial order.
 - Restored guests get their clock and eth0 identity through the guest helper's authenticated `setup` action on vsock 2224 instead of an SSH session (SSH remains the fallback for helpers that predate it; hot capture upgrades such helpers). TAP firewall policy is reasserted while the guest thaws and the link only comes up at `Expose`.
 - `start --load-only` prefaults the paused VM's page-cache-resident guest memory with read-only `process_vm_readv` before reporting `loaded`, so handed-out VMs take far fewer host page faults; it never creates private memory and is best-effort (`event=prefault`): windows not page-cache resident when sampled are skipped, though a page evicted after sampling is still read back.
 - Remove project Space, disk and running-VM quotas, including historical database values. Legacy count/disk/reserve environment variables now warn and are ignored; admin quota PATCH fields are explicitly rejected. Optional single-VM sizing and request-rate limits default to unlimited when unset.

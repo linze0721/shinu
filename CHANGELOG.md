@@ -40,6 +40,7 @@ Changes are recorded in the Keep a Changelog format.
 
 ### Fixed
 
+- Make the pool lifecycle record durable for every phase, including `resuming` before a direct restore launch or `PATCH Resumed`, and reload pending Full memory after a host crash only under a record that durably reads `loading`/`loaded`; consumption unlinks and syncs the pending files before clearing the record. Previously a host crash during resume could reload old guest memory over a disk the guest had already written.
 - Send the Firecracker vsock `CONNECT <port>` request in one write from `shinu-vsock`. Firecracker parses it from a single nonblocking read and drops a connection whose line is still incomplete, which surfaced as `shinu-vsock: Broken pipe` and `restored guest setup failed` when the host was slowed (for example under `strace`).
 - Set TAP owner and group to the configured jail uid/gid for Linux 6.12.117's stricter `tun_permitted` checks. Rebuild unused legacy TAPs only after ownership/holder inspection under a persistent, nonblocking cross-process claim held through VMM attachment; never delete occupied TAPs or unlink released lock files. Contention returns HTTP 409 `tap_busy` (CLI exit 73), not a generic 500.
 - Give jailed Firecracker processes a fixed 512 MiB host-memory allowance above guest RAM, configurable with `SHINU_VMM_OVERHEAD_MIB`, without changing guest sizing or project quotas. Invalid settings and MiB addition overflow reject new launches before jail or TAP setup.

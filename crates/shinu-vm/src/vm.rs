@@ -1076,6 +1076,8 @@ fn api_with_timeout(
             .arg("-d")
             .arg(body);
     }
+    #[cfg(test)]
+    ledger_journal::record(format!("api {method} {path}"));
     let out = command.output().ok()?;
     out.status
         .success()
@@ -2439,6 +2441,38 @@ impl Default for StartOptions<'_> {
     }
 }
 
+/// Lifecycle ledger I/O. Unit tests journal each step so the order of the
+/// crash-consistency barriers is asserted, not just the final file contents.
+#[cfg(test)]
+mod ledger_journal {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static EVENTS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record(event: String) {
+        EVENTS.with(|events| events.borrow_mut().push(event));
+    }
+
+    pub(super) fn take() -> Vec<String> {
+        EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
+    }
+}
+
+#[cfg_attr(not(test), allow(unused_variables))]
+fn sync_durable(file: &std::fs::File, path: &Path) -> Result<()> {
+    file.sync_all()?;
+    #[cfg(test)]
+    ledger_journal::record(format!("sync {}", path.display()));
+    Ok(())
+}
+
+/// Publishes the lifecycle phase durably: file data, then the rename, are on
+/// disk before this returns. `resuming` is the consumption record for pending
+/// Full memory, so it must be durable before anything can run vCPUs (direct
+/// restore launch or PATCH Resumed): a host crash kills the VMM but keeps the
+/// guest's disk writes, and recovery must then never reload the old memory.
 fn persist_phase(dir: &Path, phase: &str) -> Result<()> {
     let path = dir.join("loaded.json");
     let temporary = dir.join("loaded.json.tmp");
@@ -2449,37 +2483,48 @@ fn persist_phase(dir: &Path, phase: &str) -> Result<()> {
         .mode(0o600)
         .open(&temporary)?;
     write!(file, "{{\"phase\":\"{phase}\"}}")?;
-    if phase != "resuming" {
-        file.sync_all()?;
-    }
-    std::fs::rename(temporary, path)?;
-    // Atomic rename survives a daemon crash. A host crash also kills the VMM,
-    // so resume need not synchronously flush the btrfs store on the handoff path.
-    if phase != "resuming" {
-        std::fs::File::open(dir)?.sync_all()?;
-    }
-    Ok(())
+    sync_durable(&file, &temporary)?;
+    std::fs::rename(temporary, &path)?;
+    #[cfg(test)]
+    ledger_journal::record(format!("rename {} {phase}", path.display()));
+    sync_durable(&std::fs::File::open(dir)?, dir)
 }
 
+/// Clears the lifecycle record. Only a record that durably says `loading` or
+/// `loaded` proves the vCPUs never ran, so only then is pending Full
+/// memory/state kept for reload; `resuming` and any unknown content consume it.
+/// The pending files are unlinked and the spaces directory synced *before* the
+/// record is removed: the reverse order could leave "no record, pending files"
+/// after a power loss, which is indistinguishable from a never-loaded fork.
 fn forget_loaded(dir: &Path) -> Result<()> {
     let marker = dir.join("loaded.json");
     match std::fs::read(&marker) {
         Ok(bytes) => {
-            if bytes == b"{\"phase\":\"resuming\"}" {
+            if !matches!(
+                bytes.as_slice(),
+                b"{\"phase\":\"loading\"}" | b"{\"phase\":\"loaded\"}"
+            ) {
                 let root = dir
                     .parent()
                     .and_then(Path::parent)
                     .ok_or_else(|| Error::Internal("invalid VM directory".into()))?;
                 let image = shinu_core::space_image(root, dir_id(dir)?);
                 for path in [image.with_extension("mem"), image.with_extension("state")] {
-                    match std::fs::remove_file(path) {
+                    match std::fs::remove_file(&path) {
                         Ok(()) => {}
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                         Err(error) => return Err(error.into()),
                     }
+                    #[cfg(test)]
+                    ledger_journal::record(format!("remove {}", path.display()));
+                }
+                if let Some(spaces) = image.parent().filter(|spaces| spaces.exists()) {
+                    sync_durable(&std::fs::File::open(spaces)?, spaces)?;
                 }
             }
-            std::fs::remove_file(marker)?;
+            std::fs::remove_file(&marker)?;
+            #[cfg(test)]
+            ledger_journal::record(format!("remove {}", marker.display()));
             Ok(())
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -2623,6 +2668,8 @@ pub fn start(
     let _ = std::fs::remove_file(api_path(&dir));
     std::fs::create_dir_all(&dir)?;
     if restore.is_some() {
+        // A direct restore loads with resume_vm=true, so its vCPUs may run as
+        // soon as the load request is sent: `resuming` must be durable first.
         persist_phase(&dir, if load_only { "loading" } else { "resuming" })?;
     }
     std::fs::write(
@@ -2753,6 +2800,8 @@ pub fn start(
         // boundary. Re-read no-follow metadata immediately before execution;
         // an unsafe replacement must fail closed rather than reach `setsid`.
         validate_vm_assets(&jailer, &firecracker)?;
+        #[cfg(test)]
+        ledger_journal::record("launch".into());
         let status = command
             .stdin(std::process::Stdio::null())
             .stderr(log.try_clone()?)
@@ -3014,7 +3063,13 @@ pub fn resume(
     }
     let boot = boot_identity(&dir)?;
     forget_readiness(&dir);
+    // Durable before PATCH Resumed: the barrier stays on the handout path.
+    let persisted = Instant::now();
     persist_phase(&dir, "resuming")?;
+    eprintln!(
+        "event=restore_step vm_id={id} step=PersistResuming elapsed_us={} ok=true",
+        persisted.elapsed().as_micros()
+    );
     let result = (|| {
         let started = Instant::now();
         if api(&dir, "PATCH", "/vm", Some("{\"state\":\"Resumed\"}")).is_none() {
@@ -4373,5 +4428,289 @@ mod tap_tests {
             path.exists(),
             "releasing a claim must never unlink its lock inode"
         );
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_ledger_tests {
+    //! Host-crash recovery is simulated by writing exactly the on-disk state a
+    //! power loss could leave behind, then running the real recovery path.
+    use super::{forget_loaded, ledger_journal, persist_phase, recover_loaded, resume, start};
+    use crate::{NetConfig, VmConfig};
+    use shinu_core::{Image, space_image, vm_dir};
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Stdio};
+    use uuid::Uuid;
+
+    struct Space {
+        root: PathBuf,
+        id: Uuid,
+        dir: PathBuf,
+        memory: PathBuf,
+        state: PathBuf,
+        child: Option<Child>,
+    }
+
+    impl Space {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!("shinu-ledger-{}", Uuid::new_v4()));
+            let id = Uuid::new_v4();
+            let dir = vm_dir(&root, id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::create_dir_all(root.join("spaces")).unwrap();
+            let image = space_image(&root, id);
+            std::fs::write(&image, b"disk").unwrap();
+            let memory = image.with_extension("mem");
+            let state = image.with_extension("state");
+            std::fs::write(&memory, b"pending memory").unwrap();
+            std::fs::write(&state, b"pending state").unwrap();
+            Self {
+                root,
+                id,
+                dir,
+                memory,
+                state,
+                child: None,
+            }
+        }
+
+        fn marker(&self, bytes: &[u8]) {
+            std::fs::write(self.dir.join("loaded.json"), bytes).unwrap();
+        }
+
+        fn pending(&self) -> bool {
+            assert_eq!(self.memory.exists(), self.state.exists());
+            self.memory.exists()
+        }
+
+        /// A live stand-in VMM recognised by the real process identity checks.
+        fn spawn_vmm(&mut self) {
+            let config = super::config_path(&self.dir);
+            std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+            std::fs::write(&config, "{}").unwrap();
+            let fake = self.root.join("firecracker");
+            std::os::unix::fs::symlink("/usr/bin/yes", &fake).unwrap();
+            let child = Command::new(&fake)
+                .arg(&config)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            std::fs::write(super::pid_path(&self.dir), child.id().to_string()).unwrap();
+            while !super::is_running(&self.dir) {
+                std::thread::yield_now();
+            }
+            self.child = Some(child);
+        }
+
+        fn index(events: &[String], wanted: &str) -> usize {
+            events
+                .iter()
+                .position(|event| event == wanted)
+                .unwrap_or_else(|| panic!("missing {wanted:?} in {events:#?}"))
+        }
+    }
+
+    impl Drop for Space {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn net() -> NetConfig {
+        NetConfig {
+            enabled: false,
+            base: [172, 30],
+            allow: Vec::new(),
+            host_allow: Vec::new(),
+            uplink: "unused".into(),
+        }
+    }
+
+    #[test]
+    fn recovery_reloads_pending_memory_only_under_a_durable_loaded_record() {
+        // (marker left on disk after a power loss, pending memory survives)
+        for (marker, survives) in [
+            (Some(&b"{\"phase\":\"loading\"}"[..]), true),
+            (Some(&b"{\"phase\":\"loaded\"}"[..]), true),
+            // An old `loaded` can no longer survive a resume: `resuming` is
+            // durable before vCPUs run, so recovery sees `resuming` instead.
+            (Some(&b"{\"phase\":\"resuming\"}"[..]), false),
+            (Some(&b""[..]), false),
+            (Some(&b"{\"phase\":\"resum"[..]), false),
+            (Some(&b"{\"phase\":\"running\"}"[..]), false),
+        ] {
+            let space = Space::new();
+            if let Some(marker) = marker {
+                space.marker(marker);
+            }
+            recover_loaded(&space.root, &net()).unwrap();
+            assert_eq!(space.pending(), survives, "{marker:?}");
+            assert!(!space.dir.join("loaded.json").exists());
+            assert_eq!(super::lifecycle_state(&space.dir).unwrap(), "stopped");
+        }
+    }
+
+    #[test]
+    fn missing_or_consumed_records_never_resurrect_memory() {
+        // Consumed record: pending files are gone, the cleared marker was not
+        // yet durable. Recovery finishes the consumption without failing.
+        let space = Space::new();
+        std::fs::remove_file(&space.memory).unwrap();
+        std::fs::remove_file(&space.state).unwrap();
+        space.marker(b"{\"phase\":\"resuming\"}");
+        recover_loaded(&space.root, &net()).unwrap();
+        assert!(!space.pending());
+        assert!(!space.dir.join("loaded.json").exists());
+        // No record and no pending files: nothing to reload.
+        recover_loaded(&space.root, &net()).unwrap();
+        assert!(!space.pending());
+        // No record with pending files is only a never-loaded fork: no ledger
+        // transition can clear the record while consumed memory remains.
+        let fresh = Space::new();
+        recover_loaded(&fresh.root, &net()).unwrap();
+        assert!(fresh.pending());
+    }
+
+    #[test]
+    fn every_phase_is_synced_before_it_is_reported_published() {
+        for phase in ["loading", "loaded", "resuming"] {
+            let space = Space::new();
+            ledger_journal::take();
+            persist_phase(&space.dir, phase).unwrap();
+            let events = ledger_journal::take();
+            let temporary = space.dir.join("loaded.json.tmp");
+            let marker = space.dir.join("loaded.json");
+            assert_eq!(
+                events,
+                [
+                    format!("sync {}", temporary.display()),
+                    format!("rename {} {phase}", marker.display()),
+                    format!("sync {}", space.dir.display()),
+                ],
+                "{phase}"
+            );
+        }
+    }
+
+    #[test]
+    fn consumption_syncs_unlinked_memory_before_clearing_the_record() {
+        let space = Space::new();
+        space.marker(b"{\"phase\":\"resuming\"}");
+        ledger_journal::take();
+        forget_loaded(&space.dir).unwrap();
+        let events = ledger_journal::take();
+        let spaces = space.root.join("spaces");
+        let synced = Space::index(&events, &format!("sync {}", spaces.display()));
+        let cleared = Space::index(
+            &events,
+            &format!("remove {}", space.dir.join("loaded.json").display()),
+        );
+        for path in [&space.memory, &space.state] {
+            assert!(Space::index(&events, &format!("remove {}", path.display())) < synced);
+        }
+        assert!(
+            synced < cleared,
+            "clearing the record first can leave a stale fork after power loss: {events:#?}"
+        );
+        assert!(!space.pending());
+    }
+
+    #[test]
+    fn resume_makes_resuming_durable_before_patching_vcpus_running() {
+        let mut space = Space::new();
+        space.spawn_vmm();
+        space.marker(b"{\"phase\":\"loaded\"}");
+        ledger_journal::take();
+        // The stand-in has no API socket, so PATCH fails after being attempted.
+        assert!(resume(&space.root, space.id, None, &net(), |_| Ok(())).is_err());
+        let events = ledger_journal::take();
+        let durable = Space::index(&events, &format!("sync {}", space.dir.display()));
+        let rename = Space::index(
+            &events,
+            &format!(
+                "rename {} resuming",
+                space.dir.join("loaded.json").display()
+            ),
+        );
+        let patched = Space::index(&events, "api PATCH /vm");
+        assert!(rename < durable && durable < patched, "{events:#?}");
+        // Failure after vCPUs may have run consumes the pending memory.
+        assert!(!space.pending());
+    }
+
+    #[test]
+    fn direct_restore_makes_resuming_durable_before_launching_the_vmm() {
+        let space = Space::new();
+        let assets = space.root.join("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::write(assets.join("vmlinux"), b"kernel").unwrap();
+        for name in ["jailer", "firecracker"] {
+            let path = assets.join(name);
+            std::fs::write(&path, "#!/bin/sh\nexit 1\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let files = super::RestoreFiles {
+            mem: &space.memory,
+            state: &space.state,
+            guest_snapshot_nonce: None,
+        };
+        let cfg = VmConfig {
+            vcpus: 1,
+            mem_mib: 64,
+            idle_secs: 3600,
+            idle_reclaim: false,
+            jail_uid: 30000,
+            jail_gid: 30000,
+        };
+        ledger_journal::take();
+        let result = start(
+            &space.root,
+            space.id,
+            Image::Void,
+            super::StartOptions {
+                restore: Some(&files),
+                ..super::StartOptions::default()
+            },
+            &cfg,
+            &net(),
+            |_| Ok(()),
+        );
+        assert!(result.is_err());
+        let events = ledger_journal::take();
+        let durable = Space::index(&events, &format!("sync {}", space.dir.display()));
+        let rename = Space::index(
+            &events,
+            &format!(
+                "rename {} resuming",
+                space.dir.join("loaded.json").display()
+            ),
+        );
+        // resume_vm=true: vCPUs may run once the VMM receives the load request.
+        let launched = Space::index(&events, "launch");
+        assert!(rename < durable && durable < launched, "{events:#?}");
+        assert!(!events.iter().any(|event| event.starts_with("api ")));
+    }
+
+    #[test]
+    fn crash_after_a_successful_resume_leaves_no_reloadable_memory() {
+        // Successful resume ends with the same consumption as recovery.
+        let space = Space::new();
+        persist_phase(&space.dir, "resuming").unwrap();
+        forget_loaded(&space.dir).unwrap();
+        assert!(!space.pending());
+        // Power loss may undo the unsynced record removal but not the synced
+        // unlinks: recovery then sees `resuming` and still finds no memory.
+        space.marker(b"{\"phase\":\"resuming\"}");
+        recover_loaded(&space.root, &net()).unwrap();
+        assert!(!space.pending());
+        // A later pool load of this space cannot pair old memory with its disk.
+        assert!(!Path::new(&space.memory).exists());
     }
 }

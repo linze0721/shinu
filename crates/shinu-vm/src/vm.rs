@@ -2615,11 +2615,44 @@ fn finish_restore(
     let dir = shinu_core::vm_dir(root, id);
     let net = crate::net::net_spec(id, net_cfg);
     let vsock = vsock_path(&dir);
-    restore_transaction(|step| match step {
+    restore_transaction(|step| {
+        let started = Instant::now();
+        let result = restore_step(
+            &dir,
+            id,
+            step,
+            readiness,
+            net_cfg,
+            net.as_ref(),
+            &vsock,
+            network_ready,
+        );
+        // Sanitized per-step timing; no guest output, argv or secrets.
+        eprintln!(
+            "event=restore_step vm_id={id} step={step:?} elapsed_ms={} ok={}",
+            started.elapsed().as_millis(),
+            result.is_ok()
+        );
+        result
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_step(
+    dir: &Path,
+    id: Uuid,
+    step: RestoreStep,
+    readiness: Option<&ReadySpec>,
+    net_cfg: &NetConfig,
+    net: Option<&crate::net::NetSpec>,
+    vsock: &Path,
+    network_ready: &mut impl FnMut(Instant) -> Result<()>,
+) -> Result<()> {
+    match step {
         RestoreStep::Quarantine | RestoreStep::Load => Ok(()),
-        RestoreStep::Thaw => thaw_snapshot(&dir),
+        RestoreStep::Thaw => thaw_snapshot(dir),
         RestoreStep::Ready => {
-            if wait_ready(&dir, &vsock) {
+            if wait_ready(dir, vsock) {
                 Ok(())
             } else {
                 Err(Error::Internal(
@@ -2629,15 +2662,15 @@ fn finish_restore(
         }
         RestoreStep::Configure => {
             let mut reconfigure = format!("set -eu; date -u -s @{}; ", now_secs());
-            if let Some(spec) = net.as_ref() {
+            if let Some(spec) = net {
                 reconfigure.push_str(&format!("ip link set dev eth0 down; ip addr flush dev eth0; ip link set dev eth0 address {}; ip link set dev eth0 up; ip addr add {} dev eth0; ip route replace default via {} dev eth0; ip neigh flush dev eth0", spec.mac, spec.guest_cidr, spec.gateway));
             }
             let command = ["sh".to_owned(), "-c".to_owned(), reconfigure];
             let helper = shinu_core::vsock_helper()?;
             let ssh = ssh_command(
                 &helper,
-                &vsock,
-                &key_path(&dir),
+                vsock,
+                &key_path(dir),
                 shinu_core::VSOCK_SSH_PORT,
                 &command,
             );
@@ -2650,10 +2683,10 @@ fn finish_restore(
         }
         RestoreStep::Expose => configure_tap(id, net_cfg, &[], TapSetup::Existing),
         RestoreStep::ApplicationReady => match readiness {
-            Some(spec) => admit_application(&dir, spec, &boot_identity(&dir)?, network_ready),
+            Some(spec) => admit_application(dir, spec, &boot_identity(dir)?, network_ready),
             None => network_ready(Instant::now() + Duration::from_secs(30)),
         },
-    })
+    }
 }
 
 /// Resume only a durably loaded generation, then perform the normal admission.
@@ -2675,9 +2708,14 @@ pub fn resume(
     forget_readiness(&dir);
     persist_phase(&dir, "resuming")?;
     let result = (|| {
+        let started = Instant::now();
         if api(&dir, "PATCH", "/vm", Some("{\"state\":\"Resumed\"}")).is_none() {
             return Err(Error::Internal("failed to resume loaded VM".into()));
         }
+        eprintln!(
+            "event=restore_step vm_id={id} step=Resume elapsed_ms={} ok=true",
+            started.elapsed().as_millis()
+        );
         finish_restore(root, id, readiness, net_cfg, &mut network_ready)?;
         forget_loaded(&dir)?;
         touch(&dir)?;

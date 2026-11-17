@@ -20,6 +20,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 
 class UnixHTTP(http.client.HTTPConnection):
@@ -32,6 +33,19 @@ class UnixHTTP(http.client.HTTPConnection):
 def digest(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def expected_identity(space_id, base="172.29"):
+    """Mirror of `shinu_vm::net::net_spec`: every value derives from the UUID."""
+    raw = uuid.UUID(space_id).bytes
+    index = ((raw[0] << 8) | raw[1]) & 0x3FFF
+    third = ((index >> 8) << 2) | ((index & 0xFF) >> 6)
+    fourth = ((index & 0xFF) & 0x3F) << 2
+    return {
+        "cidr": [f"{base}.{third}.{fourth + 2}/30"],
+        "mac": "aa:fc:" + ":".join(f"{byte:02x}" for byte in raw[:4]),
+        "gateway": [f"{base}.{third}.{fourth + 1}"],
+    }
 
 
 def main():
@@ -104,6 +118,16 @@ def main():
         assert result.returncode == 0, (argv, result.stdout, result.stderr)
         return result.stdout
 
+    def guest_identity(space):
+        """The guest's actual eth0 identity: every IPv4 CIDR, MAC, default gateways."""
+        lines = run_cli("exec", space, "--", "sh", "-c",
+                        "ip -4 -o addr show dev eth0; echo mac $(cat /sys/class/net/eth0/address); ip -4 route show default").splitlines()
+        return {
+            "cidr": [line.split()[3] for line in lines if " inet " in line],
+            "mac": next(line.split()[1].lower() for line in lines if line.startswith("mac ")),
+            "gateway": [line.split()[2] for line in lines if line.startswith("default via ")],
+        }
+
     try:
         for name in ["assets", "cache"]:
             subprocess.run(["cp", "-a", "--reflink=always", str(args.assets_root / name), str(root / name)], check=True)
@@ -149,6 +173,9 @@ def main():
         assert (sys_tap / "group").read_text().strip() == env["SHINU_JAIL_GID"]
         source_ready_id = run_cli("exec", "source", "--", "cat", "/tmp/shinu-ready-id").strip()
         assert source_ready_id
+        # The identity captured in guest RAM. It also checks the UUID derivation.
+        source_identity = guest_identity("source")
+        assert source_identity == expected_identity(source["id"]), source_identity
         checkpoint = request("POST", "/v1/spaces/source/commits", {"note": "fast-ready-full", "hot": True, "snapshot": "full"}, 201)
         checkpoint_id = checkpoint["id"]
         run_cli("stop", "source")
@@ -164,6 +191,8 @@ def main():
         for name in ["pooled", "recover"]:
             value = request("POST", f"/v1/commits/{checkpoint_id}/fork", {"name": name}, 201)
             spaces.add(name)
+            if name == "pooled":
+                pooled_entry = value
             fork_memory = root / "spaces" / (value["id"] + ".mem")
             assert fork_memory.stat().st_ino == memory.stat().st_ino
             run_cli("start", "--load-only", "--track-dirty", "false", name)
@@ -189,8 +218,13 @@ def main():
         assert restored_ready_id and restored_ready_id != source_ready_id
         guest_time = int(run_cli("exec", "pooled", "--", "date", "+%s").strip())
         assert abs(time.time() - guest_time) < 5
-        guest_address = run_cli("exec", "pooled", "--", "ip", "-4", "-o", "addr", "show", "eth0")
-        assert "172.29." in guest_address
+        # Exact pooled identity, and every field differs from the captured
+        # source: a skipped or partial guest reconfiguration cannot pass.
+        pooled_identity = guest_identity("pooled")
+        pooled_expected = expected_identity(pooled_entry["id"])
+        for field in ["cidr", "mac", "gateway"]:
+            assert pooled_expected[field] != source_identity[field], (field, pooled_expected, source_identity)
+        assert pooled_identity == pooled_expected, (pooled_identity, pooled_expected, source_identity)
         child = request("POST", "/v1/spaces/pooled/commits", {"note": "pool-capture", "hot": True, "snapshot": "full"}, 201)
         assert child["snapshot"] == "full"
         child2 = request("POST", "/v1/spaces/pooled/commits", {"note": "pool-diff", "hot": True, "snapshot": "diff"}, 201)
@@ -243,7 +277,7 @@ def main():
         assert rejected.stderr == "shinu: capacity_watermark\n"
         for identifier in [child2["id"], child["id"], checkpoint_id]:
             run_cli("rmckpt", identifier)
-        print("PASS: TAP jail uid/gid, legacy rebuild, occupied/locked TAP rejection, retained lock inode, Full sharing, cache cgroup, load/resume, READY, dirty flags, capture and recovery")
+        print("PASS: TAP jail uid/gid, legacy rebuild, occupied/locked TAP rejection, retained lock inode, Full sharing, cache cgroup, load/resume, exact restored CIDR/MAC/gateway distinct from source, READY, dirty flags, capture and recovery")
     finally:
         if daemon is not None and daemon.poll() is None:
             for name in sorted(spaces):

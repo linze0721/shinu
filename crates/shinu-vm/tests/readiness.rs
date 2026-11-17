@@ -523,11 +523,15 @@ fn load_only_requires_a_memory_generation_and_cannot_relabel_a_running_vm() {
 
 #[test]
 fn loaded_spaces_are_not_admitted_by_start_and_are_stopped_on_daemon_recovery() {
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
     for phase in ["loading", "loaded", "resuming"] {
         let mut guest = Guest::new(Reply::Match);
         std::fs::write(
             guest.dir.join("loaded.json"),
-            format!("{{\"phase\":\"{phase}\"}}"),
+            format!(
+                "{{\"phase\":\"{phase}\",\"boot_id\":\"{}\"}}",
+                boot_id.trim()
+            ),
         )
         .unwrap();
         std::fs::create_dir_all(guest.root.join("spaces")).unwrap();
@@ -542,10 +546,12 @@ fn loaded_spaces_are_not_admitted_by_start_and_are_stopped_on_daemon_recovery() 
         vm::recover_loaded(&guest.root, &net).unwrap();
         guest.child.wait().unwrap();
         assert_eq!(vm::lifecycle_state(&guest.dir).unwrap(), "stopped");
-        assert!(!guest.dir.join("loaded.json").exists());
         assert!(!vm::jail_root(&guest.root, guest.id).exists());
-        assert_eq!(memory.exists(), phase != "resuming");
-        assert_eq!(state.exists(), phase != "resuming");
+        // Never-run memory of this boot stays reloadable, recorded as pending.
+        let kept = phase != "resuming";
+        assert_eq!(memory.exists(), kept);
+        assert_eq!(state.exists(), kept);
+        assert_eq!(guest.dir.join("loaded.json").exists(), kept);
     }
 }
 

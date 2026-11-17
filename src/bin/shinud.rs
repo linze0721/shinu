@@ -2641,6 +2641,9 @@ fn fork_space(
     let mount = ctx.root.join(format!("authorize.{id}.mnt"));
     let result = (|| -> shinu::Result<Value> {
         materialize_fork(ctx.root, &source_checkpoint, id)?;
+        if source_checkpoint.full {
+            shinu::vm::mark_pending(&shinu::vm_dir(ctx.root, id))?;
+        }
         let space = update_state(ctx.db, ctx.registry, |state| {
             check_name(state, &name, project)?;
             shinu::find_ckpt(state, source, project)?;
@@ -3157,6 +3160,7 @@ fn checkout_space(
             let _ = remove_space_snapshot_files(ctx.root, space_id);
             return Err(error);
         }
+        shinu::vm::mark_pending(&vm_dir)?;
     }
     update_state(ctx.db, ctx.registry, |state| {
         shinu::find_ckpt(state, target.id, project)?;
@@ -3366,9 +3370,9 @@ fn start_vm_with_pending_restore(
     track_dirty: bool,
 ) -> shinu::Result<(PathBuf, bool)> {
     let dir = shinu::vm_dir(ctx.root, id);
-    if !shinu::vm::is_running(&dir) && dir.join("loaded.json").exists() {
-        shinu::vm::stop(&dir, ctx.net_cfg)?;
-    }
+    // Settles pending memory first: only a current-boot never-run record
+    // keeps it, so the files probed below are safe to load.
+    shinu::vm::recover_space(&dir, ctx.net_cfg)?;
     if !shinu::vm::is_running(&shinu::vm_dir(ctx.root, id)) {
         ensure_capacity(ctx)?;
     }
@@ -8752,7 +8756,14 @@ mod tests {
             )
             .expect("memory template forks without source space");
             let space: Space = serde_json::from_value(forked).unwrap();
-            let destination = vm::key_path(&shinu::vm_dir(&root, space.id));
+            // Never-run pending memory is recorded for this boot and survives
+            // the start-path recovery that settles stale generations.
+            let fork_dir = shinu::vm_dir(&root, space.id);
+            assert!(fork_dir.join("loaded.json").is_file());
+            vm::recover_space(&fork_dir, &net_cfg).unwrap();
+            assert!(super::space_snapshot_mem(&root, space.id).exists());
+            assert!(super::space_snapshot_state(&root, space.id).exists());
+            let destination = vm::key_path(&fork_dir);
             assert_eq!(
                 std::fs::read(&destination).unwrap(),
                 b"archived private key"

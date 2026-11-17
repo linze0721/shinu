@@ -2254,8 +2254,9 @@ fn resident_pages(file: &std::fs::File, page: u64) -> Result<Vec<u8>> {
 
 /// One remote address per stride window that already has a cached page: the
 /// read faults on that page and fault-around maps the window's other cached
-/// pages. Windows with nothing cached are skipped, so populate never reads
-/// the disk and its cost stays bounded when the checkpoint cache was evicted.
+/// pages. Windows not resident when sampled are skipped (best effort: a page
+/// evicted after sampling is still read back), so cost stays bounded when the
+/// checkpoint cache was evicted.
 fn prefault_targets(ranges: &[MemoryRange], resident: &[u8], page: u64) -> Vec<u64> {
     let mut targets = Vec::new();
     for range in ranges {

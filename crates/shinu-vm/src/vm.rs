@@ -1213,59 +1213,24 @@ enum RestoreStep {
     Quarantine,
     Load,
     Thaw,
+    Ready,
     Configure,
     Expose,
     ApplicationReady,
 }
 
-/// `ready` is the SSH banner wait; it is told to stop once the transaction has
-/// already failed. When `helper_admission` reports (after thaw) that the
-/// helper answers SETUP-1, `Configure` never uses SSH, so the wait overlaps
-/// `Configure` → `Expose`. It is joined before `ApplicationReady` either way:
-/// the network hook there syncs peers' `/etc/hosts` over SSH, and SSH is
-/// usable whenever the restore succeeds. Otherwise the SSH setup fallback
-/// needs it first and the order stays fully serial.
-fn restore_transaction(
-    helper_admission: impl FnOnce() -> bool,
-    ready: impl FnOnce(&std::sync::atomic::AtomicBool) -> Result<()> + Send,
-    mut step: impl FnMut(RestoreStep) -> Result<()>,
-) -> Result<()> {
+/// Fully serial: overlapping `Ready` with later steps measured no gain on
+/// 4-vCPU nested guests (the extra socat/sshd forks slowed `Configure` and
+/// `ApplicationReady`), and the network hook in `ApplicationReady` uses SSH.
+fn restore_transaction(mut step: impl FnMut(RestoreStep) -> Result<()>) -> Result<()> {
     step(RestoreStep::Quarantine)?;
     let loaded = step(RestoreStep::Load);
     // A failed/lost load reply can still leave live frozen vCPUs behind.
     let thawed = step(RestoreStep::Thaw);
     combine_snapshot_results(loaded, thawed)?;
-    if !helper_admission() {
-        ready(&std::sync::atomic::AtomicBool::new(false))?;
-        step(RestoreStep::Configure)?;
-        step(RestoreStep::Expose)?;
-        return step(RestoreStep::ApplicationReady);
-    }
-    let cancelled = std::sync::atomic::AtomicBool::new(false);
-    std::thread::scope(|scope| {
-        let probe = scope.spawn(|| {
-            let probed = ready(&cancelled);
-            // Failed on its own, not because configuration had already failed.
-            let genuine = probed.is_err() && !cancelled.load(std::sync::atomic::Ordering::SeqCst);
-            (probed, genuine)
-        });
-        let configured = step(RestoreStep::Configure).and_then(|()| step(RestoreStep::Expose));
-        if configured.is_err() {
-            cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-        let (probed, genuine) = probe.join().unwrap_or_else(|_| {
-            (
-                Err(Error::Internal("SSH readiness worker panicked".into())),
-                true,
-            )
-        });
-        match (probed, configured) {
-            // Ready failures keep their own error, as in the serial order.
-            (Err(error), _) if genuine => Err(error),
-            (_, Err(error)) | (Err(error), Ok(())) => Err(error),
-            (Ok(()), Ok(())) => Ok(()),
-        }
-    })?;
+    step(RestoreStep::Ready)?;
+    step(RestoreStep::Configure)?;
+    step(RestoreStep::Expose)?;
     step(RestoreStep::ApplicationReady)
 }
 
@@ -2443,15 +2408,7 @@ fn clean_jail(dir: &Path) -> Result<()> {
 }
 
 fn wait_ready(dir: &Path, vsock: &Path) -> bool {
-    wait_ready_unless(dir, vsock, &std::sync::atomic::AtomicBool::new(false))
-}
-
-/// `wait_ready` that gives up as soon as `cancelled` is set.
-fn wait_ready_unless(dir: &Path, vsock: &Path, cancelled: &std::sync::atomic::AtomicBool) -> bool {
     for _ in 0..600 {
-        if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-            break;
-        }
         if vsock.exists() && probe(vsock, shinu_core::VSOCK_SSH_PORT) {
             return true;
         }
@@ -3095,43 +3052,26 @@ fn finish_restore(
     let dir = shinu_core::vm_dir(root, id);
     let net = crate::net::net_spec(id, net_cfg);
     let vsock = vsock_path(&dir);
-    let log = |step: &str, started: Instant, ok: bool| {
+    restore_transaction(|step| {
+        let started = Instant::now();
+        let result = restore_step(
+            &dir,
+            id,
+            step,
+            readiness,
+            net_cfg,
+            net.as_ref(),
+            &vsock,
+            network_ready,
+        );
         // Sanitized per-step timing; no guest output, argv or secrets.
         eprintln!(
-            "event=restore_step vm_id={id} step={step} elapsed_ms={} ok={ok}",
+            "event=restore_step vm_id={id} step={step:?} elapsed_ms={} ok={}",
             started.elapsed().as_millis(),
+            result.is_ok()
         );
-    };
-    restore_transaction(
-        || setup_capability(&dir, Instant::now() + Duration::from_secs(2)),
-        |cancelled| {
-            let started = Instant::now();
-            let ready = wait_ready_unless(&dir, &vsock, cancelled);
-            log("Ready", started, ready);
-            if ready {
-                Ok(())
-            } else {
-                Err(Error::Internal(
-                    "restored guest SSH did not become ready".into(),
-                ))
-            }
-        },
-        |step| {
-            let started = Instant::now();
-            let result = restore_step(
-                &dir,
-                id,
-                step,
-                readiness,
-                net_cfg,
-                net.as_ref(),
-                &vsock,
-                network_ready,
-            );
-            log(&format!("{step:?}"), started, result.is_ok());
-            result
-        },
-    )
+        result
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3157,17 +3097,20 @@ fn restore_step(
                 .unwrap_or_else(|_| Err(Error::Internal("TAP policy worker panicked".into())));
             combine_snapshot_results(thawed, policy)
         }),
+        RestoreStep::Ready => {
+            if wait_ready(dir, vsock) {
+                Ok(())
+            } else {
+                Err(Error::Internal(
+                    "restored guest SSH did not become ready".into(),
+                ))
+            }
+        }
         RestoreStep::Configure => {
             match guest_setup(dir, net, Instant::now() + Duration::from_secs(30)) {
                 Ok(()) => Ok(()),
-                // Pre-setup helpers and helper-less guests keep the SSH path;
-                // a parallel SSH wait may still be running, so confirm sshd.
-                Err(SetupError::Unsupported) if wait_ready(dir, vsock) => {
-                    ssh_guest_setup(dir, vsock, net)
-                }
-                Err(SetupError::Unsupported) => Err(Error::Internal(
-                    "restored guest SSH did not become ready".into(),
-                )),
+                // Pre-setup helpers and helper-less guests keep the SSH path.
+                Err(SetupError::Unsupported) => ssh_guest_setup(dir, vsock, net),
                 Err(SetupError::Failed(error)) => Err(error),
             }
         }
@@ -4093,101 +4036,52 @@ mod hot_snapshot_tests {
 #[cfg(test)]
 mod restore_transaction_tests {
     use super::{RestoreStep, restore_transaction};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex, mpsc};
-    use std::time::Duration;
-
-    /// One observed event: a step or the SSH readiness wait.
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum Event {
-        Step(RestoreStep),
-        Ready,
-    }
-
-    fn run(parallel: bool, failed: Option<Event>) -> (shinu_core::Result<()>, Vec<Event>) {
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let record = |event| observed.lock().unwrap().push(event);
-        let fail = |event| {
-            if failed == Some(event) {
-                Err(shinu_core::Error::Internal(format!("injected {event:?}")))
-            } else {
-                Ok(())
-            }
-        };
-        let result = restore_transaction(
-            || parallel,
-            |_: &AtomicBool| {
-                record(Event::Ready);
-                fail(Event::Ready)
-            },
-            |step| {
-                record(Event::Step(step));
-                fail(Event::Step(step))
-            },
-        );
-        let observed = observed.lock().unwrap().clone();
-        (result, observed)
-    }
-
-    fn position(observed: &[Event], event: Event) -> usize {
-        observed.iter().position(|seen| *seen == event).unwrap()
-    }
 
     #[test]
     fn restored_network_is_quarantined_until_thaw_and_configuration_succeed() {
-        use RestoreStep::{ApplicationReady, Configure, Expose, Load, Quarantine, Thaw};
-        let steps = [Quarantine, Load, Thaw, Configure, Expose, ApplicationReady].map(Event::Step);
-        // Fallback (no SETUP-1): SSH setup needs sshd, so Ready stays serial.
-        let (result, observed) = run(false, None);
-        result.unwrap();
+        use RestoreStep::{ApplicationReady, Configure, Expose, Load, Quarantine, Ready, Thaw};
+        let mut observed = Vec::new();
+        restore_transaction(|step| {
+            observed.push(step);
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(
             observed,
-            [&steps[..3], &[Event::Ready], &steps[3..]].concat()
-        );
-        // Helper admission: Ready runs alongside Configure → Expose, always
-        // after Thaw, and is joined before ApplicationReady.
-        let (result, observed) = run(true, None);
-        result.unwrap();
-        assert_eq!(
-            observed
-                .iter()
-                .filter(|event| **event != Event::Ready)
-                .copied()
-                .collect::<Vec<_>>(),
-            steps
-        );
-        assert!(position(&observed, Event::Ready) > position(&observed, Event::Step(Thaw)));
-        assert!(
-            position(&observed, Event::Ready) < position(&observed, Event::Step(ApplicationReady))
+            [
+                Quarantine,
+                Load,
+                Thaw,
+                Ready,
+                Configure,
+                Expose,
+                ApplicationReady
+            ]
         );
     }
 
     #[test]
     fn failed_restore_never_exposes_and_always_thaws_after_a_load_attempt() {
-        use RestoreStep::{Configure, Expose, Load, Quarantine, Thaw};
-        for parallel in [false, true] {
-            for failed in [
-                Event::Step(Quarantine),
-                Event::Step(Load),
-                Event::Step(Thaw),
-                Event::Ready,
-                Event::Step(Configure),
-                Event::Step(Expose),
-            ] {
-                let (result, observed) = run(parallel, Some(failed));
-                assert!(result.is_err(), "{failed:?}");
-                if observed.contains(&Event::Step(Load)) {
-                    assert!(observed.contains(&Event::Step(Thaw)), "{failed:?}");
+        use RestoreStep::{Configure, Expose, Load, Quarantine, Ready, Thaw};
+        for failed in [Quarantine, Load, Thaw, Ready, Configure, Expose] {
+            let mut observed = Vec::new();
+            let result = restore_transaction(|step| {
+                observed.push(step);
+                if step == failed {
+                    Err(shinu_core::Error::Internal(format!("injected {step:?}")))
+                } else {
+                    Ok(())
                 }
-                // Expose waits only for Configure; a parallel Ready failure
-                // still fails the whole transaction (asserted above).
-                if failed != Event::Step(Expose) && !(parallel && failed == Event::Ready) {
-                    assert!(!observed.contains(&Event::Step(Expose)), "{failed:?}");
-                }
-                if matches!(failed, Event::Step(Load | Thaw)) {
-                    assert!(!observed.contains(&Event::Step(Configure)));
-                    assert!(!observed.contains(&Event::Ready));
-                }
+            });
+            assert!(result.is_err(), "{failed:?}");
+            if observed.contains(&Load) {
+                assert!(observed.contains(&Thaw), "{failed:?}");
+            }
+            if failed != Expose {
+                assert!(!observed.contains(&Expose), "{failed:?}");
+            }
+            if matches!(failed, Load | Thaw) {
+                assert!(!observed.contains(&Configure));
             }
         }
     }
@@ -4195,95 +4089,21 @@ mod restore_transaction_tests {
     #[test]
     fn application_failure_is_after_network_activation_but_never_success() {
         use RestoreStep::{ApplicationReady, Expose, Thaw};
-        for parallel in [false, true] {
-            let (result, observed) = run(parallel, Some(Event::Step(ApplicationReady)));
-            assert!(
-                matches!(&result, Err(shinu_core::Error::Internal(message)) if message.contains("ApplicationReady")),
-                "{result:?}"
-            );
-            assert!(
-                position(&observed, Event::Step(Thaw)) < position(&observed, Event::Step(Expose))
-            );
-            assert!(
-                position(&observed, Event::Step(Expose))
-                    < position(&observed, Event::Step(ApplicationReady))
-            );
-        }
-    }
-
-    #[test]
-    fn slow_ssh_ready_overlaps_configuration_but_gates_application_ready() {
-        let (exposed, exposure) = mpsc::channel();
-        // Receivers are not Sync; the wait runs on another thread.
-        let exposure = Mutex::new(exposure);
-        let released = AtomicBool::new(false);
-        let ssh_finished = AtomicBool::new(false);
-        let result = restore_transaction(
-            || true,
-            |_: &AtomicBool| {
-                // SSH stays unavailable until Expose has finished.
-                exposure
-                    .lock()
-                    .unwrap()
-                    .recv_timeout(Duration::from_secs(5))
-                    .unwrap();
-                released.store(true, Ordering::SeqCst);
-                std::thread::sleep(Duration::from_millis(50));
-                ssh_finished.store(true, Ordering::SeqCst);
+        let mut observed = Vec::new();
+        let result = restore_transaction(|step| {
+            observed.push(step);
+            if step == ApplicationReady {
+                Err(shinu_core::Error::Internal("ready failed".into()))
+            } else {
                 Ok(())
-            },
-            |step| {
-                match step {
-                    RestoreStep::Expose => {
-                        assert!(!released.load(Ordering::SeqCst), "Configure waited for SSH");
-                        exposed.send(()).unwrap();
-                    }
-                    // The network hook here uses SSH for /etc/hosts.
-                    RestoreStep::ApplicationReady => assert!(
-                        ssh_finished.load(Ordering::SeqCst),
-                        "ApplicationReady ran before SSH was usable"
-                    ),
-                    _ => {}
-                }
-                Ok(())
-            },
-        );
-        result.unwrap();
-    }
-
-    #[test]
-    fn ready_failure_fails_the_restore_with_its_own_error() {
-        // Admission succeeds, SSH never comes up: the restore must fail.
-        let result = restore_transaction(
-            || true,
-            |_: &AtomicBool| Err(shinu_core::Error::Internal("ssh down".into())),
-            |_| Ok(()),
-        );
+            }
+        });
+        assert!(result.is_err());
         assert!(
-            matches!(&result, Err(shinu_core::Error::Internal(message)) if message == "ssh down")
+            observed.iter().position(|step| *step == Thaw).unwrap()
+                < observed.iter().position(|step| *step == Expose).unwrap()
         );
-        // Admission fails while the wait is still polling: admission's error
-        // wins and the wait is cancelled instead of running to its deadline.
-        let result = restore_transaction(
-            || true,
-            |cancelled: &AtomicBool| {
-                while !cancelled.load(Ordering::SeqCst) {
-                    std::thread::yield_now();
-                }
-                Err(shinu_core::Error::Internal("ssh cancelled".into()))
-            },
-            |step| {
-                if step == RestoreStep::Configure {
-                    Err(shinu_core::Error::Internal("setup failed".into()))
-                } else {
-                    Ok(())
-                }
-            },
-        );
-        assert!(
-            matches!(&result, Err(shinu_core::Error::Internal(message)) if message == "setup failed"),
-            "{result:?}"
-        );
+        assert_eq!(&observed[observed.len() - 2..], [Expose, ApplicationReady]);
     }
 }
 

@@ -9356,6 +9356,202 @@ esac
         }
     }
 
+    /// Fake restored guest behind the real vsock/API paths: the resident
+    /// helper answers thaw/SETUP/READY at once, while SSH (port 2222) refuses
+    /// the first probes and only then comes up, flagging `ssh-up`.
+    fn spawn_slow_ssh_guest(
+        root: &std::path::Path,
+        id: Uuid,
+        stopped: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> Vec<thread::JoinHandle<()>> {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = shinu::vm_dir(root, id);
+        let nonce = Uuid::new_v4().to_string();
+        std::fs::write(dir.join("snapshot-worker-nonce"), &nonce).unwrap();
+        let serve = |listener: UnixListener,
+                     handle: Arc<dyn Fn(UnixStream) + Send + Sync>,
+                     stopped: Arc<std::sync::atomic::AtomicBool>| {
+            listener.set_nonblocking(true).unwrap();
+            thread::spawn(move || {
+                while !stopped.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            stream.set_nonblocking(false).unwrap();
+                            let handle = Arc::clone(&handle);
+                            thread::spawn(move || handle(stream));
+                        }
+                        Err(_) => thread::sleep(Duration::from_millis(1)),
+                    }
+                }
+            })
+        };
+        let ssh_refusals = Arc::new(AtomicUsize::new(6));
+        let guest_dir = dir.clone();
+        let guest: Arc<dyn Fn(UnixStream) + Send + Sync> = Arc::new(move |mut stream| {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            let _ = reader.read_line(&mut line);
+            if line == "CONNECT 2222\n" {
+                let refused = ssh_refusals
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                        left.checked_sub(1)
+                    })
+                    .is_ok();
+                if !refused {
+                    std::fs::write(guest_dir.join("ssh-up"), b"").unwrap();
+                    let _ = stream.write_all(b"OK 1\nSSH-2.0-fake\n");
+                }
+                return;
+            }
+            assert_eq!(line, "CONNECT 2224\n");
+            stream.write_all(b"OK 2\nSHINU-SNAPSHOT-1\n").unwrap();
+            line.clear();
+            let _ = reader.read_line(&mut line);
+            let words: Vec<&str> = line.trim_end().splitn(4, ' ').collect();
+            assert_eq!(words.get(1), Some(&nonce.as_str()), "{line:?}");
+            let reply = match (words[0], words.get(2)) {
+                ("thaw", None) => "OK".to_owned(),
+                ("capabilities", Some(&"setup")) => "SETUP-1".to_owned(),
+                ("capabilities", None) => "READY-1".to_owned(),
+                ("setup", _) => "SETUP-OK".to_owned(),
+                ("ready", Some(restore_id)) => format!("READY {restore_id}"),
+                _ => panic!("unexpected helper request {line:?}"),
+            };
+            let _ = writeln!(stream, "{reply}");
+        });
+        // Firecracker's API: PATCH /vm (Resumed) succeeds.
+        let api: Arc<dyn Fn(UnixStream) + Send + Sync> = Arc::new(|mut stream| {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0;
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header).unwrap_or(0) == 0 || header == "\r\n" {
+                    break;
+                }
+                if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            let _ = reader.read_exact(&mut body);
+            let _ = stream.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n");
+        });
+        vec![
+            serve(
+                UnixListener::bind(vm::vsock_path(&dir)).unwrap(),
+                guest,
+                Arc::clone(stopped),
+            ),
+            serve(
+                UnixListener::bind(vm::api_path(&dir)).unwrap(),
+                api,
+                Arc::clone(stopped),
+            ),
+        ]
+    }
+
+    #[test]
+    fn resumed_member_gets_current_peer_hosts_only_after_its_ssh_is_ready() {
+        // Short root: the jailed vsock/API paths must fit sockaddr_un.
+        let root =
+            std::env::temp_dir().join(format!("sh-{}", &Uuid::new_v4().simple().to_string()[..8]));
+        let a = network_space("a", "blue");
+        let b = network_space("b", "blue");
+        // C joined the network after B's snapshot was captured.
+        let c = network_space("c", "blue");
+        store_state(
+            &root,
+            &State {
+                spaces: vec![a.clone(), b.clone(), c.clone()],
+                ..State::default()
+            },
+        );
+        let mut runner_a = spawn_network_vmm(&root, a.id);
+        let mut runner_b = spawn_network_vmm(&root, b.id);
+        let b_dir = shinu::vm_dir(&root, b.id);
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+        std::fs::write(
+            b_dir.join("loaded.json"),
+            format!(
+                "{{\"phase\":\"loaded\",\"boot_id\":\"{}\"}}",
+                boot_id.trim()
+            ),
+        )
+        .unwrap();
+        // B's SSH writes a stand-in /etc/hosts, refusing until sshd is up.
+        std::fs::write(
+            b_dir.join("test-ssh"),
+            r#"d=$(dirname "$0")
+[ -e "$d/ssh-up" ] || { echo early >> "$d/ssh-early"; exit 255; }
+eval "$(printf '%s' "$1" | sed "s#/etc/hosts#$d/hosts#g")"
+"#,
+        )
+        .unwrap();
+        let net_cfg = enabled_net();
+        let a_ip = super::guest_ip(a.id, &net_cfg).unwrap();
+        let c_ip = super::guest_ip(c.id, &net_cfg).unwrap();
+        // Hosts as captured in B's snapshot: C is missing.
+        std::fs::write(
+            b_dir.join("hosts"),
+            format!(
+                "127.0.0.1 localhost\n{}\n{a_ip} a\n{}\n",
+                super::NETWORK_HOSTS_BEGIN,
+                super::NETWORK_HOSTS_END
+            ),
+        )
+        .unwrap();
+        let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let servers = spawn_slow_ssh_guest(&root, b.id, &stopped);
+        let db = test_db(&root);
+        let registry = registry();
+        let (vm_cfg, vm_net) = test_configs();
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        let policy = shinu::ReadySpec {
+            command: vec!["/bin/true".into()],
+            timeout_seconds: 10,
+        };
+        // The real admission hook; host TAP/firewall work is out of scope, so
+        // the VM transaction itself runs with networking disabled.
+        let result = super::with_network_admission(
+            &ctx,
+            &RecordedPeerRules::default(),
+            &b,
+            std::slice::from_ref(&a),
+            |network_ready| {
+                vm::resume(&root, b.id, Some(&policy), &vm_net, |deadline| {
+                    network_ready(deadline)
+                })
+            },
+        );
+        stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        for server in servers {
+            server.join().unwrap();
+        }
+        for runner in [&mut runner_a, &mut runner_b] {
+            runner.kill().unwrap();
+            runner.wait().unwrap();
+        }
+        result.unwrap();
+        assert!(
+            !b_dir.join("ssh-early").exists(),
+            "the hosts update ran before the resumed guest's SSH was ready"
+        );
+        assert_eq!(
+            std::fs::read_to_string(b_dir.join("hosts")).unwrap(),
+            format!(
+                "127.0.0.1 localhost\n{}\n{a_ip} a\n{c_ip} c\n{}\n",
+                super::NETWORK_HOSTS_BEGIN,
+                super::NETWORK_HOSTS_END
+            )
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn network_members_are_scoped_by_project_and_name() {
         fn space(id: Uuid, name: &str, project: &str, network: Option<&str>) -> Space {

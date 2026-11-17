@@ -1220,10 +1220,11 @@ enum RestoreStep {
 
 /// `ready` is the SSH banner wait; it is told to stop once the transaction has
 /// already failed. When `helper_admission` reports (after thaw) that the
-/// helper answers SETUP-1, `Configure` and `ApplicationReady` never use SSH,
-/// so the wait overlaps `Configure` → `Expose` → `ApplicationReady` and is
-/// joined before returning: SSH is usable whenever the restore succeeds.
-/// Otherwise the SSH setup fallback needs it first and the order stays serial.
+/// helper answers SETUP-1, `Configure` never uses SSH, so the wait overlaps
+/// `Configure` → `Expose`. It is joined before `ApplicationReady` either way:
+/// the network hook there syncs peers' `/etc/hosts` over SSH, and SSH is
+/// usable whenever the restore succeeds. Otherwise the SSH setup fallback
+/// needs it first and the order stays fully serial.
 fn restore_transaction(
     helper_admission: impl FnOnce() -> bool,
     ready: impl FnOnce(&std::sync::atomic::AtomicBool) -> Result<()> + Send,
@@ -1234,25 +1235,22 @@ fn restore_transaction(
     // A failed/lost load reply can still leave live frozen vCPUs behind.
     let thawed = step(RestoreStep::Thaw);
     combine_snapshot_results(loaded, thawed)?;
-    let cancelled = std::sync::atomic::AtomicBool::new(false);
-    let mut admit = || {
+    if !helper_admission() {
+        ready(&std::sync::atomic::AtomicBool::new(false))?;
         step(RestoreStep::Configure)?;
         step(RestoreStep::Expose)?;
-        step(RestoreStep::ApplicationReady)
-    };
-    if !helper_admission() {
-        ready(&cancelled)?;
-        return admit();
+        return step(RestoreStep::ApplicationReady);
     }
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
     std::thread::scope(|scope| {
         let probe = scope.spawn(|| {
             let probed = ready(&cancelled);
-            // Failed on its own, not because admission had already failed.
+            // Failed on its own, not because configuration had already failed.
             let genuine = probed.is_err() && !cancelled.load(std::sync::atomic::Ordering::SeqCst);
             (probed, genuine)
         });
-        let admitted = admit();
-        if admitted.is_err() {
+        let configured = step(RestoreStep::Configure).and_then(|()| step(RestoreStep::Expose));
+        if configured.is_err() {
             cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         let (probed, genuine) = probe.join().unwrap_or_else(|_| {
@@ -1261,13 +1259,14 @@ fn restore_transaction(
                 true,
             )
         });
-        match (probed, admitted) {
+        match (probed, configured) {
             // Ready failures keep their own error, as in the serial order.
             (Err(error), _) if genuine => Err(error),
             (_, Err(error)) | (Err(error), Ok(())) => Err(error),
             (Ok(()), Ok(())) => Ok(()),
         }
-    })
+    })?;
+    step(RestoreStep::ApplicationReady)
 }
 
 // The listener is captured in guest RAM, so restore can thaw without starting
@@ -4145,7 +4144,8 @@ mod restore_transaction_tests {
             observed,
             [&steps[..3], &[Event::Ready], &steps[3..]].concat()
         );
-        // Helper admission: Ready runs alongside, always after Thaw.
+        // Helper admission: Ready runs alongside Configure → Expose, always
+        // after Thaw, and is joined before ApplicationReady.
         let (result, observed) = run(true, None);
         result.unwrap();
         assert_eq!(
@@ -4157,6 +4157,9 @@ mod restore_transaction_tests {
             steps
         );
         assert!(position(&observed, Event::Ready) > position(&observed, Event::Step(Thaw)));
+        assert!(
+            position(&observed, Event::Ready) < position(&observed, Event::Step(ApplicationReady))
+        );
     }
 
     #[test]
@@ -4209,17 +4212,17 @@ mod restore_transaction_tests {
     }
 
     #[test]
-    fn slow_ssh_ready_does_not_delay_helper_admission_but_is_joined() {
-        let (started, admitted) = mpsc::channel();
+    fn slow_ssh_ready_overlaps_configuration_but_gates_application_ready() {
+        let (exposed, exposure) = mpsc::channel();
         // Receivers are not Sync; the wait runs on another thread.
-        let admitted = Mutex::new(admitted);
+        let exposure = Mutex::new(exposure);
         let released = AtomicBool::new(false);
         let ssh_finished = AtomicBool::new(false);
         let result = restore_transaction(
             || true,
             |_: &AtomicBool| {
-                // SSH stays unavailable until ApplicationReady has started.
-                admitted
+                // SSH stays unavailable until Expose has finished.
+                exposure
                     .lock()
                     .unwrap()
                     .recv_timeout(Duration::from_secs(5))
@@ -4230,18 +4233,22 @@ mod restore_transaction_tests {
                 Ok(())
             },
             |step| {
-                if step == RestoreStep::ApplicationReady {
-                    assert!(!released.load(Ordering::SeqCst), "admission waited for SSH");
-                    started.send(()).unwrap();
+                match step {
+                    RestoreStep::Expose => {
+                        assert!(!released.load(Ordering::SeqCst), "Configure waited for SSH");
+                        exposed.send(()).unwrap();
+                    }
+                    // The network hook here uses SSH for /etc/hosts.
+                    RestoreStep::ApplicationReady => assert!(
+                        ssh_finished.load(Ordering::SeqCst),
+                        "ApplicationReady ran before SSH was usable"
+                    ),
+                    _ => {}
                 }
                 Ok(())
             },
         );
         result.unwrap();
-        assert!(
-            ssh_finished.load(Ordering::SeqCst),
-            "success must not return before SSH is usable"
-        );
     }
 
     #[test]

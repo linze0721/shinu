@@ -46,14 +46,14 @@ Start with [`AGENTS.md`](AGENTS.md), the authoritative architecture and invarian
 3. The HTTP route parser in `src/bin/shinud.rs`.
 4. The `method_allowed` HTTP method matrix in `src/bin/shinud.rs`.
 5. The `request_for` mapping and `handle()` dispatcher in `src/bin/shinud.rs`.
-6. Quota check points, such as `check_space_quota`.
+6. Physical capacity admission checks such as `ensure_capacity`.
 7. Usage event logging through `state::record_usage`.
 8. The `shinu-mcp` tool table when exposing the operation through MCP.
 9. The console routes in `src/console/app.js` when exposing the operation in the console.
 
 ### Invariants
 
-The 26 invariants in [`AGENTS.md`](AGENTS.md#invariants-worth-guarding) ("Invariants Worth Guarding") are load-bearing security and correctness properties. A pull request that changes one must say so explicitly. Headline invariants include mandatory jailer sandboxing; hardlink-not-copy for the kernel and rootfs; quota checks inside the state lock; lock order discipline; claim-before-delete; reflink-or-fail; project tenant isolation that never leaks existence; and hashed tokens compared in constant time.
+The invariants in [AGENTS.md](AGENTS.md#invariants-worth-guarding) are load-bearing security and correctness properties. Changes must preserve mandatory jailer sandboxing, zero-copy asset linking, physical capacity admission, immutable checkpoint memory, loaded/resuming recovery, lock ordering, claim-before-delete, reflink-or-fail, project isolation, and constant-time token verification.
 
 ## Commits and CI
 

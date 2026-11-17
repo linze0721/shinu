@@ -499,3 +499,64 @@ fn peer_setup_consumes_the_shared_admission_budget_instead_of_resetting_it() {
     assert!(!vm::is_running(&guest.dir));
     assert!(started.elapsed() < Duration::from_secs(3));
 }
+
+#[test]
+fn load_only_requires_a_memory_generation_and_cannot_relabel_a_running_vm() {
+    let guest = Guest::new(Reply::Match);
+    let (cfg, net) = configs();
+    let result = vm::start(
+        &guest.root,
+        guest.id,
+        Image::Void,
+        vm::StartOptions {
+            load_only: true,
+            ..vm::StartOptions::default()
+        },
+        &cfg,
+        &net,
+        |_| panic!("load-only must not run readiness"),
+    );
+    assert!(matches!(result, Err(shinu_core::Error::Invalid(_))));
+    assert!(guest.ids.lock().unwrap().is_empty());
+    assert!(vm::is_running(&guest.dir));
+}
+
+#[test]
+fn loaded_spaces_are_not_admitted_by_start_and_are_stopped_on_daemon_recovery() {
+    for phase in ["loading", "loaded", "resuming"] {
+        let mut guest = Guest::new(Reply::Match);
+        std::fs::write(
+            guest.dir.join("loaded.json"),
+            format!("{{\"phase\":\"{phase}\"}}"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(guest.root.join("spaces")).unwrap();
+        let memory = shinu_core::space_image(&guest.root, guest.id).with_extension("mem");
+        let state = memory.with_extension("state");
+        std::fs::write(&memory, b"pending memory").unwrap();
+        std::fs::write(&state, b"pending state").unwrap();
+        assert_eq!(vm::lifecycle_state(&guest.dir).unwrap(), phase);
+        assert!(guest.start(Some(&policy())).is_err());
+        assert!(guest.ids.lock().unwrap().is_empty());
+        let (_, net) = configs();
+        vm::recover_loaded(&guest.root, &net).unwrap();
+        guest.child.wait().unwrap();
+        assert_eq!(vm::lifecycle_state(&guest.dir).unwrap(), "stopped");
+        assert!(!guest.dir.join("loaded.json").exists());
+        assert!(!vm::jail_root(&guest.root, guest.id).exists());
+        assert_eq!(memory.exists(), phase != "resuming");
+        assert_eq!(state.exists(), phase != "resuming");
+    }
+}
+
+#[test]
+fn resume_rejects_an_already_running_generation_without_requesting_ready() {
+    let guest = Guest::new(Reply::Match);
+    let (_, net) = configs();
+    assert!(matches!(
+        vm::resume(&guest.root, guest.id, Some(&policy()), &net, |_| Ok(())),
+        Err(shinu_core::Error::Invalid(_))
+    ));
+    assert!(guest.ids.lock().unwrap().is_empty());
+    assert!(vm::is_running(&guest.dir));
+}

@@ -12,15 +12,29 @@ Changes are recorded in the Keep a Changelog format.
 - Full and diff guest memory snapshots.
 - Detached jobs with status and terminal-rendered logs.
 - Space leases with TTLs and named checkpoint templates.
-- Per-project quotas, usage metering, and API rate limiting.
+- Usage metering and optional request-rate limiting.
 - An MCP server and web console.
 - A VNC desktop bridge, guest HTTP proxying, and named networks.
 - `shinu rmckpt --detach` (`DELETE /v1/commits/{id}` with `{"detach":true}`) deletes a commit that other spaces or commits only name as `parent`, clearing those lineage links; space heads, templates, and diff memory bases still refuse.
-- Opt-in exclusive-byte quota reservations, persisted per-space write caps with sweep enforcement, and `shinu compact` for stopped-image trim followed by Btrfs zstd recompression.
+- Explicit per-Space write protection and `shinu compact` for stopped-image trim followed by Btrfs zstd recompression.
 - Firecracker v1.18.0 / snapshot format 12.0.0 with writable Sync virtio-blk discard and a pinned FC-CI 6.18.62 guest kernel.
 - Application-consistent hot snapshot generations with bounded guest hooks/fsfreeze, pause/create/reflink/resume/thaw ordering, restore-time thaw, generation provenance and freeze/pause/thaw timings; checkpoint listings expose consistency.
 - A tracked Docker-compatible `6.18.62-shinu` kernel config and checksum-pinned local kernel installation via `SHINU_KERNEL_FILE` / `SHINU_KERNEL_SHA256`, retaining the existing guest's built-in netfilter features.
 - Optional checkpoint-owned application readiness policies, configured with `new`, `fork`, or stopped-only `resize --readiness-json`; cold/hot starts and auto-starts require a fresh authenticated guest READY challenge before admission, with same-boot host-memory receipts and fail-closed cleanup.
+- Paused Full restores through `start --load-only` / `load_only:true`, persisted loading/loaded/resuming phases, and explicit `resume` across HTTP, CLI and MCP; interrupted paused restores are stopped on daemon restart before request admission.
+- Per-start `track_dirty` (default true) and `ckpt warm` / checkpoint warm HTTP/MCP interfaces using a persistent dedicated page-cache cgroup.
+- Physical store/MemAvailable admission floors with HTTP `capacity_watermark` errors and stable CLI exit 75.
+
+### Changed
+
+- Remove project Space, disk and running-VM quotas, including historical database values. Legacy count/disk/reserve environment variables now warn and are ignored; admin quota PATCH fields are explicitly rejected. Optional single-VM sizing and request-rate limits default to unlimited when unset.
+- Charge only sampled Btrfs exclusive storage; remove nominal/reserve pre-charge. Full non-diff memory forks share read-only checkpoint inodes, with root-owned 0440 jail access and private guest CoW; restore links are removed before any later hot capture. Existing live HEAD/template/base deletion guards remain authoritative.
+- Stop failed/inactive VMMs with TERM and bounded cleanup; report an unresponsive VMM instead of sending SIGKILL.
+
+### Breaking
+
+- `SHINU_SPACE_WRITE_CAP_MIB` no longer assigns a default quota. Schema version 1 and legacy JSON import clear all old Space caps and cap-stop reasons once, since historical state cannot prove whether they were inherited or explicit. **Old explicit protections must be specified again after upgrading.** New explicit `fork --write-cap-mib N` protections remain supported and persistent; inherited legacy caps can no longer stop running Spaces.
+- Loading/loaded recovery preserves pending Full memory/state for safe reload. Resuming/failed-resume recovery discards pending memory before clearing the phase, preventing stale memory from being paired with a disk already written by the guest.
 
 ### Fixed
 

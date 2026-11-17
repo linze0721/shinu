@@ -88,7 +88,44 @@ impl Server {
                     "/v1/spaces/{}/start",
                     shinu_client::encode_path_segment(space)
                 );
-                request_text(&client, "POST", &path, None)
+                let flag = |key, default| {
+                    arguments
+                        .get(key)
+                        .and_then(Value::as_bool)
+                        .unwrap_or(default)
+                };
+                request_text(
+                    &client,
+                    "POST",
+                    &path,
+                    Some(
+                        json!({"load_only":flag("load_only", false),"track_dirty":flag("track_dirty", true)}),
+                    ),
+                )
+            }
+            "shinu_resume" => {
+                let space = required_string(arguments, "space")?;
+                request_text(
+                    &client,
+                    "POST",
+                    &format!(
+                        "/v1/spaces/{}/resume",
+                        shinu_client::encode_path_segment(space)
+                    ),
+                    None,
+                )
+            }
+            "shinu_warm_checkpoint" => {
+                let checkpoint = required_string(arguments, "checkpoint")?;
+                request_text(
+                    &client,
+                    "POST",
+                    &format!(
+                        "/v1/commits/{}/warm",
+                        shinu_client::encode_path_segment(checkpoint)
+                    ),
+                    None,
+                )
             }
             "shinu_stop" => {
                 let space = required_string(arguments, "space")?;
@@ -634,8 +671,20 @@ fn validate_arguments(name: &str, arguments: &Map<String, Value>) -> Result<(), 
             resize_space_body(arguments)?;
             Ok(())
         }
-        "shinu_start" | "shinu_stop" => {
+        "shinu_start" | "shinu_stop" | "shinu_resume" => {
             required_string(arguments, "space")?;
+            for key in ["load_only", "track_dirty"] {
+                if let Some(value) = arguments.get(key)
+                    && !value.is_boolean()
+                {
+                    return Err(format!("{key} must be boolean"));
+                }
+            }
+            Ok(())
+        }
+        "shinu_warm_checkpoint" => {
+            let checkpoint = required_string(arguments, "checkpoint")?;
+            Uuid::parse_str(checkpoint).map_err(|_| "checkpoint must be a UUID".to_owned())?;
             Ok(())
         }
         "shinu_write_file" => {
@@ -903,9 +952,13 @@ fn tool_definitions() -> Vec<Value> {
             "name": "shinu_start",
             "description": "在需要执行命令或继续实验时启动已停止的 space；需要 commit 或 checkout 时不要用它替代 shinu_stop。",
             "inputSchema": schema(json!({
-                "space": {"type": "string", "minLength": 1, "description": "要启动的 space。"}
+                "space": {"type": "string", "minLength": 1, "description": "要启动的 space。"},
+                "load_only": {"type":"boolean", "default":false},
+                "track_dirty": {"type":"boolean", "default":true}
             }), &["space"]),
         }),
+        json!({"name":"shinu_resume", "description":"恢复 loaded space 并等待本代新 READY。", "inputSchema":schema(json!({"space":{"type":"string","minLength":1}}), &["space"])}),
+        json!({"name":"shinu_warm_checkpoint", "description":"在独立 cgroup 中预热 Full checkpoint 内存页缓存。", "inputSchema":schema(json!({"checkpoint":{"type":"string","format":"uuid"}}), &["checkpoint"])}),
         json!({
             "name": "shinu_stop",
             "description": "在 commit 或 checkout 前停止 space；这是满足后端停止状态要求的明确方式。",
@@ -1053,6 +1106,8 @@ fn is_known_tool(name: &str) -> bool {
             | "shinu_set_space_lease"
             | "shinu_resize_space"
             | "shinu_start"
+            | "shinu_resume"
+            | "shinu_warm_checkpoint"
             | "shinu_stop"
             | "shinu_write_file"
             | "shinu_read_file"
@@ -2160,7 +2215,7 @@ mod tests {
     #[test]
     fn known_tools_match_tool_definitions() {
         let definitions = tool_definitions();
-        assert_eq!(definitions.len(), 25);
+        assert_eq!(definitions.len(), 27);
         for definition in definitions {
             let name = definition
                 .get("name")

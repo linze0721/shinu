@@ -339,7 +339,7 @@ mod network_tests {
         HostAllow, NetSpec, egress_rules_with_peers, host_allow_rule, input_drop_rule, net_slot,
         parse_host_allow, parse_net_allow, peer_rules, tap_name,
     };
-    use crate::config::vm_config_json;
+    use crate::config::{MachineConfig, vm_config_json};
     use crate::vm::egress_rules;
     use serde_json::Value;
     use shinu_core::Image;
@@ -378,8 +378,11 @@ mod network_tests {
             Path::new("/rootfs"),
             Image::Void,
             Path::new("/vsock"),
-            2,
-            128,
+            MachineConfig {
+                vcpus: 2,
+                mem_mib: 128,
+                track_dirty: true,
+            },
             None,
         );
         let legacy = serde_json::json!({
@@ -409,8 +412,11 @@ mod network_tests {
             Path::new("/rootfs"),
             Image::Arch,
             Path::new("/vsock"),
-            2,
-            128,
+            MachineConfig {
+                vcpus: 2,
+                mem_mib: 128,
+                track_dirty: true,
+            },
             None,
         ))
         .expect("valid Firecracker JSON");
@@ -433,8 +439,11 @@ mod network_tests {
             Path::new("/rootfs"),
             Image::Void,
             Path::new("/vsock"),
-            2,
-            128,
+            MachineConfig {
+                vcpus: 2,
+                mem_mib: 128,
+                track_dirty: true,
+            },
             Some(&spec),
         ))
         .expect("valid Firecracker JSON");

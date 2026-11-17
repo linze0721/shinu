@@ -82,6 +82,17 @@ enum Command {
     },
     Start {
         space: String,
+        #[arg(long)]
+        load_only: bool,
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+        track_dirty: bool,
+    },
+    Resume {
+        space: String,
+    },
+    Ckpt {
+        #[command(subcommand)]
+        command: CkptCommand,
     },
     Stop {
         space: String,
@@ -225,6 +236,11 @@ enum Command {
         #[command(subcommand)]
         command: TokenCommand,
     },
+}
+
+#[derive(Subcommand)]
+enum CkptCommand {
+    Warm { checkpoint: Uuid },
 }
 
 #[derive(Subcommand)]
@@ -1125,18 +1141,46 @@ fn run_command(client: &Client, command: Command) -> Result<i32, String> {
             )?)?;
             println!("removed {}", field_text(&data, "removed"));
         }
-        Command::Start { space } => {
+        Command::Start {
+            space,
+            load_only,
+            track_dirty,
+        } => {
             let data = response_value(request_json(
                 client,
                 "POST",
                 &format!("/v1/spaces/{}/start", encode_path_segment(&space)),
-                None,
+                Some(json!({"load_only":load_only,"track_dirty":track_dirty})),
             )?)?;
+            if load_only {
+                println!("loaded {space}");
+                return Ok(0);
+            }
             if data.get("booted").and_then(Value::as_bool).unwrap_or(false) {
                 println!("started {space}");
             } else {
                 println!("running {space}");
             }
+        }
+        Command::Resume { space } => {
+            response_value(request_json(
+                client,
+                "POST",
+                &format!("/v1/spaces/{}/resume", encode_path_segment(&space)),
+                None,
+            )?)?;
+            println!("resumed {space}");
+        }
+        Command::Ckpt {
+            command: CkptCommand::Warm { checkpoint },
+        } => {
+            response_value(request_json(
+                client,
+                "POST",
+                &format!("/v1/commits/{checkpoint}/warm"),
+                None,
+            )?)?;
+            println!("warmed {checkpoint}");
         }
         Command::Stop { space } => {
             let data = response_value(request_json(
@@ -1647,6 +1691,12 @@ fn response_value(response: Response) -> Result<Value, String> {
 }
 
 fn successful_body(response: Response) -> Result<Vec<u8>, String> {
+    if response.status == 429
+        && serde_json::from_slice::<Value>(&response.body)
+            .is_ok_and(|value| value["code"] == "capacity_watermark")
+    {
+        return Err("capacity_watermark".into());
+    }
     response
         .into_success()
         .map(|response| response.body)
@@ -2241,7 +2291,11 @@ fn main() {
         }
         Err(message) => {
             eprintln!("shinu: {message}");
-            std::process::exit(1);
+            std::process::exit(if message == "capacity_watermark" {
+                75
+            } else {
+                1
+            });
         }
     }
 }

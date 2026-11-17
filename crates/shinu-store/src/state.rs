@@ -358,6 +358,14 @@ fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA)?;
     migrate_space_columns(conn)?;
     migrate_ckpt_columns(conn)?;
+    // Legacy rows cannot distinguish daemon-inherited caps from explicit ones.
+    // Retire all unproven caps exactly once; new explicit caps survive reopen.
+    let tx = conn.unchecked_transaction()?;
+    let version: u32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < 1 {
+        tx.execute_batch("UPDATE spaces SET write_cap_mib=0, stopped_reason=CASE WHEN stopped_reason='write_cap_exceeded' THEN NULL ELSE stopped_reason END; PRAGMA user_version=1;")?;
+    }
+    tx.commit()?;
     // This index references a column that older databases may receive above;
     // creating it here keeps the ALTER and index creation ordered safely.
     conn.execute_batch(
@@ -644,9 +652,13 @@ pub fn migrate_from_json(root: &Path, conn: &Connection) -> Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
     };
-    let state: State = serde_json::from_str(&contents)?;
-    for space in &state.spaces {
+    let mut state: State = serde_json::from_str(&contents)?;
+    for space in &mut state.spaces {
         validate_network_name(space.network.as_deref())?;
+        space.write_cap_mib = 0;
+        if space.stopped_reason.as_deref() == Some("write_cap_exceeded") {
+            space.stopped_reason = None;
+        }
     }
     validate_templates(&state)?;
     let tx = conn.unchecked_transaction()?;
@@ -1676,6 +1688,35 @@ mod db_tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn upgrading_unproven_legacy_caps_does_not_clear_new_explicit_protection() {
+        let root = root();
+        let conn = open(&root).unwrap();
+        let (mut state, space, _) = sample_state("project-a");
+        state.spaces[0].write_cap_mib = 20_480;
+        state.spaces[0].stopped_reason = Some("write_cap_exceeded".into());
+        store(&conn, &state).unwrap();
+        assert_eq!(load(&conn).unwrap().spaces[0].write_cap_mib, 20_480);
+        conn.execute_batch("PRAGMA user_version=0").unwrap();
+        drop(conn);
+        let conn = open(&root).unwrap();
+        let mut migrated = load(&conn).unwrap();
+        assert_eq!(migrated.spaces[0].write_cap_mib, 0);
+        assert_eq!(migrated.spaces[0].stopped_reason, None);
+        migrated.spaces[0].write_cap_mib = 17;
+        store(&conn, &migrated).unwrap();
+        drop(conn);
+        let conn = open(&root).unwrap();
+        assert_eq!(
+            find_space_by_id(&conn, space.id, "project-a")
+                .unwrap()
+                .unwrap()
+                .write_cap_mib,
+            17
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn sample_state(project: &str) -> (State, Space, Ckpt) {
         let space_id = Uuid::new_v4();
         let ckpt_id = Uuid::new_v4();
@@ -2502,13 +2543,21 @@ mod db_tests {
     #[test]
     fn migration_imports_rows_and_renames_json() {
         let root = root();
-        let (state, _, _) = sample_state("alpha");
+        let (mut state, _, _) = sample_state("alpha");
+        state.spaces[0].write_cap_mib = 20_480;
+        state.spaces[0].stopped_reason = Some("write_cap_exceeded".into());
         fs::write(root.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+        let before: State =
+            serde_json::from_slice(&fs::read(root.join("state.json")).unwrap()).unwrap();
+        assert_eq!(before.spaces[0].write_cap_mib, 20_480);
         let conn = db();
         assert!(migrate_from_json(&root, &conn).unwrap());
         assert!(!root.join("state.json").exists());
         assert!(root.join("state.json.migrated").exists());
+        state.spaces[0].write_cap_mib = 0;
+        state.spaces[0].stopped_reason = None;
         assert_eq!(load(&conn).unwrap(), state);
+        assert!(!migrate_from_json(&root, &conn).unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 

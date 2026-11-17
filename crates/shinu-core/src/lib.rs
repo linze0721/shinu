@@ -35,6 +35,7 @@ pub enum Error {
     Invalid(String),
     Auth(String),
     Quota(String),
+    CapacityWatermark(String),
     /// A daemon or host fault, mapped to HTTP 500 rather than a client error.
     Internal(String),
     Io(std::io::Error),
@@ -162,6 +163,7 @@ impl std::fmt::Display for Error {
             Self::Invalid(message) => write!(f, "invalid: {message}"),
             Self::Auth(message) => write!(f, "auth: {message}"),
             Self::Quota(message) => write!(f, "quota: {message}"),
+            Self::CapacityWatermark(message) => write!(f, "capacity_watermark: {message}"),
             Self::Internal(message) => write!(f, "internal: {message}"),
             Self::Io(error) => write!(f, "{error}"),
             Self::Json(error) => write!(f, "{error}"),

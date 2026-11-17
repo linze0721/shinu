@@ -4,21 +4,15 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-const DEFAULT_MAX_SPACES: u32 = 5;
-const DEFAULT_MAX_DISK_MIB: u64 = 10_240;
-const DEFAULT_MAX_RUNNING: u32 = 2;
-const DEFAULT_API_PER_MIN: u32 = 120;
-// These caps leave room for explicitly larger guests than the legacy
-// defaults while keeping one tenant from exhausting a host by accident.
-const DEFAULT_MAX_VCPUS: u32 = 16;
-const DEFAULT_MAX_MEM_MIB: u32 = 32 * 1024;
+const DEFAULT_API_PER_MIN: u32 = 0;
+const DEFAULT_MAX_VCPUS: u32 = 0;
+const DEFAULT_MAX_MEM_MIB: u32 = 0;
 const WINDOW: Duration = Duration::from_mins(1);
 
 /// Daemon-wide storage policy, validated once before accepting requests.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StoragePolicy {
-    pub reserve_mib: Option<u64>,
-    pub default_write_cap_mib: u64,
+    pub watermarks: Watermarks,
 }
 
 impl StoragePolicy {
@@ -28,44 +22,23 @@ impl StoragePolicy {
             Err(std::env::VarError::NotPresent) => Ok(None),
             Err(error) => Err(Error::Invalid(format!("{key}: {error}"))),
         };
-        let reserve = read("SHINU_SPACE_RESERVE_MIB")?;
-        let cap = read("SHINU_SPACE_WRITE_CAP_MIB")?;
-        Self::from_values(reserve.as_deref(), cap.as_deref())
-    }
-
-    pub fn from_values(reserve: Option<&str>, cap: Option<&str>) -> Result<Self> {
-        let parse = |key, value: &str| {
-            let value = value.trim();
-            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-                return Err(Error::Invalid(format!(
-                    "{key} must be unsigned decimal MiB"
-                )));
-            }
-            value
-                .parse::<u64>()
-                .ok()
-                .filter(|value| i64::try_from(*value).is_ok())
-                .ok_or_else(|| Error::Invalid(format!("{key} exceeds signed 64-bit MiB")))
+        let read_mib = |key: &'static str, default| -> Result<u64> {
+            read(key)?.map_or(Ok(default), |value| {
+                value
+                    .parse::<u64>()
+                    .map_err(|_| Error::Invalid(format!("{key} must be unsigned decimal MiB")))
+            })
         };
         Ok(Self {
-            reserve_mib: reserve
-                .map(|value| parse("SHINU_SPACE_RESERVE_MIB", value))
-                .transpose()?,
-            default_write_cap_mib: cap
-                .map(|value| parse("SHINU_SPACE_WRITE_CAP_MIB", value))
-                .transpose()?
-                .unwrap_or(0),
+            watermarks: Watermarks {
+                min_store_free_mib: read_mib("SHINU_MIN_STORE_FREE_MIB", 1024)?,
+                min_mem_available_mib: read_mib("SHINU_MIN_MEM_AVAILABLE_MIB", 512)?,
+            },
         })
     }
 
-    /// Unknown samples reserve the nominal allocation until the next sweep.
-    pub fn charge_mib(self, nominal: u64, exclusive: Option<u64>) -> u64 {
-        self.reserve_mib
-            .map_or(nominal, |reserve| exclusive.unwrap_or(nominal).max(reserve))
-    }
-
     pub fn write_cap(self, explicit: Option<u64>) -> Result<u64> {
-        let cap = explicit.unwrap_or(self.default_write_cap_mib);
+        let cap = explicit.unwrap_or(0);
         if i64::try_from(cap).is_err() {
             return Err(Error::Invalid(
                 "write_cap_mib exceeds signed 64-bit MiB".into(),
@@ -112,9 +85,28 @@ impl StorageAccounting {
     }
 }
 
-/// Resource ceilings applied to a project. The global environment provides `SaaS`
-/// defaults and rejects zero; a zero is unlimited only when an individual
-/// project row explicitly grants it, never through the environment.
+/// Host-wide admission floors, not project allocations or reservations.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Watermarks {
+    pub min_store_free_mib: u64,
+    pub min_mem_available_mib: u64,
+}
+
+impl Watermarks {
+    pub fn check(self, store_free_mib: u64, mem_available_mib: u64) -> Result<()> {
+        if store_free_mib < self.min_store_free_mib
+            || mem_available_mib < self.min_mem_available_mib
+        {
+            return Err(Error::CapacityWatermark(format!(
+                "store_free_mib={store_free_mib} (minimum {}), mem_available_mib={mem_available_mib} (minimum {})",
+                self.min_store_free_mib, self.min_mem_available_mib
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Optional request limits. Zero, including an unset environment setting, is unlimited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     pub max_spaces: u32,
@@ -135,11 +127,11 @@ impl Limits {
         F: Fn(&str) -> Option<String>,
     {
         Self {
-            max_spaces: positive_u32(&lookup, "SHINU_LIMIT_SPACES", DEFAULT_MAX_SPACES),
-            max_disk_mib: positive_u64(&lookup, "SHINU_LIMIT_DISK_MIB", DEFAULT_MAX_DISK_MIB),
+            max_spaces: 0,
+            max_disk_mib: 0,
             max_vcpus: positive_u32(&lookup, "SHINU_LIMIT_VCPUS", DEFAULT_MAX_VCPUS),
             max_mem_mib: positive_u32(&lookup, "SHINU_LIMIT_MEM_MIB", DEFAULT_MAX_MEM_MIB),
-            max_running: positive_u32(&lookup, "SHINU_LIMIT_RUNNING", DEFAULT_MAX_RUNNING),
+            max_running: 0,
             api_per_min: positive_u32(&lookup, "SHINU_LIMIT_API_PER_MIN", DEFAULT_API_PER_MIN),
         }
     }
@@ -151,17 +143,6 @@ where
 {
     lookup(key)
         .and_then(|value| value.trim().parse::<u32>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(default)
-}
-
-fn positive_u64<F>(lookup: &F, key: &str, default: u64) -> u64
-where
-    F: Fn(&str) -> Option<String>,
-{
-    lookup(key)
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|value| *value > 0)
         .unwrap_or(default)
 }
 
@@ -218,18 +199,8 @@ impl Default for RateLimiter {
     }
 }
 
-pub fn check_space_limit(current_spaces: u32, limits: &Limits) -> Result<()> {
-    if limits.max_spaces != 0 && current_spaces >= limits.max_spaces {
-        return Err(Error::Quota(format!(
-            "space limit reached ({current_spaces}/{}); delete a space or upgrade",
-            limits.max_spaces
-        )));
-    }
-    Ok(())
-}
-
 pub fn check_vcpu_limit(requested: u32, limits: &Limits) -> Result<()> {
-    if requested > limits.max_vcpus {
+    if limits.max_vcpus != 0 && requested > limits.max_vcpus {
         return Err(Error::Quota(format!(
             "vcpus limit exceeded (requested {requested}, cap {})",
             limits.max_vcpus
@@ -239,34 +210,10 @@ pub fn check_vcpu_limit(requested: u32, limits: &Limits) -> Result<()> {
 }
 
 pub fn check_mem_limit(requested: u32, limits: &Limits) -> Result<()> {
-    if requested > limits.max_mem_mib {
+    if limits.max_mem_mib != 0 && requested > limits.max_mem_mib {
         return Err(Error::Quota(format!(
             "memory limit exceeded (requested {requested} MiB, cap {} MiB)",
             limits.max_mem_mib
-        )));
-    }
-    Ok(())
-}
-
-pub fn check_disk_limit(current_mib: u64, adding_mib: u64, limits: &Limits) -> Result<()> {
-    if limits.max_disk_mib == 0 {
-        return Ok(());
-    }
-    let projected_mib = current_mib.saturating_add(adding_mib);
-    if projected_mib > limits.max_disk_mib {
-        return Err(Error::Quota(format!(
-            "disk limit exceeded (requested total {projected_mib} MiB, cap {} MiB; current {current_mib}, adding {adding_mib})",
-            limits.max_disk_mib
-        )));
-    }
-    Ok(())
-}
-
-pub fn check_running_limit(current_running: u32, limits: &Limits) -> Result<()> {
-    if limits.max_running != 0 && current_running >= limits.max_running {
-        return Err(Error::Quota(format!(
-            "running VM limit reached ({current_running}/{}); stop a VM or upgrade",
-            limits.max_running
         )));
     }
     Ok(())
@@ -278,14 +225,14 @@ mod quota_tests {
     use std::time::Duration;
 
     #[test]
-    fn limits_default_values_are_conservative() {
+    fn limits_default_to_unlimited() {
         let limits = Limits::from_lookup(|_| None);
-        assert_eq!(limits.max_spaces, 5);
-        assert_eq!(limits.max_disk_mib, 10_240);
-        assert_eq!(limits.max_vcpus, 16);
-        assert_eq!(limits.max_mem_mib, 32 * 1024);
-        assert_eq!(limits.max_running, 2);
-        assert_eq!(limits.api_per_min, 120);
+        assert_eq!(limits.max_spaces, 0);
+        assert_eq!(limits.max_disk_mib, 0);
+        assert_eq!(limits.max_vcpus, 0);
+        assert_eq!(limits.max_mem_mib, 0);
+        assert_eq!(limits.max_running, 0);
+        assert_eq!(limits.api_per_min, 0);
     }
 
     #[test]
@@ -304,11 +251,11 @@ mod quota_tests {
                 .to_owned(),
             )
         });
-        assert_eq!(limits.max_spaces, 9);
-        assert_eq!(limits.max_disk_mib, 20_480);
+        assert_eq!(limits.max_spaces, 0);
+        assert_eq!(limits.max_disk_mib, 0);
         assert_eq!(limits.max_vcpus, 8);
         assert_eq!(limits.max_mem_mib, 16_384);
-        assert_eq!(limits.max_running, 4);
+        assert_eq!(limits.max_running, 0);
         assert_eq!(limits.api_per_min, 600);
     }
 
@@ -332,7 +279,7 @@ mod quota_tests {
     }
 
     #[test]
-    fn zero_environment_values_use_saas_defaults() {
+    fn zero_environment_values_are_unlimited() {
         let limits = Limits::from_lookup(|key| {
             Some(
                 match key {
@@ -345,10 +292,10 @@ mod quota_tests {
                 .to_owned(),
             )
         });
-        assert_eq!(limits.max_spaces, 5);
-        assert_eq!(limits.max_disk_mib, 10_240);
-        assert_eq!(limits.max_running, 2);
-        assert_eq!(limits.api_per_min, 120);
+        assert_eq!(limits.max_spaces, 0);
+        assert_eq!(limits.max_disk_mib, 0);
+        assert_eq!(limits.max_running, 0);
+        assert_eq!(limits.api_per_min, 0);
     }
 
     #[test]
@@ -360,9 +307,6 @@ mod quota_tests {
             api_per_min: 0,
             ..Limits::from_lookup(|_| None)
         };
-        assert!(check_space_limit(u32::MAX, &limits).is_ok());
-        assert!(check_disk_limit(u64::MAX, u64::MAX, &limits).is_ok());
-        assert!(check_running_limit(u32::MAX, &limits).is_ok());
 
         let limiter = RateLimiter::new();
         for _ in 0..100 {
@@ -376,30 +320,19 @@ mod quota_tests {
     }
 
     #[test]
-    fn space_limit_rejects_boundary_and_allows_below() {
-        let limits = Limits {
-            max_spaces: 5,
-            ..Limits::from_lookup(|_| None)
+    fn capacity_watermarks_allow_exact_floors_and_reject_either_shortfall() {
+        let floors = Watermarks {
+            min_store_free_mib: 1024,
+            min_mem_available_mib: 512,
         };
-        assert!(check_space_limit(4, &limits).is_ok());
+        assert!(floors.check(1024, 512).is_ok());
         assert!(matches!(
-            check_space_limit(5, &limits),
-            Err(Error::Quota(message)) if message.contains("5/5")
+            floors.check(1023, 512),
+            Err(Error::CapacityWatermark(_))
         ));
-    }
-
-    #[test]
-    fn disk_limit_allows_exact_cap_and_rejects_above() {
-        let limits = Limits {
-            max_disk_mib: 100,
-            ..Limits::from_lookup(|_| None)
-        };
-        // The cap is inclusive: a 100 MiB allowance has to permit exactly
-        // 100 MiB, or the advertised number is never actually reachable.
-        assert!(check_disk_limit(90, 10, &limits).is_ok());
         assert!(matches!(
-            check_disk_limit(90, 11, &limits),
-            Err(Error::Quota(message)) if message.contains("100")
+            floors.check(1024, 511),
+            Err(Error::CapacityWatermark(_))
         ));
     }
 
@@ -428,19 +361,6 @@ mod quota_tests {
             check_mem_limit(1025, &limits),
             Err(Error::Quota(message))
                 if message.contains("requested 1025") && message.contains("cap 1024")
-        ));
-    }
-
-    #[test]
-    fn running_limit_rejects_boundary_and_allows_below() {
-        let limits = Limits {
-            max_running: 2,
-            ..Limits::from_lookup(|_| None)
-        };
-        assert!(check_running_limit(1, &limits).is_ok());
-        assert!(matches!(
-            check_running_limit(2, &limits),
-            Err(Error::Quota(message)) if message.contains("2/2")
         ));
     }
 
@@ -497,26 +417,11 @@ mod storage_tests {
     use super::StoragePolicy;
 
     #[test]
-    fn reserve_accounting_preserves_nominal_when_unset() {
-        let legacy = StoragePolicy::from_values(None, None).unwrap();
-        assert_eq!(legacy.charge_mib(102_400, Some(150)), 102_400);
-        let reserved = StoragePolicy::from_values(Some("20480"), Some("20480")).unwrap();
-        assert_eq!(reserved.charge_mib(102_400, Some(150)), 20_480);
-        assert_eq!(reserved.charge_mib(102_400, Some(30_000)), 30_000);
-        assert_eq!(reserved.charge_mib(102_400, None), 102_400);
-    }
-
-    #[test]
-    fn cap_defaults_and_explicit_zero_are_distinct() {
-        let legacy = StoragePolicy::from_values(None, None).unwrap();
-        assert_eq!(legacy.write_cap(None).unwrap(), 0);
-        let policy = StoragePolicy::from_values(Some(" 0 "), Some("20480")).unwrap();
-        assert_eq!(policy.write_cap(None).unwrap(), 20_480);
+    fn only_explicit_write_caps_are_enabled() {
+        let policy = StoragePolicy::default();
+        assert_eq!(policy.write_cap(None).unwrap(), 0);
         assert_eq!(policy.write_cap(Some(0)).unwrap(), 0);
         assert_eq!(policy.write_cap(Some(42)).unwrap(), 42);
-        for invalid in ["", "-1", "+1", "1MiB", "1.5", "18446744073709551615"] {
-            assert!(StoragePolicy::from_values(Some(invalid), None).is_err());
-            assert!(StoragePolicy::from_values(None, Some(invalid)).is_err());
-        }
+        assert!(policy.write_cap(Some(u64::MAX)).is_err());
     }
 }

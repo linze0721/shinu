@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -101,6 +101,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let vm_cfg = shinu::VmConfig::from_env()?;
     let net_cfg = shinu::NetConfig::from_env()?;
     let limits = Limits::from_env();
+    for key in [
+        "SHINU_LIMIT_SPACES",
+        "SHINU_LIMIT_DISK_MIB",
+        "SHINU_LIMIT_RUNNING",
+        "SHINU_SPACE_RESERVE_MIB",
+        "SHINU_SPACE_WRITE_CAP_MIB",
+    ] {
+        if std::env::var_os(key).is_some() {
+            eprintln!(
+                "warning: {key} is obsolete and ignored; admission uses physical capacity watermarks"
+            );
+        }
+    }
     // Only the deployment admin may mutate quotas; an unset secret fails closed.
     let admin_token = std::env::var("SHINU_ADMIN_TOKEN")
         .ok()
@@ -126,13 +139,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut registry = Registry::new();
     registry.storage.policy = quota::StoragePolicy::from_env()?;
     let registry = Arc::new(registry);
+    shinu::vm::recover_loaded(root.as_path(), &net_cfg)?;
     // Recover active detached jobs before the idle sweep or request listener
     // can observe the VM. A running VM is the sole survival boundary across
     // daemon restarts; stopped or missing guests are reconciled as lost.
     let jobs = JobRuntime::new(Arc::clone(&root), Arc::clone(&db), Arc::clone(&registry));
     jobs.recover();
-    // Warm extent samples before accepting requests; unknown samples reserve
-    // nominal capacity until a later successful usage sweep.
+    // Warm exclusive extent samples before accepting requests; unknown samples
+    // report zero rather than reserving nominal guest disk capacity.
     record_sweep_usage(root.as_path(), &db, &registry)?;
 
     let sweep_root = Arc::clone(&root);
@@ -1012,22 +1026,48 @@ fn update_state<T>(
     Ok(value)
 }
 
-fn update_state_with_quota<T>(
-    root: &Path,
-    db: &Mutex<Connection>,
-    registry: &Registry,
-    project: &str,
-    limits: &Limits,
-    adding_mib: u64,
-    update: impl FnOnce(&mut State) -> shinu::Result<T>,
-) -> shinu::Result<T> {
-    let _state_guard = lock_state(registry);
-    let connection = lock_db(db);
-    check_space_quota(root, &connection, registry, project, limits, adding_mib)?;
-    let mut state = state::load(&connection)?;
-    let value = update(&mut state)?;
-    state::store(&connection, &state)?;
-    Ok(value)
+fn ensure_capacity(ctx: &Ctx<'_>) -> shinu::Result<()> {
+    let floors = ctx.registry.storage.policy.watermarks;
+    let store = if floors.min_store_free_mib == 0 {
+        0
+    } else {
+        shinu::avail_bytes(ctx.root)? / BYTES_PER_MIB
+    };
+    let memory = if floors.min_mem_available_mib == 0 {
+        0
+    } else {
+        std::fs::read_to_string("/proc/meminfo")?
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("MemAvailable:")
+                    .and_then(|value| value.split_whitespace().next())?
+                    .parse::<u64>()
+                    .ok()
+            })
+            .ok_or_else(|| {
+                shinu::Error::Internal("MemAvailable missing from /proc/meminfo".into())
+            })?
+            / 1024
+    };
+    floors.check(store, memory)
+}
+
+fn warm_checkpoint(ctx: &Ctx<'_>, project: &str, id: Uuid) -> shinu::Result<Value> {
+    let lock = ctx.registry.checkpoint_lock(id);
+    let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+    let checkpoint = {
+        let connection = lock_db(ctx.db);
+        state::find_ckpt(&connection, id, project)?
+            .ok_or_else(|| shinu::Error::NotFound(id.to_string()))?
+    };
+    if !checkpoint.full || checkpoint.base.is_some() {
+        return Err(shinu::Error::Invalid(
+            "warm requires a non-diff Full checkpoint".into(),
+        ));
+    }
+    ensure_snapshot_loadable(&checkpoint)?;
+    shinu::vm::warm_checkpoint_memory(&shinu::ckpt_mem(ctx.root, id))?;
+    Ok(json!({"checkpoint":id,"warmed":true}))
 }
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
@@ -1124,7 +1164,10 @@ fn running_network_members(
         .filter(|space| {
             space.project == project
                 && space.network.as_deref() == Some(network)
-                && shinu::vm::is_running(&shinu::vm_dir(root, space.id))
+                && matches!(
+                    shinu::vm::lifecycle_state(&shinu::vm_dir(root, space.id)),
+                    Ok("running" | "resuming")
+                )
         })
         .cloned()
         .collect()
@@ -1583,84 +1626,34 @@ fn space_size_mib(root: &Path, space: &Space) -> u64 {
         .unwrap_or_else(|| image_size_mib(&shinu::space_image(root, space.id)))
 }
 
-fn current_disk_mib(
-    root: &Path,
-    state: &State,
-    project: &str,
-    registry: &Registry,
-) -> shinu::Result<u64> {
-    let spaces = state
+fn current_disk_mib(state: &State, project: &str, registry: &Registry) -> u64 {
+    state
         .spaces
         .iter()
         .filter(|space| space.project == project)
-        .map(|space| {
-            registry.storage.policy.charge_mib(
-                space_size_mib(root, space),
-                registry.storage.exclusive(space.id).map(bytes_to_mib),
-            )
+        .map(|space| space.id)
+        .chain(
+            state
+                .ckpts
+                .iter()
+                .filter(|checkpoint| checkpoint.project == project)
+                .map(|checkpoint| checkpoint.id),
+        )
+        .fold(0u64, |total, id| {
+            total.saturating_add(registry.storage.exclusive(id).map_or(0, bytes_to_mib))
         })
-        .sum::<u64>();
-    let mut checkpoints = 0u64;
-    for checkpoint in state
-        .ckpts
-        .iter()
-        .filter(|checkpoint| checkpoint.project == project)
-    {
-        let bytes = if registry.storage.policy.reserve_mib.is_some() {
-            registry
-                .storage
-                .exclusive(checkpoint.id)
-                .unwrap_or_else(|| {
-                    [
-                        shinu::ckpt_image(root, checkpoint.id),
-                        shinu::ckpt_mem(root, checkpoint.id),
-                        shinu::ckpt_state(root, checkpoint.id),
-                    ]
-                    .iter()
-                    .filter_map(|path| path.metadata().ok())
-                    .map(|metadata| metadata.len())
-                    .sum()
-                })
-        } else {
-            checkpoint_exclusive(root, checkpoint.id)?
-        };
-        checkpoints = checkpoints.saturating_add(bytes_to_mib(bytes));
-    }
-    Ok(spaces.saturating_add(checkpoints))
-}
-
-fn check_space_quota(
-    root: &Path,
-    connection: &Connection,
-    registry: &Registry,
-    project: &str,
-    limits: &Limits,
-    adding_mib: u64,
-) -> shinu::Result<()> {
-    let spaces = state::count_spaces(connection, project)?;
-    quota::check_space_limit(spaces, limits)?;
-    let state = state::load(connection)?;
-    let disk_mib = current_disk_mib(root, &state, project, registry)?;
-    // Capacity quota is an instantaneous allocation check, separate from the
-    // usage_events.disk_mib_hour billing time series.
-    quota::check_disk_limit(disk_mib, adding_mib, limits)
 }
 
 fn effective_limits(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Limits> {
     let connection = lock_db(ctx.db);
-    let (max_spaces, max_disk_mib, max_running, api_per_min) =
-        state::project_limits(&connection, project)?.unwrap_or((
-            ctx.limits.max_spaces,
-            ctx.limits.max_disk_mib,
-            ctx.limits.max_running,
-            ctx.limits.api_per_min,
-        ));
+    let api_per_min = state::project_limits(&connection, project)?
+        .map_or(ctx.limits.api_per_min, |limits| limits.3);
     Ok(Limits {
-        max_spaces,
-        max_disk_mib,
+        max_spaces: 0,
+        max_disk_mib: 0,
         max_vcpus: ctx.limits.max_vcpus,
         max_mem_mib: ctx.limits.max_mem_mib,
-        max_running,
+        max_running: 0,
         api_per_min,
     })
 }
@@ -1699,9 +1692,9 @@ fn count_running(root: &Path, state: &State, project: &str) -> u32 {
 
 fn space_start_state(
     ctx: &Ctx<'_>,
-    project: &str,
+    _project: &str,
     space: &Space,
-    limits: &Limits,
+    _limits: &Limits,
 ) -> shinu::Result<State> {
     let already_running = shinu::vm::is_running(&shinu::vm_dir(ctx.root, space.id));
     if already_running {
@@ -1712,9 +1705,6 @@ fn space_start_state(
     let _state_guard = lock_state(ctx.registry);
     let connection = lock_db(ctx.db);
     let state = state::load(&connection)?;
-    if !already_running {
-        quota::check_running_limit(count_running(ctx.root, &state, project), limits)?;
-    }
     Ok(state)
 }
 
@@ -1751,7 +1741,7 @@ fn record_sweep_usage(
         let running = shinu::vm::is_running(&shinu::vm_dir(root, id));
         samples.push((id, project, disk_mib, running));
     }
-    if registry.storage.policy.reserve_mib.is_some() {
+    {
         for checkpoint in &state_before.ckpts {
             let lock = registry.checkpoint_lock(checkpoint.id);
             let _guard = match lock.try_lock() {
@@ -1803,24 +1793,28 @@ fn record_sweep_usage(
 }
 
 fn space_exclusive(root: &Path, id: Uuid) -> shinu::Result<u64> {
-    #[cfg(test)]
-    if root.join("test-fork-host").is_file() {
-        return Ok(std::fs::metadata(shinu::space_image(root, id))?.len());
+    let probe = |path: &Path| -> shinu::Result<u64> {
+        #[cfg(test)]
+        if root.join("test-fork-host").is_file() {
+            return Ok(std::fs::metadata(path)?.len());
+        }
+        shinu::btrfs::exclusive(path)
+    };
+    let mut bytes = probe(&shinu::space_image(root, id))?;
+    for path in [space_snapshot_mem(root, id), space_snapshot_state(root, id)] {
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        // Non-diff Full memory is owned/accounted by the referenced checkpoint.
+        // Private merged memory and private CPU state belong to this Space.
+        if path.extension().is_some_and(|extension| extension == "mem") && metadata.nlink() > 1 {
+            continue;
+        }
+        bytes = bytes.saturating_add(probe(&path)?);
     }
-    shinu::btrfs::exclusive(&shinu::space_image(root, id))
-}
-
-fn new_space_charge(ctx: &Ctx<'_>, id: Uuid, nominal: u64) -> shinu::Result<u64> {
-    if ctx.registry.storage.policy.reserve_mib.is_none() {
-        return Ok(nominal);
-    }
-    let bytes = space_exclusive(ctx.root, id)?;
-    ctx.registry.storage.record(id, bytes);
-    Ok(ctx
-        .registry
-        .storage
-        .policy
-        .charge_mib(nominal, Some(bytes_to_mib(bytes))))
+    Ok(bytes)
 }
 
 fn cap_exceeded(space: &Space, bytes: u64) -> bool {
@@ -2096,6 +2090,11 @@ fn dirty_generation_path(root: &Path, space: Uuid) -> PathBuf {
 }
 
 fn dirty_base_matches(root: &Path, space: &Space, base: &Ckpt) -> bool {
+    if std::fs::read_to_string(shinu::vm_dir(root, space.id).join("track-dirty"))
+        .is_ok_and(|value| value == "false")
+    {
+        return false;
+    }
     // FC resets dirty logging at every successful create, even if disk cut or
     // publication then fails. A durable marker is invalidated before capture.
     std::fs::read_to_string(dirty_generation_path(root, space.id))
@@ -2273,7 +2272,7 @@ fn materialize_checkpoint_memory(
         }
         shinu::vm::merge_snapshot_memory(&base_memory, &memory, destination)
     } else {
-        shinu::btrfs::clone_for(&memory, destination, 0, 0)
+        shinu::vm::link_checkpoint_memory(&memory, destination)
     }
 }
 
@@ -2381,6 +2380,7 @@ fn create_space(ctx: &Ctx<'_>, project: &str, spec: SpaceSpec) -> shinu::Result<
         ttl_seconds,
         readiness,
     } = spec;
+    ensure_capacity(ctx)?;
     state::validate_network_name(network.as_deref())?;
     ensure_positive_size("vcpus", vcpus.map(u64::from))?;
     ensure_positive_size("mem_mib", mem_mib.map(u64::from))?;
@@ -2404,21 +2404,6 @@ fn create_space(ctx: &Ctx<'_>, project: &str, spec: SpaceSpec) -> shinu::Result<
             "disk cannot shrink at creation because that could cause data loss".into(),
         ));
     }
-    {
-        let _state_guard = lock_state(ctx.registry);
-        let connection = lock_db(ctx.db);
-        check_space_quota(
-            ctx.root,
-            &connection,
-            ctx.registry,
-            project,
-            &limits,
-            ctx.registry
-                .storage
-                .policy
-                .charge_mib(requested_disk, Some(0)),
-        )?;
-    }
     let id = Uuid::new_v4();
     let space_guard = ctx.registry.space_lock(id);
     let _space_guard = space_guard
@@ -2435,39 +2420,30 @@ fn create_space(ctx: &Ctx<'_>, project: &str, spec: SpaceSpec) -> shinu::Result<
         // Each image gets its own key: the base is a common ancestor, so a key
         // baked into it would otherwise be shared by every space.
         shinu::vm::authorize(&image_path, &public_key, &mount)?;
-        let charge = new_space_charge(ctx, id, requested_disk)?;
-        let space = update_state_with_quota(
-            ctx.root,
-            ctx.db,
-            ctx.registry,
-            project,
-            &limits,
-            charge,
-            |state| {
-                check_name(state, &name, project)?;
-                let created_at = Utc::now();
-                let expires_at = state::lease_expiry(created_at, ttl_seconds)?;
-                let space = Space {
-                    id,
-                    name: name.clone(),
-                    project: project.to_owned(),
-                    image,
-                    parent: None,
-                    head: None,
-                    vcpus,
-                    mem_mib,
-                    disk_mib,
-                    network: network.clone(),
-                    expires_at,
-                    created_at,
-                    write_cap_mib: ctx.registry.storage.policy.write_cap(None)?,
-                    stopped_reason: None,
-                    readiness: readiness.clone(),
-                };
-                state.spaces.push(space.clone());
-                Ok(space)
-            },
-        )?;
+        let space = update_state(ctx.db, ctx.registry, |state| {
+            check_name(state, &name, project)?;
+            let created_at = Utc::now();
+            let expires_at = state::lease_expiry(created_at, ttl_seconds)?;
+            let space = Space {
+                id,
+                name: name.clone(),
+                project: project.to_owned(),
+                image,
+                parent: None,
+                head: None,
+                vcpus,
+                mem_mib,
+                disk_mib,
+                network: network.clone(),
+                expires_at,
+                created_at,
+                write_cap_mib: ctx.registry.storage.policy.write_cap(None)?,
+                stopped_reason: None,
+                readiness: readiness.clone(),
+            };
+            state.spaces.push(space.clone());
+            Ok(space)
+        })?;
         record_usage(ctx.db, project, "space_created", Some(id), 1)?;
         Ok(serde_json::to_value(space)?)
     })();
@@ -2492,6 +2468,7 @@ fn fork_space(
         spec.validate()?;
     }
     let write_cap_mib = ctx.registry.storage.policy.write_cap(write_cap_mib)?;
+    ensure_capacity(ctx)?;
     let limits = effective_limits(ctx, project)?;
     let id = Uuid::new_v4();
     let space_guard = ctx.registry.space_lock(id);
@@ -2540,14 +2517,6 @@ fn fork_space(
             .disk_mib
             .or_else(|| source_space.and_then(|space| space.disk_mib))
             .unwrap_or_else(|| image_size_mib(&shinu::ckpt_image(ctx.root, checkpoint.id)));
-        check_space_quota(
-            ctx.root,
-            &connection,
-            ctx.registry,
-            project,
-            &limits,
-            ctx.registry.storage.policy.charge_mib(disk_mib, Some(0)),
-        )?;
         check_vm_sizing(ctx, &limits, Some(vcpus), Some(mem_mib))?;
         let image = source_space.map_or(Image::Void, |space| space.image);
         let network = source_space.and_then(|space| space.network.clone());
@@ -2559,40 +2528,31 @@ fn fork_space(
     let mount = ctx.root.join(format!("authorize.{id}.mnt"));
     let result = (|| -> shinu::Result<Value> {
         materialize_fork(ctx.root, &source_checkpoint, id)?;
-        let charge = new_space_charge(ctx, id, disk_mib)?;
-        let space = update_state_with_quota(
-            ctx.root,
-            ctx.db,
-            ctx.registry,
-            project,
-            &limits,
-            charge,
-            |state| {
-                check_name(state, &name, project)?;
-                shinu::find_ckpt(state, source, project)?;
-                let created_at = Utc::now();
-                let expires_at = state::lease_expiry(created_at, ttl_seconds)?;
-                let space = Space {
-                    id,
-                    name: name.clone(),
-                    project: project.to_owned(),
-                    image,
-                    parent: Some(source),
-                    head: Some(source),
-                    vcpus: Some(vcpus),
-                    mem_mib: Some(mem_mib),
-                    disk_mib: Some(disk_mib),
-                    network: network.clone(),
-                    expires_at,
-                    created_at,
-                    write_cap_mib,
-                    stopped_reason: None,
-                    readiness: readiness.clone(),
-                };
-                state.spaces.push(space.clone());
-                Ok(space)
-            },
-        )?;
+        let space = update_state(ctx.db, ctx.registry, |state| {
+            check_name(state, &name, project)?;
+            shinu::find_ckpt(state, source, project)?;
+            let created_at = Utc::now();
+            let expires_at = state::lease_expiry(created_at, ttl_seconds)?;
+            let space = Space {
+                id,
+                name: name.clone(),
+                project: project.to_owned(),
+                image,
+                parent: Some(source),
+                head: Some(source),
+                vcpus: Some(vcpus),
+                mem_mib: Some(mem_mib),
+                disk_mib: Some(disk_mib),
+                network: network.clone(),
+                expires_at,
+                created_at,
+                write_cap_mib,
+                stopped_reason: None,
+                readiness: readiness.clone(),
+            };
+            state.spaces.push(space.clone());
+            Ok(space)
+        })?;
         record_usage(ctx.db, project, "space_created", Some(id), 1)?;
         Ok(serde_json::to_value(space)?)
     })();
@@ -2803,6 +2763,14 @@ fn commit_space(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let vm_dir = shinu::vm_dir(ctx.root, space_id);
+    if matches!(
+        shinu::vm::lifecycle_state(&vm_dir)?,
+        "loading" | "loaded" | "resuming"
+    ) {
+        return Err(shinu::Error::Invalid(
+            "space is loaded; resume or stop before checkpointing".into(),
+        ));
+    }
     let (mode, diff_base) = match mode {
         SnapshotMode::None => (SnapshotMode::None, None),
         requested => {
@@ -2839,9 +2807,6 @@ fn commit_space(
         "none".to_owned()
     };
     let id = Uuid::new_v4();
-    let snapshot_limits = has_snapshot
-        .then(|| effective_limits(ctx, project))
-        .transpose()?;
     let image = shinu::ckpt_image(ctx.root, id);
     let jail_snapshot_mem = shinu::vm::jail_root(ctx.root, space_id).join("snap.mem");
     let jail_snapshot_state = shinu::vm::jail_root(ctx.root, space_id).join("snap.state");
@@ -2869,6 +2834,13 @@ fn commit_space(
         {
             std::fs::rename(snapshot_mem, shinu::ckpt_mem(ctx.root, id))?;
             std::fs::rename(snapshot_state, shinu::ckpt_state(ctx.root, id))?;
+            for path in [
+                shinu::ckpt_mem(ctx.root, id),
+                shinu::ckpt_state(ctx.root, id),
+            ] {
+                std::os::unix::fs::chown(&path, Some(0), Some(ctx.vm_cfg.jail_gid))?;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o440))?;
+            }
             copy_ssh_credentials(
                 &shinu::vm::key_path(&vm_dir),
                 &shinu::ckpt_key(ctx.root, id),
@@ -2876,23 +2848,7 @@ fn commit_space(
         }
         let metadata = checkpoint_metadata(id, current_space.head, capture.as_ref(), &fc_build_id);
         write_checkpoint_metadata(ctx.root, id, &metadata)?;
-        let new_checkpoint_mib =
-            if has_snapshot || ctx.registry.storage.policy.reserve_mib.is_some() {
-                let bytes = checkpoint_exclusive(ctx.root, id)?;
-                ctx.registry.storage.record(id, bytes);
-                bytes_to_mib(bytes)
-            } else {
-                0
-            };
         let checkpoint = update_state(ctx.db, ctx.registry, |state| {
-            if let Some(limits) = snapshot_limits.as_ref() {
-                quota::check_disk_limit(
-                    current_disk_mib(ctx.root, state, project, ctx.registry)?
-                        .saturating_add(new_checkpoint_mib),
-                    0,
-                    limits,
-                )?;
-            }
             if let Some(base) = diff_base.as_ref() {
                 let still_present = state.ckpts.iter().any(|checkpoint| {
                     checkpoint.id == base.id
@@ -2969,7 +2925,7 @@ fn checkout_space(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let vm_running = shinu::vm::is_running(&shinu::vm_dir(ctx.root, space_id));
-    let (target, current_head, space_name, image_kind, vcpus, mem_mib) = {
+    let (target, current_head, space_name) = {
         let _state_guard = lock_state(ctx.registry);
         let connection = lock_db(ctx.db);
         let state = state::load(&connection)?;
@@ -2997,14 +2953,7 @@ fn checkout_space(
             .find(|checkpoint| checkpoint.id == commit && checkpoint.project == project)
             .cloned()
             .ok_or_else(|| shinu::Error::NotFound(commit.to_string()))?;
-        (
-            target,
-            entry.head,
-            entry.name.clone(),
-            entry.image,
-            entry.vcpus,
-            entry.mem_mib,
-        )
+        (target, entry.head, entry.name.clone())
     };
     let target = checkpoint_for_restore(target);
     if let Some(base_id) = target.base {
@@ -3108,14 +3057,7 @@ fn checkout_space(
         Ok(())
     })?;
     if target.full {
-        let _ = start_vm_with_pending_restore(
-            ctx,
-            space_id,
-            image_kind,
-            vcpus,
-            mem_mib,
-            Some(&target),
-        )?;
+        let _ = start_vm_with_pending_restore(ctx, space_id, Some(&target), false, true)?;
     }
     Ok(json!({ "head": target.id, "auto_commit": auto_checkpoint.id }))
 }
@@ -3230,13 +3172,15 @@ fn list_spaces(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
     for space in state.spaces.iter().filter(|space| space.project == project) {
         let mut value = serde_json::to_value(space)?;
         if let Some(object) = value.as_object_mut() {
-            let size =
-                shinu::btrfs::exclusive(&shinu::space_image(ctx.root, space.id)).unwrap_or(0);
+            let size = space_exclusive(ctx.root, space.id).unwrap_or(0);
             object.insert("exclusive".into(), Value::from(size));
             object.insert(
                 "running".into(),
                 Value::from(shinu::vm::is_running(&shinu::vm_dir(ctx.root, space.id))),
             );
+            let phase = shinu::vm::lifecycle_state(&shinu::vm_dir(ctx.root, space.id))?;
+            object.insert("state".into(), json!(phase));
+            object.insert("running".into(), json!(phase == "running"));
         }
         spaces.push(value);
     }
@@ -3304,11 +3248,17 @@ fn checkpoint_snapshot_nonce(root: &Path, id: Uuid) -> shinu::Result<Option<Stri
 fn start_vm_with_pending_restore(
     ctx: &Ctx<'_>,
     id: Uuid,
-    image: Image,
-    vcpus: Option<u32>,
-    mem_mib: Option<u32>,
     restore_checkpoint: Option<&Ckpt>,
+    load_only: bool,
+    track_dirty: bool,
 ) -> shinu::Result<(PathBuf, bool)> {
+    let dir = shinu::vm_dir(ctx.root, id);
+    if !shinu::vm::is_running(&dir) && dir.join("loaded.json").exists() {
+        shinu::vm::stop(&dir, ctx.net_cfg)?;
+    }
+    if !shinu::vm::is_running(&shinu::vm_dir(ctx.root, id)) {
+        ensure_capacity(ctx)?;
+    }
     let before_start = snapshot(ctx.db, ctx.registry)?;
     let space = before_start
         .spaces
@@ -3353,12 +3303,14 @@ fn start_vm_with_pending_restore(
     let result = shinu::vm::start(
         ctx.root,
         id,
-        image,
+        space.image,
         shinu::vm::StartOptions {
-            vcpus,
-            mem_mib,
+            vcpus: space.vcpus,
+            mem_mib: space.mem_mib,
             restore: restore.as_ref(),
             readiness: space.readiness.as_ref(),
+            load_only,
+            track_dirty,
         },
         ctx.vm_cfg,
         ctx.net_cfg,
@@ -3400,18 +3352,16 @@ fn start_vm_with_pending_restore(
             eprintln!("network cleanup after failed start: {error}");
         }
     }
-    if has_restore {
-        let cleanup = remove_space_snapshot_files(ctx.root, id);
-        return match (result, cleanup) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Ok(_), Err(error)) => Err(error),
-            (Err(error), _) => Err(error),
-        };
-    }
     result
 }
 
-fn start_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value> {
+fn start_space(
+    ctx: &Ctx<'_>,
+    project: &str,
+    name: String,
+    load_only: bool,
+    track_dirty: bool,
+) -> shinu::Result<Value> {
     let initial = {
         let connection = lock_db(ctx.db);
         state::find_space(&connection, &name, project)?
@@ -3429,16 +3379,46 @@ fn start_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Valu
     let restore_checkpoint = space
         .head
         .and_then(|head| state.ckpts.iter().find(|checkpoint| checkpoint.id == head));
-    let booted = start_vm_with_pending_restore(
-        ctx,
+    let booted =
+        start_vm_with_pending_restore(ctx, space.id, restore_checkpoint, load_only, track_dirty)?.1;
+    Ok(json!({ "booted": booted, "state": if load_only { "loaded" } else { "running" } }))
+}
+
+fn resume_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value> {
+    let initial = find_space(ctx.db, &name, project)?;
+    let lock = ctx.registry.space_lock(initial.id);
+    let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+    let space = revalidate_space(ctx, project, initial.id, &name)?;
+    ensure_lease_active(&space, Utc::now())?;
+    ensure_capacity(ctx)?;
+    ensure_write_cap(ctx, &space)?;
+    if shinu::vm::lifecycle_state(&shinu::vm_dir(ctx.root, space.id))? != "loaded" {
+        return Err(shinu::Error::Invalid(
+            "resume requires a loaded space".into(),
+        ));
+    }
+    let before = snapshot(ctx.db, ctx.registry)?;
+    let previous = running_network_members(ctx.root, &before, project, space.network.as_deref());
+    let result = shinu::vm::resume(
+        ctx.root,
         space.id,
-        space.image,
-        space.vcpus,
-        space.mem_mib,
-        restore_checkpoint,
-    )?
-    .1;
-    Ok(json!({ "booted": booted }))
+        space.readiness.as_ref(),
+        ctx.net_cfg,
+        |deadline| {
+            let state = snapshot(ctx.db, ctx.registry)?;
+            let members = network_members(&state, project, space.network.as_deref());
+            let running =
+                refresh_network_rules(ctx, &state, project, space.network.as_deref(), &previous)?;
+            sync_network_hosts_with(ctx.root, ctx.net_cfg, &running, &members, deadline);
+            Ok(())
+        },
+    );
+    if result.is_err() {
+        let current = snapshot(ctx.db, ctx.registry)?;
+        refresh_network_rules(ctx, &current, project, space.network.as_deref(), &previous)?;
+    }
+    let (_, booted) = result?;
+    Ok(json!({"booted":booted,"state":"running"}))
 }
 fn stop_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value> {
     let initial = {
@@ -3518,7 +3498,7 @@ fn resize_space(
     // — once here to fail fast, and again under the lock that stores the new
     // sizes. Only the second check is authoritative: two concurrent grows can
     // both clear this one against the same stale state.
-    let (new_vcpus, new_mem_mib, new_disk_mib, image_path, actual_disk, target_disk, grew) = {
+    let (new_vcpus, new_mem_mib, new_disk_mib, image_path, actual_disk, target_disk) = {
         let _state_guard = lock_state(ctx.registry);
         let connection = lock_db(ctx.db);
         let state = state::load(&connection)?;
@@ -3567,23 +3547,6 @@ fn resize_space(
                 (Some(requested), requested)
             }
         };
-        let grew = target_disk > current_disk;
-        if grew {
-            let exclusive = ctx.registry.storage.exclusive(current.id).map(bytes_to_mib);
-            let current_charge = ctx
-                .registry
-                .storage
-                .policy
-                .charge_mib(current_disk, exclusive);
-            let target_charge = ctx
-                .registry
-                .storage
-                .policy
-                .charge_mib(target_disk, exclusive);
-            let used_without_current = current_disk_mib(ctx.root, &state, project, ctx.registry)?
-                .saturating_sub(current_charge);
-            quota::check_disk_limit(used_without_current, target_charge, &limits)?;
-        }
         (
             new_vcpus,
             new_mem_mib,
@@ -3591,7 +3554,6 @@ fn resize_space(
             image_path,
             actual_disk,
             target_disk,
-            grew,
         )
     };
     if target_disk > actual_disk {
@@ -3602,7 +3564,7 @@ fn resize_space(
     // that duration by committing one here.
     #[cfg(test)]
     tests::during_resize_grow();
-    let (updated, exceeded) = update_state(ctx.db, ctx.registry, |state| {
+    let updated = update_state(ctx.db, ctx.registry, |state| {
         let space = state
             .spaces
             .iter_mut()
@@ -3615,26 +3577,8 @@ fn resize_space(
             space.readiness = Some(spec.clone());
         }
         let updated = space.clone();
-        // Only a grow reserves anything, matching the pre-check: a request that
-        // just changes vcpus must not start failing because the project is
-        // already over its ceiling for unrelated reasons.
-        //
-        // The image is already grown by this point, so the bytes are spent
-        // whether or not the check passes. Record them either way and report the
-        // overrun afterwards: dropping the write would leave the larger file
-        // uncounted and let the next request overshoot from a stale total.
-        let exceeded = if grew {
-            quota::check_disk_limit(
-                current_disk_mib(ctx.root, state, project, ctx.registry)?,
-                0,
-                &limits,
-            )
-        } else {
-            Ok(())
-        };
-        Ok((updated, exceeded))
+        Ok(updated)
     })?;
-    exceeded?;
     Ok(serde_json::to_value(updated)?)
 }
 
@@ -3805,7 +3749,7 @@ fn limits_value(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
     let connection = lock_db(ctx.db);
     let state = state::load(&connection)?;
     let used_spaces = state::count_spaces(&connection, project)?;
-    let used_disk = current_disk_mib(ctx.root, &state, project, ctx.registry)?;
+    let used_disk = current_disk_mib(&state, project, ctx.registry);
     let used_running = count_running(ctx.root, &state, project);
     Ok(json!({
         "max_spaces": limits.max_spaces,
@@ -3823,6 +3767,12 @@ fn limits_value(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
 }
 fn patch_project_limits(ctx: &Ctx<'_>, project: &str, body: &[u8]) -> shinu::Result<Value> {
     let value = parse_body(body)?;
+    if ["max_spaces", "max_disk_mib", "max_running"]
+        .iter()
+        .any(|key| value.get(*key).is_some())
+    {
+        return Err(shinu::Error::Invalid("project spaces/disk/running quotas are obsolete; configure physical capacity watermarks instead".into()));
+    }
     let max_spaces = value_patch_u32(&value, "max_spaces")?;
     let max_disk_mib = value_patch_u64(&value, "max_disk_mib")?;
     let max_running = value_patch_u32(&value, "max_running")?;
@@ -4403,7 +4353,13 @@ fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
         Req::GetJob { id } => get_job_value(ctx, project, id),
         Req::GetJobLogs { id } => get_job_logs(ctx, project, id),
         Req::CancelJob { id } => cancel_job(ctx, project, id),
-        Req::Start { space } => start_space(ctx, project, space),
+        Req::Start {
+            space,
+            load_only,
+            track_dirty,
+        } => start_space(ctx, project, space, load_only, track_dirty),
+        Req::Resume { space } => resume_space(ctx, project, space),
+        Req::WarmCheckpoint { ckpt } => warm_checkpoint(ctx, project, ckpt),
         Req::Stop { space } => stop_space(ctx, project, space),
         Req::Compact { space } => compact_space(ctx, project, space),
         Req::Touch { space } => touch_space(ctx, project, space),
@@ -4577,6 +4533,8 @@ enum Endpoint {
     ProjectLimits(String),
     Rm(String),
     Start(String),
+    Resume(String),
+    WarmCheckpoint(String),
     Stop(String),
     Compact(String),
     Exec(String),
@@ -4693,6 +4651,7 @@ fn route(path: &str) -> Option<Endpoint> {
         let name = segments[3].clone();
         return match segments[4].as_str() {
             "start" => Some(Endpoint::Start(name)),
+            "resume" => Some(Endpoint::Resume(name)),
             "stop" => Some(Endpoint::Stop(name)),
             "compact" => Some(Endpoint::Compact(name)),
             "lease" => Some(Endpoint::Lease(name)),
@@ -4713,6 +4672,9 @@ fn route(path: &str) -> Option<Endpoint> {
     }
     if segments.len() == 5 && segments[2] == "commits" && segments[4] == "fork" {
         return Some(Endpoint::Fork(segments[3].clone()));
+    }
+    if segments.len() == 5 && segments[2] == "commits" && segments[4] == "warm" {
+        return Some(Endpoint::WarmCheckpoint(segments[3].clone()));
     }
     None
 }
@@ -4911,6 +4873,8 @@ fn method_allowed(endpoint: &Endpoint, method: &str) -> bool {
         Endpoint::Lease(_) => method == "PATCH",
         Endpoint::RmCkpt(_) => method == "DELETE",
         Endpoint::Start(_)
+        | Endpoint::Resume(_)
+        | Endpoint::WarmCheckpoint(_)
         | Endpoint::Stop(_)
         | Endpoint::Compact(_)
         | Endpoint::Exec(_)
@@ -5245,7 +5209,37 @@ fn request_for(
         Endpoint::Limits => Ok((Req::Limits, 200)),
         Endpoint::Rm(space) if method == "PATCH" => Ok((resize_request(body, space)?, 200)),
         Endpoint::Rm(space) => Ok((Req::Rm { space }, 200)),
-        Endpoint::Start(space) => Ok((Req::Start { space }, 200)),
+        Endpoint::Start(space) => {
+            let value = if body.is_empty() {
+                json!({})
+            } else {
+                parse_body(body)?
+            };
+            let flag = |key: &str, default| -> shinu::Result<bool> {
+                value.get(key).map_or(Ok(default), |value| {
+                    value
+                        .as_bool()
+                        .ok_or_else(|| shinu::Error::Invalid(format!("{key} must be boolean")))
+                })
+            };
+            Ok((
+                Req::Start {
+                    space,
+                    load_only: flag("load_only", false)?,
+                    track_dirty: flag("track_dirty", true)?,
+                },
+                200,
+            ))
+        }
+        Endpoint::Resume(space) => Ok((Req::Resume { space }, 200)),
+        Endpoint::WarmCheckpoint(ckpt) => Ok((
+            Req::WarmCheckpoint {
+                ckpt: Uuid::parse_str(&ckpt).map_err(|error| {
+                    shinu::Error::Invalid(format!("invalid checkpoint id: {error}"))
+                })?,
+            },
+            200,
+        )),
         Endpoint::Stop(space) => Ok((Req::Stop { space }, 200)),
         Endpoint::Compact(space) => Ok((Req::Compact { space }, 200)),
         Endpoint::Commit(space) => Ok((commit_request(body, space)?, 201)),
@@ -5368,14 +5362,7 @@ fn prepare_ssh_entry(ctx: &Ctx<'_>, project: &str, entry: &Space) -> shinu::Resu
     let restore_checkpoint = entry
         .head
         .and_then(|head| state.ckpts.iter().find(|checkpoint| checkpoint.id == head));
-    start_vm_with_pending_restore(
-        ctx,
-        entry.id,
-        entry.image,
-        entry.vcpus,
-        entry.mem_mib,
-        restore_checkpoint,
-    )?;
+    start_vm_with_pending_restore(ctx, entry.id, restore_checkpoint, false, true)?;
     ssh_target_for_vm(ctx.root, entry.id)
 }
 
@@ -7242,7 +7229,9 @@ fn delete_console_token(ctx: &Ctx<'_>, project: &str, prefix: &str) -> shinu::Re
 }
 
 fn respond_error(stream: &mut impl Write, status: u16, error: &shinu::Error) -> shinu::Result<()> {
-    let body = if status >= 500 {
+    let body = if matches!(error, shinu::Error::CapacityWatermark(_)) {
+        json!({"error":error.to_string(),"code":"capacity_watermark"})
+    } else if status >= 500 {
         eprintln!("{error}");
         json!({ "error": "internal server error" })
     } else {
@@ -8026,10 +8015,119 @@ mod tests {
     use std::time::Duration;
     use uuid::Uuid;
 
+    #[test]
+    fn listing_counts_private_pending_memory_without_double_charging_checkpoint_links() {
+        let root = test_root("pending-exclusive");
+        let space = snapshot_test_space(Uuid::new_v4(), None);
+        store_state(
+            &root,
+            &State {
+                spaces: vec![space.clone()],
+                ..State::default()
+            },
+        );
+        std::fs::write(root.join("test-fork-host"), b"btrfs adapter").unwrap();
+        std::fs::create_dir_all(root.join("spaces")).unwrap();
+        let memory = super::space_snapshot_mem(&root, space.id);
+        for (path, bytes) in [
+            (shinu::space_image(&root, space.id), 1_048_576),
+            (memory.clone(), 3_145_728),
+            (super::space_snapshot_state(&root, space.id), 524_288),
+        ] {
+            std::fs::File::create(path).unwrap().set_len(bytes).unwrap();
+        }
+        let db = test_db(&root);
+        let registry = registry();
+        let (vm_cfg, net_cfg) = test_configs();
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        assert_eq!(
+            handle(&ctx, Req::Ls, "project-a").unwrap()["spaces"][0]["exclusive"],
+            4_718_592
+        );
+        std::fs::create_dir_all(root.join("ckpts")).unwrap();
+        std::fs::hard_link(&memory, root.join("ckpts/shared.mem")).unwrap();
+        assert_eq!(
+            handle(&ctx, Req::Ls, "project-a").unwrap()["spaces"][0]["exclusive"],
+            1_572_864
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn start_wire_defaults_and_pool_flags_round_trip_without_coercion() {
+        for (body, loaded, dirty) in [
+            (&b""[..], false, true),
+            (
+                &br#"{"load_only":true,"track_dirty":false}"#[..],
+                true,
+                false,
+            ),
+        ] {
+            let (request, status) = super::request_for(
+                super::Endpoint::Start("world".into()),
+                "POST",
+                body,
+                None,
+                None,
+            )
+            .unwrap();
+            let request = serde_json::to_value(request).unwrap();
+            assert_eq!(status, 200);
+            assert_eq!(request["load_only"], loaded);
+            assert_eq!(request["track_dirty"], dirty);
+        }
+        for body in [
+            br#"{"load_only":"true"}"#.as_slice(),
+            br#"{"track_dirty":null}"#.as_slice(),
+        ] {
+            assert!(
+                super::request_for(
+                    super::Endpoint::Start("world".into()),
+                    "POST",
+                    body,
+                    None,
+                    None
+                )
+                .is_err()
+            );
+        }
+    }
+
     fn test_root(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("shinu-{label}-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create test root");
         root
+    }
+
+    #[test]
+    fn loaded_space_cannot_enter_the_hot_capture_transaction() {
+        let root = test_root("loaded-commit");
+        let (id, _, mut child) = running_state(&root, "project-a");
+        std::fs::write(
+            shinu::vm_dir(&root, id).join("loaded.json"),
+            b"{\"phase\":\"loaded\"}",
+        )
+        .unwrap();
+        let db = test_db(&root);
+        let registry = registry();
+        let (vm_cfg, net_cfg) = test_configs();
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        let result = handle(
+            &ctx,
+            Req::Commit {
+                space: "running".into(),
+                note: "must not capture".into(),
+                hot: true,
+                snapshot: SnapshotMode::Full,
+            },
+            "project-a",
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            matches!(result, Err(shinu::Error::Invalid(message)) if message.contains("loaded"))
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -8061,7 +8159,7 @@ mod tests {
     }
 
     #[test]
-    fn limits_charge_cached_exclusive_or_reserve_without_extent_walks() {
+    fn limits_report_cached_exclusive_without_nominal_or_reserve_charges() {
         let root = test_root("reserve-limits");
         let mut space = snapshot_test_space(Uuid::new_v4(), None);
         space.disk_mib = Some(102_400);
@@ -8073,14 +8171,12 @@ mod tests {
             },
         );
         let db = test_db(&root);
-        let mut registry = registry();
-        registry.storage.policy =
-            shinu::quota::StoragePolicy::from_values(Some("20480"), None).unwrap();
+        let registry = registry();
         registry.storage.record(space.id, 150 * 1024 * 1024);
         let (vm_cfg, net_cfg) = test_configs();
         let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
         let value = handle(&ctx, Req::Limits, "project-a").unwrap();
-        assert_eq!(value["used"]["disk_mib"], 20_480);
+        assert_eq!(value["used"]["disk_mib"], 150);
         registry.storage.record(space.id, 30_000 * 1024 * 1024);
         let value = handle(&ctx, Req::Limits, "project-a").unwrap();
         assert_eq!(value["used"]["disk_mib"], 30_000);
@@ -8100,6 +8196,29 @@ mod tests {
         let registry = registry();
         let (vm_cfg, net_cfg) = test_configs();
         let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        super::update_state(&db, &registry, |state| {
+            state.spaces[0].write_cap_mib = 1;
+            Ok(())
+        })
+        .unwrap();
+        image.set_len(2 * 1024 * 1024).unwrap();
+        super::lock_db(&db)
+            .execute_batch("PRAGMA user_version=0")
+            .unwrap();
+        let migrated = state::open(&root).unwrap();
+        assert_eq!(
+            state::find_space_by_id(&migrated, id, "project-a")
+                .unwrap()
+                .unwrap()
+                .write_cap_mib,
+            0
+        );
+        super::sweep_write_caps(&root, &db, &registry, &net_cfg).unwrap();
+        assert!(
+            vm::is_running(&shinu::vm_dir(&root, id)),
+            "upgraded inherited cap must not stop a live Space"
+        );
+        image.set_len(1_048_576).unwrap();
         super::update_state(&db, &registry, |state| {
             state.spaces[0].write_cap_mib = 1;
             Ok(())
@@ -8140,13 +8259,11 @@ mod tests {
             },
         );
         let db = test_db(&root);
-        let mut registry = registry();
-        registry.storage.policy =
-            shinu::quota::StoragePolicy::from_values(None, Some("20480")).unwrap();
+        let registry = registry();
         let (vm_cfg, net_cfg) = test_configs();
         let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
         for (name, explicit, expected) in [
-            ("default", None, 20_480),
+            ("default", None, 0),
             ("uncapped", Some(0), 0),
             ("custom", Some(17), 17),
         ] {
@@ -8173,7 +8290,7 @@ mod tests {
             );
         }
         let listing = handle(&ctx, Req::Ls, "project-a").unwrap();
-        assert_eq!(listing["spaces"][0]["write_cap_mib"], 20_480);
+        assert_eq!(listing["spaces"][0]["write_cap_mib"], 0);
         assert_eq!(listing["spaces"][1]["write_cap_mib"], 0);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -8202,6 +8319,8 @@ mod tests {
             &ctx,
             Req::Start {
                 space: space.name.clone(),
+                load_only: false,
+                track_dirty: true,
             },
             "project-a",
         );
@@ -8255,9 +8374,9 @@ mod tests {
         )?;
         if checkpoint.full {
             std::fs::create_dir_all(shinu::vm_dir(root, id))?;
-            std::fs::copy(
-                shinu::ckpt_mem(root, checkpoint.id),
-                super::space_snapshot_mem(root, id),
+            shinu::vm::link_checkpoint_memory(
+                &shinu::ckpt_mem(root, checkpoint.id),
+                &super::space_snapshot_mem(root, id),
             )?;
             std::fs::copy(
                 shinu::ckpt_state(root, checkpoint.id),
@@ -10288,11 +10407,12 @@ esac
                 body.len()
             ),
         );
-        assert!(granted.starts_with("HTTP/1.1 200"), "response: {granted}");
-        assert_eq!(
+        assert!(granted.starts_with("HTTP/1.1 400"), "response: {granted}");
+        assert!(granted.contains("obsolete"));
+        assert!(
             state::project_limit_overrides(&super::lock_db(&db), "project-a")
-                .expect("read granted limits"),
-            Some((Some(0), None, None, None))
+                .unwrap()
+                .is_none()
         );
 
         let cleared = serve_raw(
@@ -10584,52 +10704,63 @@ esac
         std::fs::remove_dir_all(root).expect("remove test root");
     }
     #[test]
-    fn space_quota_boundary_is_rejected_before_state_write() {
-        let root = test_root("quota-boundary");
-        let id = Uuid::new_v4();
+    fn physical_watermarks_reject_each_admission_without_launching_a_vm() {
+        let root = test_root("capacity-watermark");
+        let checkpoint = checkpoint_for_snapshot_gate(false, None);
+        let space = snapshot_test_space(Uuid::new_v4(), None);
         store_state(
             &root,
             &State {
-                spaces: vec![Space {
-                    write_cap_mib: 0,
-                    stopped_reason: None,
-                    readiness: None,
-                    id,
-                    name: "one".into(),
-                    project: "project-a".into(),
-                    image: Image::Void,
-                    vcpus: None,
-                    mem_mib: None,
-                    disk_mib: None,
-                    network: None,
-                    expires_at: None,
-
-                    parent: None,
-                    head: None,
-                    created_at: Utc::now(),
-                }],
-                ckpts: Vec::new(),
+                spaces: vec![space.clone()],
+                ckpts: vec![checkpoint.clone()],
                 templates: Vec::new(),
             },
         );
         let db = test_db(&root);
-        let registry = registry();
-        let limits = Limits {
-            max_spaces: 1,
-            max_disk_mib: 10240,
-            max_vcpus: 16,
-            max_mem_mib: 262_144,
-            max_running: 2,
-            api_per_min: 120,
-        };
-        let result =
-            super::update_state_with_quota(&root, &db, &registry, "project-a", &limits, 0, |_| {
-                Ok(())
-            });
-        assert!(
-            matches!(result, Err(shinu::Error::Quota(message)) if message.contains("space limit"))
-        );
-        std::fs::remove_dir_all(root).expect("remove test root");
+        let mut registry = registry();
+        registry.storage.policy.watermarks.min_store_free_mib = u64::MAX;
+        let (vm_cfg, net_cfg) = test_configs();
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        for request in [
+            Req::Fork {
+                ckpt: checkpoint.id,
+                name: "denied".into(),
+                ttl_seconds: None,
+                write_cap_mib: None,
+                readiness: None,
+            },
+            Req::Start {
+                space: space.name.clone(),
+                load_only: false,
+                track_dirty: true,
+            },
+            Req::Resume {
+                space: space.name.clone(),
+            },
+            Req::New {
+                name: "denied".into(),
+                image: None,
+                vcpus: None,
+                mem_mib: None,
+                disk_mib: None,
+                network: None,
+                ttl_seconds: None,
+                readiness: None,
+            },
+        ] {
+            let error = handle(&ctx, request, "project-a").unwrap_err();
+            assert!(
+                matches!(error, shinu::Error::CapacityWatermark(_)),
+                "{error}"
+            );
+            let mut response = Vec::new();
+            super::respond_error(&mut response, shinu::http::status_for(&error), &error).unwrap();
+            let response = String::from_utf8(response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 429"));
+            assert!(response.contains("\"code\":\"capacity_watermark\""));
+        }
+        assert!(!shinu::vm_dir(&root, space.id).exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -10694,20 +10825,20 @@ esac
             admin_token: None,
         };
         let override_limits = super::effective_limits(&ctx, "project-a").expect("override");
-        assert_eq!(override_limits.max_spaces, 7);
-        assert_eq!(override_limits.max_disk_mib, 99);
+        assert_eq!(override_limits.max_spaces, 0);
+        assert_eq!(override_limits.max_disk_mib, 0);
+        assert_eq!(override_limits.api_per_min, 321);
         let default_limits = super::effective_limits(&ctx, "project-b").expect("default");
-        assert_eq!(default_limits.max_spaces, 5);
-        assert_eq!(default_limits.max_disk_mib, 10);
+        assert_eq!(default_limits.max_spaces, 0);
+        assert_eq!(default_limits.max_disk_mib, 0);
+        assert_eq!(default_limits.max_vcpus, 16);
+        assert_eq!(default_limits.max_mem_mib, 262_144);
         let unlimited_limits =
             super::effective_limits(&ctx, "project-unlimited").expect("unlimited override");
         assert_eq!(unlimited_limits.max_spaces, 0);
         assert_eq!(unlimited_limits.max_disk_mib, 0);
         assert_eq!(unlimited_limits.max_running, 0);
         assert_eq!(unlimited_limits.api_per_min, 0);
-        assert!(shinu::quota::check_space_limit(7, &unlimited_limits).is_ok());
-        assert!(shinu::quota::check_disk_limit(u64::MAX, u64::MAX, &unlimited_limits).is_ok());
-        assert!(shinu::quota::check_running_limit(3, &unlimited_limits).is_ok());
         assert!(
             RateLimiter::new()
                 .check("project-unlimited", unlimited_limits.api_per_min)
@@ -11027,13 +11158,9 @@ esac
         std::fs::remove_dir_all(root).expect("remove test root");
     }
 
-    /// The pre-check clears against the state as it was before the grow, so it
-    /// cannot see an allocation another request commits while `resize2fs` runs.
-    /// Committing a sibling's growth inside that window leaves only the
-    /// re-check under the storing lock able to reject the resize, so this fails
-    /// if the authoritative check is dropped and only the pre-check remains.
+    /// Concurrent growth is no longer rejected by a historical project quota.
     #[test]
-    fn resize_rechecks_quota_against_state_committed_during_the_grow() {
+    fn resize_preserves_concurrent_growth_without_project_quota() {
         let root = test_root("resize-recheck");
         let project = "project-a";
         let target = Uuid::new_v4();
@@ -11133,8 +11260,8 @@ esac
             )
         });
         assert!(
-            matches!(result, Err(shinu::Error::Quota(_))),
-            "resize must be rejected once the sibling's allocation is visible, got {result:?}"
+            result.is_ok(),
+            "historical project disk cap must not reject resize: {result:?}"
         );
         std::fs::remove_dir_all(root).expect("remove test root");
     }

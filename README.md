@@ -244,7 +244,7 @@ Run `packaging/preflight.sh [root-path]` on a candidate host before installing; 
 
 ## Production Deployment & Multi-Tenancy
 
-For multi-tenant SaaS hosting, running microVM sandboxes securely requires strict isolation, quota limits, and TLS termination.
+For multi-tenant hosting, microVM sandboxes require strict isolation, host capacity admission, and TLS termination.
 
 ### 1. Jailer Sandboxing (Mandatory Security)
 `shinud` executes Firecracker instances inside the Firecracker **jailer** sub-process (`<root>/assets/jailer`), providing:
@@ -261,18 +261,21 @@ useradd -u 30000 -g 30000 -r -s /usr/sbin/nologin -d /nonexistent shinu-jail
 ```
 Host kernel must have cgroup v2 unified hierarchy mounted at `/sys/fs/cgroup`.
 
-### 2. Quota & Rate Limits
-Resource consumption is bounded per project via environment variables or DB overrides:
+### 2. Physical Capacity & Request Limits
+
+Create, fork, start and resume check actual store free space and host `MemAvailable` before new admission. There are no per-project Space, disk, or running-VM quotas and no nominal/reserve pre-charge. Concurrent admissions are not reservations: a passing check does not promise a future allocation.
 
 | Variable | Default | Description |
 |---|---|---|
-| `SHINU_LIMIT_SPACES` | `5` | Maximum active or stopped spaces per project. |
-| `SHINU_LIMIT_DISK_MIB` | `10240` | Maximum total exclusive disk allocation (MiB) per project across all spaces. |
-| `SHINU_LIMIT_RUNNING` | `2` | Maximum concurrently running Firecracker VMs per project. |
-| `SHINU_LIMIT_API_PER_MIN` | `120` | Maximum API requests per minute per project (sliding window). |
+| `SHINU_MIN_STORE_FREE_MIB` | `1024` | Minimum actual store free MiB; exact floor is admitted. `0` disables this floor. |
+| `SHINU_MIN_MEM_AVAILABLE_MIB` | `512` | Minimum host MemAvailable MiB; exact floor is admitted. `0` disables this floor. |
+| `SHINU_LIMIT_VCPUS` | `0` | Explicit optional per-VM vCPU ceiling; `0` is unlimited. |
+| `SHINU_LIMIT_MEM_MIB` | `0` | Explicit optional per-VM guest RAM ceiling; `0` is unlimited. |
+| `SHINU_LIMIT_API_PER_MIN` | `0` | Optional per-project request rate ceiling; `0` is unlimited. |
 
-When a project exceeds a quota, API calls return `429 Too Many Requests` with `{"error":"quota: ..."}`.
-Per-project quota overrides can be stored directly in `<root>/shinu.db`.
+Watermark rejection returns HTTP **429** with `{"code":"capacity_watermark","error":"capacity_watermark: ..."}`. CLI lifecycle/fork requests print exactly `shinu: capacity_watermark` to stderr and exit **75**, distinct from other failures (exit 1).
+
+**Migration:** `SHINU_LIMIT_SPACES`, `SHINU_LIMIT_DISK_MIB`, `SHINU_LIMIT_RUNNING`, `SHINU_SPACE_RESERVE_MIB`, and `SHINU_SPACE_WRITE_CAP_MIB` are ignored with a startup warning. Historical project Space/disk/running limits no longer constrain admission. A schema-versioned one-time migration clears all unproven legacy Space write caps and cap-stop reasons; legacy JSON import does the same. Old rows never recorded whether a cap was inherited or explicit, so **old explicit protections must be specified again after upgrading**. Newly explicit `fork --write-cap-mib N` protection persists across future restarts. Limits reporting returns `0` for removed project quotas; admin PATCH fields for them return **400** with an obsolete-quota explanation. Admin `api_per_min` PATCH and DELETE to clear legacy overrides remain supported. Explicit per-VM sizing, request-rate limits, registration throttling, and bounded job/template retention remain supported.
 
 ### 3. TLS Termination & Network Binding
 `shinud` listens strictly on cleartext HTTP on `127.0.0.1:7878` (loopback only) to keep the core daemon dependency tree minimal and simple.
@@ -365,7 +368,9 @@ All API routes require authentication header: `Authorization: Bearer <token>`.
 | `POST` | `/v1/templates/{name}/fork` | `{"name":"web2","ttl_seconds":3600}` | `201 Created` serialized Space | Fork the template's concrete checkpoint UUID into a destination space with optional TTL |
 | `PATCH` | `/v1/spaces/{name}` | `{"vcpus":4,"mem_mib":2048,"disk_mib":4096}` | `200 OK` | Resize VM limits (space must be stopped, disk only grows) |
 | `PATCH` | `/v1/spaces/{space}/lease` | `{"ttl_seconds":3600}` or `{"ttl_seconds":null}` | `200 OK` | Set a lease with a positive integer number of seconds or clear it with `null` |
-| `POST` | `/v1/spaces/{name}/start` | — | `200 OK` `{"booted":true}` | Start Firecracker VM for space |
+| `POST` | `/v1/spaces/{name}/start` | optional `{"load_only":false,"track_dirty":true}` | `200 OK` `{"booted":true,"state":"running"}` | Start, or load a Full generation paused with `load_only:true` (state `loaded`) |
+| `POST` | `/v1/spaces/{name}/resume` | — | `200 OK` `{"booted":true,"state":"running"}` | Resume a loaded Space and wait for fresh application readiness |
+| `POST` | `/v1/commits/{id}/warm` | — | `200 OK` `{"checkpoint":"<id>","warmed":true}` | Warm a non-diff Full checkpoint in the dedicated cache cgroup |
 | `POST` | `/v1/spaces/{name}/stop` | — | `200 OK` `{"stopped":"...","was_running":true}` | Stop VM, flush disk, release memory |
 | `POST` | `/v1/spaces/{name}/exec` | `{"cmd":["..."],"stdin":"...","session":"..."}` | `200 OK` Chunked NDJSON stream | Execute a command synchronously inside VM (optional persistent `session` id) |
 | `POST` | `/v1/spaces/{space}/jobs` | JSON command | Job record | Start a detached command without waiting for completion |
@@ -388,7 +393,7 @@ All API routes require authentication header: `Authorization: Bearer <token>`.
 | `GET` | `/v1/usage[?from=&to=]` | — | `200 OK` | Query usage summary metrics for project |
 | `GET` | `/v1/limits` | — | `200 OK` | Query project quota limits and current resource usage |
 | `GET` | `/v1/projects/{project}/limits` | — | `200 OK` | Query quota limits for a project |
-| `PATCH` | `/v1/projects/{project}/limits` | `{"max_spaces":5,"max_disk_mib":10240,"max_running":2,"api_per_min":120}` | `200 OK` | Set overrides for project quotas (requires admin token) |
+| `PATCH` | `/v1/projects/{project}/limits` | `{"api_per_min":120}` | `200 OK`; obsolete spaces/disk/running fields return `400` | Set project request-rate override (requires admin token) |
 | `DELETE` | `/v1/projects/{project}/limits` | — | `200 OK` | Clear quota overrides for project (requires admin token) |
 | `POST` | `/v1/gc` | `{"free_below":...,"dry_run":false}` | `200 OK` | Run garbage collection on unreferenced commits |
 ### Data Transfer Mechanisms
@@ -426,7 +431,7 @@ Status Code Mapping (`http::status_for`):
 `400 Bad Request`: Invalid JSON body, malformed command, invalid request payload, invalid template name, or duplicate template name.
 `404 Not Found`: Target space, commit, or template does not exist within caller's project scope; a template's missing or foreign checkpoint target also returns 404.
  `405 Method Not Allowed`: Unrecognized HTTP verb for path.
- `429 Too Many Requests`: Project resource quota, template retention cap, or API rate limit exceeded (`{"error":"quota: ..."}`).
+ `429 Too Many Requests`: A physical capacity watermark (`code: capacity_watermark`), explicit request sizing/rate limit, or metadata retention limit rejects the request.
  `500 Internal Server Error`: Host I/O errors, btrfs reflink failure, or process execution failures.
 
 ### cURL Example
@@ -512,6 +517,35 @@ Shinu implements explicit version control semantics over guest ext4 image states
   - The installer requires `file(1)` and rejects helpers that are not statically linked ELF artifacts. `SHINU_SNAPSHOT_PRECONNECT=1` (or `true`) optionally authenticates and parks a thaw connection after freeze but before pause; it is **off by default**, pending real-host comparison. The agent applies no idle/read deadline to that authenticated channel, accepts only `thaw` on it, and also watches its listener so a fresh restore connection can replace a captured stale peer. Hot cleanup closes a broken parked connection and uses normal native/SSH thaw; restores always establish a fresh connection because Firecracker does not preserve host connection tables. Preconnect setup is included in `freeze_ms`, not hidden from the timing report.
   - **Filesystem coverage is fail-closed**: The native helper must run in the initial mount namespace. Before any application freeze hook, it reads `/proc/1/mountinfo` to plan one representative per writable block-backed filesystem, then inspects `/proc/*/mountinfo` once per distinct mount namespace. A writable block-backed mount (ext4, XFS, Btrfs and other block devices) whose major:minor is absent from that plan rejects the application-consistent capture with an `unsupported private writable block filesystem` error; it does not downgrade to crash consistency. Read-only private mounts and private bind mounts sharing an already covered superblock are allowed. Cross-namespace freezing is not implemented. Nonce setup uses private stdin, never process arguments; monitored freeze/thaw scripts inherit their flock so worker death or nested timeout groups cannot overtake cleanup.
   - After hooks and filesystem freeze, the helper repeats namespace inspection and compares the exact device/path plan before acknowledging freeze. Detected private mounts or plan changes refuse capture; `vm::snapshot` completes thaw cleanup before returning that error. Configured hooks must keep mount topology stable until pause, just as they must keep application writes quiescent. Restores quarantine the TAP before memory load, attempt thaw even after an ambiguous load failure or unsuccessful SSH-banner probe, and only then wait for SSH and rebuild the guest MAC/address, routes and ARP state. The final activation reasserts host forwarding/NAT/INPUT policy without recreating the TAP already owned by Firecracker; failures leave it unexposed.
+
+### Loaded Spaces and shared Full memory
+
+```sh
+shinu fork CHECKPOINT pooled
+shinu start --load-only --track-dirty false pooled
+shinu resume pooled
+shinu ckpt warm CHECKPOINT
+```
+
+`load_only` requires a stopped, loadable Full memory generation. It prepares the jail, TAP and host network, then loads Firecracker with `resume_vm:false`, leaving the TAP quarantined and vCPUs paused. No guest command, thaw, or application readiness runs yet. `GET /v1/spaces` exposes `state: loaded` and `running:false`. `resume` alone resumes vCPUs, thaws the captured ledger, fixes guest clock/network identity, exposes networking, and performs the normal fresh restore challenge/READY transaction before returning. Ordinary start/exec/jobs never silently resume a loaded Space. Repeated load-only start of the same loaded generation is idempotent; resume of a non-loaded Space is rejected.
+
+The root-owned lifecycle record is published atomically before launch and records loading → loaded → resuming. Daemon restart stops interrupted generations before accepting requests. **Loading/loaded** retain pending Full memory/state and can safely load again: their vCPUs never executed, so the disk is still the matching captured generation. **Resuming**, or a failed resume that could have started vCPUs, consumes pending memory/state before clearing its record: the guest may already have written disk, so reusing the old memory would mix generations. Subsequent load-only is rejected; ordinary start may cold-boot, or the caller can destroy and re-fork. Destruction always removes pending files. Interrupted resuming recovery follows the same rule. Already admitted running VMs keep existing restart survival. Resume uses atomic kernel-visible transitions without synchronous btrfs flushes on the handoff path; host power loss also kills the VMM. Cleanup uses bounded guest flush where applicable, then TERM and TAP/jail cleanup; an unresponsive VMM returns an error rather than being SIGKILLed.
+
+Non-diff Full memory forks and checkouts hard-link the checkpoint's read-only `.mem` inode; disk images still reflink, and diff-memory merges still materialize a private sparse file. Memory/state capture files are root-owned, jail-group-readable **0440**, never writable by the jailed uid. Firecracker's File backend opens memory read-only ([`guest_memory_from_file`](https://github.com/firecracker-microvm/firecracker/blob/v1.18.0/src/vmm/src/persist.rs)) and maps it **MAP_PRIVATE** ([`snapshot_file`](https://github.com/firecracker-microvm/firecracker/blob/v1.18.0/src/vmm/src/vstate/memory.rs)); guest writes remain private CoW. Restore links are unlinked after load, so a later hot capture creates new files instead of truncating a checkpoint inode. A live fork's HEAD still blocks checkpoint deletion (including `--detach`); delete the fork before removing the checkpoint. Inode lifetime is additionally protected by hard links and live mappings.
+
+`track_dirty` defaults to **true** for cold and memory starts. Pool consumers can pass false to reduce restore overhead; Full hot capture still works, but subsequent Diff requests safely degrade to Full when dirty tracking is disabled. MCP mirrors these choices through `shinu_start`, `shinu_resume`, and `shinu_warm_checkpoint`.
+
+`ckpt warm` accepts only a same-project non-diff Full checkpoint. It syncs its memory file, asks the kernel to discard reclaimable old cache pages, then reads it in `/sys/fs/cgroup/shinu-ckpt-cache`. The empty dedicated cgroup is intentionally retained to own its page-cache charges instead of charging every VMM. Warm **before** loading worlds; cache already pinned by mappings cannot necessarily be recharged, and warmed pages remain reclaimable under memory pressure. Warming is opt-in and reports cgroup/read errors rather than silently succeeding.
+
+Real-host regression (root + KVM + btrfs + approved assets and a prebuilt Void base; use a short root parent for Unix socket limits):
+
+```sh
+cargo build --bins
+cargo build -p shinu-vm --target x86_64-unknown-linux-musl --bin shinu-snapshot-agent
+cp target/x86_64-unknown-linux-musl/debug/shinu-snapshot-agent target/debug/shinu-snapshot-agent
+python3 packaging/fast-ready-smoke.py --assets-root /path/to/approved-store \
+  --base /path/to/base-void.ext4 --bin-dir target/debug --root-parent /data
+```
 
 ### Application readiness admission
 
@@ -612,12 +646,11 @@ Daemon configuration via environment variables:
 | `SHINU_ROOTFS_TARBALL` | — | Local path to pre-built rootfs tarball for offline image generation. |
 | `SHINU_PAYLOAD` | — | Comma-separated list of local files/paths to inject into the guest base image (format `src` or `src=dst`). |
 | `SHINU_PAYLOAD_SERVICE` | — | runit service name to enable inside the guest, executing the run script injected via payload. |
-| `SHINU_LIMIT_SPACES` | `5` | Default maximum active or stopped spaces per project. |
-| `SHINU_LIMIT_DISK_MIB` | `10240` | Default maximum exclusive disk quota limit (MiB) per project. |
-| `SHINU_LIMIT_VCPUS` | `16` | Default maximum aggregate vCPUs limit per project. |
-| `SHINU_LIMIT_MEM_MIB` | `32768` | Default maximum aggregate memory limit (MiB) per project. |
-| `SHINU_LIMIT_RUNNING` | `2` | Default maximum concurrent active microVM limit per project. |
-| `SHINU_LIMIT_API_PER_MIN` | `120` | Default API rate limit per minute per project. |
+| `SHINU_MIN_STORE_FREE_MIB` | `1024` | Host-wide actual store free-space admission floor. |
+| `SHINU_MIN_MEM_AVAILABLE_MIB` | `512` | Host-wide MemAvailable admission floor. |
+| `SHINU_LIMIT_VCPUS` | `0` | Optional per-VM vCPU ceiling (`0` unlimited). |
+| `SHINU_LIMIT_MEM_MIB` | `0` | Optional per-VM guest memory ceiling (`0` unlimited). |
+| `SHINU_LIMIT_API_PER_MIN` | `0` | Optional request rate limit per project (`0` unlimited). |
 
 Client environment variables:
 
@@ -632,7 +665,7 @@ Client environment variables:
 **Boot Readiness SSH vsock handshake**: When starting a VM, `shinud` performs boot readiness checking. It does not simply return success as soon as the Firecracker process starts or the vsock connection opens. Instead, it repeatedly probes vsock port 2222 (`VSOCK_SSH_PORT`), establishes the handshake, reads bytes one by one to avoid swallowing any banners, and verifies both the `OK ` vsock handshake prefix and a second line beginning with `SSH-`. This prevents subsequent VM executions from failing with connection issues during guest boot.
 
 **Detached jobs**: `shinu job run` and `POST /v1/spaces/{space}/jobs` start an asynchronous command; existing `exec` remains synchronous. Job states are `starting`, `running`, `canceling`, `exited`, `canceled`, and `lost`. Jobs survive client disconnect and daemon restart only while the VM stays running. Active jobs refresh idle use and block `stop` and space removal; VM loss yields `lost`. Each job has one terminal-rendered text log capped at 1 MiB, archived with mode `0600` at `<root>/jobs/<uuid>.log` and retained for 7 days by default (`SHINU_JOB_RETENTION_DAYS`). The active cap is 64 jobs per project. There is no follow or raw log mode, force-stop, reboot survival, artifact support, or console control.
-**Detached job limits and control**: Detached commands accept at most 256 argv elements and 8192 total argument bytes. Job retention caps are 64 active jobs per project, 1024 total jobs per project, and 8192 total jobs globally. `GET /v1/jobs` returns the newest 64 jobs and includes `truncated` when older jobs are omitted. Bounded control SSH kills its local process group on deadline or overflow; cancellation fences the command before final capture, archive, and cleanup. Automatic and manual VM stops flush guest durability with a finite 60-second process-group deadline before Firecracker receives TERM then KILL.
+**Detached job limits and control**: Detached commands accept at most 256 argv elements and 8192 total argument bytes. Job retention caps are 64 active jobs per project, 1024 total jobs per project, and 8192 total jobs globally. `GET /v1/jobs` returns the newest 64 jobs and includes `truncated` when older jobs are omitted. Bounded control SSH kills its local process group on deadline or overflow; cancellation fences the command before final capture, archive, and cleanup. VM stops flush guest durability with a finite 60-second process-group deadline before Firecracker receives TERM; a VMM that does not terminate causes an error, not SIGKILL.
 
 **Detached job deadlines**: The monitor uses the earlier of submission time plus `SHINU_JOB_MAX_SECS` and the current host Space's `expires_at`. An expired deadline durably requests `canceling`, then reuses the existing fence → final capture → archive → cleanup path; a canceled job's `error` identifies the deadline. Natural completion already recorded in the guest still wins. Renewal or clearing a lease before cancellation updates this bound, but cannot revive a durably canceling job. The monitor polls every two seconds; existing bounded SSH control calls and retryable archive/fence failures govern cancellation completion. No second process-killing path is introduced.
 
@@ -640,11 +673,11 @@ Client environment variables:
 
 Nothing is deleted. The checkpoint's disk image remains usable, and disk-only checkpoints, `ls`, `log`, `reflog`, plus `checkout` and `fork` of disk-only checkpoints are all unaffected. There is no in-place snapshot converter; the remedy is to take a fresh commit after upgrading.
 
-**Dirty-page tracking on snapshot restore.** Firecracker does not inherit the dirty-page bitmap across a restore; it must be rebuilt from the load request. `PUT /snapshot/load` sends `"track_dirty_pages":true` so restored VMs track dirty pages for subsequent diff snapshots. Without this, a restored VM lacked dirty tracking and every later diff degraded to a full memory dump (measured: three successive diffs of an idle restored guest were 268.2 / 270.1 / 267.8 MiB). With dirty tracking enabled, the same idle-guest measurement gave 269.5 MiB for the first diff after restore (as the bitmap starts empty and pages touched during restore count dirty), converging to 8.2 MiB and 8.0 MiB from the second diff on.
+**Dirty-page tracking on snapshot restore.** Firecracker does not inherit the dirty bitmap across restore. Starts default to `track_dirty:true`; `track_dirty:false` is an explicit per-start choice for pool worlds, with Diff captures forced to Full while tracking is disabled.
 
 **Memory is a ceiling, not a reservation.** A VM starts at ~100 MiB host RSS footprint and expands as the guest accesses memory pages. Cold boot enables virtio-balloon **free page reporting**, so a cooperating guest hands freed pages back continuously instead of holding them until the sweep intervenes. Measured on v1.16.1: a guest allocating 500 MiB then freeing it drove host RSS 102.7 MiB → 596.9 MiB → 105.0 MiB within 5 seconds, unaided. Reporting only covers pages the guest kernel has actually freed, so `shinud` still inflates the balloon explicitly after `SHINU_IDLE_SECS / 10` (default reclaim starts at 360 seconds under the 3600-second idle default) to force an idle guest to drop page cache it is still nominally using. `exec` re-inflates balloon memory transparently. Plan host capacity based on *sum of active VM page working sets*, not `SHINU_MEM_MIB × VM count`.
 
-Reporting also shrinks `ckpts/<id>.mem`: a full snapshot no longer captures pages the guest already freed. That is billing-visible, because a checkpoint's `.ext4`, `.mem` and `.state` files all count toward the project disk quota.
+Reporting also shrinks `ckpts/<id>.mem`: a Full snapshot no longer captures pages the guest already freed. Usage accounting records actual exclusive extents, without a project disk quota.
 
 **Disk space grows permanently.** Firecracker block devices lack discard/TRIM support (still true at v1.16.1; upstream issue #2708 is parked). Deleting files inside guest OS does not release host ext4 backing blocks (`fstrim` reports "discard operation is not supported"). A space that once wrote 1.5 GiB retains host disk allocation indefinitely until offline compaction, which the idle sweep performs automatically on stopped images.
 
@@ -701,6 +734,8 @@ e2fsck -E discard -fp <root>/spaces/<uuid>.ext4
                                           id_ed25519            per-space private SSH key
                                           id_ed25519.pub        per-space public SSH key
                                           last_used             timestamp file for VM idle sweeper
+                                          loaded.json           durable paused-restore transaction phase, absent after admission
+                                          track-dirty           current boot's dirty-tracking choice
                                           console.log           guest console and serial logs
 <root>/assets/                          jailer and firecracker binaries + golden guest kernel (mode 0755)
 <root>/cache/                           downloaded image bootstrap tarballs and cache files (mode 0755)
@@ -740,21 +775,9 @@ Licensed under the Apache License, Version 2.0 (Apache-2.0). See [LICENSE](LICEN
 
 ## Exclusive storage accounting and offline compaction
 
-`SHINU_SPACE_RESERVE_MIB` is optional unsigned decimal MiB, validated at daemon
-startup. When absent, spaces retain their nominal `disk_mib` quota charge.
-When set (including zero), each space is charged the larger of its sampled
-Btrfs exclusive MiB and the reservation. Checkpoints remain charged by exclusive
-bytes. Values are rounded up to MiB; metered billing is separate from quota.
-The daemon warms the extent cache before accepting requests and refreshes it
-in the 30-second usage sweep without state/DB locks around Btrfs subprocesses.
-Until a sample succeeds, admission conservatively charges nominal capacity.
-Samples can lag a sweep plus scan time; this is not a synchronous byte-hard quota.
+All Space and checkpoint accounting uses sampled **Btrfs exclusive bytes**, rounded up to MiB. Nominal disk sizes, reservations and cumulative billing totals are not capacity charges. A missing sample reports zero until measured; it never reserves nominal capacity. The daemon warms the extent cache before accepting requests and refreshes it in the 30-second usage sweep without state/DB locks around Btrfs subprocesses. Samples can lag a sweep plus scan time; physical admission independently checks store free space and MemAvailable.
 
-`SHINU_SPACE_WRITE_CAP_MIB` defaults to zero (uncapped). New spaces and template
-forks inherit it. `shinu fork CHECKPOINT NAME --write-cap-mib N` overrides it;
-explicit `0` disables it. Existing spaces migrate to uncapped, not the current
-environment default. The persisted `write_cap_mib` and `stopped_reason` appear
-in `shinu ls --json`. A sweep stops an over-cap space with reason
+`SHINU_SPACE_WRITE_CAP_MIB` is obsolete and ignored with a startup warning. New Spaces and template forks are uncapped unless the caller explicitly supplies `shinu fork CHECKPOINT NAME --write-cap-mib N`; `0` disables that protection. Schema version 1 and legacy JSON import clear unproven pre-upgrade caps once, because the old format cannot identify inherited versus explicit settings. **Re-specify any old explicit protection after upgrading.** Newly explicit caps survive reopen and state updates. Effective `write_cap_mib` and `stopped_reason` appear in `shinu ls --json`. A sweep stops an over-cap Space with reason
 `write_cap_exceeded`; starts and auto-starts measure that image freshly and
 refuse while it remains over cap. Busy lifecycle operations postpone enforcement.
 This cap uses the same exclusive-byte notion as `ls`, not guest filesystem use

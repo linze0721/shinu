@@ -5,7 +5,14 @@ Spaces are mutable worlds; checkpoints preserve their history.
 ## Language
 
 **Space**:
-A named, mutable world that can be running or stopped.
+A named, mutable world that can be running, loaded, or stopped.
+
+**Loaded Space**:
+A Space restored from a Full checkpoint whose execution remains paused and whose application readiness has not yet been admitted. Resuming it begins a fresh readiness transaction.
+_Avoid_: ready Space, running Space
+
+**Capacity watermark**:
+A host-wide minimum of available storage or available memory below which no new Space allocation or execution is admitted. It is not a per-project quota or a resource reservation.
 
 **Checkpoint**:
 An immutable saved generation of a Space, usable independently of its source Space.

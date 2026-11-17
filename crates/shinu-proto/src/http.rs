@@ -444,6 +444,7 @@ pub fn status_for(error: &shinu_core::Error) -> u16 {
         shinu_core::Error::NotFound(_) => 404,
         shinu_core::Error::Invalid(_) => 400,
         shinu_core::Error::Quota(_) => 429,
+        shinu_core::Error::CapacityWatermark(_) => 429,
         shinu_core::Error::Btrfs(_)
         | shinu_core::Error::Io(_)
         | shinu_core::Error::Json(_)

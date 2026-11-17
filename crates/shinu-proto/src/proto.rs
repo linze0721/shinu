@@ -43,7 +43,7 @@ pub enum Req {
         /// Positive lifetime in seconds; omitted or null means no expiry.
         #[serde(default)]
         ttl_seconds: Option<u64>,
-        /// Omitted uses the daemon default; zero explicitly disables the cap.
+        /// Omitted or zero is uncapped; positive values are explicit Space protection.
         #[serde(default)]
         write_cap_mib: Option<u64>,
         /// Omitted inherits the checkpoint's readiness policy.
@@ -98,6 +98,16 @@ pub enum Req {
     /// Starts the space's VM if it is not running and reports whether it booted.
     Start {
         space: String,
+        #[serde(default)]
+        load_only: bool,
+        #[serde(default = "default_track_dirty")]
+        track_dirty: bool,
+    },
+    Resume {
+        space: String,
+    },
+    WarmCheckpoint {
+        ckpt: Uuid,
     },
     /// Shuts the space's VM down. Idempotent.
     Stop {
@@ -178,4 +188,8 @@ pub enum Req {
         #[serde(default)]
         ttl_seconds: Option<u64>,
     },
+}
+
+const fn default_track_dirty() -> bool {
+    true
 }

@@ -1887,6 +1887,30 @@ fn link_resource(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Full memory forks retain the checkpoint inode; unlinking any one name is safe.
+pub fn link_checkpoint_memory(source: &Path, destination: &Path) -> Result<()> {
+    if std::fs::metadata(source)?.mode() & 0o777 != 0o440 {
+        std::fs::set_permissions(source, std::fs::Permissions::from_mode(0o440))?;
+    }
+    std::fs::hard_link(source, destination)?;
+    Ok(())
+}
+
+/// Read immutable memory in a persistent, dedicated page-cache charging cgroup.
+pub fn warm_checkpoint_memory(memory: &Path) -> Result<()> {
+    let group = Path::new("/sys/fs/cgroup/shinu-ckpt-cache");
+    std::fs::create_dir_all(group)?;
+    std::fs::File::open(memory)?.sync_all()?;
+    let output = std::process::Command::new("sh").args(["-eu", "-c", "printf '%s\\n' \"$$\" > \"$1/cgroup.procs\"; dd if=\"$2\" of=/dev/null iflag=nocache count=0 status=none; exec dd if=\"$2\" of=/dev/null bs=4M status=none", "shinu-ckpt-warm"]).arg(group).arg(memory).output()?;
+    if !output.status.success() {
+        return Err(Error::Internal(format!(
+            "checkpoint cache warming failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(())
+}
+
 fn clean_jail(dir: &Path) -> Result<()> {
     let Some(id) = dir
         .file_name()
@@ -1924,12 +1948,103 @@ fn wait_ready(dir: &Path, vsock: &Path) -> bool {
 
 /// Per-Space boot choices. Absent CPU/memory inherit the daemon defaults;
 /// readiness is always evaluated against the actual running VM generation.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct StartOptions<'a> {
     pub vcpus: Option<u32>,
     pub mem_mib: Option<u32>,
     pub restore: Option<&'a RestoreFiles<'a>>,
     pub readiness: Option<&'a ReadySpec>,
+    pub load_only: bool,
+    pub track_dirty: bool,
+}
+
+impl Default for StartOptions<'_> {
+    fn default() -> Self {
+        Self {
+            vcpus: None,
+            mem_mib: None,
+            restore: None,
+            readiness: None,
+            load_only: false,
+            track_dirty: true,
+        }
+    }
+}
+
+fn persist_phase(dir: &Path, phase: &str) -> Result<()> {
+    let path = dir.join("loaded.json");
+    let temporary = dir.join("loaded.json.tmp");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    write!(file, "{{\"phase\":\"{phase}\"}}")?;
+    if phase != "resuming" {
+        file.sync_all()?;
+    }
+    std::fs::rename(temporary, path)?;
+    // Atomic rename survives a daemon crash. A host crash also kills the VMM,
+    // so resume need not synchronously flush the btrfs store on the handoff path.
+    if phase != "resuming" {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn forget_loaded(dir: &Path) -> Result<()> {
+    let marker = dir.join("loaded.json");
+    match std::fs::read(&marker) {
+        Ok(bytes) => {
+            if bytes == b"{\"phase\":\"resuming\"}" {
+                let root = dir
+                    .parent()
+                    .and_then(Path::parent)
+                    .ok_or_else(|| Error::Internal("invalid VM directory".into()))?;
+                let image = shinu_core::space_image(root, dir_id(dir)?);
+                for path in [image.with_extension("mem"), image.with_extension("state")] {
+                    match std::fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+            std::fs::remove_file(marker)?;
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// A loaded VM has a live VMM but no executing vCPUs or readiness receipt.
+pub fn lifecycle_state(dir: &Path) -> Result<&'static str> {
+    if !is_running(dir) {
+        return Ok("stopped");
+    }
+    match std::fs::read(dir.join("loaded.json")) {
+        Ok(bytes) => match bytes.as_slice() {
+            b"{\"phase\":\"loading\"}" => Ok("loading"),
+            b"{\"phase\":\"loaded\"}" => Ok("loaded"),
+            b"{\"phase\":\"resuming\"}" => Ok("resuming"),
+            _ => Err(Error::Internal("invalid persisted VM phase".into())),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok("running"),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Recover interrupted pool transactions before accepting any requests.
+pub fn recover_loaded(root: &Path, cfg: &NetConfig) -> Result<()> {
+    for entry in std::fs::read_dir(root.join("vm"))? {
+        let dir = entry?.path();
+        if dir.join("loaded.json").exists() {
+            stop(&dir, cfg)?;
+        }
+    }
+    Ok(())
 }
 
 /// Host-side snapshot files to load instead of a cold boot.
@@ -1939,14 +2054,12 @@ pub struct RestoreFiles<'a> {
     pub guest_snapshot_nonce: Option<&'a str>,
 }
 
-/// Builds the `PUT /snapshot/load` request body.
-///
-/// Firecracker rebuilds dirty-page tracking from the load request rather than
-/// inheriting it from the snapshot, so restores must set `track_dirty_pages`.
-/// A snapshot's interface belongs to its source space; `tap` overrides it so
-/// a fork does not reopen the source tap.
-fn snapshot_load_body(tap: Option<&str>) -> String {
-    let base = "\"snapshot_path\":\"snap.state\",\"mem_backend\":{\"backend_path\":\"snap.mem\",\"backend_type\":\"File\"},\"track_dirty_pages\":true,\"resume_vm\":true";
+/// File-backed restore uses private mappings; never grant the jail write access.
+fn snapshot_load_body(tap: Option<&str>, load_only: bool, track_dirty: bool) -> String {
+    let base = format!(
+        "\"snapshot_path\":\"snap.state\",\"mem_backend\":{{\"backend_path\":\"snap.mem\",\"backend_type\":\"File\"}},\"track_dirty_pages\":{track_dirty},\"resume_vm\":{}",
+        !load_only
+    );
     tap.map_or_else(
         || format!("{{{base}}}"),
         |tap| format!(
@@ -1974,13 +2087,30 @@ pub fn start(
         mem_mib,
         restore,
         readiness,
+        load_only,
+        track_dirty,
     } = options;
     let vcpus = vcpus.unwrap_or(cfg.vcpus);
     let mem_mib = mem_mib.unwrap_or(cfg.mem_mib);
     let dir = shinu_core::vm_dir(root, id);
     let vsock = vsock_path(&dir);
+    let phase = lifecycle_state(&dir)?;
+    if phase == "loaded" && load_only {
+        return Ok((vsock, false));
+    }
+    if phase != "running" && phase != "stopped" {
+        return Err(Error::Invalid("space is loaded; use resume or stop".into()));
+    }
+    if load_only && (restore.is_none() || is_running(&dir)) {
+        return Err(Error::Invalid(
+            "load_only requires a stopped Full memory fork".into(),
+        ));
+    }
     if let Some(spec) = readiness {
         spec.validate()?;
+    }
+    if phase == "stopped" {
+        forget_loaded(&dir)?;
     }
     if is_running(&dir) {
         // The idle sweeper may have reclaimed this VM's memory; give it
@@ -2024,6 +2154,13 @@ pub fn start(
     let _ = std::fs::remove_file(&vsock);
     let _ = std::fs::remove_file(api_path(&dir));
     std::fs::create_dir_all(&dir)?;
+    if restore.is_some() {
+        persist_phase(&dir, if load_only { "loading" } else { "resuming" })?;
+    }
+    std::fs::write(
+        dir.join("track-dirty"),
+        if track_dirty { "true" } else { "false" },
+    )?;
     if let Some(nonce) = restore.and_then(|files| files.guest_snapshot_nonce) {
         store_snapshot_nonce(&dir, nonce)?;
     } else {
@@ -2062,12 +2199,17 @@ pub fn start(
             let jail_state = jail.join(JAIL_SNAP_STATE);
             link_resource(files.mem, &jail_mem)?;
             link_resource(files.state, &jail_state)?;
-            // Snapshot files must remain readable by the jailed Firecracker
-            // uid while staying inaccessible to the space owner on the host.
-            std::os::unix::fs::chown(&jail_mem, None, Some(cfg.jail_gid))?;
-            std::os::unix::fs::chown(&jail_state, None, Some(cfg.jail_gid))?;
-            std::fs::set_permissions(&jail_mem, std::fs::Permissions::from_mode(0o660))?;
-            std::fs::set_permissions(&jail_state, std::fs::Permissions::from_mode(0o660))?;
+            // Shared checkpoint inodes must never be writable by the jailed uid.
+            // Root owns the inode; only its group is granted read access.
+            for path in [&jail_mem, &jail_state] {
+                let metadata = std::fs::metadata(path)?;
+                if metadata.uid() != 0 || metadata.gid() != cfg.jail_gid {
+                    std::os::unix::fs::chown(path, Some(0), Some(cfg.jail_gid))?;
+                }
+                if metadata.mode() & 0o777 != 0o440 {
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o440))?;
+                }
+            }
         }
 
         if restore.is_none() {
@@ -2077,8 +2219,11 @@ pub fn start(
                 Path::new(JAIL_ROOTFS),
                 image_kind,
                 Path::new(JAIL_VSOCK),
-                vcpus,
-                mem_mib,
+                crate::config::MachineConfig {
+                    vcpus,
+                    mem_mib,
+                    track_dirty,
+                },
                 net.as_ref(),
             );
             let mut config_file = std::fs::OpenOptions::new()
@@ -2213,65 +2358,39 @@ pub fn start(
                     "snapshot restore API socket did not appear".to_owned(),
                 ));
             }
-            restore_transaction(|step| match step {
-                RestoreStep::Quarantine => {
-                    if let Some(spec) = net.as_ref() {
-                        require_success("ip", &["link", "set", &spec.tap, "down"])?;
-                    }
-                    Ok(())
+            if let Some(spec) = net.as_ref() {
+                require_success("ip", &["link", "set", &spec.tap, "down"])?;
+            }
+            let body = snapshot_load_body(
+                net.as_ref().map(|spec| spec.tap.as_str()),
+                load_only,
+                track_dirty,
+            );
+            if api_with_timeout(
+                &dir,
+                "PUT",
+                "/snapshot/load",
+                Some(&body),
+                SNAPSHOT_TIMEOUT_SECS,
+            )
+            .is_none()
+            {
+                return Err(Error::Internal("failed to load VM snapshot".into()));
+            }
+            // The private mapping keeps the inode alive. New hot captures must
+            // create fresh files, never truncate a linked checkpoint inode.
+            std::fs::remove_file(jail.join(JAIL_SNAP_MEM))?;
+            std::fs::remove_file(jail.join(JAIL_SNAP_STATE))?;
+            if load_only {
+                std::fs::set_permissions(api_path(&dir), std::fs::Permissions::from_mode(0o600))?;
+                if vsock.exists() {
+                    std::fs::set_permissions(&vsock, std::fs::Permissions::from_mode(0o600))?;
                 }
-                RestoreStep::Load => {
-                    let body = snapshot_load_body(net.as_ref().map(|spec| spec.tap.as_str()));
-                    if api(&dir, "PUT", "/snapshot/load", Some(&body)).is_none() {
-                        let _ = std::fs::remove_file(jail.join(JAIL_SNAP_MEM));
-                        let _ = std::fs::remove_file(jail.join(JAIL_SNAP_STATE));
-                        return Err(Error::Internal("failed to load VM snapshot".to_owned()));
-                    }
-                    Ok(())
-                }
-                RestoreStep::Thaw => thaw_snapshot(&dir),
-                RestoreStep::Ready => ready(),
-                RestoreStep::Configure => {
-                    // Vsock does not depend on the quarantined TAP. Rebuild
-                    // the cloned address/MAC, routes and ARP only after thaw.
-                    let mut reconfigure = format!("set -eu; date -u -s @{}; ", now_secs());
-                    if let Some(spec) = net.as_ref() {
-                        reconfigure.push_str(&format!(
-                            "ip link set dev eth0 down; ip addr flush dev eth0; ip link set dev eth0 address {}; ip link set dev eth0 up; ip addr add {} dev eth0; ip route replace default via {} dev eth0; ip neigh flush dev eth0",
-                            spec.mac, spec.guest_cidr, spec.gateway
-                        ));
-                    }
-                    let command = ["sh".to_owned(), "-c".to_owned(), reconfigure];
-                    let helper = shinu_core::vsock_helper()?;
-                    let ssh = ssh_command(
-                        &helper,
-                        &vsock,
-                        &key_path(&dir),
-                        shinu_core::VSOCK_SSH_PORT,
-                        &command,
-                    );
-                    match run_process_group(ssh, Duration::from_secs(30), None) {
-                        Some(status) if status.success() => Ok(()),
-                        _ => Err(Error::Internal(
-                            "restored guest setup failed or timed out".into(),
-                        )),
-                    }
-                }
-                // This idempotent operation also reasserts the /30 address,
-                // forwarding/NAT and world-host INPUT allowance after thaw.
-                RestoreStep::Expose => configure_tap(id, net_cfg, &[], TapSetup::Existing),
-                RestoreStep::ApplicationReady => match readiness {
-                    Some(spec) => admit_application(
-                        &dir,
-                        spec,
-                        attempted_boot.as_ref().ok_or_else(|| {
-                            Error::Internal("readiness boot identity missing".into())
-                        })?,
-                        &mut network_ready,
-                    ),
-                    None => network_ready(Instant::now() + Duration::from_secs(30)),
-                },
-            })?;
+                persist_phase(&dir, "loaded")?;
+                touch(&dir)?;
+                return Ok((vsock, true));
+            }
+            finish_restore(root, id, readiness, net_cfg, &mut network_ready)?;
         } else {
             ready()?;
         }
@@ -2302,6 +2421,9 @@ pub fn start(
         // The control API remains daemon-only: it can resize the balloon
         // and reconfigure devices, so an owner must never receive it.
         std::fs::set_permissions(api_path(&dir), std::fs::Permissions::from_mode(0o600))?;
+        if restore.is_some() {
+            forget_loaded(&dir)?;
+        }
         touch(&dir)?;
         Ok((vsock, true))
     })();
@@ -2313,6 +2435,92 @@ pub fn start(
         if let Err(error) = cleanup {
             eprintln!("boot cleanup for {id}: {error}");
         }
+    }
+    result
+}
+
+fn finish_restore(
+    root: &Path,
+    id: Uuid,
+    readiness: Option<&ReadySpec>,
+    net_cfg: &NetConfig,
+    network_ready: &mut impl FnMut(Instant) -> Result<()>,
+) -> Result<()> {
+    let dir = shinu_core::vm_dir(root, id);
+    let net = crate::net::net_spec(id, net_cfg);
+    let vsock = vsock_path(&dir);
+    restore_transaction(|step| match step {
+        RestoreStep::Quarantine | RestoreStep::Load => Ok(()),
+        RestoreStep::Thaw => thaw_snapshot(&dir),
+        RestoreStep::Ready => {
+            if wait_ready(&dir, &vsock) {
+                Ok(())
+            } else {
+                Err(Error::Internal(
+                    "restored guest SSH did not become ready".into(),
+                ))
+            }
+        }
+        RestoreStep::Configure => {
+            let mut reconfigure = format!("set -eu; date -u -s @{}; ", now_secs());
+            if let Some(spec) = net.as_ref() {
+                reconfigure.push_str(&format!("ip link set dev eth0 down; ip addr flush dev eth0; ip link set dev eth0 address {}; ip link set dev eth0 up; ip addr add {} dev eth0; ip route replace default via {} dev eth0; ip neigh flush dev eth0", spec.mac, spec.guest_cidr, spec.gateway));
+            }
+            let command = ["sh".to_owned(), "-c".to_owned(), reconfigure];
+            let helper = shinu_core::vsock_helper()?;
+            let ssh = ssh_command(
+                &helper,
+                &vsock,
+                &key_path(&dir),
+                shinu_core::VSOCK_SSH_PORT,
+                &command,
+            );
+            match run_process_group(ssh, Duration::from_secs(30), None) {
+                Some(status) if status.success() => Ok(()),
+                _ => Err(Error::Internal(
+                    "restored guest setup failed or timed out".into(),
+                )),
+            }
+        }
+        RestoreStep::Expose => configure_tap(id, net_cfg, &[], TapSetup::Existing),
+        RestoreStep::ApplicationReady => match readiness {
+            Some(spec) => admit_application(&dir, spec, &boot_identity(&dir)?, network_ready),
+            None => network_ready(Instant::now() + Duration::from_secs(30)),
+        },
+    })
+}
+
+/// Resume only a durably loaded generation, then perform the normal admission.
+pub fn resume(
+    root: &Path,
+    id: Uuid,
+    readiness: Option<&ReadySpec>,
+    net_cfg: &NetConfig,
+    mut network_ready: impl FnMut(Instant) -> Result<()>,
+) -> Result<(PathBuf, bool)> {
+    let dir = shinu_core::vm_dir(root, id);
+    if lifecycle_state(&dir)? != "loaded" {
+        return Err(Error::Invalid("resume requires a loaded space".into()));
+    }
+    if let Some(spec) = readiness {
+        spec.validate()?;
+    }
+    let boot = boot_identity(&dir)?;
+    forget_readiness(&dir);
+    persist_phase(&dir, "resuming")?;
+    let result = (|| {
+        if api(&dir, "PATCH", "/vm", Some("{\"state\":\"Resumed\"}")).is_none() {
+            return Err(Error::Internal("failed to resume loaded VM".into()));
+        }
+        finish_restore(root, id, readiness, net_cfg, &mut network_ready)?;
+        forget_loaded(&dir)?;
+        touch(&dir)?;
+        Ok((vsock_path(&dir), true))
+    })();
+    if result.is_err()
+        && let Err(error) = cleanup_boot(&dir, net_cfg, &boot)
+    {
+        eprintln!("resume cleanup for {id}: {error}");
     }
     result
 }
@@ -2480,11 +2688,12 @@ pub fn stop_with_peers(dir: &Path, cfg: &NetConfig, peers: &[String]) -> Result<
         let _ = std::fs::remove_file(&pid_file);
         tap_down_with_peers(id, cfg, peers);
         clean_jail(dir)?;
+        forget_loaded(dir)?;
         mark_stopped(dir);
         return Ok(false);
     };
 
-    if vsock.exists() {
+    if vsock.exists() && !matches!(lifecycle_state(dir), Ok("loading" | "loaded")) {
         // Durability needs exactly one thing: the guest's dirty pages on
         // the image before the VMM dies. `sync` plus a read-only remount
         // does that and returns normally, leaving the connection intact.
@@ -2501,16 +2710,6 @@ pub fn stop_with_peers(dir: &Path, cfg: &NetConfig, peers: &[String]) -> Result<
         std::thread::sleep(Duration::from_millis(50));
     }
     if !gone {
-        signal(pid, "KILL");
-        for _ in 0..20 {
-            if running_pid(dir).is_none() {
-                gone = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-    if !gone {
         tap_down_with_peers(id, cfg, peers);
         return Err(Error::Internal(format!(
             "firecracker pid {pid} did not stop"
@@ -2521,6 +2720,7 @@ pub fn stop_with_peers(dir: &Path, cfg: &NetConfig, peers: &[String]) -> Result<
     let _ = std::fs::remove_file(&pid_file);
     tap_down_with_peers(id, cfg, peers);
     clean_jail(dir)?;
+    forget_loaded(dir)?;
     mark_stopped(dir);
     Ok(true)
 }
@@ -2577,7 +2777,7 @@ pub fn sweep_idle(
                 continue;
             }
             stopped.push(dir);
-        } else if idle_for >= (idle_secs / 10).max(30) {
+        } else if idle_for >= (idle_secs / 10).max(30) && !dir.join("loaded.json").exists() {
             reclaim(&dir, KEEP_MIB);
         }
     }
@@ -3113,13 +3313,16 @@ mod snapshot_load_tests {
     // restore body must keep this flag on every branch.
     #[test]
     fn every_restore_requests_dirty_page_tracking() {
-        assert!(snapshot_load_body(None).contains("\"track_dirty_pages\":true"));
-        assert!(snapshot_load_body(Some("shinu0123456789")).contains("\"track_dirty_pages\":true"));
+        assert!(snapshot_load_body(None, false, true).contains("\"track_dirty_pages\":true"));
+        assert!(
+            snapshot_load_body(Some("shinu0123456789"), false, true)
+                .contains("\"track_dirty_pages\":true")
+        );
     }
 
     #[test]
     fn a_tap_override_repoints_only_the_interface() {
-        let body = snapshot_load_body(Some("shinudeadbeef0"));
+        let body = snapshot_load_body(Some("shinudeadbeef0"), false, true);
         assert!(body.contains("\"iface_id\":\"eth0\""));
         assert!(body.contains("\"host_dev_name\":\"shinudeadbeef0\""));
         assert!(body.contains("\"resume_vm\":true"));
@@ -3127,7 +3330,7 @@ mod snapshot_load_tests {
 
     #[test]
     fn no_tap_omits_the_override_entirely() {
-        let body = snapshot_load_body(None);
+        let body = snapshot_load_body(None, false, true);
         assert!(!body.contains("network_overrides"));
         assert!(body.contains("\"snapshot_path\":\"snap.state\""));
         assert!(body.contains("\"backend_type\":\"File\""));

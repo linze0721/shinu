@@ -77,6 +77,14 @@ pub fn jailer_memory_limit_bytes(mem_mib: u32) -> Result<u64> {
     Ok(u64::from(total_mib) * 1024 * 1024)
 }
 
+/// Per-start machine sizing and memory logging passed to Firecracker.
+#[derive(Clone, Copy)]
+pub struct MachineConfig {
+    pub vcpus: u32,
+    pub mem_mib: u32,
+    pub track_dirty: bool,
+}
+
 /// Firecracker's `--config-file` body. The init path follows the selected
 /// image because Arch's usr-merged `/sbin/init` symlink is not kernel-safe.
 /// The ext4 image boots without an initrd, so the guest kernel must include
@@ -86,8 +94,7 @@ pub fn vm_config_json(
     rootfs: &Path,
     image: Image,
     vsock_uds: &Path,
-    vcpus: u32,
-    mem_mib: u32,
+    machine: MachineConfig,
     net: Option<&NetSpec>,
 ) -> String {
     let mut boot_args = format!(
@@ -125,8 +132,7 @@ pub fn vm_config_json(
             "stats_polling_interval_s": 1,
             "free_page_reporting": true
         },
-        // Firecracker must enable dirty-page tracking before the VM boots.
-        "machine-config": { "vcpu_count": vcpus, "mem_size_mib": mem_mib, "track_dirty_pages": true }
+        "machine-config": { "vcpu_count": machine.vcpus, "mem_size_mib": machine.mem_mib, "track_dirty_pages": machine.track_dirty }
     });
     if let Some(net) = net {
         config["network-interfaces"] = serde_json::json!([{
@@ -140,7 +146,7 @@ pub fn vm_config_json(
 
 #[cfg(test)]
 mod memory_limit_tests {
-    use super::{jailer_memory_limit_bytes, vm_config_json};
+    use super::{MachineConfig, jailer_memory_limit_bytes, vm_config_json};
     use shinu_core::Image;
     use std::ffi::OsString;
     use std::path::Path;
@@ -182,8 +188,11 @@ mod memory_limit_tests {
             Path::new("/rootfs"),
             Image::Ubuntu,
             Path::new("/vsock"),
-            2,
-            4096,
+            MachineConfig {
+                vcpus: 2,
+                mem_mib: 4096,
+                track_dirty: true,
+            },
             None,
         ))
         .expect("guest config");
@@ -205,8 +214,11 @@ mod memory_limit_tests {
             Path::new("/rootfs"),
             Image::Void,
             Path::new("/vsock"),
-            2,
-            14_336,
+            MachineConfig {
+                vcpus: 2,
+                mem_mib: 14_336,
+                track_dirty: true,
+            },
             None,
         ))
         .expect("guest config");

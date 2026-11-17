@@ -1173,6 +1173,64 @@ fn running_network_members(
         .collect()
 }
 
+/// Host firewall adapter for named-network peer exceptions.
+trait PeerRules {
+    fn remove(&self, member: Uuid, peers: &[String]);
+    fn ensure(&self, member: Uuid, peers: &[String]) -> shinu::Result<()>;
+}
+
+struct HostPeerRules<'a>(&'a shinu::NetConfig);
+
+impl PeerRules for HostPeerRules<'_> {
+    fn remove(&self, member: Uuid, peers: &[String]) {
+        shinu::vm::remove_peer_rules(member, self.0, peers);
+    }
+
+    fn ensure(&self, member: Uuid, peers: &[String]) -> shinu::Result<()> {
+        shinu::vm::refresh_peer_rules(member, self.0, peers)
+    }
+}
+
+/// Peer ACCEPTs each running member must drop: those toward any member of
+/// `connected` that is no longer running. `connected` must include every
+/// member the caller may have opened rules toward, not just earlier runners.
+fn departed_peer_rules(
+    cfg: &shinu::NetConfig,
+    connected: &[Space],
+    current_running: &[Space],
+) -> Vec<(Uuid, Vec<String>)> {
+    current_running
+        .iter()
+        .map(|member| {
+            let new_peers = peer_ips(member, current_running, cfg);
+            let departed = peer_ips(member, connected, cfg)
+                .into_iter()
+                .filter(|peer| !new_peers.contains(peer))
+                .collect();
+            (member.id, departed)
+        })
+        .collect()
+}
+
+fn reconcile_peer_rules(
+    root: &Path,
+    cfg: &shinu::NetConfig,
+    rules: &impl PeerRules,
+    state: &State,
+    project: &str,
+    network: Option<&str>,
+    previous_running: &[Space],
+) -> shinu::Result<Vec<Space>> {
+    let current_running = running_network_members(root, state, project, network);
+    for (member, departed) in departed_peer_rules(cfg, previous_running, &current_running) {
+        rules.remove(member, &departed);
+    }
+    for member in &current_running {
+        rules.ensure(member.id, &peer_ips(member, &current_running, cfg))?;
+    }
+    Ok(current_running)
+}
+
 fn refresh_network_rules_with(
     root: &Path,
     cfg: &shinu::NetConfig,
@@ -1181,19 +1239,15 @@ fn refresh_network_rules_with(
     network: Option<&str>,
     previous_running: &[Space],
 ) -> shinu::Result<Vec<Space>> {
-    let current_running = running_network_members(root, state, project, network);
-    for member in &current_running {
-        let old_peers = peer_ips(member, previous_running, cfg);
-        let new_peers = peer_ips(member, &current_running, cfg);
-        let departed = old_peers
-            .iter()
-            .filter(|peer| !new_peers.contains(peer))
-            .cloned()
-            .collect::<Vec<_>>();
-        shinu::vm::remove_peer_rules(member.id, cfg, &departed);
-        shinu::vm::refresh_peer_rules(member.id, cfg, &new_peers)?;
-    }
-    Ok(current_running)
+    reconcile_peer_rules(
+        root,
+        cfg,
+        &HostPeerRules(cfg),
+        state,
+        project,
+        network,
+        previous_running,
+    )
 }
 
 fn refresh_network_rules(
@@ -1211,6 +1265,65 @@ fn refresh_network_rules(
         network,
         previous_running,
     )
+}
+
+/// Runs a VM transaction whose pre-admission hook connects `space` to its
+/// named network. On failure (after the VM's own cleanup), every member the
+/// hook could have opened rules toward is reconciled against the members still
+/// running, so peers drop their ACCEPTs toward the failed space. Cleanup
+/// errors are logged and never replace the transaction's error.
+fn with_network_admission<T>(
+    ctx: &Ctx<'_>,
+    rules: &impl PeerRules,
+    space: &Space,
+    previous_running: &[Space],
+    transaction: impl FnOnce(&mut dyn FnMut(Instant) -> shinu::Result<()>) -> shinu::Result<T>,
+) -> shinu::Result<T> {
+    let network = space.network.as_deref();
+    let mut connected_members = Vec::new();
+    let result = transaction(&mut |deadline| {
+        let state = snapshot(ctx.db, ctx.registry)?;
+        let all_members = network_members(&state, &space.project, network);
+        connected_members.clone_from(&all_members);
+        let current_running = reconcile_peer_rules(
+            ctx.root,
+            ctx.net_cfg,
+            rules,
+            &state,
+            &space.project,
+            network,
+            previous_running,
+        )?;
+        sync_network_hosts_with(
+            ctx.root,
+            ctx.net_cfg,
+            &current_running,
+            &all_members,
+            deadline,
+        );
+        Ok(())
+    });
+    if result.is_err() && !connected_members.is_empty() {
+        let cleanup = snapshot(ctx.db, ctx.registry).and_then(|state| {
+            reconcile_peer_rules(
+                ctx.root,
+                ctx.net_cfg,
+                rules,
+                &state,
+                &space.project,
+                network,
+                &connected_members,
+            )
+            .map(|_| ())
+        });
+        if let Err(error) = cleanup {
+            eprintln!(
+                "network cleanup after failed admission of {}: {error}",
+                space.id
+            );
+        }
+    }
+    result
 }
 
 fn network_hosts_command<'a>(
@@ -3299,60 +3412,30 @@ fn start_vm_with_pending_restore(
         &space.project,
         space.network.as_deref(),
     );
-    let mut connected_members = Vec::new();
-    let result = shinu::vm::start(
-        ctx.root,
-        id,
-        space.image,
-        shinu::vm::StartOptions {
-            vcpus: space.vcpus,
-            mem_mib: space.mem_mib,
-            restore: restore.as_ref(),
-            readiness: space.readiness.as_ref(),
-            load_only,
-            track_dirty,
-        },
-        ctx.vm_cfg,
-        ctx.net_cfg,
-        |deadline| {
-            let state = snapshot(ctx.db, ctx.registry)?;
-            let all_members = network_members(&state, &space.project, space.network.as_deref());
-            connected_members.clone_from(&all_members);
-            let current_running = refresh_network_rules(
-                ctx,
-                &state,
-                &space.project,
-                space.network.as_deref(),
-                &previous_running,
-            )?;
-            sync_network_hosts_with(
+    with_network_admission(
+        ctx,
+        &HostPeerRules(ctx.net_cfg),
+        &space,
+        &previous_running,
+        |network_ready| {
+            shinu::vm::start(
                 ctx.root,
+                id,
+                space.image,
+                shinu::vm::StartOptions {
+                    vcpus: space.vcpus,
+                    mem_mib: space.mem_mib,
+                    restore: restore.as_ref(),
+                    readiness: space.readiness.as_ref(),
+                    load_only,
+                    track_dirty,
+                },
+                ctx.vm_cfg,
                 ctx.net_cfg,
-                &current_running,
-                &all_members,
-                deadline,
-            );
-            Ok(())
-        },
-    );
-    if result.is_err() && !connected_members.is_empty() {
-        // VM cleanup runs before this reconciliation. Remove its incoming
-        // peer exemptions too; never remove a live successor's connectivity.
-        let cleanup = snapshot(ctx.db, ctx.registry).and_then(|state| {
-            refresh_network_rules(
-                ctx,
-                &state,
-                &space.project,
-                space.network.as_deref(),
-                &connected_members,
+                network_ready,
             )
-            .map(|_| ())
-        });
-        if let Err(error) = cleanup {
-            eprintln!("network cleanup after failed start: {error}");
-        }
-    }
-    result
+        },
+    )
 }
 
 fn start_space(
@@ -3399,25 +3482,23 @@ fn resume_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Val
     }
     let before = snapshot(ctx.db, ctx.registry)?;
     let previous = running_network_members(ctx.root, &before, project, space.network.as_deref());
-    let result = shinu::vm::resume(
-        ctx.root,
-        space.id,
-        space.readiness.as_ref(),
-        ctx.net_cfg,
-        |deadline| {
-            let state = snapshot(ctx.db, ctx.registry)?;
-            let members = network_members(&state, project, space.network.as_deref());
-            let running =
-                refresh_network_rules(ctx, &state, project, space.network.as_deref(), &previous)?;
-            sync_network_hosts_with(ctx.root, ctx.net_cfg, &running, &members, deadline);
-            Ok(())
+    // The loaded space is not in `previous`; the hook records the members it
+    // actually connected so a failed READY revokes peers' ACCEPTs toward it.
+    let (_, booted) = with_network_admission(
+        ctx,
+        &HostPeerRules(ctx.net_cfg),
+        &space,
+        &previous,
+        |network_ready| {
+            shinu::vm::resume(
+                ctx.root,
+                space.id,
+                space.readiness.as_ref(),
+                ctx.net_cfg,
+                network_ready,
+            )
         },
-    );
-    if result.is_err() {
-        let current = snapshot(ctx.db, ctx.registry)?;
-        refresh_network_rules(ctx, &current, project, space.network.as_deref(), &previous)?;
-    }
-    let (_, booted) = result?;
+    )?;
     Ok(json!({"booted":booted,"state":"running"}))
 }
 fn stop_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value> {
@@ -9095,6 +9176,175 @@ esac
     fn test_db(root: &std::path::Path) -> Mutex<Connection> {
         Mutex::new(state::open(root).expect("open test database"))
     }
+    #[derive(Default)]
+    struct RecordedPeerRules {
+        removed: Mutex<Vec<(Uuid, Vec<String>)>>,
+        ensured: Mutex<Vec<(Uuid, Vec<String>)>>,
+        fail_after: Option<usize>,
+    }
+
+    impl super::PeerRules for RecordedPeerRules {
+        fn remove(&self, member: Uuid, peers: &[String]) {
+            self.removed.lock().unwrap().push((member, peers.to_vec()));
+        }
+
+        fn ensure(&self, member: Uuid, peers: &[String]) -> shinu::Result<()> {
+            let mut ensured = self.ensured.lock().unwrap();
+            ensured.push((member, peers.to_vec()));
+            if self.fail_after.is_some_and(|limit| ensured.len() > limit) {
+                return Err(shinu::Error::Internal("iptables unavailable".into()));
+            }
+            Ok(())
+        }
+    }
+
+    fn network_space(name: &str, network: &str) -> Space {
+        Space {
+            id: Uuid::new_v4(),
+            name: name.to_owned(),
+            project: "project-a".to_owned(),
+            image: Image::Void,
+            parent: None,
+            head: None,
+            vcpus: None,
+            mem_mib: None,
+            disk_mib: None,
+            network: Some(network.to_owned()),
+            expires_at: None,
+            created_at: Utc::now(),
+            write_cap_mib: 0,
+            stopped_reason: None,
+            readiness: None,
+        }
+    }
+
+    fn enabled_net() -> NetConfig {
+        NetConfig {
+            enabled: true,
+            base: [172, 31],
+            allow: Vec::new(),
+            host_allow: Vec::new(),
+            uplink: String::new(),
+        }
+    }
+
+    /// A stand-in VMM recognised by the real lifecycle checks, with a no-op
+    /// SSH fixture so /etc/hosts sync never reaches a real guest.
+    fn spawn_network_vmm(root: &std::path::Path, id: Uuid) -> std::process::Child {
+        let dir = shinu::vm_dir(root, id);
+        let config = vm::config_path(&dir);
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&config, "{}").unwrap();
+        std::fs::write(dir.join("test-ssh"), "exit 0\n").unwrap();
+        let fake = root.join("firecracker");
+        if !fake.exists() {
+            symlink("/usr/bin/yes", &fake).unwrap();
+        }
+        let child = Command::new(&fake)
+            .arg(&config)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        std::fs::write(vm::pid_path(&dir), child.id().to_string()).unwrap();
+        while !vm::is_running(&dir) {
+            thread::yield_now();
+        }
+        child
+    }
+
+    #[test]
+    fn departed_rules_cover_every_connected_member_that_stopped_running() {
+        let cfg = enabled_net();
+        let a = network_space("a", "blue");
+        let b = network_space("b", "blue");
+        let c = network_space("c", "blue");
+        let ip = |space: &Space| super::guest_ip(space.id, &cfg).unwrap();
+        // B was loaded (absent from the pre-resume runners) yet connected.
+        let connected = [a.clone(), b.clone(), c.clone()];
+        let running = [a.clone(), c.clone()];
+        let departed = super::departed_peer_rules(&cfg, &connected, &running);
+        assert_eq!(
+            departed,
+            vec![(a.id, vec![ip(&b)]), (c.id, vec![ip(&b)])],
+            "running peers must drop ACCEPTs toward the failed space"
+        );
+        // Reconciling against pre-resume runners alone can never revoke them.
+        assert!(
+            super::departed_peer_rules(&cfg, &running, &running)
+                .iter()
+                .all(|(_, peers)| peers.is_empty())
+        );
+    }
+
+    #[test]
+    fn failed_resume_ready_revokes_running_peers_accept_toward_the_space() {
+        for cleanup_fails in [false, true] {
+            let root = test_root("resume-peer-cleanup");
+            let a = network_space("a", "blue");
+            let b = network_space("b", "blue");
+            store_state(
+                &root,
+                &State {
+                    spaces: vec![a.clone(), b.clone()],
+                    ..State::default()
+                },
+            );
+            let mut runner_a = spawn_network_vmm(&root, a.id);
+            let db = test_db(&root);
+            let registry = registry();
+            let (vm_cfg, _) = test_configs();
+            let net_cfg = enabled_net();
+            let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+            let rules = RecordedPeerRules {
+                // The hook ensures A and B; cleanup's ensure for A then fails.
+                fail_after: cleanup_fails.then_some(2),
+                ..RecordedPeerRules::default()
+            };
+            let b_ip = super::guest_ip(b.id, &net_cfg).unwrap();
+            // B is loaded, so the pre-resume runners hold only A.
+            let previous = vec![a.clone()];
+            let result: shinu::Result<()> =
+                super::with_network_admission(&ctx, &rules, &b, &previous, |network_ready| {
+                    // Resume: B's vCPUs run (phase resuming) and the hook connects it.
+                    let mut runner_b = spawn_network_vmm(&root, b.id);
+                    std::fs::write(
+                        shinu::vm_dir(&root, b.id).join("loaded.json"),
+                        b"{\"phase\":\"resuming\"}",
+                    )
+                    .unwrap();
+                    let connected =
+                        network_ready(std::time::Instant::now() + Duration::from_secs(5));
+                    // READY fails; vm::resume stops B before returning.
+                    runner_b.kill().unwrap();
+                    runner_b.wait().unwrap();
+                    connected?;
+                    Err(shinu::Error::Internal("READY mismatch".into()))
+                });
+            runner_a.kill().unwrap();
+            runner_a.wait().unwrap();
+            assert!(
+                matches!(&result, Err(shinu::Error::Internal(message)) if message == "READY mismatch"),
+                "cleanup must not mask the READY error: {result:?}"
+            );
+            assert!(
+                rules
+                    .ensured
+                    .lock()
+                    .unwrap()
+                    .contains(&(a.id, vec![b_ip.clone()])),
+                "the hook must have opened A toward B"
+            );
+            assert!(
+                rules.removed.lock().unwrap().contains(&(a.id, vec![b_ip])),
+                "A's ACCEPT toward the failed B must be removed (cleanup_fails={cleanup_fails})"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     #[test]
     fn network_members_are_scoped_by_project_and_name() {
         fn space(id: Uuid, name: &str, project: &str, network: Option<&str>) -> Space {

@@ -4522,7 +4522,7 @@ mod prefault_tests {
         file.write_all_at(&[1], PREFAULT_STRIDE).unwrap();
         file.sync_all().unwrap();
         let page = super::page_size();
-        let mut resident = vec![1; (3 * PREFAULT_STRIDE / page) as usize];
+        let mut resident = vec![1; usize::try_from(3 * PREFAULT_STRIDE / page).unwrap()];
         mask_hole_residency(&file, page, &mut resident).unwrap();
         let range = MemoryRange {
             start: 0,

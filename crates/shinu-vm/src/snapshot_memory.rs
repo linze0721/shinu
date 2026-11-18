@@ -164,7 +164,7 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn only_whole_zero_chunks_are_punched_and_warming_keeps_them_holes() {
+    fn only_whole_zero_chunks_are_punched() {
         let path = std::env::temp_dir().join(format!("shinu-sparse-{}", uuid::Uuid::new_v4()));
         let mut contents = vec![0; 4 * CHUNK + 4096];
         // Isolate one nonzero byte so punching its otherwise zero chunk fails the comparison.
@@ -178,8 +178,68 @@ mod tests {
         assert_eq!(stats.hole_bytes_before, 0);
         assert_eq!(stats.hole_bytes_after, 3 * CHUNK as u64);
         assert_eq!(std::fs::read(&path).unwrap(), contents);
-        warm_file(&path).unwrap();
-        assert_eq!(sparsify(&path).unwrap().hole_bytes_before, 3 * CHUNK as u64);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn warming_populates_data_pages_but_not_holes() {
+        let page_size = {
+            // SAFETY: sysconf with _SC_PAGESIZE takes no pointers.
+            let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            assert!(size > 0);
+            usize::try_from(size).unwrap()
+        };
+        let path = std::env::temp_dir().join(format!("shinu-warm-{}", uuid::Uuid::new_v4()));
+        let file = File::create_new(&path).unwrap();
+        let pages = 2 * CHUNK / page_size;
+        let length = pages * page_size;
+        file.set_len(length as u64).unwrap();
+        let data = vec![0x91; page_size];
+        file.write_all_at(&data, 0).unwrap();
+        file.write_all_at(&data, (length - page_size) as u64)
+            .unwrap();
+        file.sync_all().unwrap();
+        // SAFETY: the descriptor is open, and a zero length means to EOF.
+        let status =
+            unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+        assert_eq!(status, 0);
+        let before = page_residency(&file, pages, length);
+        assert!(
+            before.iter().all(|state| state & 1 == 0),
+            "fixture must start cold (use a disk-backed TMPDIR)"
+        );
+
+        warm_file(&path).unwrap();
+        let after = page_residency(&file, pages, length);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(after[0] & 1, 1, "the first data page must be warmed");
+        assert_eq!(after[pages - 1] & 1, 1, "the last data page must be warmed");
+        assert!(
+            after[1..pages - 1].iter().all(|state| state & 1 == 0),
+            "warming must not populate hole pages"
+        );
+    }
+
+    fn page_residency(file: &File, pages: usize, length: usize) -> Vec<u8> {
+        // SAFETY: the file is open and sized to `length`. No mapping is dereferenced.
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(address, libc::MAP_FAILED, "{}", io::Error::last_os_error());
+        let mut resident = vec![0_u8; pages];
+        // SAFETY: the mapping is live, and `resident` has one byte per mapped page.
+        let status = unsafe { libc::mincore(address, length, resident.as_mut_ptr()) };
+        let error = io::Error::last_os_error();
+        // SAFETY: unmap exactly the range mapped above.
+        assert_eq!(unsafe { libc::munmap(address, length) }, 0);
+        assert_eq!(status, 0, "{error}");
+        resident
     }
 }

@@ -4314,10 +4314,9 @@ mod snapshot_load_tests {
         assert_eq!(clock_thaw(legacy), Some(("kvmclock_only", 1501)));
         let failed = "[x:fc_api] Thawed the frozen guest clock with errors: clock_frozen=false dwell_ms=2 tsc_frozen=false reason=KVM_SET_CLOCK: Invalid argument (os error 22)\n";
         assert_eq!(clock_thaw(failed), Some(("none", 2)));
-        assert_eq!(
-            clock_thaw("[x:main] Thawed the frozen guest clock: clock_frozen=false dwell_ms=1 tsc_frozen=true"),
-            None
-        );
+        let invalid =
+            "[x:main] Thawed the frozen guest clock: clock_frozen=false dwell_ms=1 tsc_frozen=true";
+        assert_eq!(clock_thaw(invalid), None);
         assert_eq!(clock_thaw("no thaw here\n"), None);
     }
 }

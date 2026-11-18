@@ -54,7 +54,8 @@ Changes are recorded in the Keep a Changelog format.
 - Retain full/diff snapshot SSH credentials with checkpoint assets so source Space or lease cleanup does not strand memory forks; remove archived keys with checkpoint GC/deletion.
 - Bound detached jobs by `SHINU_JOB_MAX_SECS` (default 3600 seconds, 0 disables the cap) and the host Space lease, reusing normal cancellation and final-log archival with a deadline-specific error.
 - Cold-boot incompatible memory checkpoints from their retained disk images instead of attempting to load old Firecracker state.
-- Reject stock/unapproved Firecracker builds for application snapshots: require the `v1.18.0-shinu.1` marker at asset admission and on the actual running executable; use a mandatory local patched archive rather than downloading stock.
+- Reject stock/unapproved Firecracker builds for application snapshots: require the `v1.18.0-shinu.2` marker at asset admission and on the actual running executable; use a mandatory local patched archive rather than downloading stock.
+- Freeze guest kvmclock and TSC from a load-only pool fill until its handout resume (`freeze_clock_until_resume`, Firecracker `v1.18.0-shinu.2`), so the pool dwell neither advances guest monotonic time nor fires overdue guest timers at once; `step=Resume` logs `clock_frozen` and `dwell_ms`.
 - Fail hot captures on block drain/flush errors, including an explicit backing-file fsync for disk-only hot cuts, while preserving resume/thaw cleanup.
 - Guard Diff creation with the actual live dirty epoch: failed captures, restarts and consecutive Diff requests force Full rather than dropping dirty pages from earlier captures.
 - Replace snapshot-time SSH reconnects with a memory-locked, nonce-authenticated resident guest helper; thaw restored guests through the same fixed protocol, retain SSH cleanup on helper failure, and batch restored clock/network setup into one SSH session.

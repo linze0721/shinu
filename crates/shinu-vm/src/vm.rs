@@ -2707,10 +2707,18 @@ pub struct RestoreFiles<'a> {
 }
 
 /// File-backed restore uses private mappings; never grant the jail write access.
+/// A load-only (pool) load also freezes the guest clocks until the handout
+/// resume, so the pool dwell neither advances guest monotonic time nor fires
+/// every overdue guest timer at once.
 fn snapshot_load_body(tap: Option<&str>, load_only: bool, track_dirty: bool) -> String {
     let base = format!(
-        "\"snapshot_path\":\"snap.state\",\"mem_backend\":{{\"backend_path\":\"snap.mem\",\"backend_type\":\"File\"}},\"track_dirty_pages\":{track_dirty},\"resume_vm\":{}",
-        !load_only
+        "\"snapshot_path\":\"snap.state\",\"mem_backend\":{{\"backend_path\":\"snap.mem\",\"backend_type\":\"File\"}},\"track_dirty_pages\":{track_dirty},\"resume_vm\":{}{}",
+        !load_only,
+        if load_only {
+            ",\"freeze_clock_until_resume\":true"
+        } else {
+            ""
+        }
     );
     tap.map_or_else(
         || format!("{{{base}}}"),
@@ -2718,6 +2726,32 @@ fn snapshot_load_body(tap: Option<&str>, load_only: bool, track_dirty: bool) -> 
             "{{{base},\"network_overrides\":[{{\"iface_id\":\"eth0\",\"host_dev_name\":\"{tap}\"}}]}}"
         ),
     )
+}
+
+/// Parses Firecracker's thaw line (`... guest clock...: clock_frozen=<bool> dwell_ms=<n> ...`)
+/// from console output written after the resume request. The console also
+/// carries guest serial output, so only these two typed fields are kept.
+fn clock_thaw(console: &str) -> Option<(bool, u64)> {
+    console.lines().find_map(|line| {
+        let (_, summary) = line.split_once(" guest clock")?;
+        let (_, fields) = summary.split_once(" clock_frozen=")?;
+        let mut fields = fields.split(' ');
+        let frozen = fields.next()?.parse().ok()?;
+        let dwell_ms = fields.next()?.strip_prefix("dwell_ms=")?.parse().ok()?;
+        Some((frozen, dwell_ms))
+    })
+}
+
+/// Console output appended since `offset`, capped so a chatty guest cannot
+/// make the resume path read megabytes.
+fn resumed_console(dir: &Path, offset: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    const MAX: u64 = 64 * 1024;
+    let mut file = std::fs::File::open(dir.join("console.log")).ok()?;
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX).read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Boots the VM unless it is already up. Returns whether a boot happened.
@@ -3217,11 +3251,20 @@ pub fn resume(
     );
     let result = (|| {
         let started = Instant::now();
+        let console_offset = std::fs::metadata(dir.join("console.log")).map_or(0, |m| m.len());
         if api(&dir, "PATCH", "/vm", Some("{\"state\":\"Resumed\"}")).is_none() {
             return Err(Error::Internal("failed to resume loaded VM".into()));
         }
+        // Firecracker logs the thaw before acknowledging the resume.
+        let clock = resumed_console(&dir, console_offset)
+            .as_deref()
+            .and_then(clock_thaw)
+            .map_or_else(
+                || " clock_frozen=false".to_owned(),
+                |(frozen, dwell_ms)| format!(" clock_frozen={frozen} dwell_ms={dwell_ms}"),
+            );
         eprintln!(
-            "event=restore_step vm_id={id} step=Resume elapsed_ms={} ok=true",
+            "event=restore_step vm_id={id} step=Resume elapsed_ms={} ok=true{clock}",
             started.elapsed().as_millis()
         );
         finish_restore(root, id, readiness, net_cfg, &mut network_ready)?;

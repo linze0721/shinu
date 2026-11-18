@@ -2720,17 +2720,23 @@ fn snapshot_load_body(
     )
 }
 
-/// Parses Firecracker's thaw line (`... guest clock...: clock_frozen=<bool> dwell_ms=<n> ...`)
-/// from console output written after the resume request. The console also
-/// carries guest serial output, so only these two typed fields are kept.
-fn clock_thaw(console: &str) -> Option<(bool, u64)> {
+/// Classifies the typed thaw fields in Firecracker's clock log, which shares
+/// the console with guest serial output. A missing thaw line is not success.
+fn clock_thaw(console: &str) -> Option<(&'static str, u64)> {
     console.lines().find_map(|line| {
         let (_, summary) = line.split_once(" guest clock")?;
         let (_, fields) = summary.split_once(" clock_frozen=")?;
         let mut fields = fields.split(' ');
         let frozen = fields.next()?.parse().ok()?;
         let dwell_ms = fields.next()?.strip_prefix("dwell_ms=")?.parse().ok()?;
-        Some((frozen, dwell_ms))
+        let tsc_frozen = fields.next()?.strip_prefix("tsc_frozen=")?.parse().ok()?;
+        let outcome = match (frozen, tsc_frozen) {
+            (true, true) => "both",
+            (true, false) => "kvmclock_only",
+            (false, false) => "none",
+            (false, true) => return None,
+        };
+        Some((outcome, dwell_ms))
     })
 }
 
@@ -3265,8 +3271,8 @@ pub fn resume(
             .as_deref()
             .and_then(clock_thaw)
             .map_or_else(
-                || " clock_frozen=false".to_owned(),
-                |(frozen, dwell_ms)| format!(" clock_frozen={frozen} dwell_ms={dwell_ms}"),
+                || " clock_frozen=none".to_owned(),
+                |(outcome, dwell_ms)| format!(" clock_frozen={outcome} dwell_ms={dwell_ms}"),
             );
         eprintln!(
             "event=restore_step vm_id={id} step=Resume elapsed_ms={} ok=true{clock}",
@@ -4118,11 +4124,17 @@ mod snapshot_load_tests {
 
     #[test]
     fn thaw_line_yields_only_typed_fields() {
-        let console = "guest says guest clock: clock_frozen=maybe dwell_ms=1\n\
+        let console = "guest says guest clock: clock_frozen=maybe dwell_ms=1 tsc_frozen=false\n\
             2026-11-18T11:15:00.1 [anonymous-instance:fc_api] Thawed the frozen guest clock: clock_frozen=true dwell_ms=15004 tsc_frozen=true\n";
-        assert_eq!(clock_thaw(console), Some((true, 15004)));
+        assert_eq!(clock_thaw(console), Some(("both", 15004)));
+        let legacy = "[x:fc_api] Thawed the frozen guest clock with errors: clock_frozen=true dwell_ms=1501 tsc_frozen=false reason=unsupported\n";
+        assert_eq!(clock_thaw(legacy), Some(("kvmclock_only", 1501)));
         let failed = "[x:fc_api] Thawed the frozen guest clock with errors: clock_frozen=false dwell_ms=2 tsc_frozen=false reason=KVM_SET_CLOCK: Invalid argument (os error 22)\n";
-        assert_eq!(clock_thaw(failed), Some((false, 2)));
+        assert_eq!(clock_thaw(failed), Some(("none", 2)));
+        assert_eq!(
+            clock_thaw("guest clock: clock_frozen=false dwell_ms=1 tsc_frozen=true"),
+            None
+        );
         assert_eq!(clock_thaw("no thaw here\n"), None);
     }
 }

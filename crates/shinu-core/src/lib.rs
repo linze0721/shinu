@@ -5,14 +5,14 @@ use uuid::Uuid;
 
 pub const DEFAULT_ROOT: &str = "/var/lib/shinu";
 
-pub const FC_VERSION: &str = "v1.18.0-shinu.3";
+pub const FC_VERSION: &str = "v1.18.0-shinu.4";
 /// Firecracker snapshot data format expected by `PUT /snapshot/load`.
 /// Old memory state is refused; its checkpoint disk can still boot cold.
 pub const FC_SNAPSHOT_VERSION: &str = "12.0.0";
 /// Root-relative local archive; stock releases do not fail closed on block flush errors.
 /// This build supports both the load-only clock freeze and anonymous Full restore holes.
-pub const FC_URL: &str = "cache/firecracker-v1.18.0-shinu.3-x86_64.tgz";
-const FC_ALLOWED_BUILDS: &[&str] = &["Firecracker v1.18.0-shinu.3"];
+pub const FC_URL: &str = "cache/firecracker-v1.18.0-shinu.4-x86_64.tgz";
+const FC_ALLOWED_BUILDS: &[&str] = &["Firecracker v1.18.0-shinu.4"];
 /// Newest published FC-CI kernel, pinned to an immutable dated artifact set.
 /// FC v1.18 tests support 6.18; virtio-blk, vsock, ext4 and overlayfs are built in.
 /// There is no published firecracker-ci/v1.18 prefix: devtool uses dated sets.
@@ -1052,13 +1052,14 @@ mod firecracker_build_tests {
     fn only_allowlisted_shinu_builds_can_claim_application_consistency() {
         let program = std::env::temp_dir().join(format!("shinu-fc-build-{}", uuid::Uuid::new_v4()));
         for (label, status, allowed) in [
-            ("Firecracker v1.18.0-shinu.3", 0, true),
+            ("Firecracker v1.18.0-shinu.4", 0, true),
             ("Firecracker v1.18.0", 0, false),
             // shinu.1 rejects the load-only `freeze_clock_until_resume` field.
             ("Firecracker v1.18.0-shinu.1", 0, false),
             ("Firecracker v1.18.0-shinu.2", 0, false),
-            ("Firecracker v1.18.0-shinu.3-unapproved", 0, false),
-            ("Firecracker v1.18.0-shinu.3", 1, false),
+            ("Firecracker v1.18.0-shinu.3", 0, false),
+            ("Firecracker v1.18.0-shinu.4-unapproved", 0, false),
+            ("Firecracker v1.18.0-shinu.4", 1, false),
         ] {
             std::fs::write(
                 &program,

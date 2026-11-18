@@ -789,6 +789,13 @@ pub fn find_ckpt(conn: &Connection, id: Uuid, project: &str) -> Result<Option<Ck
     .map_err(Into::into)
 }
 
+/// List Space identities across projects for host-wide offline maintenance.
+pub fn space_ids(conn: &Connection) -> Result<Vec<Uuid>> {
+    let mut stmt = conn.prepare("SELECT id FROM spaces")?;
+    let ids = stmt.query_map([], |row| parse_uuid(row.get(0)?, 0))?;
+    Ok(ids.collect::<rusqlite::Result<_>>()?)
+}
+
 pub fn count_spaces(conn: &Connection, project: &str) -> Result<u32> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM spaces WHERE project = ?1",

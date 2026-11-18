@@ -70,6 +70,7 @@ struct Cli {
     #[arg(long)]
     root: Option<PathBuf>,
     /// Punch zero ranges in an existing Full checkpoint with all Spaces stopped.
+    /// Refuses if it cannot verify that every Space is stopped.
     #[arg(long, requires = "project")]
     offline_sparsify: Option<Uuid>,
     /// Checkpoint's project for offline maintenance.
@@ -1109,12 +1110,15 @@ fn offline_sparsify(root: &Path, project: &str, id: Uuid) -> shinu::Result<()> {
             "offline sparsify requires a non-diff Full checkpoint".into(),
         ));
     }
-    for entry in std::fs::read_dir(root.join("vm"))? {
-        if shinu::vm::is_running(&entry?.path()) {
-            return Err(shinu::Error::Invalid(
-                "stop every Space before offline sparsify".into(),
-            ));
-        }
+    let process = shinu::vm::offline_vm_process(root, state::space_ids(&db)?).map_err(|error| {
+        shinu::Error::Internal(format!(
+            "cannot verify that every Space is stopped for offline sparsify: {error}"
+        ))
+    })?;
+    if let Some(pid) = process {
+        return Err(shinu::Error::Invalid(format!(
+            "stop every Space before offline sparsify (VM or jailer PID {pid} is still live)"
+        )));
     }
     let stats = shinu_vm::snapshot_memory::sparsify(&shinu::ckpt_mem(root, id))?;
     println!("{}", json!({"checkpoint":id,"memory_sparsity":stats}));
@@ -8281,6 +8285,103 @@ mod tests {
         let root = std::env::temp_dir().join(format!("shinu-{label}-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("create test root");
         root
+    }
+
+    #[test]
+    fn offline_sparsify_refuses_detached_processes_without_a_valid_pid_file() {
+        let root = test_root("offline-detached");
+        shinu::init_layout(&root).unwrap();
+        let space = Uuid::new_v4();
+        let checkpoint = Uuid::new_v4();
+        store_state(
+            &root,
+            &State {
+                spaces: vec![snapshot_test_space(space, Some(checkpoint))],
+                ckpts: vec![snapshot_test_checkpoint(
+                    checkpoint, space, None, None, None,
+                )],
+                ..State::default()
+            },
+        );
+        let dir = shinu::vm_dir(&root, space);
+        std::fs::create_dir(&dir).unwrap();
+        let pid_file = vm::pid_path(&dir);
+        std::fs::create_dir_all(pid_file.parent().unwrap()).unwrap();
+
+        for (name, corrupt_pid_file) in [("firecracker", false), ("jailer", true)] {
+            if corrupt_pid_file {
+                std::fs::write(&pid_file, b"not a pid").unwrap();
+            }
+            let fake = root.join(name);
+            symlink("/usr/bin/yes", &fake).unwrap();
+            let mut child = Command::new(fake)
+                .args(["--", "--id", &space.to_string()])
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap();
+            // Wait for the stand-in to execute, then keep the pipe open so it
+            // blocks instead of exiting or spinning while the command scans.
+            let mut stdout = child.stdout.take().unwrap();
+            stdout.read_exact(&mut [0]).unwrap();
+            let running = vm::is_running(&dir);
+            // With no .mem file, reaching sparsify would return an I/O error
+            // instead of the precheck's refusal.
+            let result = super::offline_sparsify(&root, "project-a", checkpoint);
+            let absent_runtime_dirs = corrupt_pid_file.then(|| {
+                std::fs::remove_dir_all(&dir).unwrap();
+                std::fs::remove_dir_all(pid_file.parent().unwrap()).unwrap();
+                super::offline_sparsify(&root, "project-a", checkpoint)
+            });
+            child.kill().unwrap();
+            child.wait().unwrap();
+            assert!(!running, "normal lifecycle checks still use the PID file");
+            assert!(
+                matches!(&result, Err(shinu::Error::Invalid(message))
+                    if message.contains("stop every Space")),
+                "did not refuse detached {name}: {result:?}"
+            );
+            if let Some(result) = absent_runtime_dirs {
+                assert!(
+                    matches!(&result, Err(shinu::Error::Invalid(message))
+                        if message.contains("stop every Space")),
+                    "did not refuse live Space after its runtime directories vanished: {result:?}"
+                );
+            }
+        }
+
+        // Once the VMM exits, offline maintenance is allowed.
+        write_snapshot_test_files(&root, checkpoint);
+        super::offline_sparsify(&root, "project-a", checkpoint).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn offline_sparsify_refuses_when_process_absence_cannot_be_checked() {
+        let root = test_root("offline-unknown");
+        shinu::init_layout(&root).unwrap();
+        let space = Uuid::new_v4();
+        let checkpoint = Uuid::new_v4();
+        store_state(
+            &root,
+            &State {
+                spaces: vec![snapshot_test_space(space, Some(checkpoint))],
+                ckpts: vec![snapshot_test_checkpoint(
+                    checkpoint, space, None, None, None,
+                )],
+                ..State::default()
+            },
+        );
+        let vm_root = root.join("vm");
+        std::fs::remove_dir(&vm_root).unwrap();
+        std::fs::write(&vm_root, b"not a directory").unwrap();
+        write_snapshot_test_files(&root, checkpoint);
+        let result = super::offline_sparsify(&root, "project-a", checkpoint);
+        assert!(
+            matches!(&result, Err(shinu::Error::Internal(message))
+                if message.contains("cannot verify that every Space is stopped")),
+            "did not distinguish an unknown process state: {result:?}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

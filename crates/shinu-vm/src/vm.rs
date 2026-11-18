@@ -999,23 +999,27 @@ fn is_vm_process(pid: u32, config: &Path, id: Uuid) -> bool {
     let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
         return false;
     };
-    let config_needle = config.as_os_str().as_encoded_bytes();
-    let id_text = id.to_string();
-    let mut id_matches = false;
-    let mut config_matches = false;
+    let id = id.to_string();
+    let config = config.as_os_str().as_encoded_bytes();
+    matches_vm_args(&cmdline, |arg| arg == id.as_bytes(), |arg| arg == config)
+}
+
+fn matches_vm_args(
+    cmdline: &[u8],
+    matches_id: impl Fn(&[u8]) -> bool,
+    matches_config: impl Fn(&[u8]) -> bool,
+) -> bool {
     let mut previous_was_id_flag = false;
     for arg in cmdline.split(|byte| *byte == 0) {
-        if (arg.strip_prefix(b"--id=") == Some(id_text.as_bytes()))
-            || (previous_was_id_flag && arg == id_text.as_bytes())
+        if arg.strip_prefix(b"--id=").is_some_and(&matches_id)
+            || (previous_was_id_flag && matches_id(arg))
+            || matches_config(arg)
         {
-            id_matches = true;
-        }
-        if arg == config_needle {
-            config_matches = true;
+            return true;
         }
         previous_was_id_flag = arg == b"--id";
     }
-    id_matches || config_matches
+    false
 }
 
 /// The pid of this space's VM, or `None` if it is not running.
@@ -1028,6 +1032,154 @@ pub fn running_pid(dir: &Path) -> Option<u32> {
 
 pub fn is_running(dir: &Path) -> bool {
     running_pid(dir).is_some()
+}
+
+/// Find a live Firecracker or jailer for this root without relying on PID files.
+/// `Ok(None)` means no match was found; an error means absence could not be
+/// verified. Run with the host's process view and hold the daemon's root lock
+/// through the check and maintenance operation to exclude new launches.
+pub fn offline_vm_process(root: &Path, space_ids: Vec<Uuid>) -> std::io::Result<Option<u32>> {
+    scan_offline_vm_processes(root, Path::new("/proc"), space_ids)
+}
+
+fn scan_offline_vm_processes(
+    root: &Path,
+    proc_root: &Path,
+    space_ids: Vec<Uuid>,
+) -> std::io::Result<Option<u32>> {
+    use std::collections::HashSet;
+
+    let mut ids: HashSet<_> = space_ids.into_iter().collect();
+    // A detached VMM can outlive the daemon's bookkeeping. Include UUIDs
+    // still present in either half of the jail layout.
+    for name in ["vm", "jail/firecracker"] {
+        for entry in std::fs::read_dir(root.join(name))? {
+            let name = entry?.file_name();
+            if let Ok(id) = Uuid::try_parse_ascii(name.as_encoded_bytes()) {
+                ids.insert(id);
+            }
+        }
+    }
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    let configs: HashSet<_> = ids
+        .iter()
+        .map(|&id| {
+            config_path(&shinu_core::vm_dir(root, id))
+                .into_os_string()
+                .into_encoded_bytes()
+        })
+        .collect();
+
+    for entry in std::fs::read_dir(proc_root)? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let process = entry.path();
+        if !live_vm_process(&process)? {
+            continue;
+        }
+        let Some(cmdline) = read_process_file(&process, "cmdline")? else {
+            continue;
+        };
+        if cmdline.is_empty() {
+            // A process exiting after the first status read can have no args
+            // by the time we read cmdline. Only ignore it if it is now gone.
+            if !live_vm_process(&process)? {
+                continue;
+            }
+            return Err(std::io::Error::other(format!(
+                "{} has no process arguments",
+                process.display()
+            )));
+        }
+        if matches_vm_args(
+            &cmdline,
+            |arg| Uuid::try_parse_ascii(arg).is_ok_and(|id| ids.contains(&id)),
+            |arg| configs.contains(arg),
+        ) {
+            return Ok(Some(pid));
+        }
+    }
+    Ok(None)
+}
+
+fn read_process_file(process: &Path, name: &str) -> std::io::Result<Option<Vec<u8>>> {
+    let path = process.join(name);
+    match std::fs::read(&path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error)
+            if (error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH))
+                && !process.try_exists()? =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(std::io::Error::new(
+            error.kind(),
+            format!("inspect {}: {error}", path.display()),
+        )),
+    }
+}
+
+fn live_vm_process(process: &Path) -> std::io::Result<bool> {
+    let Some(status) = read_process_file(process, "status")? else {
+        return Ok(false);
+    };
+    // Linux comm strings need not be UTF-8.
+    let field = |prefix: &[u8]| {
+        status
+            .split(|byte| *byte == b'\n')
+            .find_map(|line| line.strip_prefix(prefix))
+            .filter(|field| !field.is_empty())
+            .ok_or_else(|| {
+                std::io::Error::other(format!("invalid process status at {}", process.display()))
+            })
+    };
+    let name = field(b"Name:\t")?;
+    if name != b"firecracker" && name != b"jailer" {
+        return Ok(false);
+    }
+    let state = field(b"State:\t")?[0];
+    Ok(!matches!(state, b'Z' | b'X'))
+}
+
+#[cfg(test)]
+mod offline_process_tests {
+    use super::*;
+
+    #[test]
+    fn offline_scan_distinguishes_absence_from_unreadable_identity() {
+        let root = std::env::temp_dir().join(format!("shinu-offline-{}", Uuid::new_v4()));
+        shinu_core::init_layout(&root).unwrap();
+        let id = Uuid::new_v4();
+        // Recognize a jail UUID even if the corresponding vm/ entry is gone.
+        std::fs::create_dir_all(jail_root(&root, id)).unwrap();
+        let proc_root = root.join("proc");
+        let scan = || scan_offline_vm_processes(&root, &proc_root, Vec::new());
+        assert!(scan().is_err());
+        let process = proc_root.join("123");
+        std::fs::create_dir_all(&process).unwrap();
+        std::fs::write(process.join("status"), b"Name:\tfirecracker\nState:\tZ\n").unwrap();
+        assert_eq!(scan().unwrap(), None);
+
+        std::fs::write(process.join("status"), b"Name:\tfirecracker\nState:\tS\n").unwrap();
+        assert!(scan().is_err());
+        let cmdline = process.join("cmdline");
+        std::fs::write(&cmdline, b"").unwrap();
+        assert!(scan().is_err());
+        std::fs::write(&cmdline, format!("firecracker\0--id={}\0", Uuid::new_v4())).unwrap();
+        assert_eq!(scan().unwrap(), None);
+        std::fs::write(cmdline, format!("firecracker\0--id={id}\0")).unwrap();
+        assert_eq!(scan().unwrap(), Some(123));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 pub fn touch(dir: &Path) -> Result<()> {

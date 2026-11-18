@@ -49,6 +49,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Hermetic: no root, KVM, btrfs, or network required.
       - run: cargo test --workspace
+      - name: Sparse warm page-cache regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          TMPDIR=$(mktemp -d "$RUNNER_TEMP/shinu-warm.XXXXXX")
+          export TMPDIR
+          trap 'rm -rf -- "$TMPDIR"' EXIT
+          case "$(findmnt --noheadings --output FSTYPE --target "$TMPDIR")" in
+            ext4|xfs|btrfs) ;;
+            *) echo 'Sparse warm test requires a disk-backed ext4, XFS or Btrfs TMPDIR' >&2; exit 1 ;;
+          esac
+          test_name=snapshot_memory::tests::warming_populates_data_pages_but_not_holes
+          cargo test --color never -p shinu-vm --lib "$test_name" -- --ignored --exact | tee "$TMPDIR/test.log"
+          # An exact filter that matches zero tests is otherwise a successful Cargo run.
+          grep -Fx "test $test_name ... ok" "$TMPDIR/test.log"
 
   build:
     name: build

@@ -1039,7 +1039,28 @@ pub fn is_running(dir: &Path) -> bool {
 /// verified. Run with the host's process view and hold the daemon's root lock
 /// through the check and maintenance operation to exclude new launches.
 pub fn offline_vm_process(root: &Path, space_ids: Vec<Uuid>) -> std::io::Result<Option<u32>> {
-    scan_offline_vm_processes(root, Path::new("/proc"), space_ids)
+    let proc_root = Path::new("/proc");
+    require_process_view(proc_root)?;
+    scan_offline_vm_processes(root, proc_root, space_ids)
+}
+
+fn require_process_view(proc_root: &Path) -> std::io::Result<()> {
+    let proc = std::fs::File::open(proc_root)?;
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: proc is open and stats is writable for the duration of fstatfs.
+    if unsafe { libc::fstatfs(proc.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fstatfs succeeded and initialized the structure.
+    if unsafe { stats.assume_init() }.f_type != libc::PROC_SUPER_MAGIC {
+        return Err(std::io::Error::other("process view must be on procfs"));
+    }
+    let pid = std::process::id().to_string();
+    if std::fs::read_link(proc_root.join("self"))? != Path::new(&pid) {
+        return Err(std::io::Error::other("procfs does not expose this process"));
+    }
+    std::fs::File::open(proc_root.join(pid).join("status"))?;
+    Ok(())
 }
 
 fn scan_offline_vm_processes(
@@ -1162,6 +1183,9 @@ mod offline_process_tests {
         // Recognize a jail UUID even if the corresponding vm/ entry is gone.
         std::fs::create_dir_all(jail_root(&root, id)).unwrap();
         let proc_root = root.join("proc");
+        std::fs::create_dir(&proc_root).unwrap();
+        assert!(require_process_view(&proc_root).is_err());
+        std::fs::remove_dir(&proc_root).unwrap();
         let scan = || scan_offline_vm_processes(&root, &proc_root, Vec::new());
         assert!(scan().is_err());
         let process = proc_root.join("123");
@@ -2876,8 +2900,12 @@ fn snapshot_load_body(
 /// the console with guest serial output. A missing thaw line is not success.
 fn clock_thaw(console: &str) -> Option<(&'static str, u64)> {
     console.lines().find_map(|line| {
-        let (_, summary) = line.split_once(" guest clock")?;
-        let (_, fields) = summary.split_once(" clock_frozen=")?;
+        let (_, message) = line.split_once(":fc_api] ")?;
+        let fields = message
+            .strip_prefix("Thawed the frozen guest clock: clock_frozen=")
+            .or_else(|| {
+                message.strip_prefix("Thawed the frozen guest clock with errors: clock_frozen=")
+            })?;
         let mut fields = fields.split(' ');
         let frozen = fields.next()?.parse().ok()?;
         let dwell_ms = fields.next()?.strip_prefix("dwell_ms=")?.parse().ok()?;
@@ -3423,7 +3451,7 @@ pub fn resume(
             .as_deref()
             .and_then(clock_thaw)
             .map_or_else(
-                || " clock_frozen=none".to_owned(),
+                || " clock_frozen=unknown".to_owned(),
                 |(outcome, dwell_ms)| format!(" clock_frozen={outcome} dwell_ms={dwell_ms}"),
             );
         eprintln!(

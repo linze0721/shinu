@@ -182,6 +182,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires disk-backed TMPDIR and observable page-cache eviction"]
     fn warming_populates_data_pages_but_not_holes() {
         let page_size = {
             // SAFETY: sysconf with _SC_PAGESIZE takes no pointers.

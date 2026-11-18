@@ -2900,7 +2900,10 @@ fn snapshot_load_body(
 /// the console with guest serial output. A missing thaw line is not success.
 fn clock_thaw(console: &str) -> Option<(&'static str, u64)> {
     console.lines().find_map(|line| {
-        let (_, message) = line.split_once(":fc_api] ")?;
+        let (prefix, message) = line.split_once("] ")?;
+        if !prefix.ends_with(":main") && !prefix.ends_with(":fc_api") {
+            return None;
+        }
         let fields = message
             .strip_prefix("Thawed the frozen guest clock: clock_frozen=")
             .or_else(|| {
@@ -4305,14 +4308,14 @@ mod snapshot_load_tests {
     #[test]
     fn thaw_line_yields_only_typed_fields() {
         let console = "guest says guest clock: clock_frozen=maybe dwell_ms=1 tsc_frozen=false\n\
-            2026-11-18T11:15:00.1 [anonymous-instance:fc_api] Thawed the frozen guest clock: clock_frozen=true dwell_ms=15004 tsc_frozen=true\n";
+            2026-11-18T11:15:00.1 [anonymous-instance:main] Thawed the frozen guest clock: clock_frozen=true dwell_ms=15004 tsc_frozen=true\n";
         assert_eq!(clock_thaw(console), Some(("both", 15004)));
         let legacy = "[x:fc_api] Thawed the frozen guest clock with errors: clock_frozen=true dwell_ms=1501 tsc_frozen=false reason=unsupported\n";
         assert_eq!(clock_thaw(legacy), Some(("kvmclock_only", 1501)));
         let failed = "[x:fc_api] Thawed the frozen guest clock with errors: clock_frozen=false dwell_ms=2 tsc_frozen=false reason=KVM_SET_CLOCK: Invalid argument (os error 22)\n";
         assert_eq!(clock_thaw(failed), Some(("none", 2)));
         assert_eq!(
-            clock_thaw("guest clock: clock_frozen=false dwell_ms=1 tsc_frozen=true"),
+            clock_thaw("[x:main] Thawed the frozen guest clock: clock_frozen=false dwell_ms=1 tsc_frozen=true"),
             None
         );
         assert_eq!(clock_thaw("no thaw here\n"), None);

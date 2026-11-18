@@ -1,5 +1,6 @@
 pub mod config;
 pub mod net;
+pub mod snapshot_memory;
 /// microVM lifecycle. Everything here runs in the root daemon: it spawns
 /// Firecracker, owns `/dev/kvm` access, and hands the unprivileged client
 /// nothing but a socket and a key it already owns.

@@ -69,12 +69,39 @@ const TEMPLATE_GLOBAL_CAP: usize = 2048;
 struct Cli {
     #[arg(long)]
     root: Option<PathBuf>,
+    /// Punch zero ranges in an existing Full checkpoint with all Spaces stopped.
+    #[arg(long, requires = "project")]
+    offline_sparsify: Option<Uuid>,
+    /// Checkpoint's project for offline maintenance.
+    #[arg(long, requires = "offline_sparsify")]
+    project: Option<String>,
+    #[arg(long, hide = true)]
+    warm_memory_file: Option<PathBuf>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    if let Some(memory) = cli.warm_memory_file {
+        return Ok(shinu_vm::snapshot_memory::warm_file(&memory)?);
+    }
     let root = shinu::resolve_root(cli.root.as_deref());
     shinu::init_daemon_layout(&root)?;
+    let root_lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(root.join("daemon.lock"))?;
+    root_lock.try_lock().map_err(|error| {
+        std::io::Error::other(format!(
+            "shinu root is in use by another daemon or offline operation: {error}"
+        ))
+    })?;
+    if let (Some(id), Some(project)) = (cli.offline_sparsify, cli.project) {
+        offline_sparsify(&root, &project, id)?;
+        return Ok(());
+    }
     purge_diff_temp(&root)?;
     let connection = state::open(&root)?;
     if state::migrate_from_json(&root, &connection)? {
@@ -1068,6 +1095,30 @@ fn warm_checkpoint(ctx: &Ctx<'_>, project: &str, id: Uuid) -> shinu::Result<Valu
     ensure_snapshot_loadable(&checkpoint)?;
     shinu::vm::warm_checkpoint_memory(&shinu::ckpt_mem(ctx.root, id))?;
     Ok(json!({"checkpoint":id,"warmed":true}))
+}
+
+fn offline_sparsify(root: &Path, project: &str, id: Uuid) -> shinu::Result<()> {
+    let db = Connection::open_with_flags(
+        root.join("shinu.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    let checkpoint = state::find_ckpt(&db, id, project)?
+        .ok_or_else(|| shinu::Error::NotFound(id.to_string()))?;
+    if !checkpoint.full || checkpoint.base.is_some() {
+        return Err(shinu::Error::Invalid(
+            "offline sparsify requires a non-diff Full checkpoint".into(),
+        ));
+    }
+    for entry in std::fs::read_dir(root.join("vm"))? {
+        if shinu::vm::is_running(&entry?.path()) {
+            return Err(shinu::Error::Invalid(
+                "stop every Space before offline sparsify".into(),
+            ));
+        }
+    }
+    let stats = shinu_vm::snapshot_memory::sparsify(&shinu::ckpt_mem(root, id))?;
+    println!("{}", json!({"checkpoint":id,"memory_sparsity":stats}));
+    Ok(())
 }
 
 const BYTES_PER_MIB: u64 = 1024 * 1024;
@@ -2973,9 +3024,21 @@ fn commit_space(
             shinu::btrfs::clone_for(&shinu::space_image(ctx.root, space_id), &image, 0, 0)?;
             None
         };
+        let mut memory_sparsity = None;
         if let Some((snapshot_mem, snapshot_state)) =
             capture.as_ref().and_then(|capture| capture.memory.as_ref())
         {
+            if matches!(mode, SnapshotMode::Full) {
+                // The guest has resumed. The new inode has not been published or linked.
+                let started = Instant::now();
+                let stats = shinu_vm::snapshot_memory::sparsify(snapshot_mem)?;
+                eprintln!(
+                    "event=checkpoint_sparsify checkpoint={id} elapsed_ms={} stats={}",
+                    started.elapsed().as_millis(),
+                    serde_json::to_string(&stats)?
+                );
+                memory_sparsity = Some(stats);
+            }
             std::fs::rename(snapshot_mem, shinu::ckpt_mem(ctx.root, id))?;
             std::fs::rename(snapshot_state, shinu::ckpt_state(ctx.root, id))?;
             for path in [
@@ -2990,7 +3053,11 @@ fn commit_space(
                 &shinu::ckpt_key(ctx.root, id),
             )?;
         }
-        let metadata = checkpoint_metadata(id, current_space.head, capture.as_ref(), &fc_build_id);
+        let mut metadata =
+            checkpoint_metadata(id, current_space.head, capture.as_ref(), &fc_build_id);
+        if let Some(stats) = memory_sparsity {
+            metadata["memory_sparsity"] = serde_json::to_value(stats)?;
+        }
         write_checkpoint_metadata(ctx.root, id, &metadata)?;
         let checkpoint = update_state(ctx.db, ctx.registry, |state| {
             if let Some(base) = diff_base.as_ref() {
@@ -3437,6 +3504,8 @@ fn start_vm_with_pending_restore(
         mem: &snapshot_mem,
         state: &snapshot_state,
         guest_snapshot_nonce: nonce.as_deref(),
+        anon_holes: restore_checkpoint
+            .is_some_and(|checkpoint| checkpoint.full && checkpoint.base.is_none()),
     });
     let previous_running = running_network_members(
         ctx.root,

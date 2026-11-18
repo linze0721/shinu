@@ -2,6 +2,7 @@ pub use crate::net::{egress_rules, peer_rules};
 
 use crate::config::VmConfig;
 use crate::net::NetConfig;
+use crate::snapshot_memory::data_extents;
 use shinu_core::{Error, Image, ReadySpec, Result};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -2035,56 +2036,6 @@ pub fn snapshot(
     Ok(capture)
 }
 
-/// Firecracker diff snapshots are sparse: allocated extents are dirty pages
-/// and holes are untouched. The kernel's extent view is required because a
-/// dirty page filled with zeroes is indistinguishable from a hole by content.
-fn written_extents(file: &std::fs::File, size: u64) -> Result<Vec<(u64, u64)>> {
-    // `lseek` with SEEK_DATA/SEEK_HOLE is the kernel's sparse extent view.
-    unsafe extern "C" {
-        fn lseek(fd: i32, offset: i64, whence: i32) -> i64;
-    }
-    const SEEK_DATA: i32 = 3;
-    const SEEK_HOLE: i32 = 4;
-    let fd = std::os::fd::AsRawFd::as_raw_fd(file);
-    let mut extents = Vec::new();
-    let mut offset = 0i64;
-    while offset >= 0 && offset.cast_unsigned() < size {
-        // SAFETY: `fd` comes from the open `File`, and the constants match
-        // Linux's `SEEK_DATA`/`SEEK_HOLE` ABI.
-        let start = unsafe { lseek(fd, offset, SEEK_DATA) };
-        if start < 0 {
-            let error = std::io::Error::last_os_error();
-            // ENXIO means no data remains past this offset: the normal exit.
-            // Anything else (a filesystem without extent seeks, most of all)
-            // must fail loudly, because silently treating the diff as empty
-            // would restore the base alone and call it the caller's snapshot.
-            if error.raw_os_error() == Some(6) {
-                break;
-            }
-            return Err(Error::Internal(format!(
-                "cannot map written extents of a diff snapshot: {error}"
-            )));
-        }
-        // SAFETY: `fd` remains the open snapshot descriptor and `SEEK_HOLE`
-        // is the Linux ABI constant declared above.
-        let end = unsafe { lseek(fd, start, SEEK_HOLE) };
-        if end < 0 {
-            return Err(Error::Internal(format!(
-                "cannot map the end of a diff snapshot extent: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-        if end < start {
-            return Err(Error::Internal(
-                "diff snapshot extent ended before it started".to_owned(),
-            ));
-        }
-        extents.push((start.cast_unsigned(), (end - start).cast_unsigned()));
-        offset = end;
-    }
-    Ok(extents)
-}
-
 /// Builds a loadable memory image from a full base and a Firecracker diff.
 /// Reflinking keeps untouched pages shared with the base; only allocated diff
 /// extents are copied over it. Holes must not be copied as zeroes, while
@@ -2096,7 +2047,7 @@ pub fn merge_snapshot_memory(base: &Path, diff: &Path, merged: &Path) -> Result<
     shinu_core::btrfs::reflink(base, merged)?;
     let source = std::fs::File::open(diff)?;
     let size = source.metadata()?.len();
-    let extents = written_extents(&source, size)?;
+    // A dirty diff page filled with zeroes is still an allocated data extent.
     let target = std::fs::OpenOptions::new().write(true).open(merged)?;
     let mut buffer = vec![0u8; 1024 * 1024];
     let buffer_len = u64::try_from(buffer.len()).map_err(|error| {
@@ -2104,7 +2055,10 @@ pub fn merge_snapshot_memory(base: &Path, diff: &Path, merged: &Path) -> Result<
             "snapshot merge buffer length does not fit u64: {error}"
         ))
     })?;
-    for (offset, length) in extents {
+    for extent in data_extents(&source, size) {
+        let extent = extent?;
+        let offset = extent.start;
+        let length = extent.end - offset;
         let mut copied = 0u64;
         while copied < length {
             let chunk =
@@ -2214,8 +2168,18 @@ pub fn link_checkpoint_memory(source: &Path, destination: &Path) -> Result<()> {
 pub fn warm_checkpoint_memory(memory: &Path) -> Result<()> {
     let group = Path::new("/sys/fs/cgroup/shinu-ckpt-cache");
     std::fs::create_dir_all(group)?;
-    std::fs::File::open(memory)?.sync_all()?;
-    let output = std::process::Command::new("sh").args(["-eu", "-c", "printf '%s\\n' \"$$\" > \"$1/cgroup.procs\"; dd if=\"$2\" of=/dev/null iflag=nocache count=0 status=none; exec dd if=\"$2\" of=/dev/null bs=4M status=none", "shinu-ckpt-warm"]).arg(group).arg(memory).output()?;
+    let executable = format!("/proc/{}/exe", std::process::id());
+    let output = std::process::Command::new("sh")
+        .args([
+            "-eu",
+            "-c",
+            "printf '%s\n' \"$$\" > \"$1/cgroup.procs\"; exec \"$2\" --warm-memory-file \"$3\"",
+            "shinu-ckpt-warm",
+        ])
+        .arg(group)
+        .arg(executable)
+        .arg(memory)
+        .output()?;
     if !output.status.success() {
         return Err(Error::Internal(format!(
             "checkpoint cache warming failed: {}",
@@ -2401,15 +2365,18 @@ fn page_size() -> u64 {
 /// logged: the VM stays correct and merely faults pages on first touch.
 fn prefault_loaded(dir: &Path, id: Uuid, memory: &Path) {
     let started = Instant::now();
-    let result = (|| {
+    let result = (|| -> Result<(u64, u64)> {
         let pid =
             running_pid(dir).ok_or_else(|| Error::Internal("loaded VMM is not running".into()))?;
         let ranges = snapshot_memory_ranges(&std::fs::read_to_string(format!("/proc/{pid}/maps"))?);
+        // An all-hole image can legitimately have no file-backed mappings.
         if ranges.is_empty() {
-            return Err(Error::Internal("snapshot memory mapping not found".into()));
+            return Ok((0, 0));
         }
         let page = page_size();
-        let resident = resident_pages(&std::fs::File::open(memory)?, page)?;
+        let file = std::fs::File::open(memory)?;
+        let mut resident = resident_pages(&file, page)?;
+        mask_hole_residency(&file, page, &mut resident)?;
         let targets = prefault_targets(&ranges, &resident, page);
         populate_read(pid, &targets)?;
         let mapped: u64 = ranges.iter().map(|range| range.end - range.start).sum();
@@ -2426,6 +2393,22 @@ fn prefault_loaded(dir: &Path, id: Uuid, memory: &Path) {
             eprintln!("event=prefault vm_id={id} elapsed_ms={elapsed_ms} ok=false error={error}");
         }
     }
+}
+
+fn mask_hole_residency(file: &std::fs::File, page: u64, resident: &mut [u8]) -> Result<()> {
+    let mut previous_end = 0;
+    for extent in data_extents(file, file.metadata()?.len()) {
+        let extent = extent?;
+        let start = usize::try_from(extent.start / page)
+            .unwrap_or(resident.len())
+            .min(resident.len());
+        resident[previous_end..start.max(previous_end)].fill(0);
+        previous_end = usize::try_from(extent.end.div_ceil(page))
+            .unwrap_or(resident.len())
+            .min(resident.len());
+    }
+    resident[previous_end..].fill(0);
+    Ok(())
 }
 
 fn clean_jail(dir: &Path) -> Result<()> {
@@ -2704,14 +2687,20 @@ pub struct RestoreFiles<'a> {
     pub mem: &'a Path,
     pub state: &'a Path,
     pub guest_snapshot_nonce: Option<&'a str>,
+    pub anon_holes: bool,
 }
 
 /// File-backed restore uses private mappings; never grant the jail write access.
 /// A load-only (pool) load also freezes the guest clocks until the handout
 /// resume, so the pool dwell neither advances guest monotonic time nor fires
 /// every overdue guest timer at once.
-fn snapshot_load_body(tap: Option<&str>, load_only: bool, track_dirty: bool) -> String {
-    let base = format!(
+fn snapshot_load_body(
+    tap: Option<&str>,
+    load_only: bool,
+    track_dirty: bool,
+    anon_holes: bool,
+) -> String {
+    let mut base = format!(
         "\"snapshot_path\":\"snap.state\",\"mem_backend\":{{\"backend_path\":\"snap.mem\",\"backend_type\":\"File\"}},\"track_dirty_pages\":{track_dirty},\"resume_vm\":{}{}",
         !load_only,
         if load_only {
@@ -2720,6 +2709,9 @@ fn snapshot_load_body(tap: Option<&str>, load_only: bool, track_dirty: bool) -> 
             ""
         }
     );
+    if anon_holes {
+        base.push_str(",\"anon_holes\":true");
+    }
     tap.map_or_else(
         || format!("{{{base}}}"),
         |tap| format!(
@@ -2973,6 +2965,18 @@ pub fn start(
         // boundary. Re-read no-follow metadata immediately before execution;
         // an unsafe replacement must fail closed rather than reach `setsid`.
         validate_vm_assets(&jailer, &firecracker)?;
+        if std::env::var("SHINU_KSM_MERGE").as_deref() == Ok("1") {
+            // SAFETY: the post-fork hook only performs prctl and captures no references.
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::prctl(libc::PR_SET_MEMORY_MERGE, 1_u64, 0_u64, 0_u64, 0_u64) == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                });
+            }
+        }
         #[cfg(test)]
         ledger_journal::record("launch".into());
         let status = command
@@ -3061,6 +3065,7 @@ pub fn start(
                 net.as_ref().map(|spec| spec.tap.as_str()),
                 load_only,
                 track_dirty,
+                restore.is_some_and(|files| files.anon_holes),
             );
             if api_with_timeout(
                 &dir,
@@ -4062,33 +4067,63 @@ pub fn exec_in_vm(vsock_uds: &Path, key: &Path, port: u16, cmd: &[String]) -> Re
 
 #[cfg(test)]
 mod snapshot_load_tests {
-    use super::snapshot_load_body;
+    use super::{clock_thaw, snapshot_load_body};
 
     // Firecracker rebuilds dirty-page tracking from the load request, so the
     // restore body must keep this flag on every branch.
     #[test]
     fn every_restore_requests_dirty_page_tracking() {
-        assert!(snapshot_load_body(None, false, true).contains("\"track_dirty_pages\":true"));
         assert!(
-            snapshot_load_body(Some("shinu0123456789"), false, true)
+            snapshot_load_body(None, false, true, false).contains("\"track_dirty_pages\":true")
+        );
+        assert!(
+            snapshot_load_body(Some("shinu0123456789"), false, true, false)
                 .contains("\"track_dirty_pages\":true")
         );
     }
 
     #[test]
     fn a_tap_override_repoints_only_the_interface() {
-        let body = snapshot_load_body(Some("shinudeadbeef0"), false, true);
+        let body = snapshot_load_body(Some("shinudeadbeef0"), false, true, true);
         assert!(body.contains("\"iface_id\":\"eth0\""));
         assert!(body.contains("\"host_dev_name\":\"shinudeadbeef0\""));
         assert!(body.contains("\"resume_vm\":true"));
+        assert!(body.contains("\"anon_holes\":true"));
     }
 
     #[test]
     fn no_tap_omits_the_override_entirely() {
-        let body = snapshot_load_body(None, false, true);
+        let body = snapshot_load_body(None, false, true, false);
         assert!(!body.contains("network_overrides"));
         assert!(body.contains("\"snapshot_path\":\"snap.state\""));
         assert!(body.contains("\"backend_type\":\"File\""));
+        assert!(!body.contains("anon_holes"));
+    }
+
+    // Only a load-only (pool) load keeps the VM paused, so only it freezes the
+    // clock; Firecracker rejects the flag together with resume_vm=true.
+    #[test]
+    fn only_load_only_freezes_the_clock() {
+        for tap in [None, Some("shinudeadbeef0")] {
+            let pooled: serde_json::Value =
+                serde_json::from_str(&snapshot_load_body(tap, true, true, true)).unwrap();
+            assert_eq!(pooled["resume_vm"], false);
+            assert_eq!(pooled["freeze_clock_until_resume"], true);
+            let direct: serde_json::Value =
+                serde_json::from_str(&snapshot_load_body(tap, false, true, false)).unwrap();
+            assert_eq!(direct["resume_vm"], true);
+            assert!(direct.get("freeze_clock_until_resume").is_none());
+        }
+    }
+
+    #[test]
+    fn thaw_line_yields_only_typed_fields() {
+        let console = "guest says guest clock: clock_frozen=maybe dwell_ms=1\n\
+            2026-11-18T11:15:00.1 [anonymous-instance:fc_api] Thawed the frozen guest clock: clock_frozen=true dwell_ms=15004 tsc_frozen=true\n";
+        assert_eq!(clock_thaw(console), Some((true, 15004)));
+        let failed = "[x:fc_api] Thawed the frozen guest clock with errors: clock_frozen=false dwell_ms=2 tsc_frozen=false reason=KVM_SET_CLOCK: Invalid argument (os error 22)\n";
+        assert_eq!(clock_thaw(failed), Some((false, 2)));
+        assert_eq!(clock_thaw("no thaw here\n"), None);
     }
 }
 
@@ -4309,9 +4344,33 @@ mod guest_setup_tests {
 #[cfg(test)]
 mod prefault_tests {
     use super::{
-        MemoryRange, PREFAULT_STRIDE, populate_read, prefault_targets, resident_pages,
-        snapshot_memory_ranges,
+        MemoryRange, PREFAULT_STRIDE, mask_hole_residency, populate_read, prefault_targets,
+        resident_pages, snapshot_memory_ranges,
     };
+
+    #[test]
+    fn cached_holes_are_not_prefault_targets() {
+        use std::os::unix::fs::FileExt;
+        let path =
+            std::env::temp_dir().join(format!("shinu-prefault-hole-{}", uuid::Uuid::new_v4()));
+        let file = std::fs::File::create_new(&path).unwrap();
+        file.set_len(3 * PREFAULT_STRIDE).unwrap();
+        file.write_all_at(&[1], PREFAULT_STRIDE).unwrap();
+        file.sync_all().unwrap();
+        let page = super::page_size();
+        let mut resident = vec![1; (3 * PREFAULT_STRIDE / page) as usize];
+        mask_hole_residency(&file, page, &mut resident).unwrap();
+        let range = MemoryRange {
+            start: 0,
+            end: 3 * PREFAULT_STRIDE,
+            offset: 0,
+        };
+        assert_eq!(
+            prefault_targets(&[range], &resident, page),
+            [PREFAULT_STRIDE]
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn only_private_snapshot_file_mappings_are_guest_memory() {
@@ -4898,6 +4957,7 @@ mod lifecycle_ledger_tests {
             mem: &space.memory,
             state: &space.state,
             guest_snapshot_nonce: None,
+            anon_holes: false,
         };
         let cfg = VmConfig {
             vcpus: 1,

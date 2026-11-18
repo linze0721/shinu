@@ -24,6 +24,7 @@ Changes are recorded in the Keep a Changelog format.
 - Paused Full restores through `start --load-only` / `load_only:true`, persisted loading/loaded/resuming phases, and explicit `resume` across HTTP, CLI and MCP; interrupted paused restores are stopped on daemon restart before request admission.
 - Per-start `track_dirty` (default true) and `ckpt warm` / checkpoint warm HTTP/MCP interfaces using a persistent dedicated page-cache cgroup.
 - Physical store/MemAvailable admission floors with HTTP `capacity_watermark` errors and stable CLI exit 75.
+- Full captures punch aligned zero chunks before publication and report memory sparsity; existing Full checkpoints can be converted offline. Full restores substitute anonymous zero mappings for large holes, and warming and prefault skip holes. Optional `SHINU_KSM_MERGE=1` enables per-VMM host KSM eligibility.
 
 ### Changed
 

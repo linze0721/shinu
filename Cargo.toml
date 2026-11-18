@@ -20,6 +20,7 @@ clap = { version = "4", features = ["derive"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+libc = "0.2"
 shinu-core = { path = "crates/shinu-core" }
 shinu-store = { path = "crates/shinu-store" }
 shinu-crypto = { path = "crates/shinu-crypto" }

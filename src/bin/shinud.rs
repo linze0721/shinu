@@ -2571,28 +2571,6 @@ struct SpaceSpec {
     readiness: Option<shinu::ReadySpec>,
 }
 
-fn materialize_new_space(
-    root: &Path,
-    id: Uuid,
-    base: &Path,
-    image: &Path,
-    mount: &Path,
-    grow_to: Option<u64>,
-) -> shinu::Result<()> {
-    #[cfg(test)]
-    if root.join("test-create-host").is_file() {
-        std::fs::copy(base, image)?;
-        return Ok(());
-    }
-    shinu::btrfs::clone_for(base, image, 0, 0)?;
-    if let Some(size) = grow_to {
-        resize_disk_image(image, size)?;
-    }
-    let public_key = shinu::vm::prepare(&shinu::vm_dir(root, id), 0, 0)?;
-    // The common base never contains a credential shared by every space.
-    shinu::vm::authorize(image, &public_key, mount)
-}
-
 fn create_space(ctx: &Ctx<'_>, project: &str, spec: SpaceSpec) -> shinu::Result<Value> {
     let SpaceSpec {
         name,
@@ -2634,6 +2612,7 @@ fn create_space(ctx: &Ctx<'_>, project: &str, spec: SpaceSpec) -> shinu::Result<
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let image_path = shinu::space_image(ctx.root, id);
+    shinu::btrfs::clone_for(&base, &image_path, 0, 0)?;
     let mount = ctx.root.join(format!("authorize.{id}.mnt"));
     let result = (|| -> shinu::Result<Value> {
         if requested_disk > base_mib {

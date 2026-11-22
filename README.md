@@ -362,7 +362,7 @@ All API routes require authentication header: `Authorization: Bearer <token>`.
 | `POST` | `/console/tokens` | — | `201 Created` `{"token":"..."}` | Mint new 32-byte API token for active project |
 | `DELETE` | `/console/tokens/{prefix}` | — | `200 OK` | Delete matching token prefix |
 | `POST` | `/v1/spaces` | `{"name":"web","image":"ubuntu","vcpus":2,"mem_mib":1024,"disk_mib":2048,"network":"lan","ttl_seconds":3600}` | `201 Created` | Create space with sizing, network, and optional `ttl_seconds` options |
-| `GET` | `/v1/spaces` | — | `200 OK` `{"spaces":[...],"ckpts":[...]}` | List spaces and commits in project namespace; space records include `expires_at` as RFC3339 or `null` |
+| `GET` | `/v1/spaces` | — | `200 OK` `{"spaces":[...],"ckpts":[...],"guest_cidr":"172.31.0.0/16"}` | List spaces and commits in project namespace; space records include `expires_at` as RFC3339 or `null` |
 | `DELETE` | `/v1/spaces/{name}` | — | `200 OK` `{"removed":"..."}` | Stop VM and delete space and its images |
 | `GET` | `/v1/templates` | — | `200 OK` `{"templates":[...]}` | List immutable project-scoped checkpoint templates, bounded to 256 retained references for the project and sorted by `name`, `created_at`, and `checkpoint` |
 | `POST` | `/v1/templates` | `{"name":"baseline","checkpoint":"<checkpoint-uuid>"}` | `201 Created` serialized Template | Create an immutable template reference to a same-project checkpoint; over the 256-per-project or 2048-global retention cap returns `429 Too Many Requests` |
@@ -398,6 +398,9 @@ All API routes require authentication header: `Authorization: Bearer <token>`.
 | `PATCH` | `/v1/projects/{project}/limits` | `{"api_per_min":120}` | `200 OK`; obsolete spaces/disk/running fields return `400` | Set project request-rate override (requires admin token) |
 | `DELETE` | `/v1/projects/{project}/limits` | — | `200 OK` | Clear quota overrides for project (requires admin token) |
 | `POST` | `/v1/gc` | `{"free_below":...,"dry_run":false}` | `200 OK` | Run garbage collection on unreferenced commits |
+
+Space records returned by create, fork, resize, lease, and list operations include `ip`, the assigned guest IPv4 address, even before the guest boots. The list response includes `guest_cidr`, the daemon-wide allocation pool from `SHINU_NET_BASE`, even when the list is empty. Both fields are `null` when guest networking is disabled.
+
 ### Data Transfer Mechanisms
 
 Shinu provides three mechanisms to move data into and out of guest spaces:

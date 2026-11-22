@@ -1196,6 +1196,12 @@ fn guest_ip(id: Uuid, cfg: &shinu::NetConfig) -> Option<String> {
     })
 }
 
+fn space_json(space: &Space, cfg: &shinu::NetConfig) -> shinu::Result<Value> {
+    let mut value = serde_json::to_value(space)?;
+    value["ip"] = json!(guest_ip(space.id, cfg));
+    Ok(value)
+}
+
 fn peer_ips(space: &Space, members: &[Space], cfg: &shinu::NetConfig) -> Vec<String> {
     members
         .iter()
@@ -2565,6 +2571,28 @@ struct SpaceSpec {
     readiness: Option<shinu::ReadySpec>,
 }
 
+fn materialize_new_space(
+    root: &Path,
+    id: Uuid,
+    base: &Path,
+    image: &Path,
+    mount: &Path,
+    grow_to: Option<u64>,
+) -> shinu::Result<()> {
+    #[cfg(test)]
+    if root.join("test-create-host").is_file() {
+        std::fs::copy(base, image)?;
+        return Ok(());
+    }
+    shinu::btrfs::clone_for(base, image, 0, 0)?;
+    if let Some(size) = grow_to {
+        resize_disk_image(image, size)?;
+    }
+    let public_key = shinu::vm::prepare(&shinu::vm_dir(root, id), 0, 0)?;
+    // The common base never contains a credential shared by every space.
+    shinu::vm::authorize(image, &public_key, mount)
+}
+
 fn create_space(ctx: &Ctx<'_>, project: &str, spec: SpaceSpec) -> shinu::Result<Value> {
     let SpaceSpec {
         name,
@@ -2606,7 +2634,6 @@ fn create_space(ctx: &Ctx<'_>, project: &str, spec: SpaceSpec) -> shinu::Result<
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let image_path = shinu::space_image(ctx.root, id);
-    shinu::btrfs::clone_for(&base, &image_path, 0, 0)?;
     let mount = ctx.root.join(format!("authorize.{id}.mnt"));
     let result = (|| -> shinu::Result<Value> {
         if requested_disk > base_mib {
@@ -2641,7 +2668,7 @@ fn create_space(ctx: &Ctx<'_>, project: &str, spec: SpaceSpec) -> shinu::Result<
             Ok(space)
         })?;
         record_usage(ctx.db, project, "space_created", Some(id), 1)?;
-        Ok(serde_json::to_value(space)?)
+        space_json(&space, ctx.net_cfg)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&image_path);
@@ -2753,7 +2780,7 @@ fn fork_space(
             Ok(space)
         })?;
         record_usage(ctx.db, project, "space_created", Some(id), 1)?;
-        Ok(serde_json::to_value(space)?)
+        space_json(&space, ctx.net_cfg)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&image_path);
@@ -3386,7 +3413,7 @@ fn list_spaces(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
     let state = snapshot(ctx.db, ctx.registry)?;
     let mut spaces = Vec::new();
     for space in state.spaces.iter().filter(|space| space.project == project) {
-        let mut value = serde_json::to_value(space)?;
+        let mut value = space_json(space, ctx.net_cfg)?;
         if let Some(object) = value.as_object_mut() {
             let size = space_exclusive(ctx.root, space.id).unwrap_or(0);
             object.insert("exclusive".into(), Value::from(size));
@@ -3427,7 +3454,11 @@ fn list_spaces(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
         }
         checkpoints.push(value);
     }
-    Ok(json!({ "spaces": spaces, "ckpts": checkpoints }))
+    let guest_cidr = ctx.net_cfg.enabled.then(|| {
+        let [first, second] = ctx.net_cfg.base;
+        format!("{first}.{second}.0.0/16")
+    });
+    Ok(json!({ "spaces": spaces, "ckpts": checkpoints, "guest_cidr": guest_cidr }))
 }
 fn list_images(ctx: &Ctx<'_>) -> Value {
     let images = Image::all()
@@ -3791,7 +3822,7 @@ fn set_space_lease(
         space.expires_at = state::lease_expiry(now, ttl_seconds)?;
         Ok(space.clone())
     })?;
-    Ok(serde_json::to_value(updated)?)
+    space_json(&updated, ctx.net_cfg)
 }
 
 fn touch_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value> {
@@ -8851,7 +8882,9 @@ mod tests {
             retained_checkpoint_fixture(&root, &checkpoint);
             let db = test_db(&root);
             let registry = registry();
-            let (vm_cfg, net_cfg) = test_configs();
+            let (vm_cfg, mut net_cfg) = test_configs();
+            net_cfg.enabled = true;
+            net_cfg.base = [192, 0];
             let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
             if !source_present {
                 super::update_state(&db, &registry, |state| {
@@ -8884,6 +8917,9 @@ mod tests {
                 "project-a",
             )
             .expect("fork without requiring source space");
+            let ip: std::net::Ipv4Addr = forked["ip"].as_str().unwrap().parse().unwrap();
+            assert_eq!(ip.octets()[..2], [192, 0]);
+            assert_eq!(ip.octets()[3] % 4, 2);
             let space: Space = serde_json::from_value(forked).unwrap();
             assert_eq!(
                 (space.vcpus, space.mem_mib, space.disk_mib),

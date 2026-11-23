@@ -443,7 +443,7 @@ pub fn status_for(error: &shinu_core::Error) -> u16 {
     match error {
         shinu_core::Error::Auth(_) => 401,
         shinu_core::Error::NotFound(_) => 404,
-        shinu_core::Error::Invalid(_) => 400,
+        shinu_core::Error::Invalid(_) | shinu_core::Error::NoReachableGuestDnsResolver => 400,
         shinu_core::Error::Quota(_) => 429,
         shinu_core::Error::CapacityWatermark(_) => 429,
         shinu_core::Error::TapBusy(_) => 409,
@@ -759,6 +759,10 @@ mod http_tests {
         assert_eq!(status_for(&shinu_core::Error::Auth("bad".into())), 401);
         assert_eq!(status_for(&shinu_core::Error::NotFound("gone".into())), 404);
         assert_eq!(status_for(&shinu_core::Error::Invalid("bad".into())), 400);
+        assert_eq!(
+            status_for(&shinu_core::Error::NoReachableGuestDnsResolver),
+            400
+        );
         assert_eq!(status_for(&shinu_core::Error::Quota("limit".into())), 429);
         assert_eq!(status_for(&shinu_core::Error::TapBusy("held".into())), 409);
         assert_eq!(status_for(&shinu_core::Error::Btrfs("bad".into())), 500);

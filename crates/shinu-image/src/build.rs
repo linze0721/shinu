@@ -3,8 +3,8 @@ use std::path::Path;
 use shinu_core::{Error, Image, Result, base_path, env_u32, migrate_base};
 
 use super::configure::{
-    chroot_run, configure_image, filter_guest_nameservers, guest_dns_fallback,
-    guest_resolv_needs_repair, install_payload,
+    chroot_run, configure_image, install_payload, repair_guest_resolv, seed_resolv,
+    write_guest_resolv,
 };
 use super::extract::{extract_rootfs, mount_image, umount};
 use super::fetch::{BaseConfig, fetch_tarball};
@@ -45,6 +45,7 @@ fn build_base(root: &Path, base: &Path, image: Image, cfg: &BaseConfig) -> Resul
         let mounted_result = (|| -> Result<()> {
             extract_rootfs(root, image, &tarball, &mnt)?;
             // This first pass must seed DNS before any package-manager command.
+            let resolv = seed_resolv(&mnt)?;
             configure_image(&mnt, image)?;
             match image {
                 Image::Void => {
@@ -82,6 +83,7 @@ fn build_base(root: &Path, base: &Path, image: Image, cfg: &BaseConfig) -> Resul
             }
             // Package installation can create or replace service/config files, so
             // reapply the boot wiring after packages and before key generation.
+            write_guest_resolv(&mnt, &resolv)?;
             configure_image(&mnt, image)?;
             chroot_run(&mnt, "ssh-keygen -A")?;
             install_payload(&mnt, image)?;
@@ -184,35 +186,7 @@ fn repair_one_base_resolv(root: &Path, image: Image) -> Result<bool> {
         let _ = std::fs::remove_dir(&mnt);
         return Err(error);
     }
-    let result = (|| -> Result<bool> {
-        let path = mnt.join("etc/resolv.conf");
-        let is_symlink = std::fs::symlink_metadata(&path)
-            .map(|meta| meta.file_type().is_symlink())
-            .unwrap_or(false);
-        let resolv = if is_symlink {
-            String::new()
-        } else {
-            match std::fs::read_to_string(&path) {
-                Ok(contents) => contents,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-                Err(error) => return Err(error.into()),
-            }
-        };
-        if !is_symlink && !guest_resolv_needs_repair(&resolv) {
-            return Ok(false);
-        }
-        let fallback = guest_dns_fallback();
-        let filtered = filter_guest_nameservers(&resolv, &fallback);
-        // Ubuntu and Rocky ship /etc/resolv.conf as a symlink into a runtime
-        // directory that does not exist in a cold image. Writing through it
-        // would create the link target and leave the resolver unfixed, so the
-        // link is replaced by a regular file.
-        if is_symlink {
-            std::fs::remove_file(&path)?;
-        }
-        std::fs::write(path, filtered)?;
-        Ok(true)
-    })();
+    let result = repair_guest_resolv(&mnt);
     let unmount = umount(&mnt);
     let _ = std::fs::remove_dir(&mnt);
     match (result, unmount) {

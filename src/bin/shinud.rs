@@ -116,7 +116,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Best effort: a busy or damaged base is an operator problem, not a
     // reason to refuse service.
     match shinu::repair_base_resolv(&root) {
-        Ok(true) => eprintln!("rewrote a base image resolv.conf to a reachable resolver"),
+        Ok(true) => eprintln!("updated a base image's guest DNS configuration"),
         Ok(false) => {}
         Err(error) => eprintln!("base resolv repair: {error}"),
     }
@@ -7229,6 +7229,8 @@ fn respond_error(stream: &mut impl Write, status: u16, error: &shinu::Error) -> 
         json!({"error":error.to_string(),"code":"capacity_watermark"})
     } else if matches!(error, shinu::Error::TapBusy(_)) {
         json!({"error":error.to_string(),"code":"tap_busy"})
+    } else if matches!(error, shinu::Error::NoReachableGuestDnsResolver) {
+        json!({"error":error.to_string(),"code":"no_reachable_guest_dns_resolver"})
     } else if status >= 500 {
         eprintln!("{error}");
         json!({ "error": "internal server error" })
@@ -11083,6 +11085,23 @@ eval "$(printf '%s' "$1" | sed "s#/etc/hosts#$d/hosts#g")"
         }
         assert!(!shinu::vm_dir(&root, space.id).exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn guest_dns_failure_explains_the_fix_in_the_http_response() {
+        let error = shinu::Error::NoReachableGuestDnsResolver;
+        let mut response = Vec::new();
+        super::respond_error(&mut response, shinu::http::status_for(&error), &error).unwrap();
+        let response = String::from_utf8(response).unwrap();
+        let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+        assert!(headers.starts_with("HTTP/1.1 400"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap(),
+            serde_json::json!({
+                "code": "no_reachable_guest_dns_resolver",
+                "error": "no reachable guest DNS resolver; set SHINU_GUEST_DNS=<reachable public resolver>"
+            })
+        );
     }
 
     #[test]

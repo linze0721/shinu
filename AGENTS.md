@@ -305,7 +305,7 @@ CLI Subcommand Surface (`src/bin/shinu.rs:33-177`):
   - `SHINU_NET_ALLOW`: Comma-separated guest egress whitelist CIDRs.
   - `SHINU_HOST_ALLOW`: Comma-separated guest host access rules (`protocol:port[@host]`).
   - `SHINU_NET_UPLINK`: Host egress interface for NAT.
-  - `SHINU_GUEST_DNS`: Guest resolver fallback DNS server (default `1.1.1.1`).
+  - `SHINU_GUEST_DNS`: Explicit guest resolver override; see [Configuration](README.md#configuration) for automatic selection and failure handling.
   - `SHINU_PAYLOAD`: Files to inject into new guest filesystems.
   - `SHINU_PAYLOAD_SERVICE`: runit service to enable on boot.
   - `SHINU_ROOTFS_TARBALL`: Local rootfs archive overriding the download.

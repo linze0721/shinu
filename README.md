@@ -667,7 +667,7 @@ Daemon configuration via environment variables:
 | `SHINU_NET_ALLOW` | — | Semicolon-delimited list of host CIDRs or peer destinations the guest VM is allowed to reach. |
 | `SHINU_HOST_ALLOW` | — | Comma-separated list of host ports (e.g. `tcp:23000`, `udp:5353`, or `tcp:23000@127.0.0.1`) that the guest is allowed to contact. |
 | `SHINU_NET_UPLINK` | Default route | Host egress network interface for NAT forwarding. |
-| `SHINU_GUEST_DNS` | `1.1.1.1` | Default DNS nameserver baked into the guest's `/etc/resolv.conf`. |
+| `SHINU_GUEST_DNS` | Automatic | Explicit public IPv4 resolver for the base-image build chroot and baked guest configuration. Unset or blank uses guest-compatible host nameservers, or probes `1.1.1.1:53` over UDP if none remain. |
 | `SHINU_MIRROR` | — | Custom mirror URL for fetching packages during guest rootfs generation. |
 | `SHINU_ARCH` | `uname -m` | Target guest CPU architecture (e.g., `x86_64`). |
 | `SHINU_ROOTFS_TARBALL` | — | Local path to pre-built rootfs tarball for offline image generation. |
@@ -675,6 +675,14 @@ Daemon configuration via environment variables:
 | `SHINU_PAYLOAD_SERVICE` | — | runit service name to enable inside the guest, executing the run script injected via payload. |
 | `SHINU_MIN_STORE_FREE_MIB` | `1024` | Host-wide actual store free-space admission floor. |
 | `SHINU_MIN_MEM_AVAILABLE_MIB` | `512` | Host-wide MemAvailable admission floor. |
+
+If that fallback does not return a DNS answer, a fresh build stops before
+package installation with HTTP 400 (`no_reachable_guest_dns_resolver`):
+`no reachable guest DNS resolver; set SHINU_GUEST_DNS=<reachable public resolver>`.
+Set the variable in the `shinud` environment and restart it. Choose a resolver
+reachable from both the build host and the guest, for example `223.5.5.5`
+where it is reachable in mainland China. The override also applies to existing
+base images at daemon startup; it does not rewrite existing Spaces or Checkpoints.
 
 Client environment variables:
 

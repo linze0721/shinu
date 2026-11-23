@@ -1,65 +1,95 @@
+use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use shinu_core::{
     Error, Image, Result, VSOCK_SSH_PORT, VSOCK_VNC_PORT, is_blocked_guest_destination, parse_ipv4,
 };
 
-pub(super) fn guest_dns_fallback() -> String {
-    std::env::var("SHINU_GUEST_DNS")
-        .ok()
-        .and_then(|value| {
-            let value = value.trim();
-            guest_can_reach_resolver(value).then(|| value.to_owned())
-        })
-        .unwrap_or_else(|| "1.1.1.1".to_owned())
+const GUEST_DNS_FALLBACK: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 53);
+
+fn guest_dns_override() -> Result<Option<Ipv4Addr>> {
+    match std::env::var("SHINU_GUEST_DNS") {
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) if guest_can_reach_resolver(value.trim()) => value
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(|_| Error::NoReachableGuestDnsResolver),
+        _ => Err(Error::NoReachableGuestDnsResolver),
+    }
 }
 
-/// Whether the guest could actually reach this resolver. One decision, used by
-/// both the filter and the repair check: the guest has no IPv6 configuration,
-/// so a v6 resolver is as unreachable as a private or loopback v4 one, and
-/// keeping either would suppress the fallback and leave the guest without DNS.
+fn probe_guest_dns(server: SocketAddrV4) -> std::io::Result<bool> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+    let timeout = Some(Duration::from_secs(2));
+    socket.set_write_timeout(timeout)?;
+    socket.set_read_timeout(timeout)?;
+    socket.connect(server)?;
+
+    // One recursive A query for example.com; never use the host's resolver.
+    let mut query = *b"\0\0\x01\0\0\x01\0\0\0\0\0\0\x07example\x03com\0\0\x01\0\x01";
+    query[..2].copy_from_slice(&uuid::Uuid::new_v4().as_bytes()[..2]);
+    socket.send(&query)?;
+    let mut reply = [0; 512];
+    let len = socket.recv(&mut reply)?;
+    let flags = u16::from_be_bytes([reply[2], reply[3]]);
+    Ok(len >= query.len() + 12
+        && reply[..2] == query[..2]
+        // Response to a standard query, not truncated, NOERROR, one question.
+        && flags & 0xfa0f == 0x8000
+        && reply[4..6] == [0, 1]
+        && reply[6..8] != [0, 0]
+        && reply[12..query.len()] == query[12..])
+}
+
+fn guest_resolv_contents(
+    resolv: &str,
+    override_dns: Option<Ipv4Addr>,
+    probe: impl FnOnce(SocketAddrV4) -> std::io::Result<bool>,
+) -> Result<String> {
+    if let Some(address) = override_dns {
+        return Ok(format!("nameserver {address}\n"));
+    }
+    if let Some(contents) = filter_guest_nameservers(resolv) {
+        return Ok(contents);
+    }
+    if !matches!(probe(GUEST_DNS_FALLBACK), Ok(true)) {
+        return Err(Error::NoReachableGuestDnsResolver);
+    }
+    Ok(format!("nameserver {}\n", GUEST_DNS_FALLBACK.ip()))
+}
+
+/// The guest only has IPv4 routes and its egress policy blocks local addresses.
+/// This is an address filter, not a reachability probe.
 fn guest_can_reach_resolver(address: &str) -> bool {
     parse_ipv4(address).is_some() && !is_blocked_guest_destination(address)
 }
 
-/// Filters host resolver entries before baking them into the guest image.
-/// Private and link-local host resolvers cannot be reached after guest egress
-/// filtering, so copying one would make xbps unable to resolve package mirrors.
-/// An unusable fallback is replaced with the public default resolver.
-pub fn filter_guest_nameservers(resolv: &str, fallback: &str) -> String {
-    let fallback = fallback.trim();
-    let fallback = if guest_can_reach_resolver(fallback) {
-        fallback
-    } else {
-        "1.1.1.1"
-    };
+/// Retains options and comments only if at least one guest-usable nameserver remains.
+fn filter_guest_nameservers(resolv: &str) -> Option<String> {
     let mut has_nameserver = false;
-    let filtered = resolv
-        .lines()
-        .filter(|line| {
-            let mut fields = line.split_whitespace();
-            match (fields.next(), fields.next()) {
-                (Some("nameserver"), Some(address)) if guest_can_reach_resolver(address) => {
-                    has_nameserver = true;
-                    true
-                }
-                (Some("nameserver"), _) => false,
-                _ => true,
+    let mut filtered = String::new();
+    for line in resolv.lines() {
+        let mut fields = line.split_whitespace();
+        if fields.next() == Some("nameserver") {
+            if !fields.next().is_some_and(guest_can_reach_resolver) {
+                continue;
             }
-        })
-        .collect::<Vec<_>>();
-    if has_nameserver {
-        format!("{}\n", filtered.join("\n"))
-    } else {
-        format!("nameserver {fallback}\n")
+            has_nameserver = true;
+        }
+        filtered.push_str(line);
+        filtered.push('\n');
     }
+    has_nameserver.then_some(filtered)
 }
 
 /// Returns whether a baked resolver file contains an unusable or missing
 /// nameserver. Formatting alone does not trigger a repair, so a public file
 /// remains untouched on every daemon restart.
-pub fn guest_resolv_needs_repair(resolv: &str) -> bool {
+fn guest_resolv_needs_repair(resolv: &str) -> bool {
     let mut has_nameserver = false;
     for line in resolv.lines() {
         let mut fields = line.split_whitespace();
@@ -77,17 +107,52 @@ pub fn guest_resolv_needs_repair(resolv: &str) -> bool {
     !has_nameserver
 }
 
-pub fn seed_resolv(mnt: &Path) -> Result<()> {
-    let fallback = guest_dns_fallback();
-    let contents = std::fs::read("/etc/resolv.conf").map_or_else(
-        |_| format!("nameserver {fallback}\n"),
-        |resolv| filter_guest_nameservers(&String::from_utf8_lossy(&resolv), &fallback),
-    );
+/// Seeds the build chroot and returns the selected contents to restore after package installation.
+pub fn seed_resolv(mnt: &Path) -> Result<String> {
+    let override_dns = guest_dns_override()?;
+    let host_resolv = if override_dns.is_none() {
+        std::fs::read("/etc/resolv.conf").unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    // chroot_run unshares mount and PID namespaces, not networking. The probe
+    // here therefore uses the same routes as the build's package manager.
+    let contents = guest_resolv_contents(
+        &String::from_utf8_lossy(&host_resolv),
+        override_dns,
+        probe_guest_dns,
+    )?;
+    write_guest_resolv(mnt, &contents)?;
+    Ok(contents)
+}
+
+pub(super) fn repair_guest_resolv(mnt: &Path) -> Result<bool> {
     let path = mnt.join("etc/resolv.conf");
-    if std::fs::symlink_metadata(&path)
-        .map(|metadata| metadata.file_type().is_symlink())
-        .unwrap_or(false)
-    {
+    let is_symlink = std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_symlink());
+    let resolv = if is_symlink {
+        String::new()
+    } else {
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let override_dns = guest_dns_override()?;
+    if override_dns.is_none() && !guest_resolv_needs_repair(&resolv) {
+        return Ok(false);
+    }
+    let contents = guest_resolv_contents(&resolv, override_dns, probe_guest_dns)?;
+    if contents == resolv {
+        return Ok(false);
+    }
+    write_guest_resolv(mnt, &contents)?;
+    Ok(true)
+}
+
+pub(super) fn write_guest_resolv(mnt: &Path, contents: &str) -> Result<()> {
+    let path = mnt.join("etc/resolv.conf");
+    if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_symlink()) {
         // Distro archives often ship a dangling systemd-resolved link; writing
         // through it would fail before the package manager has created /run.
         std::fs::remove_file(&path)?;
@@ -95,6 +160,7 @@ pub fn seed_resolv(mnt: &Path) -> Result<()> {
     std::fs::write(path, contents)?;
     Ok(())
 }
+
 /// Runs a shell command inside the mounted image. Only ever called by the
 /// root daemon while building the base. The PID namespace is intentional:
 /// package hooks can daemonize helpers, and killing the namespace at shell exit
@@ -130,11 +196,6 @@ pub(super) fn chroot_run(mnt: &Path, command: &str) -> Result<()> {
 /// console, sshd, and the vsock bridge. OpenSSH cannot provide an `AF_VSOCK`
 /// listener itself, so socat forwards the guest vsock port to it.
 pub(super) fn configure_image(mnt: &Path, image: Image) -> Result<()> {
-    // Package managers resolve mirrors during this build, before a guest has
-    // a runtime network interface; a baked public resolver is the only DNS
-    // path available inside the chroot.
-    seed_resolv(mnt)?;
-
     // Passwordless root for the serial console. Key auth is what `exec` uses;
     // this only matters when a human attaches to ttyS0 to debug a boot.
     let shadow = mnt.join("etc/shadow");
@@ -566,52 +627,57 @@ mod payload_tests {
 
 #[cfg(test)]
 mod resolver_tests {
-    use super::{filter_guest_nameservers, guest_resolv_needs_repair};
+    use super::{Ipv4Addr, SocketAddrV4, guest_resolv_contents, guest_resolv_needs_repair};
+    use shinu_core::Error;
 
     #[test]
-    fn filters_private_guest_nameservers_and_keeps_public_ones() {
-        let resolv = "# Generated by dhcpcd\nnameserver 192.168.5.123\nnameserver 8.8.8.8\nnameserver 172.16.0.1\nnameserver 127.0.0.53\n";
+    fn filters_private_stub_and_ipv6_resolvers_without_probing() {
+        let resolv = "# Generated by dhcpcd\nnameserver 192.168.5.123\nnameserver 8.8.8.8\nnameserver 172.16.0.1\nnameserver 127.0.0.53\nnameserver 2001:db8::1\n";
         assert_eq!(
-            filter_guest_nameservers(resolv, "1.1.1.1"),
+            guest_resolv_contents(resolv, None, |_| panic!("public nameserver remains")).unwrap(),
             "# Generated by dhcpcd\nnameserver 8.8.8.8\n"
         );
     }
 
     #[test]
-    fn resolver_filter_falls_back_when_every_nameserver_is_private() {
-        let resolv = "nameserver 10.0.0.2\nnameserver 169.254.169.254\n";
+    fn fails_fast_when_the_fallback_does_not_answer() {
+        let resolv = "nameserver 127.0.0.53\nnameserver 10.0.0.2\nnameserver 169.254.169.254\n";
+        let error =
+            guest_resolv_contents(resolv, None, |_| Err(std::io::ErrorKind::TimedOut.into()))
+                .unwrap_err();
+        assert!(matches!(error, Error::NoReachableGuestDnsResolver));
         assert_eq!(
-            filter_guest_nameservers(resolv, "1.1.1.1"),
-            "nameserver 1.1.1.1\n"
+            error.to_string(),
+            "no reachable guest DNS resolver; set SHINU_GUEST_DNS=<reachable public resolver>"
         );
     }
 
     #[test]
-    fn resolver_filter_replaces_unreachable_fallback() {
-        assert_eq!(
-            filter_guest_nameservers("", "192.168.5.123"),
-            "nameserver 1.1.1.1\n"
-        );
-        assert_eq!(
-            filter_guest_nameservers("", "2001:db8::1"),
-            "nameserver 1.1.1.1\n"
-        );
+    fn accepts_fallback_only_after_a_dns_reply() {
+        let resolv = "nameserver 2001:db8::1\n";
+        let resolver = SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 53);
+        let contents = guest_resolv_contents(resolv, None, |endpoint| {
+            assert_eq!(endpoint, resolver);
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(contents, "nameserver 1.1.1.1\n");
+        assert!(matches!(
+            guest_resolv_contents(resolv, None, |_| Ok(false)),
+            Err(Error::NoReachableGuestDnsResolver)
+        ));
     }
 
     #[test]
-    fn resolver_filter_falls_back_when_only_nameserver_is_ipv6() {
+    fn explicit_override_wins_even_if_the_host_has_a_public_resolver() {
         assert_eq!(
-            filter_guest_nameservers("nameserver 2001:db8::1\n", "1.1.1.1"),
-            "nameserver 1.1.1.1\n"
-        );
-    }
-
-    #[test]
-    fn resolver_filter_falls_back_when_blocked_ipv4_precedes_ipv6() {
-        let resolv = "nameserver 192.168.5.123\nnameserver 2001:db8::1\n";
-        assert_eq!(
-            filter_guest_nameservers(resolv, "1.1.1.1"),
-            "nameserver 1.1.1.1\n"
+            guest_resolv_contents(
+                "nameserver 8.8.8.8\n",
+                Some(Ipv4Addr::new(223, 5, 5, 5)),
+                |_| { panic!("explicit override bypasses the fallback probe") }
+            )
+            .unwrap(),
+            "nameserver 223.5.5.5\n"
         );
     }
 

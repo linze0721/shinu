@@ -38,6 +38,7 @@ pub enum Error {
     Quota(String),
     CapacityWatermark(String),
     TapBusy(String),
+    NoReachableGuestDnsResolver,
     /// A daemon or host fault, mapped to HTTP 500 rather than a client error.
     Internal(String),
     Io(std::io::Error),
@@ -167,6 +168,9 @@ impl std::fmt::Display for Error {
             Self::Quota(message) => write!(f, "quota: {message}"),
             Self::CapacityWatermark(message) => write!(f, "capacity_watermark: {message}"),
             Self::TapBusy(message) => write!(f, "tap_busy: {message}"),
+            Self::NoReachableGuestDnsResolver => f.write_str(
+                "no reachable guest DNS resolver; set SHINU_GUEST_DNS=<reachable public resolver>",
+            ),
             Self::Internal(message) => write!(f, "internal: {message}"),
             Self::Io(error) => write!(f, "{error}"),
             Self::Json(error) => write!(f, "{error}"),

@@ -44,7 +44,17 @@ impl Server {
             "shinu_list_spaces" => request_text(&client, "GET", "/v1/spaces", None),
             "shinu_list_images" => request_text(&client, "GET", "/v1/images", None),
             "shinu_list_templates" => {
-                request_structured_json(&client, "GET", "/v1/templates", None)
+                if arguments.contains_key("after") {
+                    let after = required_template_name(arguments, "after")?;
+                    request_structured_json(
+                        &client,
+                        "GET",
+                        &format!("/v1/templates?after={after}"),
+                        None,
+                    )
+                } else {
+                    request_structured_json(&client, "GET", "/v1/templates", None)
+                }
             }
             "shinu_create_template" => {
                 let name = required_template_name(arguments, "name")?;
@@ -646,7 +656,11 @@ fn required_job_command(arguments: &Map<String, Value>) -> Result<&[Value], Stri
 
 fn validate_arguments(name: &str, arguments: &Map<String, Value>) -> Result<(), String> {
     match name {
-        "shinu_list_spaces" | "shinu_list_images" | "shinu_list_jobs" | "shinu_list_templates" => {
+        "shinu_list_spaces" | "shinu_list_images" | "shinu_list_jobs" => Ok(()),
+        "shinu_list_templates" => {
+            if arguments.contains_key("after") {
+                required_template_name(arguments, "after")?;
+            }
             Ok(())
         }
 
@@ -886,8 +900,10 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "shinu_list_templates",
-            "description": "列出当前项目可见的不可变 checkpoint template，返回结构化 JSON。",
-            "inputSchema": schema(json!({}), &[]),
+            "description": "分页列出当前项目的不可变 checkpoint template；传入上一页返回的 next 作为 after 继续。",
+            "inputSchema": schema(json!({
+                "after": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9-]+$"}
+            }), &[]),
         }),
         json!({
             "name": "shinu_create_template",
@@ -1619,6 +1635,20 @@ mod tests {
         assert!(validate_arguments("shinu_list_templates", &Map::new()).is_ok());
         assert!(
             validate_arguments(
+                "shinu_list_templates",
+                &arguments(json!({"after":"release-1"}))
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_arguments(
+                "shinu_list_templates",
+                &arguments(json!({"after":"bad/name"}))
+            )
+            .is_err()
+        );
+        assert!(
+            validate_arguments(
                 "shinu_create_template",
                 &arguments(json!({"name": "release-1", "checkpoint": checkpoint}))
             )
@@ -1722,7 +1752,10 @@ mod tests {
         };
 
         let list = definition("shinu_list_templates");
-        assert_eq!(list["inputSchema"]["properties"], json!({}));
+        assert_eq!(
+            list["inputSchema"]["properties"]["after"]["pattern"],
+            json!("^[a-z0-9-]+$")
+        );
         assert_eq!(list["inputSchema"]["required"], json!([]));
 
         let create = definition("shinu_create_template");
@@ -1794,6 +1827,13 @@ mod tests {
                 "GET /v1/templates HTTP/1.1",
                 None,
                 json!({"templates": []}),
+            ),
+            (
+                "shinu_list_templates",
+                json!({"after":"release-1"}),
+                "GET /v1/templates?after=release-1 HTTP/1.1",
+                None,
+                json!({"templates": [], "next": null}),
             ),
             (
                 "shinu_delete_template",

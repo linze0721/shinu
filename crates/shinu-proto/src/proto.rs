@@ -174,8 +174,11 @@ pub enum Req {
         name: String,
         checkpoint: Uuid,
     },
-    /// Lists immutable checkpoint templates in the authenticated project.
-    ListTemplates,
+    /// Lists one page of immutable templates in name order within the project.
+    ListTemplates {
+        #[serde(default)]
+        after: Option<String>,
+    },
     /// Removes one project-scoped checkpoint template reference.
     DeleteTemplate {
         name: String,

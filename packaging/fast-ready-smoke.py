@@ -70,8 +70,7 @@ def main():
     env.update(SHINU_ROOT=str(root), SHINU_LISTEN=f"127.0.0.1:{port}",
                SHINU_ENDPOINT=f"http://127.0.0.1:{port}", SHINU_NET_ENABLE="1", SHINU_NET_BASE="172.29",
                SHINU_IDLE_RECLAIM="0", SHINU_MEM_MIB="256", SHINU_VCPUS="1",
-               SHINU_LIMIT_SPACES="1", SHINU_LIMIT_RUNNING="1", SHINU_LIMIT_DISK_MIB="1",
-               SHINU_SPACE_WRITE_CAP_MIB="20480", SHINU_JAIL_UID="31003", SHINU_JAIL_GID="32007")
+               SHINU_JAIL_UID="31003", SHINU_JAIL_GID="32007")
     cli = str(args.bin_dir.resolve() / "shinu")
 
     def request(method, path, body=None, expected=200):

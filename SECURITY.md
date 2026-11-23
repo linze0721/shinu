@@ -17,7 +17,7 @@ The following security boundaries are in scope:
 - Multi-tenant project isolation, including cross-project access and disclosure of whether another project's spaces or commits exist.
 - Bearer-token and console-session authentication, including token handling in [`crates/shinu-crypto`](crates/shinu-crypto).
 - Escape from the Firecracker Jailer/microVM sandbox. Guest code is untrusted by design; escaping the jailer sandbox is in scope.
-- Per-project quota enforcement and API rate-limit bypass.
+- Bypass of public console registration abuse protection.
 - Guest-to-host and guest egress controls, including `SHINU_NET_ALLOW`, `SHINU_HOST_ALLOW`, and iptables exception ordering.
 - The `shinud` HTTP surface, including authentication and request routing.
 
@@ -25,5 +25,4 @@ The following security boundaries are in scope:
 
 - `shinud` implements no TLS. It MUST remain bound to loopback and sit behind a TLS-terminating proxy; the repository provides a [Caddy configuration](packaging/caddy/Caddyfile). The daemon's default bind address is `127.0.0.1:7878`. Exposing its cleartext listener is an operator deployment failure.
 - `shinud` runs as root by design to configure host resources.
-- `SHINU_ADMIN_TOKEN` gates the project-limits administration endpoint and fails closed when unset.
 - Guest code is expected to be untrusted. A guest escape from the Jailer sandbox remains in scope, as stated above.

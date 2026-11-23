@@ -12,7 +12,7 @@ Changes are recorded in the Keep a Changelog format.
 - Full and diff guest memory snapshots.
 - Detached jobs with status and terminal-rendered logs.
 - Space leases with TTLs and named checkpoint templates.
-- Usage metering and optional request-rate limiting.
+- Usage metering.
 - An MCP server and web console.
 - A VNC desktop bridge, guest HTTP proxying, and named networks.
 - `shinu rmckpt --detach` (`DELETE /v1/commits/{id}` with `{"detach":true}`) deletes a commit that other spaces or commits only name as `parent`, clearing those lineage links; space heads, templates, and diff memory bases still refuse.
@@ -33,12 +33,13 @@ Changes are recorded in the Keep a Changelog format.
 - Lifecycle records carry the host boot id and are renamed into place without fsync. `resume` and direct restores no longer pay a synchronous flush before handout, and a successful resume no longer syncs the spaces directory before replying. A host crash invalidates every surviving record by boot id, so the never-reuse-run-memory contract holds without durability.
 - Restored guests get their clock and eth0 identity through the guest helper's authenticated `setup` action on vsock 2224 instead of an SSH session (SSH remains the fallback for helpers that predate it; hot capture upgrades such helpers). TAP firewall policy is reasserted while the guest thaws and the link only comes up at `Expose`.
 - `start --load-only` prefaults the paused VM's page-cache-resident guest memory with read-only `process_vm_readv` before reporting `loaded`, so handed-out VMs take far fewer host page faults; it never creates private memory and is best-effort (`event=prefault`): windows not page-cache resident when sampled are skipped, though a page evicted after sampling is still read back.
-- Remove project Space, disk and running-VM quotas, including historical database values. Legacy count/disk/reserve environment variables now warn and are ignored; admin quota PATCH fields are explicitly rejected. Optional single-VM sizing and request-rate limits default to unlimited when unset.
 - Charge only sampled Btrfs exclusive storage; remove nominal/reserve pre-charge. Full non-diff memory forks share read-only checkpoint inodes, with root-owned 0440 jail access and private guest CoW; restore links are removed before any later hot capture. Existing live HEAD/template/base deletion guards remain authoritative.
 - Stop failed/inactive VMMs with TERM and bounded cleanup; report an unresponsive VMM instead of sending SIGKILL.
 
 ### Breaking
 
+- Remove request throttling for authenticated API callers, project quotas, optional per-VM sizing ceilings, and template and detached-job count caps. `GET /v1/limits` and `shinu limits` now show only host capacity watermarks and project usage; project override routes and commands are gone. Schema version 2 drops the obsolete `projects` limits table, and startup names ignored `SHINU_LIMIT_*` variables in one warning.
+- Template listing is paginated by name, with `next` in each response and an `after` cursor in HTTP, CLI and MCP.
 - `SHINU_SPACE_WRITE_CAP_MIB` no longer assigns a default quota. Schema version 1 and legacy JSON import clear all old Space caps and cap-stop reasons once, since historical state cannot prove whether they were inherited or explicit. **Old explicit protections must be specified again after upgrading.** New explicit `fork --write-cap-mib N` protections remain supported and persistent; inherited legacy caps can no longer stop running Spaces.
 - Pending Full memory/state is reloaded only under a lifecycle record of the current host boot. Full forks made by earlier versions but never loaded, and all pending memory after a host reboot, cold-boot instead (`event=pending_consumed reason=…`); the 109 rollout already stops or cold-restarts every Space, so no extra maintenance step is needed.
 

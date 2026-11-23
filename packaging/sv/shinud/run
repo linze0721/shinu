@@ -15,9 +15,7 @@ exec 2>&1
 # export SHINU_DISK_MIB=2048          # read only when a base image is built
 export SHINU_JAIL_UID="${SHINU_JAIL_UID:-30000}" # uid used inside the jailer
 export SHINU_JAIL_GID="${SHINU_JAIL_GID:-30000}" # gid used inside the jailer
-# export SHINU_LIMIT_SPACES=5         # max spaces per project
-# export SHINU_LIMIT_DISK_MIB=10240   # max exclusive disk allocation (MiB) per project
-# export SHINU_LIMIT_RUNNING=2        # max active VMs per project
-# export SHINU_LIMIT_API_PER_MIN=120  # rate limit per project (API calls per minute)
+# export SHINU_MIN_STORE_FREE_MIB=1024
+# export SHINU_MIN_MEM_AVAILABLE_MIB=512
 
 exec "/usr/local/bin/shinud"

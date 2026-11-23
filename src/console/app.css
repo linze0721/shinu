@@ -39,7 +39,7 @@
   --jade-600: #1f7d5b;
   --jade-700: #176247;
 
-  /* semantics: red for errors and over-limit quota, amber for warnings */
+  /* Semantics: red for errors, amber for warnings. */
   --red: #b42318;
   --red-tint: #fef3f2;
   --red-edge: #f3cdc8;
@@ -635,10 +635,6 @@ input::placeholder {
   color: var(--ink-soft);
 }
 
-.quota-table .quota-num {
-  color: var(--ink);
-}
-
 tr.space-row {
   cursor: pointer;
 }
@@ -787,34 +783,6 @@ tr.commit-row td {
   color: var(--ink);
   font-weight: 500;
   box-shadow: var(--shadow-rest);
-}
-
-/* ---------- quota: bar turns amber near the cap, red at it ---------- */
-
-.quota-table td.quota-bar-cell {
-  width: 40%;
-}
-
-.meter {
-  height: 8px;
-  background: var(--sunken);
-  border-radius: var(--radius-pill);
-  overflow: hidden;
-}
-
-.meter .fill {
-  height: 100%;
-  background: var(--jade-500);
-  border-radius: var(--radius-pill);
-  transition: width 300ms var(--ease-soft);
-}
-
-.meter.warn .fill {
-  background: var(--amber);
-}
-
-.meter.full .fill {
-  background: var(--red);
 }
 
 .usage-line {

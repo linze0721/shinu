@@ -517,44 +517,22 @@
         '</tbody></table>';
     }
 
-    /* One quota row: label, "used / limit" as text (red near the cap), and a
-       hard-edged bar — solid fill, square corners, no animation. */
-    function meterRow(label, used, max, fmt) {
-      used = Number(used) || 0;
-      max = Number(max) || 0;
-      var pct =
-        max > 0 ? Math.min(100, Math.round((used / max) * 100)) : used > 0 ? 100 : 0;
-      var cls = pct >= 100 ? ' full' : pct >= 80 ? ' warn' : '';
-      return (
-        '<tr><td>' +
-        esc(label) +
-        '</td><td class="mono nobr' +
-        (pct >= 80 ? ' red' : '') +
-        '">' +
-        esc(fmt(used)) +
-        ' / ' +
-        esc(fmt(max)) +
-        '</td><td class="quota-bar-cell"><div class="meter' +
-        cls +
-        '"><div class="fill" style="width:' +
-        pct +
-        '%"></div></div></td></tr>'
-      );
-    }
-
-    function renderQuota() {
-      var L = state.limits;
-      if (!L) return;
-      $('#meters').innerHTML =
-        '<table class="data-table quota-table"><thead><tr><th>Resource</th>' +
-        '<th>Used / limit</th><th>Usage</th></tr></thead><tbody>' +
-        meterRow('Spaces', L.used.spaces, L.max_spaces, String) +
-        meterRow('Disk', L.used.disk_mib, L.max_disk_mib, fmtMib) +
-        meterRow('Running VMs', L.used.running, L.max_running, String) +
-        '<tr><td>API rate</td><td class="mono nobr quota-num">' +
-        esc(String(L.api_per_min)) +
-        ' / min</td><td></td></tr>' +
-        '</tbody></table>';
+    function renderUsage() {
+      var used = state.limits.used;
+      var floors = state.limits.watermarks;
+      var rows = [
+        ['Project spaces', used.spaces],
+        ['Project exclusive disk', fmtMib(used.disk_mib)],
+        ['Project running VMs', used.running],
+        ['Host minimum free storage', fmtMib(floors.min_store_free_mib)],
+        ['Host minimum available memory', fmtMib(floors.min_mem_available_mib)],
+      ];
+      $('#usage-summary').innerHTML =
+        '<table class="data-table"><thead><tr><th>Resource</th><th>Value</th></tr></thead><tbody>' +
+        rows.map(function (row) {
+          return '<tr><td>' + esc(row[0]) + '</td><td class="mono nobr">' +
+            esc(String(row[1])) + '</td></tr>';
+        }).join('') + '</tbody></table>';
       var U = state.usage;
       if (U) {
         $('#usage-line').textContent =
@@ -641,19 +619,19 @@
       );
     }
 
-    function refreshQuota(quiet) {
+    function refreshUsage(quiet) {
       return Promise.all([capi('GET', '/v1/limits'), capi('GET', '/v1/usage')]).then(
         function (results) {
           state.limits = results[0];
           state.usage = results[1];
-          renderQuota();
+          renderUsage();
         },
         function (err) {
           if (quiet && state.limits) {
             notify(err.message);
             return;
           }
-          $('#meters').innerHTML = errorState(err.message, 'retry-quota');
+          $('#usage-summary').innerHTML = errorState(err.message, 'retry-usage');
         }
       );
     }
@@ -698,7 +676,7 @@
 
     function refreshAll() {
       refreshSpaces(false);
-      refreshQuota(false);
+      refreshUsage(false);
       refreshTokens(false);
       if (state.selected) loadHistory(state.tab);
     }
@@ -712,7 +690,7 @@
       spaces: $('#spaces-panel'),
       commits: $('#detail-panel'),
       tokens: $('#tokens-panel'),
-      quota: $('#quota-panel'),
+      usage: $('#usage-panel'),
     };
     var menuItems = document.querySelectorAll('.menu-item');
 
@@ -806,9 +784,9 @@
         showLoading('#spaces-list');
         refreshSpaces(false);
       },
-      'retry-quota': function () {
-        showLoading('#meters');
-        refreshQuota(false);
+      'retry-usage': function () {
+        showLoading('#usage-summary');
+        refreshUsage(false);
       },
       'retry-tokens': function () {
         showLoading('#tokens-list');
@@ -870,7 +848,7 @@
         setInterval(function () {
           if (document.hidden) return;
           refreshSpaces(true);
-          refreshQuota(true);
+          refreshUsage(true);
         }, 5000);
       },
       function (err) {

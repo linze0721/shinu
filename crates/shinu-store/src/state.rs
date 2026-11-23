@@ -216,12 +216,8 @@ const SCHEMA: &str = r#"
         log_bytes INTEGER NOT NULL DEFAULT 0,
         log_truncated INTEGER NOT NULL DEFAULT 0
     );
-    CREATE TABLE IF NOT EXISTS projects (
-        project TEXT PRIMARY KEY,
-        max_spaces INTEGER,
-        max_disk_mib INTEGER,
-        max_running INTEGER,
-        api_per_min INTEGER
+    CREATE TABLE IF NOT EXISTS job_log_deletions (
+        id TEXT PRIMARY KEY NOT NULL
     );
     CREATE TABLE IF NOT EXISTS usage_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -257,6 +253,7 @@ const SCHEMA: &str = r#"
     CREATE INDEX IF NOT EXISTS jobs_project_created ON jobs(project, created_at DESC, id DESC);
     CREATE INDEX IF NOT EXISTS jobs_project_space_state ON jobs(project, space, state);
     CREATE INDEX IF NOT EXISTS jobs_project_state ON jobs(project, state);
+    CREATE INDEX IF NOT EXISTS jobs_active_id ON jobs(id) WHERE state IN ('starting', 'running', 'canceling');
     CREATE INDEX IF NOT EXISTS usage_events_project_at ON usage_events(project, "at");
     CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
     CREATE INDEX IF NOT EXISTS memberships_project ON memberships(project);
@@ -363,7 +360,11 @@ fn init_schema(conn: &Connection) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     let version: u32 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version < 1 {
-        tx.execute_batch("UPDATE spaces SET write_cap_mib=0, stopped_reason=CASE WHEN stopped_reason='write_cap_exceeded' THEN NULL ELSE stopped_reason END; PRAGMA user_version=1;")?;
+        tx.execute_batch("UPDATE spaces SET write_cap_mib=0, stopped_reason=CASE WHEN stopped_reason='write_cap_exceeded' THEN NULL ELSE stopped_reason END;")?;
+    }
+    if version < 2 {
+        // Project limits are not project identity; ownership stays on each row.
+        tx.execute_batch("DROP TABLE IF EXISTS projects; PRAGMA user_version=2;")?;
     }
     tx.commit()?;
     // This index references a column that older databases may receive above;
@@ -611,8 +612,8 @@ fn insert_ckpt(tx: &Transaction<'_>, ckpt: &Ckpt) -> rusqlite::Result<usize> {
     )
 }
 
-fn insert_template(tx: &Transaction<'_>, template: &Template) -> rusqlite::Result<usize> {
-    tx.execute(
+fn insert_template(conn: &Connection, template: &Template) -> rusqlite::Result<usize> {
+    conn.execute(
         "INSERT INTO templates (project, name, checkpoint, created_at) VALUES (?1, ?2, ?3, ?4)",
         params![
             template.project.as_str(),
@@ -676,8 +677,17 @@ pub fn migrate_from_json(root: &Path, conn: &Connection) -> Result<bool> {
     Ok(true)
 }
 
+/// Loads only the mutable Space and Checkpoint graph used by the daemon.
+pub fn load_spaces_and_checkpoints(conn: &Connection) -> Result<State> {
+    load_state(conn, false)
+}
+
 /// Loads the complete in-memory snapshot for listing and history operations.
 pub fn load(conn: &Connection) -> Result<State> {
+    load_state(conn, true)
+}
+
+fn load_state(conn: &Connection, include_templates: bool) -> Result<State> {
     let spaces = {
         let mut statement = conn.prepare(
             "SELECT id, name, project, image, parent, head, vcpus, mem_mib, disk_mib, network, expires_at, created_at, write_cap_mib, stopped_reason, readiness FROM spaces ORDER BY rowid",
@@ -694,13 +704,15 @@ pub fn load(conn: &Connection) -> Result<State> {
             .query_map([], ckpt_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?
     };
-    let templates = {
+    let templates = if include_templates {
         let mut statement = conn.prepare(
             "SELECT project, name, checkpoint, created_at FROM templates ORDER BY rowid",
         )?;
         statement
             .query_map([], template_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        Vec::new()
     };
     Ok(State {
         spaces,
@@ -729,14 +741,24 @@ fn validate_templates(state: &State) -> Result<()> {
 
 /// Replaces persisted spaces, checkpoints, and template refs atomically.
 pub fn store(conn: &Connection, state: &State) -> Result<()> {
+    store_state(conn, state, true)
+}
+
+/// Replaces Spaces and Checkpoints without reading or rewriting template refs.
+/// The caller must guard checkpoint deletion against template references.
+pub fn store_spaces_and_checkpoints(conn: &Connection, state: &State) -> Result<()> {
+    store_state(conn, state, false)
+}
+
+fn store_state(conn: &Connection, state: &State, replace_templates: bool) -> Result<()> {
     for space in &state.spaces {
         validate_network_name(space.network.as_deref())?;
     }
-    validate_templates(state)?;
     let tx = conn.unchecked_transaction()?;
-    // Refs must disappear before their checkpoint targets so a full replacement
-    // remains valid even when foreign keys are enabled by a future schema.
-    tx.execute("DELETE FROM templates", [])?;
+    if replace_templates {
+        validate_templates(state)?;
+        tx.execute("DELETE FROM templates", [])?;
+    }
     tx.execute("DELETE FROM ckpts", [])?;
     tx.execute("DELETE FROM spaces", [])?;
     for space in &state.spaces {
@@ -745,11 +767,102 @@ pub fn store(conn: &Connection, state: &State) -> Result<()> {
     for ckpt in &state.ckpts {
         insert_ckpt(&tx, ckpt)?;
     }
-    for template in &state.templates {
-        insert_template(&tx, template)?;
+    if replace_templates {
+        for template in &state.templates {
+            insert_template(&tx, template)?;
+        }
     }
     tx.commit()?;
     Ok(())
+}
+
+pub fn create_template(conn: &Connection, template: &Template) -> Result<()> {
+    validate_template_name(&template.name)?;
+    let tx = conn.unchecked_transaction()?;
+    let target = template.checkpoint.to_string();
+    if !tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM ckpts WHERE id = ?1 AND project = ?2)",
+        params![target, template.project],
+        |row| row.get::<_, bool>(0),
+    )? {
+        return Err(Error::NotFound(target));
+    }
+    if tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM templates WHERE project = ?1 AND name = ?2)",
+        params![template.project, template.name],
+        |row| row.get::<_, bool>(0),
+    )? {
+        return Err(Error::Invalid(format!(
+            "template name already exists: {}",
+            template.name
+        )));
+    }
+    insert_template(&tx, template)?;
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn find_template(conn: &Connection, project: &str, name: &str) -> Result<Option<Template>> {
+    Ok(conn.query_row(
+        "SELECT project, name, checkpoint, created_at FROM templates WHERE project = ?1 AND name = ?2",
+        params![project, name], template_from_row,
+    ).optional()?)
+}
+
+/// A name cursor is stable across inserts and deletes; names are unique per project.
+pub fn list_templates_page(
+    conn: &Connection,
+    project: &str,
+    after: Option<&str>,
+) -> Result<(Vec<Template>, Option<String>)> {
+    const PAGE_SIZE: usize = 64;
+    let mut statement = conn.prepare_cached(
+        "SELECT project, name, checkpoint, created_at FROM templates WHERE project = ?1 AND name > ?2 ORDER BY name LIMIT ?3",
+    )?;
+    let mut page = statement
+        .query_map(
+            params![project, after.unwrap_or(""), PAGE_SIZE + 1],
+            template_from_row,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let next = if page.len() > PAGE_SIZE {
+        page.truncate(PAGE_SIZE);
+        page.last().map(|entry| entry.name.clone())
+    } else {
+        None
+    };
+    Ok((page, next))
+}
+
+pub fn delete_template(
+    conn: &Connection,
+    project: &str,
+    name: &str,
+    checkpoint: Uuid,
+) -> Result<()> {
+    if conn.execute(
+        "DELETE FROM templates WHERE project = ?1 AND name = ?2 AND checkpoint = ?3",
+        params![project, name, checkpoint.to_string()],
+    )? == 0
+    {
+        return Err(Error::NotFound(name.to_owned()));
+    }
+    Ok(())
+}
+
+/// One indexed reference is enough to pin a checkpoint without collecting all names.
+pub fn checkpoint_template(
+    conn: &Connection,
+    project: &str,
+    checkpoint: Uuid,
+) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT name FROM templates WHERE project = ?1 AND checkpoint = ?2 LIMIT 1",
+            params![project, checkpoint.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?)
 }
 
 pub fn find_space(conn: &Connection, name: &str, project: &str) -> Result<Option<Space>> {
@@ -860,12 +973,7 @@ pub fn claim_expired_space(
         tx.commit()?;
         return Ok(None);
     }
-    let active: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM jobs WHERE project = ?1 AND space = ?2 AND state IN ('starting', 'running', 'canceling')",
-        params![project, id.to_string()],
-        |row| row.get(0),
-    )?;
-    if active != 0 {
+    if space_has_active_jobs(&tx, id, project)? {
         tx.commit()?;
         return Ok(None);
     }
@@ -880,8 +988,6 @@ pub fn claim_expired_space(
     tx.commit()?;
     Ok(Some(space))
 }
-const MAX_PROJECT_JOB_ROWS: i64 = 1024;
-const MAX_GLOBAL_JOB_ROWS: i64 = 8192;
 const MAX_JOB_LIST_ROWS: usize = 64;
 
 fn sqlite_i64(value: u64, field: &str) -> Result<i64> {
@@ -911,163 +1017,91 @@ pub fn insert_job(conn: &Connection, job: &Job) -> Result<()> {
     )?;
     Ok(())
 }
-/// Inserts a starting job only when active and retained-row limits permit it.
-/// The count and insert share one `SQLite` transaction so concurrent
-/// submissions cannot pass any cap together.
-pub fn insert_job_if_capacity(conn: &Connection, job: &Job, max_active: u32) -> Result<bool> {
-    insert_job_if_capacity_with_limits(
+
+pub struct ActiveJob {
+    pub id: Uuid,
+    pub project: String,
+    pub space: Uuid,
+}
+
+/// Keyset pages keep host-wide startup recovery and idle sweeps bounded.
+pub fn active_jobs_page(conn: &Connection, after: Option<Uuid>) -> Result<Vec<ActiveJob>> {
+    let mut statement = conn.prepare_cached(
+        "SELECT id, project, space FROM jobs WHERE id > ?1 AND state IN ('starting', 'running', 'canceling') ORDER BY id LIMIT 64",
+    )?;
+    let after = after.map_or_else(String::new, |id| id.to_string());
+    Ok(statement
+        .query_map(params![after], |row| {
+            Ok(ActiveJob {
+                id: parse_uuid(row.get(0)?, 0)?,
+                project: row.get(1)?,
+                space: parse_uuid(row.get(2)?, 2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// Retires a bounded batch of terminal jobs and queues their archived logs for deletion.
+pub fn claim_terminal_jobs_before(conn: &Connection, before: DateTime<Utc>) -> Result<()> {
+    claim_job_logs(
         conn,
-        job,
-        max_active,
-        MAX_PROJECT_JOB_ROWS,
-        MAX_GLOBAL_JOB_ROWS,
+        "DELETE FROM jobs WHERE id IN (SELECT id FROM jobs WHERE state IN ('exited', 'canceled', 'lost') AND finished_at < ?1 ORDER BY finished_at, id LIMIT 8192) RETURNING id",
+        params![before.to_rfc3339()],
+    )?;
+    Ok(())
+}
+
+/// Retires a page of terminal jobs while the caller holds the Space lock.
+pub fn claim_space_job_logs(conn: &Connection, space: Uuid, project: &str) -> Result<Vec<Uuid>> {
+    claim_job_logs(
+        conn,
+        "DELETE FROM jobs WHERE id IN (SELECT id FROM jobs WHERE project = ?1 AND space = ?2 AND state IN ('exited', 'canceled', 'lost') LIMIT 64) RETURNING id",
+        params![project, space.to_string()],
     )
 }
 
-/// Variant with explicit caps used by hermetic store tests.
-pub fn insert_job_if_capacity_with_limits(
+fn claim_job_logs(
     conn: &Connection,
-    job: &Job,
-    max_active: u32,
-    max_project_rows: i64,
-    max_global_rows: i64,
-) -> Result<bool> {
+    sql: &str,
+    bindings: impl rusqlite::Params,
+) -> Result<Vec<Uuid>> {
     let tx = conn.unchecked_transaction()?;
-    let active: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM jobs WHERE project = ?1 AND state IN ('starting', 'running', 'canceling')",
-        params![job.project.as_str()],
-        |row| row.get(0),
-    )?;
-    let project_rows: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM jobs WHERE project = ?1",
-        params![job.project.as_str()],
-        |row| row.get(0),
-    )?;
-    let global_rows: i64 = tx.query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))?;
-    if active >= i64::from(max_active)
-        || project_rows >= max_project_rows
-        || global_rows >= max_global_rows
+    let ids = {
+        let mut statement = tx.prepare_cached(sql)?;
+        statement
+            .query_map(bindings, |row| parse_uuid(row.get(0)?, 0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
     {
-        return Ok(false);
-    }
-    let command = serde_json::to_string(&job.command)?;
-    let log_bytes = sqlite_i64(job.log_bytes, "log_bytes")?;
-    tx.execute(
-        "INSERT INTO jobs (id, project, space, command, state, created_at, started_at, finished_at, exit_code, error, log_bytes, log_truncated) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![
-            job.id.to_string(),
-            job.project.as_str(),
-            job.space.to_string(),
-            command,
-            job.state.as_str(),
-            job.created_at.to_rfc3339(),
-            job.started_at.map(|at| at.to_rfc3339()),
-            job.finished_at.map(|at| at.to_rfc3339()),
-            job.exit_code.map(i64::from),
-            job.error.as_deref(),
-            log_bytes,
-            i32::from(job.log_truncated),
-        ],
-    )?;
-    tx.commit()?;
-    Ok(true)
-}
-
-/// Lists every active job during daemon startup recovery.
-pub fn all_active_jobs(conn: &Connection) -> Result<Vec<Job>> {
-    let mut statement = conn.prepare(
-        "SELECT id, project, space, command, state, created_at, started_at, finished_at, exit_code, error, log_bytes, log_truncated FROM jobs WHERE state IN ('starting', 'running', 'canceling') ORDER BY created_at DESC, id DESC LIMIT 8192",
-    )?;
-    statement
-        .query_map([], job_from_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
-}
-
-/// Atomically claims and removes terminal rows older than the retention cutoff.
-///
-/// Returned rows identify the host log files that the caller must remove after
-/// releasing the database lock. Active rows are never claimed.
-pub fn claim_terminal_jobs_before(
-    conn: &Connection,
-    project: Option<&str>,
-    before: DateTime<Utc>,
-) -> Result<Vec<Job>> {
-    let tx = conn.unchecked_transaction()?;
-    let cutoff = before.to_rfc3339();
-    let mut jobs = Vec::new();
-    {
-        let mut statement = if project.is_some() {
-            tx.prepare(
-                "SELECT id, project, space, command, state, created_at, started_at, finished_at, exit_code, error, log_bytes, log_truncated FROM jobs WHERE project = ?1 AND state IN ('exited', 'canceled', 'lost') AND finished_at IS NOT NULL AND finished_at < ?2 ORDER BY finished_at, id LIMIT 8192",
-            )?
-        } else {
-            tx.prepare(
-                "SELECT id, project, space, command, state, created_at, started_at, finished_at, exit_code, error, log_bytes, log_truncated FROM jobs WHERE state IN ('exited', 'canceled', 'lost') AND finished_at IS NOT NULL AND finished_at < ?1 ORDER BY finished_at, id LIMIT 8192",
-            )?
-        };
-        let rows = if let Some(project) = project {
-            statement.query_map(params![project, cutoff], job_from_row)?
-        } else {
-            statement.query_map(params![cutoff], job_from_row)?
-        };
-        for row in rows {
-            jobs.push(row?);
+        let mut statement = tx.prepare_cached("INSERT INTO job_log_deletions (id) VALUES (?1)")?;
+        for id in &ids {
+            statement.execute(params![id.to_string()])?;
         }
     }
-    for job in &jobs {
-        tx.execute(
-            "DELETE FROM jobs WHERE id = ?1 AND project = ?2 AND state IN ('exited', 'canceled', 'lost')",
-            params![job.id.to_string(), job.project.as_str()],
-        )?;
-    }
     tx.commit()?;
-    Ok(jobs)
+    Ok(ids)
 }
 
-/// Atomically claims all terminal rows belonging to one space.
-///
-/// The caller must hold the space lock and separately reject active rows. Host
-/// log deletion happens after this transaction, never while the DB is locked.
-pub fn claim_terminal_jobs_by_space(
-    conn: &Connection,
-    space: Uuid,
-    project: &str,
-) -> Result<Vec<Job>> {
-    claim_terminal_jobs_where(conn, Some(space), Some(project))
+/// Returns a page of unacknowledged log deletions, including those from prior runs.
+pub fn pending_job_log_deletions(conn: &Connection, after: Option<Uuid>) -> Result<Vec<Uuid>> {
+    let mut statement =
+        conn.prepare_cached("SELECT id FROM job_log_deletions WHERE id > ?1 ORDER BY id LIMIT 64")?;
+    let cursor = after.map_or_else(String::new, |id| id.to_string());
+    Ok(statement
+        .query_map(params![cursor], |row| parse_uuid(row.get(0)?, 0))?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
-fn claim_terminal_jobs_where(
-    conn: &Connection,
-    space: Option<Uuid>,
-    project: Option<&str>,
-) -> Result<Vec<Job>> {
+pub fn finish_job_log_deletions(conn: &Connection, ids: &[Uuid]) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
-    let mut jobs = Vec::new();
     {
-        let (space, project) = match (space, project) {
-            (Some(space), Some(project)) => (space, project),
-            _ => {
-                return Err(Error::Invalid(
-                    "terminal job claim requires a space and project".into(),
-                ));
-            }
-        };
-        let mut statement = tx.prepare(
-            "SELECT id, project, space, command, state, created_at, started_at, finished_at, exit_code, error, log_bytes, log_truncated FROM jobs WHERE space = ?1 AND project = ?2 AND state IN ('exited', 'canceled', 'lost') ORDER BY created_at, id",
-        )?;
-        for row in statement.query_map(params![space.to_string(), project], job_from_row)? {
-            jobs.push(row?);
+        let mut statement = tx.prepare_cached("DELETE FROM job_log_deletions WHERE id = ?1")?;
+        for id in ids {
+            statement.execute(params![id.to_string()])?;
         }
     }
-    for job in &jobs {
-        tx.execute(
-            "DELETE FROM jobs WHERE id = ?1 AND project = ?2 AND state IN ('exited', 'canceled', 'lost')",
-            params![job.id.to_string(), job.project.as_str()],
-        )?;
-    }
     tx.commit()?;
-    Ok(jobs)
+    Ok(())
 }
 
 /// Retrieves one job only within the requested project's namespace.
@@ -1079,17 +1113,6 @@ pub fn get_job(conn: &Connection, id: Uuid, project: &str) -> Result<Option<Job>
     )
     .optional()
     .map_err(Into::into)
-}
-
-/// Lists jobs newest first without disclosing another project's rows.
-pub fn list_jobs(conn: &Connection, project: &str) -> Result<Vec<Job>> {
-    let mut statement = conn.prepare(
-        "SELECT id, project, space, command, state, created_at, started_at, finished_at, exit_code, error, log_bytes, log_truncated FROM jobs WHERE project = ?1 ORDER BY created_at DESC, id DESC",
-    )?;
-    statement
-        .query_map(params![project], job_from_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
 }
 
 /// Returns only the newest bounded page and whether more rows exist.
@@ -1113,27 +1136,11 @@ pub fn list_jobs_page(
     Ok((jobs, truncated))
 }
 
-/// Lists active jobs for one space and project. Active means starting,
-/// running, or canceling; terminal rows are never returned.
-pub fn active_jobs_by_space(conn: &Connection, space: Uuid, project: &str) -> Result<Vec<Job>> {
-    let mut statement = conn.prepare(
-        "SELECT id, project, space, command, state, created_at, started_at, finished_at, exit_code, error, log_bytes, log_truncated FROM jobs WHERE project = ?1 AND space = ?2 AND state IN ('starting', 'running', 'canceling') ORDER BY created_at DESC, id DESC",
-    )?;
-    statement
-        .query_map(params![project, space.to_string()], job_from_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
-}
-
-/// Lists all active jobs in one project without exposing other projects.
-pub fn active_jobs_by_project(conn: &Connection, project: &str) -> Result<Vec<Job>> {
-    let mut statement = conn.prepare(
-        "SELECT id, project, space, command, state, created_at, started_at, finished_at, exit_code, error, log_bytes, log_truncated FROM jobs WHERE project = ?1 AND state IN ('starting', 'running', 'canceling') ORDER BY created_at DESC, id DESC",
-    )?;
-    statement
-        .query_map(params![project], job_from_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(Into::into)
+pub fn space_has_active_jobs(conn: &Connection, space: Uuid, project: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM jobs WHERE project = ?1 AND space = ?2 AND state IN ('starting', 'running', 'canceling'))",
+        params![project, space.to_string()], |row| row.get(0),
+    )?)
 }
 
 /// Updates bounded combined-log accounting without storing log contents.
@@ -1449,127 +1456,6 @@ pub fn usage_summary(
     }))
 }
 
-type ProjectLimitRow = (Option<i64>, Option<i64>, Option<i64>, Option<i64>);
-
-pub type ProjectLimitOverrides = (Option<u32>, Option<u64>, Option<u32>, Option<u32>);
-
-fn project_optional_u32(value: Option<i64>, field: &str) -> Result<Option<u32>> {
-    value
-        .map(|value| {
-            u32::try_from(value)
-                .map_err(|error| Error::Invalid(format!("{field} limit out of range: {error}")))
-        })
-        .transpose()
-}
-
-fn project_optional_u64(value: Option<i64>, field: &str) -> Result<Option<u64>> {
-    value
-        .map(|value| {
-            u64::try_from(value)
-                .map_err(|error| Error::Invalid(format!("{field} limit out of range: {error}")))
-        })
-        .transpose()
-}
-
-fn project_u32(value: Option<i64>, fallback: u32, field: &str) -> Result<u32> {
-    Ok(project_optional_u32(value, field)?.unwrap_or(fallback))
-}
-
-fn project_u64(value: Option<i64>, fallback: u64, field: &str) -> Result<u64> {
-    Ok(project_optional_u64(value, field)?.unwrap_or(fallback))
-}
-
-fn project_limit_row(conn: &Connection, project: &str) -> Result<Option<ProjectLimitRow>> {
-    Ok(conn
-        .query_row(
-            "SELECT max_spaces, max_disk_mib, max_running, api_per_min FROM projects WHERE project = ?1",
-            params![project],
-            |row| {
-                Ok((
-                    row.get::<_, Option<i64>>(0)?,
-                    row.get::<_, Option<i64>>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                ))
-            },
-        )
-        .optional()?)
-}
-
-/// Returns the nullable values stored for a project without applying defaults.
-pub fn project_limit_overrides(
-    conn: &Connection,
-    project: &str,
-) -> Result<Option<ProjectLimitOverrides>> {
-    let Some((max_spaces, max_disk_mib, max_running, api_per_min)) =
-        project_limit_row(conn, project)?
-    else {
-        return Ok(None);
-    };
-    Ok(Some((
-        project_optional_u32(max_spaces, "max_spaces")?,
-        project_optional_u64(max_disk_mib, "max_disk_mib")?,
-        project_optional_u32(max_running, "max_running")?,
-        project_optional_u32(api_per_min, "api_per_min")?,
-    )))
-}
-
-/// Upserts nullable project overrides. `Some(0)` is an explicit unlimited
-/// grant; `None` stores SQL NULL so the project inherits the environment.
-pub fn set_project_limits(
-    conn: &Connection,
-    project: &str,
-    max_spaces: Option<u32>,
-    max_disk_mib: Option<u64>,
-    max_running: Option<u32>,
-    api_per_min: Option<u32>,
-) -> Result<()> {
-    let max_disk_mib = max_disk_mib
-        .map(|value| {
-            i64::try_from(value).map_err(|error| {
-                Error::Invalid(format!("max_disk_mib limit out of range: {error}"))
-            })
-        })
-        .transpose()?;
-    conn.execute(
-        "INSERT INTO projects (project, max_spaces, max_disk_mib, max_running, api_per_min)
-         VALUES (?1, ?2, ?3, ?4, ?5)
-         ON CONFLICT(project) DO UPDATE SET
-             max_spaces = excluded.max_spaces,
-             max_disk_mib = excluded.max_disk_mib,
-             max_running = excluded.max_running,
-             api_per_min = excluded.api_per_min",
-        params![
-            project,
-            max_spaces.map(i64::from),
-            max_disk_mib,
-            max_running.map(i64::from),
-            api_per_min.map(i64::from),
-        ],
-    )?;
-    Ok(())
-}
-
-pub fn clear_project_limits(conn: &Connection, project: &str) -> Result<()> {
-    conn.execute("DELETE FROM projects WHERE project = ?1", params![project])?;
-    Ok(())
-}
-
-pub fn project_limits(conn: &Connection, project: &str) -> Result<Option<(u32, u64, u32, u32)>> {
-    let Some((max_spaces, max_disk_mib, max_running, api_per_min)) =
-        project_limit_row(conn, project)?
-    else {
-        return Ok(None);
-    };
-    let defaults = crate::quota::Limits::from_env();
-    Ok(Some((
-        project_u32(max_spaces, defaults.max_spaces, "max_spaces")?,
-        project_u64(max_disk_mib, defaults.max_disk_mib, "max_disk_mib")?,
-        project_u32(max_running, defaults.max_running, "max_running")?,
-        project_u32(api_per_min, defaults.api_per_min, "api_per_min")?,
-    )))
-}
-
 #[cfg(test)]
 mod db_tests {
     use super::*;
@@ -1721,6 +1607,38 @@ mod db_tests {
                 .write_cap_mib,
             17
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reopening_version_one_discards_only_project_limits() {
+        let root = root();
+        let conn = open(&root).unwrap();
+        let (mut state, _, _) = sample_state("project-a");
+        state.spaces[0].write_cap_mib = 17;
+        store(&conn, &state).unwrap();
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS projects;
+             CREATE TABLE projects (project TEXT PRIMARY KEY, max_spaces INTEGER,
+                 max_disk_mib INTEGER, max_running INTEGER, api_per_min INTEGER);
+             INSERT INTO projects VALUES ('project-a', 1, 2, 3, 4);
+             PRAGMA user_version=1;",
+        )
+        .unwrap();
+        drop(conn);
+
+        for _ in 0..2 {
+            let conn = open(&root).unwrap();
+            assert_eq!(load(&conn).unwrap(), state);
+            let legacy_table: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='projects'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(legacy_table, 0);
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2145,7 +2063,7 @@ mod db_tests {
         let conn = open(&root).expect("second open");
         let tables: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('spaces', 'ckpts', 'templates', 'jobs', 'projects', 'usage_events', 'users', 'memberships', 'sessions')",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('spaces', 'ckpts', 'templates', 'jobs', 'job_log_deletions', 'usage_events', 'users', 'memberships', 'sessions')",
                 [],
                 |row| row.get(0),
             )
@@ -2347,8 +2265,11 @@ mod db_tests {
                 .expect("foreign get")
                 .is_none()
         );
-        assert_eq!(list_jobs(&conn, "alpha").expect("list jobs"), vec![job]);
-        assert!(list_jobs(&conn, "other").expect("foreign list").is_empty());
+        assert_eq!(
+            list_jobs_page(&conn, "alpha", 64).unwrap(),
+            (vec![job], false)
+        );
+        assert_eq!(list_jobs_page(&conn, "other", 64).unwrap(), (vec![], false));
     }
 
     #[test]
@@ -2363,15 +2284,15 @@ mod db_tests {
             insert_job(&conn, job).expect("insert active-filter job");
         }
 
-        let active = active_jobs_by_space(&conn, space, "alpha").expect("space active jobs");
+        let active = active_jobs_page(&conn, None).expect("active jobs");
         assert_eq!(active.len(), 3);
-        assert!(active.iter().all(|job| job.state.is_active()));
-        assert_eq!(active_jobs_by_project(&conn, "alpha").unwrap().len(), 3);
         assert!(
-            active_jobs_by_space(&conn, space, "other")
-                .unwrap()
-                .is_empty()
+            active
+                .iter()
+                .all(|job| job.project == "alpha" && job.space == space && job.id != exited.id)
         );
+        assert!(space_has_active_jobs(&conn, space, "alpha").unwrap());
+        assert!(!space_has_active_jobs(&conn, space, "other").unwrap());
 
         let transition = sample_job("alpha", space, Uuid::new_v4(), JobState::Starting);
         insert_job(&conn, &transition).expect("insert transition job");
@@ -2411,11 +2332,67 @@ mod db_tests {
         assert_eq!(loser.state, JobState::Canceled);
         assert_eq!(loser.exit_code, Some(130));
         assert!(
-            active_jobs_by_space(&conn, space, "alpha")
+            active_jobs_page(&conn, None)
                 .unwrap()
                 .iter()
                 .all(|job| job.id != transition.id)
         );
+    }
+
+    #[test]
+    fn active_scans_and_space_log_claims_page_without_skipping_jobs() {
+        let conn = db();
+        let space = Uuid::new_v4();
+        for number in 1..=65 {
+            insert_job(
+                &conn,
+                &sample_job("alpha", space, Uuid::from_u128(number), JobState::Starting),
+            )
+            .unwrap();
+            insert_job(
+                &conn,
+                &sample_job(
+                    "alpha",
+                    space,
+                    Uuid::from_u128(100 + number),
+                    JobState::Exited,
+                ),
+            )
+            .unwrap();
+        }
+        let foreign = sample_job("beta", space, Uuid::from_u128(200), JobState::Exited);
+        insert_job(&conn, &foreign).unwrap();
+        let first = active_jobs_page(&conn, None).unwrap();
+        assert_eq!(first.len(), 64);
+        let second = active_jobs_page(&conn, first.last().map(|job| job.id)).unwrap();
+        assert_eq!(
+            second.iter().map(|job| job.id).collect::<Vec<_>>(),
+            vec![Uuid::from_u128(65)]
+        );
+        assert!(
+            active_jobs_page(&conn, Some(second[0].id))
+                .unwrap()
+                .is_empty()
+        );
+
+        assert_eq!(
+            claim_space_job_logs(&conn, space, "alpha").unwrap().len(),
+            64
+        );
+        assert_eq!(
+            claim_space_job_logs(&conn, space, "alpha").unwrap().len(),
+            1
+        );
+        assert!(
+            claim_space_job_logs(&conn, space, "alpha")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            claim_space_job_logs(&conn, space, "beta").unwrap(),
+            vec![foreign.id]
+        );
+        assert!(space_has_active_jobs(&conn, space, "alpha").unwrap());
     }
 
     #[test]
@@ -2645,65 +2622,5 @@ mod db_tests {
         assert!(!root.join("state.json").exists());
         assert!(root.join("state.json.migrated").exists());
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn project_limits_resolve_overrides_and_defaults() {
-        let conn = db();
-        conn.execute(
-            "INSERT INTO projects (project, max_spaces, max_disk_mib, max_running, api_per_min) VALUES ('alpha', 3, 2048, 1, 60)",
-            [],
-        )
-        .unwrap();
-        assert_eq!(
-            project_limits(&conn, "alpha").unwrap(),
-            Some((3, 2048, 1, 60))
-        );
-        assert!(project_limits(&conn, "missing").unwrap().is_none());
-    }
-    #[test]
-    fn project_limit_writes_round_trip_null_zero_and_values() {
-        let conn = db();
-        let defaults = crate::quota::Limits::from_env();
-
-        set_project_limits(&conn, "alpha", None, None, None, None).unwrap();
-        let raw: (Option<i64>, Option<i64>, Option<i64>, Option<i64>) = conn
-            .query_row(
-                "SELECT max_spaces, max_disk_mib, max_running, api_per_min FROM projects WHERE project = 'alpha'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(raw, (None, None, None, None));
-        assert_eq!(
-            project_limit_overrides(&conn, "alpha").unwrap(),
-            Some((None, None, None, None))
-        );
-        assert_eq!(
-            project_limits(&conn, "alpha").unwrap(),
-            Some((
-                defaults.max_spaces,
-                defaults.max_disk_mib,
-                defaults.max_running,
-                defaults.api_per_min
-            ))
-        );
-
-        set_project_limits(&conn, "alpha", Some(0), Some(0), Some(0), Some(0)).unwrap();
-        assert_eq!(
-            project_limit_overrides(&conn, "alpha").unwrap(),
-            Some((Some(0), Some(0), Some(0), Some(0)))
-        );
-        assert_eq!(project_limits(&conn, "alpha").unwrap(), Some((0, 0, 0, 0)));
-
-        set_project_limits(&conn, "alpha", Some(7), Some(2048), Some(3), Some(600)).unwrap();
-        assert_eq!(
-            project_limits(&conn, "alpha").unwrap(),
-            Some((7, 2048, 3, 600))
-        );
-
-        clear_project_limits(&conn, "alpha").unwrap();
-        assert!(project_limit_overrides(&conn, "alpha").unwrap().is_none());
-        assert!(project_limits(&conn, "alpha").unwrap().is_none());
     }
 }

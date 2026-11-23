@@ -23,9 +23,9 @@ use rusqlite::Connection;
 use shinu::{
     Image, http,
     proto::{Req, SnapshotMode},
-    quota::{self, Limits, RateLimiter},
     registry::Registry,
     state::{self, Ckpt, Space, State, Template},
+    storage::StoragePolicy,
 };
 use shinu_image::{
     DEFAULT_DIFF_LIMIT, DEFAULT_EXCLUSIONS, DiffEntry, DiffOptions, DiffResult, DiffStatus,
@@ -49,7 +49,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Maximum number of diff snapshots anchored to one full base before a new
 /// full snapshot is captured. `SHINU_FULL_EVERY` overrides this value; zero
 /// disables automatic degradation.
-const JOB_ACTIVE_CAP: u32 = 64;
 const JOB_LOG_CAP: usize = 1024 * 1024;
 const JOB_TOUCH_EVERY: Duration = Duration::from_secs(10);
 const JOB_POLL_EVERY: Duration = Duration::from_secs(2);
@@ -61,8 +60,6 @@ const JOB_LIST_LIMIT: usize = 64;
 const DEFAULT_FULL_EVERY: usize = 8;
 const LEASE_GRACE_DEFAULT_SECS: u64 = 300;
 const DIFF_TMP_DIR: &str = "diff-tmp";
-const TEMPLATE_PROJECT_CAP: usize = 256;
-const TEMPLATE_GLOBAL_CAP: usize = 2048;
 
 #[derive(Parser)]
 #[command(name = "shinud")]
@@ -128,27 +125,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     shinu::ensure_assets(&root)?;
     let vm_cfg = shinu::VmConfig::from_env()?;
     let net_cfg = shinu::NetConfig::from_env()?;
-    let limits = Limits::from_env();
-    for key in [
-        "SHINU_LIMIT_SPACES",
-        "SHINU_LIMIT_DISK_MIB",
-        "SHINU_LIMIT_RUNNING",
-        "SHINU_SPACE_RESERVE_MIB",
-        "SHINU_SPACE_WRITE_CAP_MIB",
-    ] {
-        if std::env::var_os(key).is_some() {
-            eprintln!(
-                "warning: {key} is obsolete and ignored; admission uses physical capacity watermarks"
-            );
-        }
+    let mut obsolete: Vec<_> = std::env::vars_os()
+        .filter_map(|(key, _)| {
+            (key.as_encoded_bytes().starts_with(b"SHINU_LIMIT_")
+                || key == "SHINU_SPACE_RESERVE_MIB"
+                || key == "SHINU_SPACE_WRITE_CAP_MIB")
+                .then(|| {
+                    key.into_string()
+                        .unwrap_or_else(|key| key.to_string_lossy().into_owned())
+                })
+        })
+        .collect();
+    if !obsolete.is_empty() {
+        obsolete.sort_unstable();
+        eprintln!(
+            "warning: obsolete and ignored environment variables: {}",
+            obsolete.join(", ")
+        );
     }
-    // Only the deployment admin may mutate quotas; an unset secret fails closed.
-    let admin_token = std::env::var("SHINU_ADMIN_TOKEN")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    let rate = RateLimiter::new();
-    // Registration has its own IP-keyed limiter so API traffic cannot consume
-    // the account-creation allowance (and vice versa).
+    // Public signup retains its per-IP abuse guard.
     let register_rate = RegistrationLimiter::new();
 
     let listen = std::env::var("SHINU_LISTEN")
@@ -160,12 +155,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Arc::new(Mutex::new(connection));
     let vm_cfg = Arc::new(vm_cfg);
     let net_cfg = Arc::new(net_cfg);
-    let limits = Arc::new(limits);
-    let rate = Arc::new(rate);
     let register_rate = Arc::new(register_rate);
-    let admin_token = Arc::new(admin_token);
     let mut registry = Registry::new();
-    registry.storage.policy = quota::StoragePolicy::from_env()?;
+    registry.storage.policy = StoragePolicy::from_env()?;
     let registry = Arc::new(registry);
     shinu::vm::recover_loaded(root.as_path(), &net_cfg)?;
     // Recover active detached jobs before the idle sweep or request listener
@@ -261,11 +253,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let connection_db = Arc::clone(&db);
                 let connection_vm_cfg = Arc::clone(&vm_cfg);
                 let connection_net_cfg = Arc::clone(&net_cfg);
-                let connection_limits = Arc::clone(&limits);
-                let connection_rate = Arc::clone(&rate);
                 let connection_register_rate = Arc::clone(&register_rate);
                 let connection_registry = Arc::clone(&registry);
-                let connection_admin_token = Arc::clone(&admin_token);
                 let connection_jobs = Arc::clone(&jobs);
                 thread::spawn(move || {
                     let ctx = Ctx {
@@ -273,12 +262,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         db: connection_db.as_ref(),
                         vm_cfg: connection_vm_cfg.as_ref(),
                         net_cfg: connection_net_cfg.as_ref(),
-                        limits: connection_limits.as_ref(),
-                        rate: connection_rate.as_ref(),
                         register_rate: connection_register_rate.as_ref(),
                         registry: connection_registry.as_ref(),
                         jobs: Some(connection_jobs),
-                        admin_token: connection_admin_token.as_deref(),
                     };
                     if let Err(error) = serve_connection(stream, &ctx) {
                         eprintln!("connection: {error}");
@@ -295,12 +281,9 @@ struct Ctx<'a> {
     db: &'a Mutex<Connection>,
     vm_cfg: &'a shinu::VmConfig,
     net_cfg: &'a shinu::NetConfig,
-    limits: &'a Limits,
-    rate: &'a RateLimiter,
     register_rate: &'a RegistrationLimiter,
     registry: &'a Registry,
     jobs: Option<Arc<JobRuntime>>,
-    admin_token: Option<&'a str>,
 }
 
 struct JobRuntime {
@@ -326,18 +309,8 @@ impl JobRuntime {
     }
 
     fn recover(self: &Arc<Self>) {
-        let active = {
-            let connection = lock_db(&self.db);
-            match state::all_active_jobs(&connection) {
-                Ok(jobs) => jobs,
-                Err(error) => {
-                    eprintln!("job startup recovery query: {error}");
-                    return;
-                }
-            }
-        };
-        for job in active {
-            self.ensure_monitor(job.id, job.project);
+        if let Err(error) = self.for_each_active(|job| self.ensure_monitor(job.id, job.project)) {
+            eprintln!("job startup recovery query: {error}");
         }
     }
 
@@ -364,12 +337,22 @@ impl JobRuntime {
     }
 
     fn touch_active(&self) {
-        let active = {
-            let connection = lock_db(&self.db);
-            state::all_active_jobs(&connection).unwrap_or_default()
-        };
-        for job in active {
+        if let Err(error) = self.for_each_active(|job| {
             let _ = shinu::vm::touch(&shinu::vm_dir(&self.root, job.space));
+        }) {
+            eprintln!("job idle sweep query: {error}");
+        }
+    }
+
+    fn for_each_active(&self, mut handle: impl FnMut(state::ActiveJob)) -> shinu::Result<()> {
+        let mut after = None;
+        loop {
+            let jobs = state::active_jobs_page(&lock_db(&self.db), after)?;
+            let Some(last) = jobs.last() else {
+                return Ok(());
+            };
+            after = Some(last.id);
+            jobs.into_iter().for_each(&mut handle);
         }
     }
 
@@ -380,20 +363,29 @@ impl JobRuntime {
             .filter(|days| *days >= 0)
             .unwrap_or(JOB_RETENTION_DEFAULT_DAYS);
         let cutoff = Utc::now() - chrono::Duration::days(days);
-        let claimed = {
+        let claim = {
             let _state_guard = lock_state(&self.registry);
-            let connection = lock_db(&self.db);
-            match state::claim_terminal_jobs_before(&connection, None, cutoff) {
-                Ok(jobs) => jobs,
+            state::claim_terminal_jobs_before(&lock_db(&self.db), cutoff)
+        };
+        if let Err(error) = claim {
+            eprintln!("job retention claim: {error}");
+        }
+        let mut after = None;
+        loop {
+            let page = state::pending_job_log_deletions(&lock_db(&self.db), after);
+            let ids = match page {
+                Ok(ids) => ids,
                 Err(error) => {
-                    eprintln!("job retention claim: {error}");
+                    eprintln!("job retention pending deletions: {error}");
                     return;
                 }
-            }
-        };
-        for job in claimed {
-            if let Err(error) = remove_file_if_missing(&shinu::job_log_path(&self.root, job.id)) {
-                eprintln!("job retention log {}: {error}", job.id);
+            };
+            let Some(last) = ids.last() else {
+                return;
+            };
+            after = Some(*last);
+            if let Err(error) = remove_claimed_job_logs(&self.root, &self.db, &self.registry, ids) {
+                eprintln!("job retention: {error}");
             }
         }
     }
@@ -983,8 +975,7 @@ impl BufRead for RequestReader<'_> {
 }
 
 struct RegistrationLimiter {
-    // quota::RateLimiter is a 60-second per-project limiter; registration is
-    // intentionally a separate one-hour per-IP policy, so the semantics differ.
+    // Public account creation is limited to five attempts per hour and IP.
     requests: Mutex<HashMap<String, VecDeque<Instant>>>,
 }
 
@@ -1038,7 +1029,7 @@ fn lock_state(registry: &Registry) -> MutexGuard<'_, ()> {
 
 fn snapshot(db: &Mutex<Connection>, registry: &Registry) -> shinu::Result<State> {
     let _state_guard = lock_state(registry);
-    state::load(&lock_db(db))
+    state::load_spaces_and_checkpoints(&lock_db(db))
 }
 
 fn update_state<T>(
@@ -1048,9 +1039,9 @@ fn update_state<T>(
 ) -> shinu::Result<T> {
     let _state_guard = lock_state(registry);
     let connection = lock_db(db);
-    let mut state = state::load(&connection)?;
+    let mut state = state::load_spaces_and_checkpoints(&connection)?;
     let value = update(&mut state)?;
-    state::store(&connection, &state)?;
+    state::store_spaces_and_checkpoints(&connection, &state)?;
     Ok(value)
 }
 
@@ -1692,7 +1683,7 @@ fn sweep_expired_lease(
     let (space, state_before) = {
         let _state_guard = lock_state(sweep.registry);
         let connection = lock_db(sweep.db);
-        let state = state::load(&connection)?;
+        let state = state::load_spaces_and_checkpoints(&connection)?;
         let Some(space) = state
             .spaces
             .iter()
@@ -1708,7 +1699,7 @@ fn sweep_expired_lease(
         {
             return Ok(());
         }
-        if !state::active_jobs_by_space(&connection, id, project)?.is_empty() {
+        if state::space_has_active_jobs(&connection, id, project)? {
             // Active jobs pin the VM and the Space until their terminal rows
             // are durable; the next sweep gets a fresh advisory candidate.
             return Ok(());
@@ -1747,7 +1738,7 @@ fn sweep_expired_lease(
     // Claim the row before any destructive I/O. A renewal that won the Space
     // lock before this point changes the expected timestamp and returns None;
     // active jobs are checked again transactionally by the claim helper.
-    let (space, terminal_jobs, state_after) = {
+    let (space, state_after) = {
         let _state_guard = lock_state(sweep.registry);
         let connection = lock_db(sweep.db);
         let Some(space) =
@@ -1755,13 +1746,9 @@ fn sweep_expired_lease(
         else {
             return Ok(());
         };
-        let terminal_jobs = state::claim_terminal_jobs_by_space(&connection, id, project)?;
-        let state_after = state::load(&connection)?;
-        (space, terminal_jobs, state_after)
+        let state_after = state::load_spaces_and_checkpoints(&connection)?;
+        (space, state_after)
     };
-    for job in terminal_jobs {
-        remove_file_if_missing(&shinu::job_log_path(sweep.root, job.id))?;
-    }
     stop_space_runtime(sweep.root, sweep.cfg, &space, &previous_running)?;
     let current_running = refresh_network_rules_with(
         sweep.root,
@@ -1779,7 +1766,8 @@ fn sweep_expired_lease(
         &all_members,
         Instant::now() + Duration::from_secs(30),
     );
-    remove_space_files(sweep.root, id)
+    remove_space_files(sweep.root, id)?;
+    remove_space_job_logs(sweep.root, sweep.db, sweep.registry, id, project)
 }
 fn checkpoint_exclusive(root: &Path, id: Uuid) -> shinu::Result<u64> {
     #[cfg(test)]
@@ -1846,20 +1834,6 @@ fn current_disk_mib(state: &State, project: &str, registry: &Registry) -> u64 {
         })
 }
 
-fn effective_limits(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Limits> {
-    let connection = lock_db(ctx.db);
-    let api_per_min = state::project_limits(&connection, project)?
-        .map_or(ctx.limits.api_per_min, |limits| limits.3);
-    Ok(Limits {
-        max_spaces: 0,
-        max_disk_mib: 0,
-        max_vcpus: ctx.limits.max_vcpus,
-        max_mem_mib: ctx.limits.max_mem_mib,
-        max_running: 0,
-        api_per_min,
-    })
-}
-
 fn ensure_positive_size(name: &str, value: Option<u64>) -> shinu::Result<()> {
     if value == Some(0) {
         return Err(shinu::Error::Invalid(format!(
@@ -1867,18 +1841,6 @@ fn ensure_positive_size(name: &str, value: Option<u64>) -> shinu::Result<()> {
         )));
     }
     Ok(())
-}
-
-fn check_vm_sizing(
-    ctx: &Ctx<'_>,
-    limits: &Limits,
-    vcpus: Option<u32>,
-    mem_mib: Option<u32>,
-) -> shinu::Result<()> {
-    let vcpus = vcpus.unwrap_or(ctx.vm_cfg.vcpus);
-    let mem_mib = mem_mib.unwrap_or(ctx.vm_cfg.mem_mib);
-    quota::check_vcpu_limit(vcpus, limits)?;
-    quota::check_mem_limit(mem_mib, limits)
 }
 
 fn count_running(root: &Path, state: &State, project: &str) -> u32 {
@@ -1890,24 +1852,6 @@ fn count_running(root: &Path, state: &State, project: &str) -> u32 {
         })
         .count();
     u32::try_from(count).unwrap_or(u32::MAX)
-}
-
-fn space_start_state(
-    ctx: &Ctx<'_>,
-    _project: &str,
-    space: &Space,
-    _limits: &Limits,
-) -> shinu::Result<State> {
-    let already_running = shinu::vm::is_running(&shinu::vm_dir(ctx.root, space.id));
-    if already_running {
-        ensure_write_cap(ctx, space)?;
-    }
-    // Keep the running-slot check under the state lock, but release it before
-    // vm::start waits for platform connectivity and application admission.
-    let _state_guard = lock_state(ctx.registry);
-    let connection = lock_db(ctx.db);
-    let state = state::load(&connection)?;
-    Ok(state)
 }
 
 fn record_sweep_usage(
@@ -1963,7 +1907,7 @@ fn record_sweep_usage(
     // replacement or to a tenant that no longer owns the id.
     let _state_guard = lock_state(registry);
     let connection = lock_db(db);
-    let state = state::load(&connection)?;
+    let state = state::load_spaces_and_checkpoints(&connection)?;
     for (id, project, disk_mib, running) in samples {
         if !state
             .spaces
@@ -2170,24 +2114,6 @@ fn check_name(state: &State, name: &str, project: &str) -> shinu::Result<()> {
     {
         return Err(shinu::Error::Invalid(format!(
             "space name already exists: {name}"
-        )));
-    }
-    Ok(())
-}
-fn check_template_capacity(state: &State, project: &str) -> shinu::Result<()> {
-    if state.templates.len() >= TEMPLATE_GLOBAL_CAP {
-        return Err(shinu::Error::Quota(format!(
-            "template limit exceeded: host may retain at most {TEMPLATE_GLOBAL_CAP} templates"
-        )));
-    }
-    let project_count = state
-        .templates
-        .iter()
-        .filter(|template| template.project == project)
-        .count();
-    if project_count >= TEMPLATE_PROJECT_CAP {
-        return Err(shinu::Error::Quota(format!(
-            "template limit exceeded: project may retain at most {TEMPLATE_PROJECT_CAP} templates"
         )));
     }
     Ok(())
@@ -2517,7 +2443,7 @@ fn revalidate_space(
 ) -> shinu::Result<Space> {
     let _state_guard = lock_state(ctx.registry);
     let connection = lock_db(ctx.db);
-    let state = state::load(&connection)?;
+    let state = state::load_spaces_and_checkpoints(&connection)?;
     state
         .spaces
         .into_iter()
@@ -2591,8 +2517,6 @@ fn create_space(ctx: &Ctx<'_>, project: &str, spec: SpaceSpec) -> shinu::Result<
     if let Some(spec) = &readiness {
         spec.validate()?;
     }
-    let limits = effective_limits(ctx, project)?;
-    check_vm_sizing(ctx, &limits, vcpus, mem_mib)?;
     let image = image.unwrap_or(Image::Void);
     let base_cfg = shinu::BaseConfig::from_env()?;
     // Building only this requested image avoids turning daemon startup into a
@@ -2671,7 +2595,6 @@ fn fork_space(
     }
     let write_cap_mib = ctx.registry.storage.policy.write_cap(write_cap_mib)?;
     ensure_capacity(ctx)?;
-    let limits = effective_limits(ctx, project)?;
     let id = Uuid::new_v4();
     let space_guard = ctx.registry.space_lock(id);
     let _space_guard = space_guard
@@ -2687,7 +2610,7 @@ fn fork_space(
     let (source_checkpoint, image, network, vcpus, mem_mib, disk_mib) = {
         let _state_guard = lock_state(ctx.registry);
         let connection = lock_db(ctx.db);
-        let state = state::load(&connection)?;
+        let state = state::load_spaces_and_checkpoints(&connection)?;
         let checkpoint = state
             .ckpts
             .iter()
@@ -2719,7 +2642,6 @@ fn fork_space(
             .disk_mib
             .or_else(|| source_space.and_then(|space| space.disk_mib))
             .unwrap_or_else(|| image_size_mib(&shinu::ckpt_image(ctx.root, checkpoint.id)));
-        check_vm_sizing(ctx, &limits, Some(vcpus), Some(mem_mib))?;
         let image = source_space.map_or(Image::Void, |space| space.image);
         let network = source_space.and_then(|space| space.network.clone());
         (checkpoint, image, network, vcpus, mem_mib, disk_mib)
@@ -2835,62 +2757,24 @@ fn create_template(
     name: String,
     checkpoint: Uuid,
 ) -> shinu::Result<Value> {
-    state::validate_template_name(&name)?;
-    // This lookup only selects the checkpoint lock. The authoritative target
-    // and template uniqueness checks happen again under state → DB below.
-    let checkpoint = {
-        let connection = lock_db(ctx.db);
-        state::find_ckpt(&connection, checkpoint, project)?
-            .ok_or_else(|| shinu::Error::NotFound(checkpoint.to_string()))?
-    };
-    let checkpoint_guard = ctx.registry.checkpoint_lock(checkpoint.id);
+    let checkpoint_guard = ctx.registry.checkpoint_lock(checkpoint);
     let _checkpoint_guard = checkpoint_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let template = update_state(ctx.db, ctx.registry, |state| {
-        let target = state
-            .ckpts
-            .iter()
-            .find(|candidate| candidate.id == checkpoint.id && candidate.project == project)
-            .ok_or_else(|| shinu::Error::NotFound(checkpoint.id.to_string()))?;
-        if state
-            .templates
-            .iter()
-            .any(|template| template.project == project && template.name == name)
-        {
-            return Err(shinu::Error::Invalid(format!(
-                "template name already exists: {name}"
-            )));
-        }
-        check_template_capacity(state, project)?;
-        let template = Template {
-            project: project.to_owned(),
-            name: name.clone(),
-            checkpoint: target.id,
-            created_at: Utc::now(),
-        };
-        state.templates.push(template.clone());
-        Ok(template)
-    })?;
+    let _state_guard = lock_state(ctx.registry);
+    let template = Template {
+        project: project.to_owned(),
+        name,
+        checkpoint,
+        created_at: Utc::now(),
+    };
+    state::create_template(&lock_db(ctx.db), &template)?;
     Ok(serde_json::to_value(template)?)
 }
 
-fn list_templates(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
-    let state = snapshot(ctx.db, ctx.registry)?;
-    let mut templates = state
-        .templates
-        .into_iter()
-        .filter(|template| template.project == project)
-        .collect::<Vec<_>>();
-    // Template names are the primary stable order. The timestamp and concrete
-    // checkpoint identity make ties deterministic even for hand-written state.
-    templates.sort_by(|left, right| {
-        left.name
-            .cmp(&right.name)
-            .then_with(|| left.created_at.cmp(&right.created_at))
-            .then_with(|| left.checkpoint.cmp(&right.checkpoint))
-    });
-    Ok(json!({ "templates": templates }))
+fn list_templates(ctx: &Ctx<'_>, project: &str, after: Option<&str>) -> shinu::Result<Value> {
+    let (templates, next) = state::list_templates_page(&lock_db(ctx.db), project, after)?;
+    Ok(json!({ "templates": templates, "next": next }))
 }
 
 fn delete_template(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value> {
@@ -2898,33 +2782,16 @@ fn delete_template(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<
     // Resolve the project-scoped ref before waiting on its target. A tenant
     // that cannot see this name receives the same 404 whether another tenant
     // owns it or it does not exist.
-    let checkpoint = {
-        let state = snapshot(ctx.db, ctx.registry)?;
-        state
-            .templates
-            .iter()
-            .find(|template| template.project == project && template.name == name)
-            .map(|template| template.checkpoint)
-            .ok_or_else(|| shinu::Error::NotFound(name.clone()))?
-    };
+    let checkpoint = state::find_template(&lock_db(ctx.db), project, &name)?
+        .ok_or_else(|| shinu::Error::NotFound(name.clone()))?
+        .checkpoint;
     let checkpoint_guard = ctx.registry.checkpoint_lock(checkpoint);
     let _checkpoint_guard = checkpoint_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let (removed, checkpoint) = update_state(ctx.db, ctx.registry, |state| {
-        let index = state
-            .templates
-            .iter()
-            .position(|template| {
-                template.project == project
-                    && template.name == name
-                    && template.checkpoint == checkpoint
-            })
-            .ok_or_else(|| shinu::Error::NotFound(name.clone()))?;
-        let template = state.templates.remove(index);
-        Ok((template.name, template.checkpoint))
-    })?;
-    Ok(json!({ "removed": removed, "checkpoint": checkpoint }))
+    let _state_guard = lock_state(ctx.registry);
+    state::delete_template(&lock_db(ctx.db), project, &name, checkpoint)?;
+    Ok(json!({ "removed": name, "checkpoint": checkpoint }))
 }
 
 fn fork_template(
@@ -2937,16 +2804,10 @@ fn fork_template(
     state::validate_template_name(&template)?;
     // Resolve the ref once, then deliberately hand the concrete checkpoint to
     // the existing fork path. That path owns all checkpoint/base validation,
-    // quota checks, TTL handling, and the established lock order.
-    let checkpoint = {
-        let state = snapshot(ctx.db, ctx.registry)?;
-        state
-            .templates
-            .iter()
-            .find(|entry| entry.project == project && entry.name == template)
-            .map(|entry| entry.checkpoint)
-            .ok_or_else(|| shinu::Error::NotFound(template.clone()))?
-    };
+    // capacity admission, TTL handling, and the established lock order.
+    let checkpoint = state::find_template(&lock_db(ctx.db), project, &template)?
+        .ok_or_else(|| shinu::Error::NotFound(template.clone()))?
+        .checkpoint;
     fork_space(ctx, project, checkpoint, name, ttl_seconds, None, None)
 }
 
@@ -3149,7 +3010,7 @@ fn checkout_space(
     let (target, current_head, space_name) = {
         let _state_guard = lock_state(ctx.registry);
         let connection = lock_db(ctx.db);
-        let state = state::load(&connection)?;
+        let state = state::load_spaces_and_checkpoints(&connection)?;
         let entry = state
             .spaces
             .iter()
@@ -3162,7 +3023,7 @@ fn checkout_space(
                 entry.name
             )));
         }
-        if !state::active_jobs_by_space(&connection, entry.id, project)?.is_empty() {
+        if state::space_has_active_jobs(&connection, entry.id, project)? {
             return Err(shinu::Error::Invalid(format!(
                 "space {} has active detached jobs",
                 entry.name
@@ -3183,7 +3044,7 @@ fn checkout_space(
         let base = {
             let _state_guard = lock_state(ctx.registry);
             let connection = lock_db(ctx.db);
-            let state = state::load(&connection)?;
+            let state = state::load_spaces_and_checkpoints(&connection)?;
             state
                 .ckpts
                 .iter()
@@ -3296,16 +3157,15 @@ fn remove_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Val
     let network = current.network.clone();
     // Claiming the Space lock first makes this check race-free with submit:
     // a new Starting row cannot appear until removal has completed.
-    let (state_before, state_after, terminal_jobs) = {
+    let (state_before, state_after) = {
         let _state_guard = lock_state(ctx.registry);
         let connection = lock_db(ctx.db);
-        let active = state::active_jobs_by_space(&connection, id, project)?;
-        if !active.is_empty() {
+        if state::space_has_active_jobs(&connection, id, project)? {
             return Err(shinu::Error::Invalid(format!(
                 "space {name} has active detached jobs"
             )));
         }
-        let state_before = state::load(&connection)?;
+        let state_before = state::load_spaces_and_checkpoints(&connection)?;
         let mut state_after = state_before.clone();
         if !state_after
             .spaces
@@ -3315,17 +3175,11 @@ fn remove_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Val
             return Err(shinu::Error::NotFound(id.to_string()));
         }
         state_after.spaces.retain(|space| space.id != id);
-        state::store(&connection, &state_after)?;
-        let terminal_jobs = state::claim_terminal_jobs_by_space(&connection, id, project)?;
-        (state_before, state_after, terminal_jobs)
+        state::store_spaces_and_checkpoints(&connection, &state_after)?;
+        (state_before, state_after)
     };
     let previous_running =
         running_network_members(ctx.root, &state_before, project, network.as_deref());
-    // Host log unlinking follows the DB claim and is intentionally outside the
-    // state/DB lock scope.
-    for job in terminal_jobs {
-        remove_file_if_missing(&shinu::job_log_path(ctx.root, job.id))?;
-    }
     stop_space_runtime(ctx.root, ctx.net_cfg, &current, &previous_running)?;
     let current_running = refresh_network_rules(
         ctx,
@@ -3339,8 +3193,55 @@ fn remove_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Val
     sync_network_hosts(ctx, &current_running, &all_members);
     // Any deletion failure leaves an orphan for gc, not a dangling record.
     remove_space_files(ctx.root, id)?;
+    remove_space_job_logs(ctx.root, ctx.db, ctx.registry, id, project)?;
     Ok(json!({ "removed": resolved_name, "id": id }))
 }
+
+fn remove_space_job_logs(
+    root: &Path,
+    db: &Mutex<Connection>,
+    registry: &Registry,
+    space: Uuid,
+    project: &str,
+) -> shinu::Result<()> {
+    let mut first_failure = None;
+    loop {
+        let ids = {
+            let _guard = lock_state(registry);
+            state::claim_space_job_logs(&lock_db(db), space, project)?
+        };
+        if ids.is_empty() {
+            return first_failure.map_or(Ok(()), Err);
+        }
+        if let Err(error) = remove_claimed_job_logs(root, db, registry, ids) {
+            first_failure.get_or_insert(error);
+        }
+    }
+}
+
+fn remove_claimed_job_logs(
+    root: &Path,
+    db: &Mutex<Connection>,
+    registry: &Registry,
+    mut ids: Vec<Uuid>,
+) -> shinu::Result<()> {
+    let mut first_failure = None;
+    ids.retain(|id| {
+        if let Err(error) = remove_file_if_missing(&shinu::job_log_path(root, *id)) {
+            first_failure
+                .get_or_insert_with(|| std::io::Error::other(format!("job log {id}: {error}")));
+            false
+        } else {
+            true
+        }
+    });
+    if !ids.is_empty() {
+        let _guard = lock_state(registry);
+        state::finish_job_log_deletions(&lock_db(db), &ids)?;
+    }
+    first_failure.map_or(Ok(()), |error| Err(error.into()))
+}
+
 fn remove_checkpoint(ctx: &Ctx<'_>, project: &str, id: Uuid, detach: bool) -> shinu::Result<Value> {
     // Serialize the claim with every consumer that can read these files. The
     // row and its references are re-evaluated under state+DB locks, after the
@@ -3349,7 +3250,10 @@ fn remove_checkpoint(ctx: &Ctx<'_>, project: &str, id: Uuid, detach: bool) -> sh
     let _checkpoint_guard = checkpoint_guard
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let detached = update_state(ctx.db, ctx.registry, |state| {
+    let detached = {
+        let _state_guard = lock_state(ctx.registry);
+        let connection = lock_db(ctx.db);
+        let mut state = state::load_spaces_and_checkpoints(&connection)?;
         let checkpoint = state
             .ckpts
             .iter()
@@ -3358,21 +3262,25 @@ fn remove_checkpoint(ctx: &Ctx<'_>, project: &str, id: Uuid, detach: bool) -> sh
         // Every checkpoint image is an independent reflink, so `parent` edges
         // are lineage only and may be detached. Heads, templates, and memory
         // bases still read these files and always refuse.
-        let referenced = if detach {
-            shinu::blocking_references(state, checkpoint.id)
+        let mut referenced = if detach {
+            shinu::blocking_references(&state, checkpoint.id)
         } else {
-            shinu::is_referenced(state, checkpoint.id)
+            shinu::is_referenced(&state, checkpoint.id)
         };
+        if let Some(name) = state::checkpoint_template(&connection, project, id)? {
+            referenced.push(name);
+        }
         if !referenced.is_empty() {
             return Err(shinu::Error::Invalid(format!(
                 "checkpoint {id} is still referenced by: {}",
                 referenced.join(", ")
             )));
         }
-        let detached = detach.then(|| shinu::detach_children(state, id));
+        let detached = detach.then(|| shinu::detach_children(&mut state, id));
         state.ckpts.retain(|entry| entry.id != id);
-        Ok(detached)
-    })?;
+        state::store_spaces_and_checkpoints(&connection, &state)?;
+        detached
+    };
     // Keep the checkpoint lock through unlinking. A consumer that already
     // holds it finishes before the claim; later consumers see the missing row.
     remove_file_if_missing(&shinu::ckpt_image(ctx.root, id))?;
@@ -3493,6 +3401,14 @@ fn start_vm_with_pending_restore(
         .cloned()
         .ok_or_else(|| shinu::Error::NotFound(id.to_string()))?;
     ensure_write_cap(ctx, &space)?;
+    let restore_checkpoint = restore_checkpoint.or_else(|| {
+        space.head.and_then(|head| {
+            before_start
+                .ckpts
+                .iter()
+                .find(|checkpoint| checkpoint.id == head)
+        })
+    });
     let snapshot_mem = space_snapshot_mem(ctx.root, id);
     let snapshot_state = space_snapshot_state(ctx.root, id);
     let has_mem = snapshot_mem.exists();
@@ -3571,14 +3487,7 @@ fn start_space(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let space = revalidate_space(ctx, project, initial.id, &name)?;
     ensure_lease_active(&space, Utc::now())?;
-    let limits = effective_limits(ctx, project)?;
-    check_vm_sizing(ctx, &limits, space.vcpus, space.mem_mib)?;
-    let state = space_start_state(ctx, project, &space, &limits)?;
-    let restore_checkpoint = space
-        .head
-        .and_then(|head| state.ckpts.iter().find(|checkpoint| checkpoint.id == head));
-    let booted =
-        start_vm_with_pending_restore(ctx, space.id, restore_checkpoint, load_only, track_dirty)?.1;
+    let (_, booted) = start_vm_with_pending_restore(ctx, space.id, None, load_only, track_dirty)?;
     Ok(json!({ "booted": booted, "state": if load_only { "loaded" } else { "running" } }))
 }
 
@@ -3630,7 +3539,7 @@ fn stop_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Value
     {
         let _state_guard = lock_state(ctx.registry);
         let connection = lock_db(ctx.db);
-        if !state::active_jobs_by_space(&connection, space.id, project)?.is_empty() {
+        if state::space_has_active_jobs(&connection, space.id, project)? {
             return Err(shinu::Error::Invalid(format!(
                 "space {name} has active detached jobs"
             )));
@@ -3665,7 +3574,6 @@ fn resize_space(
         spec.validate()?;
     }
     let existing = find_space(ctx.db, &name, project)?;
-    let limits = effective_limits(ctx, project)?;
     let space_guard = ctx.registry.space_lock(existing.id);
     let _space_guard = space_guard
         .lock()
@@ -3689,15 +3597,12 @@ fn resize_space(
         })?;
         return Ok(serde_json::to_value(updated)?);
     }
-    // The grow cannot hold the state lock: truncate, e2fsck and resize2fs run
-    // for minutes on a multi-gigabyte image. So the allowance is checked twice
-    // — once here to fail fast, and again under the lock that stores the new
-    // sizes. Only the second check is authoritative: two concurrent grows can
-    // both clear this one against the same stale state.
+    // Do not hold the state lock while truncate, e2fsck and resize2fs operate
+    // on the image. The Space lock keeps its requested sizing stable.
     let (new_vcpus, new_mem_mib, new_disk_mib, image_path, actual_disk, target_disk) = {
         let _state_guard = lock_state(ctx.registry);
         let connection = lock_db(ctx.db);
-        let state = state::load(&connection)?;
+        let state = state::load_spaces_and_checkpoints(&connection)?;
         let index = state
             .spaces
             .iter()
@@ -3708,7 +3613,6 @@ fn resize_space(
         let new_mem_mib = mem_mib.unwrap_or(current.mem_mib);
         ensure_positive_size("vcpus", new_vcpus.map(u64::from))?;
         ensure_positive_size("mem_mib", new_mem_mib.map(u64::from))?;
-        check_vm_sizing(ctx, &limits, new_vcpus, new_mem_mib)?;
 
         let image_path = shinu::space_image(ctx.root, current.id);
         let current_disk = space_size_mib(ctx.root, &current);
@@ -3846,7 +3750,7 @@ fn gc(ctx: &Ctx<'_>, project: &str, free_below: u64, dry_run: bool) -> shinu::Re
         let candidate = {
             let _state_guard = lock_state(ctx.registry);
             let connection = lock_db(ctx.db);
-            let state = state::load(&connection)?;
+            let state = state::load_spaces_and_checkpoints(&connection)?;
             let Some(checkpoint) = state
                 .ckpts
                 .iter()
@@ -3859,6 +3763,7 @@ fn gc(ctx: &Ctx<'_>, project: &str, free_below: u64, dry_run: bool) -> shinu::Re
                 .num_seconds();
             if age <= i64::try_from(retention_secs).unwrap_or(i64::MAX)
                 || !shinu::is_referenced(&state, checkpoint.id).is_empty()
+                || state::checkpoint_template(&connection, project, id)?.is_some()
             {
                 continue;
             }
@@ -3895,7 +3800,7 @@ fn gc(ctx: &Ctx<'_>, project: &str, free_below: u64, dry_run: bool) -> shinu::Re
         let note = {
             let _state_guard = lock_state(ctx.registry);
             let connection = lock_db(ctx.db);
-            let mut state = state::load(&connection)?;
+            let mut state = state::load_spaces_and_checkpoints(&connection)?;
             let Some(checkpoint) = state
                 .ckpts
                 .iter()
@@ -3908,12 +3813,13 @@ fn gc(ctx: &Ctx<'_>, project: &str, free_below: u64, dry_run: bool) -> shinu::Re
                 .num_seconds();
             if age <= i64::try_from(retention_secs).unwrap_or(i64::MAX)
                 || !shinu::is_referenced(&state, id).is_empty()
+                || state::checkpoint_template(&connection, project, id)?.is_some()
             {
                 continue;
             }
             let note = checkpoint.note.clone();
             state.ckpts.retain(|checkpoint| checkpoint.id != id);
-            state::store(&connection, &state)?;
+            state::store_spaces_and_checkpoints(&connection, &state)?;
             note
         };
         remove_file_if_missing(&shinu::ckpt_image(ctx.root, id))?;
@@ -3940,74 +3846,23 @@ fn checkpoint_json(checkpoint: &Ckpt) -> shinu::Result<Value> {
 }
 
 fn limits_value(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
-    let limits = effective_limits(ctx, project)?;
     let _state_guard = lock_state(ctx.registry);
     let connection = lock_db(ctx.db);
-    let state = state::load(&connection)?;
+    let state = state::load_spaces_and_checkpoints(&connection)?;
     let used_spaces = state::count_spaces(&connection, project)?;
     let used_disk = current_disk_mib(&state, project, ctx.registry);
     let used_running = count_running(ctx.root, &state, project);
     Ok(json!({
-        "max_spaces": limits.max_spaces,
-        "max_disk_mib": limits.max_disk_mib,
-        "max_vcpus": limits.max_vcpus,
-        "max_mem_mib": limits.max_mem_mib,
-        "max_running": limits.max_running,
-        "api_per_min": limits.api_per_min,
+        "watermarks": {
+            "min_store_free_mib": ctx.registry.storage.policy.watermarks.min_store_free_mib,
+            "min_mem_available_mib": ctx.registry.storage.policy.watermarks.min_mem_available_mib,
+        },
         "used": {
             "spaces": used_spaces,
             "disk_mib": used_disk,
             "running": used_running,
         },
     }))
-}
-fn patch_project_limits(ctx: &Ctx<'_>, project: &str, body: &[u8]) -> shinu::Result<Value> {
-    let value = parse_body(body)?;
-    if ["max_spaces", "max_disk_mib", "max_running"]
-        .iter()
-        .any(|key| value.get(*key).is_some())
-    {
-        return Err(shinu::Error::Invalid("project spaces/disk/running quotas are obsolete; configure physical capacity watermarks instead".into()));
-    }
-    let max_spaces = value_patch_u32(&value, "max_spaces")?;
-    let max_disk_mib = value_patch_u64(&value, "max_disk_mib")?;
-    let max_running = value_patch_u32(&value, "max_running")?;
-    let api_per_min = value_patch_u32(&value, "api_per_min")?;
-    if max_spaces.is_none()
-        && max_disk_mib.is_none()
-        && max_running.is_none()
-        && api_per_min.is_none()
-    {
-        return Err(shinu::Error::Invalid(
-            "limits set requires at least one limit field".into(),
-        ));
-    }
-
-    // Serialize the nullable read-modify-write with the same state-then-db
-    // order used by all other state mutations.
-    let state_guard = lock_state(ctx.registry);
-    let connection = lock_db(ctx.db);
-    let existing = state::project_limit_overrides(&connection, project)?;
-    let (current_spaces, current_disk_mib, current_running, current_api_per_min) =
-        existing.unwrap_or((None, None, None, None));
-    state::set_project_limits(
-        &connection,
-        project,
-        max_spaces.unwrap_or(current_spaces),
-        max_disk_mib.unwrap_or(current_disk_mib),
-        max_running.unwrap_or(current_running),
-        api_per_min.unwrap_or(current_api_per_min),
-    )?;
-    drop(connection);
-    drop(state_guard);
-    limits_value(ctx, project)
-}
-
-fn clear_project_limits(ctx: &Ctx<'_>, project: &str) -> shinu::Result<Value> {
-    let _state_guard = lock_state(ctx.registry);
-    let connection = lock_db(ctx.db);
-    state::clear_project_limits(&connection, project)?;
-    Ok(json!({ "project": project, "cleared": true }))
 }
 
 struct DiffSpec {
@@ -4209,17 +4064,11 @@ fn submit_job(
         log_bytes: 0,
         log_truncated: false,
     };
-    let inserted = {
+    {
         let _state_guard = lock_state(ctx.registry);
-        let connection = lock_db(ctx.db);
-        state::insert_job_if_capacity(&connection, &job, JOB_ACTIVE_CAP)?
-    };
-    if !inserted {
-        return Err(shinu::Error::Quota(format!(
-            "project active detached job limit is {JOB_ACTIVE_CAP}"
-        )));
+        state::insert_job(&lock_db(ctx.db), &job)?;
     }
-    let target = match prepare_ssh_entry(ctx, project, &entry) {
+    let target = match prepare_ssh_entry(ctx, &entry) {
         Ok(target) => target,
         Err(error) => {
             let message = format!("could not prepare detached job VM: {error}");
@@ -4476,7 +4325,7 @@ fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
         } => resize_space(ctx, project, space, vcpus, mem_mib, disk_mib, readiness),
         Req::Images => Ok(list_images(ctx)),
         Req::CreateTemplate { name, checkpoint } => create_template(ctx, project, name, checkpoint),
-        Req::ListTemplates => list_templates(ctx, project),
+        Req::ListTemplates { after } => list_templates(ctx, project, after.as_deref()),
         Req::DeleteTemplate { name } => delete_template(ctx, project, name),
         Req::ForkTemplate {
             template,
@@ -4715,7 +4564,7 @@ enum Endpoint {
     ConsoleTokens,
     ConsoleToken(String),
     Spaces,
-    Templates,
+    Templates(String),
     Template(String),
     TemplateFork(String),
     JobSubmit(String),
@@ -4726,7 +4575,6 @@ enum Endpoint {
     Images,
     Usage,
     Limits,
-    ProjectLimits(String),
     Rm(String),
     Start(String),
     Resume(String),
@@ -4806,7 +4654,7 @@ fn route(path: &str) -> Option<Endpoint> {
         return Some(Endpoint::JobSubmit(segments[3].clone()));
     }
     if segments.len() == 3 && segments[2] == "templates" {
-        return Some(Endpoint::Templates);
+        return Some(Endpoint::Templates(query.to_owned()));
     }
     if segments.len() == 4 && segments[2] == "templates" && !segments[3].is_empty() {
         return Some(Endpoint::Template(segments[3].clone()));
@@ -4826,13 +4674,6 @@ fn route(path: &str) -> Option<Endpoint> {
     }
     if segments.len() == 3 && segments[2] == "usage" {
         return Some(Endpoint::Usage);
-    }
-    if segments.len() == 5
-        && segments[2] == "projects"
-        && segments[4] == "limits"
-        && !segments[3].is_empty()
-    {
-        return Some(Endpoint::ProjectLimits(segments[3].clone()));
     }
     if segments.len() == 3 && segments[2] == "limits" {
         return Some(Endpoint::Limits);
@@ -5054,7 +4895,7 @@ fn method_allowed(endpoint: &Endpoint, method: &str) -> bool {
         Endpoint::ConsoleTokens => method == "GET" || method == "POST",
         Endpoint::ConsoleToken(_) => method == "DELETE",
         Endpoint::Spaces => method == "GET" || method == "POST",
-        Endpoint::Templates => method == "GET" || method == "POST",
+        Endpoint::Templates(_) => method == "GET" || method == "POST",
         Endpoint::Template(_) => method == "DELETE",
         Endpoint::TemplateFork(_) => method == "POST",
         Endpoint::JobList | Endpoint::Job(_) | Endpoint::JobLogs(_) => method == "GET",
@@ -5064,7 +4905,6 @@ fn method_allowed(endpoint: &Endpoint, method: &str) -> bool {
         | Endpoint::Log(_)
         | Endpoint::Reflog(_)
         | Endpoint::Diff(_) => method == "GET",
-        Endpoint::ProjectLimits(_) => matches!(method, "GET" | "PATCH" | "DELETE"),
         Endpoint::Rm(_) => method == "DELETE" || method == "PATCH",
         Endpoint::Lease(_) => method == "PATCH",
         Endpoint::RmCkpt(_) => method == "DELETE",
@@ -5373,8 +5213,22 @@ fn request_for(
     match endpoint {
         Endpoint::Spaces if method == "GET" => Ok((Req::Ls, 200)),
         Endpoint::Spaces => Ok((new_request(body)?, 201)),
-        Endpoint::Templates if method == "GET" => Ok((Req::ListTemplates, 200)),
-        Endpoint::Templates => Ok((template_create_request(body)?, 201)),
+        Endpoint::Templates(query) if method == "GET" => {
+            let after = if query.is_empty() {
+                None
+            } else {
+                let name = query
+                    .strip_prefix("after=")
+                    .and_then(decode_segment)
+                    .ok_or_else(|| {
+                        shinu::Error::Invalid("template list expects an after name".into())
+                    })?;
+                state::validate_template_name(&name)?;
+                Some(name)
+            };
+            Ok((Req::ListTemplates { after }, 200))
+        }
+        Endpoint::Templates(_) => Ok((template_create_request(body)?, 201)),
         Endpoint::Template(name) => {
             state::validate_template_name(&name)?;
             Ok((Req::DeleteTemplate { name }, 200))
@@ -5550,15 +5404,9 @@ fn job_ssh_target(root: &Path, space_id: Uuid) -> shinu::Result<SshTarget> {
 
 /// Prepares an SSH target while the caller owns the Space lock. No lock is
 /// acquired here so submit can keep the lock through VM start and tmux launch.
-fn prepare_ssh_entry(ctx: &Ctx<'_>, project: &str, entry: &Space) -> shinu::Result<SshTarget> {
+fn prepare_ssh_entry(ctx: &Ctx<'_>, entry: &Space) -> shinu::Result<SshTarget> {
     ensure_lease_active(entry, Utc::now())?;
-    let limits = effective_limits(ctx, project)?;
-    check_vm_sizing(ctx, &limits, entry.vcpus, entry.mem_mib)?;
-    let state = space_start_state(ctx, project, entry, &limits)?;
-    let restore_checkpoint = entry
-        .head
-        .and_then(|head| state.ckpts.iter().find(|checkpoint| checkpoint.id == head));
-    start_vm_with_pending_restore(ctx, entry.id, restore_checkpoint, false, true)?;
+    start_vm_with_pending_restore(ctx, entry.id, None, false, true)?;
     ssh_target_for_vm(ctx.root, entry.id)
 }
 
@@ -5569,7 +5417,7 @@ fn prepare_ssh(ctx: &Ctx<'_>, project: &str, space: &str) -> shinu::Result<SshTa
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let entry = revalidate_space(ctx, project, initial.id, space)?;
-    prepare_ssh_entry(ctx, project, &entry)
+    prepare_ssh_entry(ctx, &entry)
 }
 
 fn ssh_command(target: &SshTarget, remote: &[String]) -> Command {
@@ -7106,54 +6954,6 @@ fn is_state_changing(method: &str) -> bool {
     matches!(method, "POST" | "PUT" | "DELETE" | "PATCH")
 }
 
-/// The admin bearer is separate from project tokens so a tenant cannot grant
-/// itself a larger quota. Hash both values first, then compare fixed-size
-/// digests without an early return; an unset admin token never authorizes.
-fn admin_token_matches(ctx: &Ctx<'_>, request: &http::Request) -> bool {
-    let Some(expected) = ctx.admin_token else {
-        return false;
-    };
-    let Some(candidate) = request.token.as_deref() else {
-        return false;
-    };
-    let expected = shinu::sha256_hex(expected.as_bytes());
-    let candidate = shinu::sha256_hex(candidate.as_bytes());
-    let mut difference = 0_u8;
-    for index in 0..64 {
-        difference |= expected.as_bytes()[index] ^ candidate.as_bytes()[index];
-    }
-    difference == 0
-}
-
-fn require_admin_token(ctx: &Ctx<'_>, request: &http::Request) -> shinu::Result<()> {
-    if request.authorization_present && request.token.is_none() {
-        return Err(shinu::Error::Auth("invalid token".into()));
-    }
-    if admin_token_matches(ctx, request) {
-        Ok(())
-    } else {
-        Err(shinu::Error::Auth("administrative token required".into()))
-    }
-}
-
-fn authorize_project_limits_read(
-    ctx: &Ctx<'_>,
-    request: &http::Request,
-    project: &str,
-) -> shinu::Result<()> {
-    if admin_token_matches(ctx, request) {
-        return Ok(());
-    }
-    let caller = authenticate(ctx, request)?;
-    if caller_project(&caller) == project {
-        Ok(())
-    } else {
-        Err(shinu::Error::Auth(
-            "project token may only read its own limits".into(),
-        ))
-    }
-}
-
 fn authenticate(ctx: &Ctx<'_>, request: &http::Request) -> shinu::Result<Caller> {
     // A bearer token is deliberately authoritative when present. Falling back
     // to a cookie after an invalid bearer would let a malformed proxy header
@@ -7616,29 +7416,6 @@ fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
         _ => {}
     }
 
-    if let Endpoint::ProjectLimits(project) = &endpoint {
-        let authorization = if request.method == "GET" {
-            authorize_project_limits_read(ctx, &request, project)
-        } else {
-            require_admin_token(ctx, &request)
-        };
-        if let Err(error) = authorization {
-            respond_error(&mut stream, http::status_for(&error), &error)?;
-            return Ok(());
-        }
-        let result = match request.method.as_str() {
-            "GET" => limits_value(ctx, project),
-            "PATCH" => patch_project_limits(ctx, project, &request.body),
-            "DELETE" => clear_project_limits(ctx, project),
-            _ => unreachable!("project limits method was checked above"),
-        };
-        match result {
-            Ok(value) => http::respond(&mut stream, 200, &value)?,
-            Err(error) => respond_error(&mut stream, http::status_for(&error), &error)?,
-        }
-        return Ok(());
-    }
-
     let caller = match authenticate(ctx, &request) {
         Ok(caller) => caller,
         Err(error) => {
@@ -7709,17 +7486,6 @@ fn serve_connection(mut stream: TcpStream, ctx: &Ctx<'_>) -> shinu::Result<()> {
         return Ok(());
     }
     let project = caller_project(&caller);
-    let effective = match effective_limits(ctx, project) {
-        Ok(limits) => limits,
-        Err(error) => {
-            respond_error(&mut stream, http::status_for(&error), &error)?;
-            return Ok(());
-        }
-    };
-    if let Err(error) = ctx.rate.check(project, effective.api_per_min) {
-        respond_error(&mut stream, http::status_for(&error), &error)?;
-        return Ok(());
-    }
 
     let (from, to) = if matches!(&endpoint, Endpoint::Usage) {
         match usage_query(&request.path) {
@@ -8197,7 +7963,6 @@ mod tests {
     use shinu::{
         Image, NetConfig, VmConfig,
         proto::{Req, SnapshotMode},
-        quota::{Limits, RateLimiter},
         state::{self, Ckpt, Space, State, Template},
         vm,
     };
@@ -8466,12 +8231,20 @@ mod tests {
             },
         );
         let db = test_db(&root);
-        let registry = registry();
+        let mut registry = registry();
+        registry.storage.policy.watermarks.min_store_free_mib = 1024;
+        registry.storage.policy.watermarks.min_mem_available_mib = 512;
         registry.storage.record(space.id, 150 * 1024 * 1024);
         let (vm_cfg, net_cfg) = test_configs();
         let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
         let value = handle(&ctx, Req::Limits, "project-a").unwrap();
-        assert_eq!(value["used"]["disk_mib"], 150);
+        assert_eq!(
+            value,
+            json!({
+                "watermarks": { "min_store_free_mib": 1024, "min_mem_available_mib": 512 },
+                "used": { "spaces": 1, "disk_mib": 150, "running": 0 },
+            })
+        );
         registry.storage.record(space.id, 30_000 * 1024 * 1024);
         let value = handle(&ctx, Req::Limits, "project-a").unwrap();
         assert_eq!(value["used"]["disk_mib"], 30_000);
@@ -8661,7 +8434,7 @@ mod tests {
             return Ok(false);
         }
         // Stand in only for privileged btrfs/VM host operations. Credential
-        // resolution and all authoritative state/quota checks remain real.
+        // resolution and all authoritative state and capacity checks remain real.
         std::fs::create_dir_all(root.join("spaces"))?;
         std::fs::copy(
             shinu::ckpt_image(root, checkpoint.id),
@@ -9814,22 +9587,6 @@ eval "$(printf '%s' "$1" | sed "s#/etc/hosts#$d/hosts#g")"
         assert!(super::network_members(&state, "project-a", None).is_empty());
     }
 
-    fn test_limits() -> &'static Limits {
-        static LIMITS: LazyLock<Limits> = LazyLock::new(|| Limits {
-            max_spaces: 5,
-            max_disk_mib: 10240,
-            max_vcpus: 16,
-            max_mem_mib: 262_144,
-            max_running: 2,
-            api_per_min: 120,
-        });
-        &LIMITS
-    }
-
-    fn test_rate() -> &'static RateLimiter {
-        static RATE: LazyLock<RateLimiter> = LazyLock::new(RateLimiter::new);
-        &RATE
-    }
     fn test_register_rate() -> &'static super::RegistrationLimiter {
         static RATE: LazyLock<super::RegistrationLimiter> =
             LazyLock::new(super::RegistrationLimiter::new);
@@ -9853,12 +9610,9 @@ eval "$(printf '%s' "$1" | sed "s#/etc/hosts#$d/hosts#g")"
             db,
             vm_cfg,
             net_cfg,
-            limits: test_limits(),
-            rate: test_rate(),
             register_rate: test_register_rate(),
             registry,
             jobs: None,
-            admin_token: None,
         }
     }
     fn snapshot_test_space(id: Uuid, head: Option<Uuid>) -> Space {
@@ -10847,60 +10601,10 @@ eval "$(printf '%s' "$1" | sed "s#/etc/hosts#$d/hosts#g")"
     }
 
     #[test]
-    fn template_capacity_has_project_and_global_boundaries() {
-        let now = Utc::now();
-        let mut project_state = State::default();
-        project_state
-            .templates
-            .extend(
-                (0..(super::TEMPLATE_PROJECT_CAP - 1)).map(|index| Template {
-                    project: "project-a".into(),
-                    name: format!("template-{index}"),
-                    checkpoint: Uuid::nil(),
-                    created_at: now,
-                }),
-            );
-        assert!(super::check_template_capacity(&project_state, "project-a").is_ok());
-        project_state.templates.push(Template {
-            project: "project-a".into(),
-            name: "template-last".into(),
-            checkpoint: Uuid::nil(),
-            created_at: now,
-        });
-        let project_error = super::check_template_capacity(&project_state, "project-a")
-            .expect_err("project cap must reject the next template");
-        assert!(matches!(
-            project_error,
-            shinu::Error::Quota(message)
-                if message == "template limit exceeded: project may retain at most 256 templates"
-        ));
-        assert!(super::check_template_capacity(&project_state, "project-b").is_ok());
-
-        let global_state = State {
-            templates: (0..super::TEMPLATE_GLOBAL_CAP)
-                .map(|index| Template {
-                    project: format!("project-{}", index / super::TEMPLATE_PROJECT_CAP),
-                    name: format!("template-{index}"),
-                    checkpoint: Uuid::nil(),
-                    created_at: now,
-                })
-                .collect(),
-            ..State::default()
-        };
-        let global_error = super::check_template_capacity(&global_state, "project-new")
-            .expect_err("global cap must reject the next template");
-        assert!(matches!(
-            global_error,
-            shinu::Error::Quota(message)
-                if message == "template limit exceeded: host may retain at most 2048 templates"
-        ));
-    }
-
-    #[test]
     fn template_routes_methods_and_bodies_are_explicit() {
         let checkpoint = Uuid::new_v4();
         let collection = super::route("/v1/templates").expect("template collection route");
-        assert!(matches!(&collection, super::Endpoint::Templates));
+        assert!(matches!(&collection, super::Endpoint::Templates(query) if query.is_empty()));
         assert!(super::method_allowed(&collection, "GET"));
         assert!(super::method_allowed(&collection, "POST"));
         assert!(!super::method_allowed(&collection, "DELETE"));
@@ -10926,7 +10630,7 @@ eval "$(printf '%s' "$1" | sed "s#/etc/hosts#$d/hosts#g")"
         ));
 
         let (request, status) = super::request_for(
-            super::route("/v1/templates").expect("list route"),
+            super::route("/v1/templates?after=release").expect("list route"),
             "GET",
             &[],
             None,
@@ -10934,7 +10638,7 @@ eval "$(printf '%s' "$1" | sed "s#/etc/hosts#$d/hosts#g")"
         )
         .expect("list template request");
         assert_eq!(status, 200);
-        assert!(matches!(request, Req::ListTemplates));
+        assert!(matches!(request, Req::ListTemplates { after: Some(name) } if name == "release"));
 
         let (request, status) =
             super::request_for(item, "DELETE", &[], None, None).expect("delete template request");
@@ -10958,7 +10662,7 @@ eval "$(printf '%s' "$1" | sed "s#/etc/hosts#$d/hosts#g")"
 
         assert!(
             super::request_for(
-                super::Endpoint::Templates,
+                super::Endpoint::Templates(String::new()),
                 "POST",
                 br#"{"name":"release","checkpoint":"not-a-uuid"}"#,
                 None,
@@ -10968,7 +10672,7 @@ eval "$(printf '%s' "$1" | sed "s#/etc/hosts#$d/hosts#g")"
         );
         assert!(
             super::request_for(
-                super::Endpoint::Templates,
+                super::Endpoint::Templates(String::new()),
                 "POST",
                 br#"{"name":"Release","checkpoint":"00000000-0000-0000-0000-000000000000"}"#,
                 None,
@@ -11030,74 +10734,20 @@ eval "$(printf '%s' "$1" | sed "s#/etc/hosts#$d/hosts#g")"
     }
 
     #[test]
-    fn project_limit_route_requires_admin_for_mutation() {
-        let root = test_root("project-limit-auth");
+    fn project_limit_routes_are_gone() {
+        let root = test_root("removed-project-limits");
         let db = test_db(&root);
         let registry = registry();
         let (vm_cfg, net_cfg) = test_configs();
-        let mut ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
-        ctx.admin_token = Some("admin-secret");
-
-        let project_token = shinu::token::mint().expect("mint project token");
-        shinu::token::store(
-            &root,
-            &[shinu::token::Token {
-                hash: shinu::token::hash(&project_token),
-                project: "project-a".into(),
-                created_at: Utc::now(),
-            }],
-        )
-        .expect("store project token");
-
-        let endpoint = super::route("/v1/projects/project-a/limits").expect("limits route");
-        assert!(
-            matches!(&endpoint, super::Endpoint::ProjectLimits(project) if project == "project-a")
-        );
-        assert!(super::method_allowed(&endpoint, "GET"));
-        assert!(super::method_allowed(&endpoint, "PATCH"));
-        assert!(super::method_allowed(&endpoint, "DELETE"));
-
-        let body = r#"{"max_spaces":0}"#;
-        let denied = serve_raw(
-            &ctx,
-            &format!(
-                "PATCH /v1/projects/project-a/limits HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {project_token}\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            ),
-        );
-        assert!(denied.starts_with("HTTP/1.1 401"), "response: {denied}");
-        assert!(
-            state::project_limits(&super::lock_db(&db), "project-a")
-                .expect("read denied limits")
-                .is_none()
-        );
-
-        let granted = serve_raw(
-            &ctx,
-            &format!(
-                "PATCH /v1/projects/project-a/limits HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer admin-secret\r\nContent-Length: {}\r\n\r\n{body}",
-                body.len()
-            ),
-        );
-        assert!(granted.starts_with("HTTP/1.1 400"), "response: {granted}");
-        assert!(granted.contains("obsolete"));
-        assert!(
-            state::project_limit_overrides(&super::lock_db(&db), "project-a")
-                .unwrap()
-                .is_none()
-        );
-
-        let cleared = serve_raw(
-            &ctx,
-            "DELETE /v1/projects/project-a/limits HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer admin-secret\r\nContent-Length: 0\r\n\r\n",
-        );
-        assert!(cleared.starts_with("HTTP/1.1 200"), "response: {cleared}");
-        assert!(
-            state::project_limits(&super::lock_db(&db), "project-a")
-                .expect("read cleared limits")
-                .is_none()
-        );
-        std::fs::remove_dir_all(root).expect("remove test root");
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        for method in ["GET", "PATCH", "DELETE"] {
+            let request = format!(
+                "{method} /v1/projects/project-a/limits HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            );
+            let response = serve_raw(&ctx, &request);
+            assert!(response.starts_with("HTTP/1.1 404"), "response: {response}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -11436,13 +11086,33 @@ eval "$(printf '%s' "$1" | sed "s#/etc/hosts#$d/hosts#g")"
     }
 
     #[test]
-    fn rate_limit_rejects_the_request_after_the_boundary() {
-        let rate = RateLimiter::new();
-        assert!(rate.check("project-a", 1).is_ok());
-        let result = rate.check("project-a", 1);
-        assert!(
-            matches!(result, Err(shinu::Error::Quota(message)) if message.contains("rate limit"))
+    fn authenticated_requests_are_not_throttled() {
+        let root = test_root("unthrottled-requests");
+        let db = test_db(&root);
+        let registry = registry();
+        let (vm_cfg, net_cfg) = test_configs();
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        let token = shinu::token::mint().unwrap();
+        shinu::token::store(
+            &root,
+            &[shinu::token::Token {
+                hash: shinu::token::hash(&token),
+                project: "unthrottled-requests".into(),
+                created_at: Utc::now(),
+            }],
+        )
+        .unwrap();
+        let request = format!(
+            "GET /v1/spaces HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n\r\n"
         );
+        for number in 1..=121 {
+            let response = serve_raw(&ctx, &request);
+            assert!(
+                response.starts_with("HTTP/1.1 200"),
+                "request {number}: {response}"
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -11455,68 +11125,116 @@ eval "$(printf '%s' "$1" | sed "s#/etc/hosts#$d/hosts#g")"
     }
 
     #[test]
-    fn effective_limits_prefers_project_override() {
-        let root = test_root("project-limits");
-        let db = test_db(&root);
-        {
-            let connection = db.lock().expect("lock test database");
-            connection
-                .execute(
-                    "INSERT INTO projects(project,max_spaces,max_disk_mib,max_running,api_per_min) VALUES ('project-a',7,99,4,321)",
-                    [],
-                )
-                .expect("insert project limits");
-            connection
-                .execute(
-                    "INSERT INTO projects(project,max_spaces,max_disk_mib,max_running,api_per_min) VALUES ('project-unlimited',0,0,0,0)",
-                    [],
-                )
-                .expect("insert unlimited project limits");
-        }
-        let (vm_cfg, net_cfg) = test_configs();
-        let registry = registry();
-        let global = Limits {
-            max_spaces: 5,
-            max_disk_mib: 10,
-            max_vcpus: 16,
-            max_mem_mib: 262_144,
-            max_running: 2,
-            api_per_min: 120,
-        };
-        let rate = RateLimiter::new();
-        let ctx = super::Ctx {
-            root: &root,
-            db: &db,
-            vm_cfg: &vm_cfg,
-            net_cfg: &net_cfg,
-            limits: &global,
-            rate: &rate,
-            register_rate: test_register_rate(),
-            registry: &registry,
-            jobs: None,
-            admin_token: None,
-        };
-        let override_limits = super::effective_limits(&ctx, "project-a").expect("override");
-        assert_eq!(override_limits.max_spaces, 0);
-        assert_eq!(override_limits.max_disk_mib, 0);
-        assert_eq!(override_limits.api_per_min, 321);
-        let default_limits = super::effective_limits(&ctx, "project-b").expect("default");
-        assert_eq!(default_limits.max_spaces, 0);
-        assert_eq!(default_limits.max_disk_mib, 0);
-        assert_eq!(default_limits.max_vcpus, 16);
-        assert_eq!(default_limits.max_mem_mib, 262_144);
-        let unlimited_limits =
-            super::effective_limits(&ctx, "project-unlimited").expect("unlimited override");
-        assert_eq!(unlimited_limits.max_spaces, 0);
-        assert_eq!(unlimited_limits.max_disk_mib, 0);
-        assert_eq!(unlimited_limits.max_running, 0);
-        assert_eq!(unlimited_limits.api_per_min, 0);
-        assert!(
-            RateLimiter::new()
-                .check("project-unlimited", unlimited_limits.api_per_min)
-                .is_ok()
+    fn resize_accepts_large_representable_guest_sizes_but_not_zero() {
+        let root = test_root("resize-without-sizing-caps");
+        let space = snapshot_test_space(Uuid::new_v4(), None);
+        let name = space.name.clone();
+        store_state(
+            &root,
+            &State {
+                spaces: vec![space],
+                ..State::default()
+            },
         );
-        std::fs::remove_dir_all(root).expect("remove test root");
+        let db = test_db(&root);
+        let registry = registry();
+        let (vm_cfg, net_cfg) = test_configs();
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        let resize = |vcpus, mem_mib| {
+            handle(
+                &ctx,
+                Req::Resize {
+                    space: name.clone(),
+                    vcpus: Some(Some(vcpus)),
+                    mem_mib: Some(Some(mem_mib)),
+                    disk_mib: None,
+                    readiness: None,
+                },
+                "project-a",
+            )
+        };
+        let resized = resize(32, 300_000).unwrap();
+        assert_eq!(resized["vcpus"], 32);
+        assert_eq!(resized["mem_mib"], 300_000);
+        assert!(
+            matches!(resize(0, 300_000), Err(shinu::Error::Invalid(message)) if message.contains("vcpus"))
+        );
+        assert!(
+            matches!(resize(32, 0), Err(shinu::Error::Invalid(message)) if message.contains("mem_mib"))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn detached_job_submission_ignores_old_counts_and_keeps_the_listing_bounded() {
+        let root = test_root("jobs-without-count-caps");
+        let space = snapshot_test_space(Uuid::new_v4(), None);
+        let space_id = space.id;
+        let name = space.name.clone();
+        store_state(
+            &root,
+            &State {
+                spaces: vec![space],
+                ..State::default()
+            },
+        );
+        let db = Arc::new(test_db(&root));
+        let mut registry = registry();
+        // Prevent guest launch at the real admission seam, not with a fake VM.
+        registry.storage.policy.watermarks.min_mem_available_mib = u64::MAX;
+        let registry = Arc::new(registry);
+        let (vm_cfg, net_cfg) = test_configs();
+        let mut ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        ctx.jobs = Some(super::JobRuntime::new(
+            Arc::new(root.clone()),
+            Arc::clone(&db),
+            Arc::clone(&registry),
+        ));
+        {
+            let connection = super::lock_db(&db);
+            let tx = connection.unchecked_transaction().unwrap();
+            let mut job = state::Job {
+                id: Uuid::nil(),
+                project: "project-a".into(),
+                space: space_id,
+                command: vec!["true".into()],
+                state: state::JobState::Starting,
+                created_at: Utc::now(),
+                started_at: None,
+                finished_at: None,
+                exit_code: None,
+                error: None,
+                log_bytes: 0,
+                log_truncated: false,
+            };
+            for number in 1..=8192 {
+                job.id = Uuid::from_u128(number);
+                state::insert_job(&tx, &job).unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let submitted = handle(
+            &ctx,
+            Req::SubmitJob {
+                space: name,
+                cmd: vec!["true".into()],
+                stdin: None,
+            },
+            "project-a",
+        )
+        .unwrap();
+        assert_eq!(submitted["state"], "lost");
+        assert!(
+            submitted["error"]
+                .as_str()
+                .unwrap()
+                .contains("capacity_watermark")
+        );
+        let jobs = handle(&ctx, Req::ListJobs, "project-a").unwrap();
+        assert_eq!(jobs["jobs"].as_array().unwrap().len(), 64);
+        assert_eq!(jobs["truncated"], true);
+        assert_eq!(jobs["jobs"][0]["id"], submitted["id"]);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -11830,9 +11548,8 @@ eval "$(printf '%s' "$1" | sed "s#/etc/hosts#$d/hosts#g")"
         std::fs::remove_dir_all(root).expect("remove test root");
     }
 
-    /// Concurrent growth is no longer rejected by a historical project quota.
     #[test]
-    fn resize_preserves_concurrent_growth_without_project_quota() {
+    fn resize_preserves_concurrent_growth_of_a_sibling_space() {
         let root = test_root("resize-recheck");
         let project = "project-a";
         let target = Uuid::new_v4();
@@ -11877,31 +11594,8 @@ eval "$(printf '%s' "$1" | sed "s#/etc/hosts#$d/hosts#g")"
         let (vm_cfg, net_cfg) = test_configs();
         let registry = Arc::new(registry());
         let db = Arc::new(test_db(&root));
-        // 20 MiB declared, 50 MiB cap: growing target to 30 passes the pre-check
-        // against 10+10, but 30+30 exceeds the cap once the sibling commits.
-        let limits = Limits {
-            max_spaces: 5,
-            max_disk_mib: 50,
-            max_vcpus: 16,
-            max_mem_mib: 262_144,
-            max_running: 2,
-            api_per_min: 120,
-        };
-        let rate = RateLimiter::new();
-        let register_rate = super::RegistrationLimiter::new();
-        let ctx = super::Ctx {
-            root: &root,
-            db: &db,
-            vm_cfg: &vm_cfg,
-            net_cfg: &net_cfg,
-            limits: &limits,
-            rate: &rate,
-            register_rate: &register_rate,
-            registry: &registry,
-            jobs: None,
-            admin_token: None,
-        };
-        // Committed only after resize_space has already cleared its pre-check.
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        // The sibling commits while the target has released the state lock.
         let grow_sibling = {
             let db = Arc::clone(&db);
             let registry = Arc::clone(&registry);
@@ -11931,10 +11625,11 @@ eval "$(printf '%s' "$1" | sed "s#/etc/hosts#$d/hosts#g")"
                 project,
             )
         });
-        assert!(
-            result.is_ok(),
-            "historical project disk cap must not reject resize: {result:?}"
-        );
+        assert_eq!(result.unwrap()["disk_mib"], 30);
+        let listing = handle(&ctx, Req::Ls, project).unwrap();
+        let spaces = listing["spaces"].as_array().unwrap();
+        assert_eq!(spaces.len(), 2);
+        assert!(spaces.iter().all(|space| space["disk_mib"] == 30));
         std::fs::remove_dir_all(root).expect("remove test root");
     }
 
@@ -12006,6 +11701,73 @@ eval "$(printf '%s' "$1" | sed "s#/etc/hosts#$d/hosts#g")"
         );
 
         std::fs::remove_dir_all(root).expect("remove test root");
+    }
+
+    #[test]
+    fn removing_space_continues_after_a_failed_job_log_and_retries_it() {
+        let root = test_root("rm-job-log-failure");
+        let space = snapshot_test_space(Uuid::new_v4(), None);
+        let image = shinu::space_image(&root, space.id);
+        std::fs::create_dir_all(image.parent().unwrap()).unwrap();
+        std::fs::write(&image, b"disk").unwrap();
+        let space_id = space.id;
+        let project = space.project.clone();
+        let name = space.name.clone();
+        store_state(
+            &root,
+            &State {
+                spaces: vec![space],
+                ..State::default()
+            },
+        );
+        let db = Arc::new(test_db(&root));
+        let registry = Arc::new(registry());
+        let (vm_cfg, net_cfg) = test_configs();
+        let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
+        let terminal = |id| state::Job {
+            id,
+            project: project.clone(),
+            space: space_id,
+            command: vec!["true".into()],
+            state: state::JobState::Exited,
+            created_at: Utc::now(),
+            started_at: None,
+            finished_at: Some(Utc::now()),
+            exit_code: Some(0),
+            error: None,
+            log_bytes: 1,
+            log_truncated: false,
+        };
+        let blocked = terminal(Uuid::from_u128(1));
+        let removable = terminal(Uuid::from_u128(2));
+        let blocked_log = shinu::job_log_path(&root, blocked.id);
+        let removable_log = shinu::job_log_path(&root, removable.id);
+        std::fs::create_dir_all(&blocked_log).unwrap();
+        std::fs::write(&removable_log, b"x").unwrap();
+        {
+            let conn = super::lock_db(&db);
+            state::insert_job(&conn, &blocked).unwrap();
+            state::insert_job(&conn, &removable).unwrap();
+        }
+        assert!(handle(&ctx, Req::Rm { space: name }, &project).is_err());
+        assert!(
+            !image.exists(),
+            "job-log cleanup must not abort Space cleanup"
+        );
+        assert!(
+            !removable_log.exists(),
+            "one broken log must not skip later logs"
+        );
+
+        std::fs::remove_dir(&blocked_log).unwrap();
+        std::fs::write(&blocked_log, b"x").unwrap();
+        let reopened = Arc::new(test_db(&root));
+        super::JobRuntime::new(Arc::new(root.clone()), reopened, registry).purge_retention();
+        assert!(
+            !blocked_log.exists(),
+            "retention must retry the failed unlink"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -12237,7 +11999,8 @@ eval "$(printf '%s' "$1" | sed "s#/etc/hosts#$d/hosts#g")"
         let (vm_cfg, net_cfg) = test_configs();
         let registry = registry();
         let ctx = daemon_ctx(&root, &db, &vm_cfg, &net_cfg, &registry);
-        let listed = handle(&ctx, Req::ListTemplates, project).expect("list templates");
+        let listed =
+            handle(&ctx, Req::ListTemplates { after: None }, project).expect("list templates");
         let names = listed["templates"]
             .as_array()
             .expect("template array")
@@ -12249,8 +12012,8 @@ eval "$(printf '%s' "$1" | sed "s#/etc/hosts#$d/hosts#g")"
     }
 
     #[test]
-    fn template_creation_enforces_project_cap_transactionally() {
-        let root = test_root("template-project-cap");
+    fn templates_can_exceed_old_caps_and_are_listed_in_pages() {
+        let root = test_root("template-pagination");
         let project = "project-a";
         let checkpoint_id = Uuid::new_v4();
         let now = Utc::now();
@@ -12272,10 +12035,10 @@ eval "$(printf '%s' "$1" | sed "s#/etc/hosts#$d/hosts#g")"
                 mem_mib: None,
                 disk_mib: None,
             }],
-            templates: (0..super::TEMPLATE_PROJECT_CAP)
+            templates: (0..2048)
                 .map(|index| Template {
                     project: project.into(),
-                    name: format!("template-{index}"),
+                    name: format!("template-{index:04}"),
                     checkpoint: checkpoint_id,
                     created_at: now,
                 })
@@ -12294,20 +12057,32 @@ eval "$(printf '%s' "$1" | sed "s#/etc/hosts#$d/hosts#g")"
             },
             project,
         );
-        assert!(matches!(
-            result,
-            Err(shinu::Error::Quota(message))
-                if message == "template limit exceeded: project may retain at most 256 templates"
-        ));
-        let after = super::snapshot(&db, &registry).expect("read state after cap refusal");
-        assert_eq!(after.templates.len(), super::TEMPLATE_PROJECT_CAP);
         assert!(
-            after
-                .templates
-                .iter()
-                .all(|template| template.name != "template-next")
+            result.is_ok(),
+            "old template counts must not block creation: {result:?}"
         );
-        std::fs::remove_dir_all(root).expect("remove template cap test root");
+        let mut after = None;
+        let mut count = 0;
+        loop {
+            let page = handle(&ctx, Req::ListTemplates { after }, project).unwrap();
+            let templates = page["templates"].as_array().unwrap();
+            assert!(templates.len() <= 64);
+            for template in templates {
+                let expected = if count == 2048 {
+                    "template-next".to_owned()
+                } else {
+                    format!("template-{count:04}")
+                };
+                assert_eq!(template["name"], expected);
+                count += 1;
+            }
+            let Some(next) = page["next"].as_str() else {
+                break;
+            };
+            after = Some(next.to_owned());
+        }
+        assert_eq!(count, 2049);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -12438,13 +12213,15 @@ eval "$(printf '%s' "$1" | sed "s#/etc/hosts#$d/hosts#g")"
         .expect("create same template name in another project");
         assert_eq!(foreign_created["name"], "release");
         assert_eq!(
-            handle(&ctx, Req::ListTemplates, project).expect("list project templates")["templates"]
+            handle(&ctx, Req::ListTemplates { after: None }, project)
+                .expect("list project templates")["templates"]
                 .as_array()
                 .expect("template list"),
             &vec![created]
         );
         assert_eq!(
-            handle(&ctx, Req::ListTemplates, "project-c").expect("list foreign project")["templates"],
+            handle(&ctx, Req::ListTemplates { after: None }, "project-c")
+                .expect("list foreign project")["templates"],
             serde_json::json!([])
         );
         let hidden_delete = handle(
@@ -13277,13 +13054,6 @@ eval "$(printf '%s' "$1" | sed "s#/etc/hosts#$d/hosts#g")"
                     created_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL
                 );
-                CREATE TABLE projects (
-                    project TEXT PRIMARY KEY,
-                    max_spaces INTEGER,
-                    max_disk_mib INTEGER,
-                    max_running INTEGER,
-                    api_per_min INTEGER
-                );
                 ",
             )
             .expect("create console schema");
@@ -13315,12 +13085,9 @@ eval "$(printf '%s' "$1" | sed "s#/etc/hosts#$d/hosts#g")"
             db,
             vm_cfg: &VM_CONFIG,
             net_cfg: &NET_CONFIG,
-            limits: test_limits(),
-            rate: test_rate(),
             register_rate: test_register_rate(),
             registry,
             jobs: None,
-            admin_token: None,
         }
     }
 

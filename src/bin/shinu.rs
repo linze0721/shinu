@@ -222,9 +222,8 @@ enum Command {
         #[command(subcommand)]
         command: JobCommand,
     },
+    /// Show host capacity watermarks and current project usage.
     Limits {
-        #[command(subcommand)]
-        command: Option<LimitsCommand>,
         #[arg(long)]
         json: bool,
     },
@@ -250,6 +249,9 @@ enum TemplateCommand {
         commit: Uuid,
     },
     Ls {
+        /// Continue after a template name from the previous page.
+        #[arg(long)]
+        after: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -295,26 +297,6 @@ enum JobCommand {
     Cancel {
         #[arg(value_name = "UUID")]
         id: Uuid,
-    },
-}
-
-#[derive(Subcommand)]
-enum LimitsCommand {
-    Set {
-        project: String,
-        #[arg(long, value_name = "N|unlimited")]
-        spaces: Option<String>,
-        #[arg(long, value_name = "N|unlimited")]
-        disk_mib: Option<String>,
-        #[arg(long, value_name = "N|unlimited")]
-        running: Option<String>,
-        #[arg(long, value_name = "N|unlimited")]
-        api_per_min: Option<String>,
-        #[arg(long, value_name = "FIELD", value_delimiter = ',')]
-        inherit: Vec<String>,
-    },
-    Clear {
-        project: String,
     },
 }
 
@@ -955,123 +937,6 @@ fn resize_space_body(
     Ok(Value::Object(object))
 }
 
-fn parse_limit_u32(raw: &str, field: &str) -> Result<u32, String> {
-    if raw.trim().eq_ignore_ascii_case("unlimited") {
-        Ok(0)
-    } else {
-        raw.trim().parse::<u32>().map_err(|error| {
-            format!("--{field} must be a non-negative integer or unlimited: {error}")
-        })
-    }
-}
-
-fn parse_limit_u64(raw: &str, field: &str) -> Result<u64, String> {
-    if raw.trim().eq_ignore_ascii_case("unlimited") {
-        Ok(0)
-    } else {
-        raw.trim().parse::<u64>().map_err(|error| {
-            format!("--{field} must be a non-negative integer or unlimited: {error}")
-        })
-    }
-}
-
-fn inherit_requested(fields: &[String], field: &str) -> Result<bool, String> {
-    let mut found = false;
-    for requested in fields {
-        if !matches!(
-            requested.as_str(),
-            "spaces" | "disk-mib" | "running" | "api-per-min"
-        ) {
-            return Err(format!(
-                "--inherit field must be one of: spaces, disk-mib, running, api-per-min (got {requested})"
-            ));
-        }
-        if requested == field {
-            if found {
-                return Err(format!("--inherit {field} was specified more than once"));
-            }
-            found = true;
-        }
-    }
-    Ok(found)
-}
-
-fn limits_set_body(
-    spaces: Option<String>,
-    disk_mib: Option<String>,
-    running: Option<String>,
-    api_per_min: Option<String>,
-    inherit: &[String],
-) -> Result<Value, String> {
-    let spaces_inherit = inherit_requested(inherit, "spaces")?;
-    let disk_inherit = inherit_requested(inherit, "disk-mib")?;
-    let running_inherit = inherit_requested(inherit, "running")?;
-    let api_inherit = inherit_requested(inherit, "api-per-min")?;
-    let mut object = serde_json::Map::new();
-    let mut fields = 0;
-
-    if let Some(raw) = spaces {
-        if spaces_inherit {
-            return Err("--spaces and --inherit spaces cannot be combined".into());
-        }
-        object.insert(
-            "max_spaces".into(),
-            Value::from(parse_limit_u32(&raw, "spaces")?),
-        );
-        fields += 1;
-    } else if spaces_inherit {
-        object.insert("max_spaces".into(), Value::Null);
-        fields += 1;
-    }
-
-    if let Some(raw) = disk_mib {
-        if disk_inherit {
-            return Err("--disk-mib and --inherit disk-mib cannot be combined".into());
-        }
-        object.insert(
-            "max_disk_mib".into(),
-            Value::from(parse_limit_u64(&raw, "disk-mib")?),
-        );
-        fields += 1;
-    } else if disk_inherit {
-        object.insert("max_disk_mib".into(), Value::Null);
-        fields += 1;
-    }
-
-    if let Some(raw) = running {
-        if running_inherit {
-            return Err("--running and --inherit running cannot be combined".into());
-        }
-        object.insert(
-            "max_running".into(),
-            Value::from(parse_limit_u32(&raw, "running")?),
-        );
-        fields += 1;
-    } else if running_inherit {
-        object.insert("max_running".into(), Value::Null);
-        fields += 1;
-    }
-
-    if let Some(raw) = api_per_min {
-        if api_inherit {
-            return Err("--api-per-min and --inherit api-per-min cannot be combined".into());
-        }
-        object.insert(
-            "api_per_min".into(),
-            Value::from(parse_limit_u32(&raw, "api-per-min")?),
-        );
-        fields += 1;
-    } else if api_inherit {
-        object.insert("api_per_min".into(), Value::Null);
-        fields += 1;
-    }
-
-    if fields == 0 {
-        return Err("limits set requires at least one limit flag or --inherit field".to_string());
-    }
-    Ok(Value::Object(object))
-}
-
 fn run_command(client: &Client, command: Command) -> Result<i32, String> {
     match command {
         Command::New {
@@ -1458,61 +1323,13 @@ fi"#
                 print_usage(&response_value_from_body(&body)?);
             }
         }
-        Command::Limits {
-            command: None,
-            json,
-        } => {
+        Command::Limits { json } => {
             let response = request_json(client, "GET", "/v1/limits", None)?;
             let body = successful_body(response)?;
             if json {
                 print_raw_json(&body)?;
             } else {
                 print_limits(&response_value_from_body(&body)?);
-            }
-        }
-        Command::Limits {
-            command:
-                Some(LimitsCommand::Set {
-                    project,
-                    spaces,
-                    disk_mib,
-                    running,
-                    api_per_min,
-                    inherit,
-                }),
-            json,
-        } => {
-            let path = format!("/v1/projects/{}/limits", encode_path_segment(&project));
-            let response = request_json(
-                client,
-                "PATCH",
-                &path,
-                Some(limits_set_body(
-                    spaces,
-                    disk_mib,
-                    running,
-                    api_per_min,
-                    &inherit,
-                )?),
-            )?;
-            let body = successful_body(response)?;
-            if json {
-                print_raw_json(&body)?;
-            } else {
-                print_limits(&response_value_from_body(&body)?);
-            }
-        }
-        Command::Limits {
-            command: Some(LimitsCommand::Clear { project }),
-            json,
-        } => {
-            let path = format!("/v1/projects/{}/limits", encode_path_segment(&project));
-            let response = request_json(client, "DELETE", &path, None)?;
-            let body = successful_body(response)?;
-            if json {
-                print_raw_json(&body)?;
-            } else {
-                println!("cleared limits for {project}");
             }
         }
         Command::Template { command } => match command {
@@ -1529,13 +1346,25 @@ fi"#
                     field_text(&data, "checkpoint")
                 );
             }
-            TemplateCommand::Ls { json } => {
-                let response = request_json(client, "GET", "/v1/templates", None)?;
+            TemplateCommand::Ls { json, after } => {
+                let path = after
+                    .as_deref()
+                    .map(|name| format!("/v1/templates?after={}", encode_path_segment(name)));
+                let response = request_json(
+                    client,
+                    "GET",
+                    path.as_deref().unwrap_or("/v1/templates"),
+                    None,
+                )?;
                 let body = successful_body(response)?;
                 if json {
                     print_raw_json(&body)?;
                 } else {
-                    print_templates(&response_value_from_body(&body)?);
+                    let data = response_value_from_body(&body)?;
+                    print_templates(&data);
+                    if let Some(next) = data.get("next").and_then(Value::as_str) {
+                        eprintln!("Next page: shinu template ls --after {next}");
+                    }
                 }
             }
             TemplateCommand::Rm { name } => {
@@ -1614,30 +1443,24 @@ fn print_usage(data: &Value) {
 }
 
 fn print_limits(data: &Value) {
+    let watermarks = data.get("watermarks").unwrap_or(&Value::Null);
     let used = data.get("used").unwrap_or(&Value::Null);
     println!(
-        "spaces: {}/{}",
-        value_u64(used.get("spaces")).unwrap_or(0),
-        value_u64(data.get("max_spaces")).unwrap_or(0)
+        "min_store_free_mib: {}",
+        human_mib(watermarks.get("min_store_free_mib"))
     );
     println!(
-        "max_vcpus: {}",
-        value_u64(data.get("max_vcpus")).unwrap_or(0)
-    );
-    println!("max_mem_mib: {}", human_mib(data.get("max_mem_mib")));
-    println!(
-        "disk_mib: {}/{}",
-        value_u64(used.get("disk_mib")).unwrap_or(0),
-        value_u64(data.get("max_disk_mib")).unwrap_or(0)
+        "min_mem_available_mib: {}",
+        human_mib(watermarks.get("min_mem_available_mib"))
     );
     println!(
-        "running: {}/{}",
-        value_u64(used.get("running")).unwrap_or(0),
-        value_u64(data.get("max_running")).unwrap_or(0)
+        "used.spaces: {}",
+        value_u64(used.get("spaces")).unwrap_or(0)
     );
+    println!("used.disk_mib: {}", human_mib(used.get("disk_mib")));
     println!(
-        "api_per_min: {}",
-        value_u64(data.get("api_per_min")).unwrap_or(0)
+        "used.running: {}",
+        value_u64(used.get("running")).unwrap_or(0)
     );
 }
 
@@ -2406,12 +2229,15 @@ mod tests {
             _ => panic!("unexpected command parsed"),
         }
 
-        let cli = Cli::try_parse_from(["shinu", "template", "ls", "--json"])
+        let cli = Cli::try_parse_from(["shinu", "template", "ls", "--json", "--after", "release"])
             .expect("parse template JSON list");
         match cli.command {
             Command::Template {
-                command: TemplateCommand::Ls { json },
-            } => assert!(json),
+                command: TemplateCommand::Ls { json, after },
+            } => {
+                assert!(json);
+                assert_eq!(after.as_deref(), Some("release"));
+            }
             _ => panic!("unexpected command parsed"),
         }
     }
@@ -2648,66 +2474,11 @@ mod tests {
     }
 
     #[test]
-    fn limits_set_body_maps_unlimited_and_inherit() {
-        let inherit = vec!["disk-mib".to_owned()];
-        let body = limits_set_body(
-            Some("unlimited".into()),
-            None,
-            Some("3".into()),
-            None,
-            &inherit,
-        )
-        .expect("limit payload");
-        assert_eq!(
-            body,
-            json!({
-                "max_spaces": 0,
-                "max_disk_mib": null,
-                "max_running": 3
-            })
-        );
-    }
-
-    #[test]
-    fn limits_set_body_requires_a_change_and_rejects_conflicts() {
-        assert!(limits_set_body(None, None, None, None, &[]).is_err());
-        let inherit = vec!["spaces".to_owned()];
-        assert!(limits_set_body(Some("4".into()), None, None, None, &inherit).is_err());
-    }
-
-    #[test]
-    fn parses_nested_limits_set_command() {
-        let cli = Cli::try_parse_from([
-            "shinu",
-            "limits",
-            "set",
-            "project-a",
-            "--spaces",
-            "unlimited",
-            "--inherit",
-            "disk-mib",
-        ])
-        .expect("parse limits set command");
-        match cli.command {
-            Command::Limits {
-                command:
-                    Some(LimitsCommand::Set {
-                        project,
-                        spaces,
-                        disk_mib,
-                        inherit,
-                        ..
-                    }),
-                json,
-            } => {
-                assert_eq!(project, "project-a");
-                assert_eq!(spaces.as_deref(), Some("unlimited"));
-                assert!(disk_mib.is_none());
-                assert_eq!(inherit, vec!["disk-mib"]);
-                assert!(!json);
-            }
-            _ => panic!("unexpected command parsed"),
-        }
+    fn limits_is_read_only_and_accepts_json() {
+        let cli = Cli::try_parse_from(["shinu", "limits", "--json"]).unwrap();
+        assert!(matches!(cli.command, Command::Limits { json: true }));
+        assert!(Cli::try_parse_from(["shinu", "limits", "set", "project-a"]).is_err());
+        assert!(Cli::try_parse_from(["shinu", "limits", "clear", "project-a"]).is_err());
     }
 
     #[test]

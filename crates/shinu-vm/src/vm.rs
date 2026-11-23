@@ -2267,58 +2267,125 @@ fn signal(pid: u32, sig: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Total budget of one SSH readiness wait (the former 600 × 50 ms polls).
 const READY_WAIT: Duration = Duration::from_secs(30);
-/// Longest wait for the banner on a connection the guest already accepted.
 const PROBE_BANNER_WAIT: Duration = Duration::from_secs(10);
+const READY_MAX_SECS: u32 = 180;
 
-/// True once the guest's sshd is ready to serve on `port`.
-///
-/// A successful vsock CONNECT only proves that the bridge accepts a socket.
-/// Requiring the SSH identification line makes readiness match the service
-/// that execution actually uses.
-fn probe(uds: &Path, port: u16, deadline: Instant) -> bool {
-    use std::io::{Read, Write};
-    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(uds) else {
-        return false;
+struct SshReadyBudget {
+    total: Duration,
+    banner_idle: Duration,
+}
+
+impl SshReadyBudget {
+    const BASELINE: Self = Self {
+        total: READY_WAIT,
+        banner_idle: PROBE_BANNER_WAIT,
     };
-    if stream
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .is_err()
-        || stream
-            .write_all(format!("CONNECT {port}\n").as_bytes())
-            .is_err()
-    {
-        return false;
-    }
-    // Read one byte at a time so the handshake read cannot consume the SSH banner.
-    let line = |stream: &mut std::os::unix::net::UnixStream| -> Option<Vec<u8>> {
-        let mut out = Vec::new();
-        let mut byte = [0u8; 1];
-        while out.len() < 256 {
-            match stream.read(&mut byte) {
-                Ok(0) | Err(_) => return None,
-                Ok(_) if byte[0] == b'\n' => return Some(out),
-                Ok(_) => out.push(byte[0]),
-            }
+
+    fn restored(load_and_thaw: Duration, cap: Duration) -> Self {
+        let total = load_and_thaw
+            .saturating_mul(2)
+            .clamp(READY_WAIT, cap.max(READY_WAIT));
+        Self {
+            total,
+            // A silent connection still leaves time to retry another sshd fork.
+            banner_idle: load_and_thaw.clamp(PROBE_BANNER_WAIT, total / 2),
         }
-        Some(out)
-    };
-    let Some(reply) = line(&mut stream) else {
-        return false;
-    };
-    if !reply.starts_with(b"OK ") {
-        return false;
     }
-    // The guest accepted: sshd is being forked for this very connection, so
-    // wait for its banner instead of dropping it and forking another.
-    let banner_wait = deadline
-        .saturating_duration_since(Instant::now())
-        .min(PROBE_BANNER_WAIT);
-    if banner_wait.is_zero() || stream.set_read_timeout(Some(banner_wait)).is_err() {
-        return false;
+}
+
+#[derive(Debug)]
+enum SshProbeError {
+    Transport(&'static str, Error),
+    VsockMissing,
+    VmExited,
+    Refused,
+    BannerTimeout(usize),
+    BannerEof(usize),
+    InvalidBanner,
+}
+
+impl std::fmt::Display for SshProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Transport(stage, error) => write!(f, "{stage}: {error}"),
+            Self::VsockMissing => f.write_str("vsock socket did not appear"),
+            Self::VmExited => f.write_str("Firecracker exited"),
+            Self::Refused => f.write_str("vsock CONNECT refused"),
+            Self::BannerTimeout(bytes) => write!(f, "SSH banner timed out after {bytes} bytes"),
+            Self::BannerEof(bytes) => write!(f, "SSH banner connection closed after {bytes} bytes"),
+            Self::InvalidBanner => f.write_str("invalid SSH banner"),
+        }
     }
-    line(&mut stream).is_some_and(|banner| banner.starts_with(b"SSH-"))
+}
+
+/// CONNECT is progress, not readiness: wait on that connection for sshd to
+/// identify itself. New banner bytes refresh the stall timer, never the total.
+fn probe(
+    uds: &Path,
+    deadline: Instant,
+    banner_idle: Duration,
+) -> std::result::Result<(), SshProbeError> {
+    let handshake_deadline = deadline.min(Instant::now() + Duration::from_millis(500));
+    let mut transport = ReadyTransport::connect(uds, handshake_deadline)
+        .map_err(|error| SshProbeError::Transport("vsock connect", error))?;
+    let handshake_error = |error| SshProbeError::Transport("vsock CONNECT handshake", error);
+    transport
+        .write(b"CONNECT 2222\n")
+        .map_err(handshake_error)?;
+    let reply = transport.line().map_err(handshake_error)?;
+    if !reply.starts_with("OK ") {
+        return Err(SshProbeError::Refused);
+    }
+
+    let ReadyTransport {
+        mut stream,
+        mut buffer,
+        ..
+    } = transport;
+    let banner_io = |error: std::io::Error| SshProbeError::Transport("SSH banner", error.into());
+    stream.set_nonblocking(false).map_err(banner_io)?;
+    let mut length = 0;
+    let mut stall_deadline = deadline.min(Instant::now() + banner_idle);
+    while length < buffer.len() {
+        let remaining = stall_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(SshProbeError::BannerTimeout(length));
+        }
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(banner_io)?;
+        match stream.read(&mut buffer[length..]) {
+            Ok(0) => return Err(SshProbeError::BannerEof(length)),
+            Ok(count) => {
+                let now = Instant::now();
+                if now >= stall_deadline {
+                    return Err(SshProbeError::BannerTimeout(length));
+                }
+                let has_newline = buffer[length..length + count].contains(&b'\n');
+                length += count;
+                if has_newline {
+                    return if buffer[..length].starts_with(b"SSH-") {
+                        Ok(())
+                    } else {
+                        Err(SshProbeError::InvalidBanner)
+                    };
+                }
+                stall_deadline = deadline.min(now + banner_idle);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(SshProbeError::BannerTimeout(length));
+            }
+            Err(error) => return Err(banner_io(error)),
+        }
+    }
+    Err(SshProbeError::InvalidBanner)
 }
 fn link_resource(src: &Path, dst: &Path) -> Result<()> {
     if dst.exists() {
@@ -2615,36 +2682,52 @@ fn clean_jail(dir: &Path) -> Result<()> {
 }
 
 fn wait_ready(dir: &Path, vsock: &Path) -> bool {
-    wait_ready_observed(dir, vsock, |_, _, _| {})
+    wait_ready_observed(dir, vsock, SshReadyBudget::BASELINE, |_, _, _| {}).is_ok()
 }
 
-/// `wait_ready` reporting each SSH banner probe (1-based attempt, duration,
-/// success); every probe makes the guest fork socat and sshd work. Only a
-/// failed connection (no socket yet, CONNECT refused, EOF) is retried, every
-/// 50 ms; an accepted one waits for its banner. All within `READY_WAIT`.
+#[derive(Debug)]
+struct SshReadyFailure {
+    elapsed: Duration,
+    probes: usize,
+    last_error: SshProbeError,
+}
+
+/// Observe each probe with a single absolute deadline spanning all retries.
 fn wait_ready_observed(
     dir: &Path,
     vsock: &Path,
-    mut probed: impl FnMut(usize, Duration, bool),
-) -> bool {
-    let deadline = Instant::now() + READY_WAIT;
-    let mut attempt = 0;
+    budget: SshReadyBudget,
+    mut report: impl FnMut(usize, Duration, bool),
+) -> std::result::Result<(), SshReadyFailure> {
+    let started = Instant::now();
+    let deadline = started + budget.total;
+    let mut probes = 0;
+    let mut last_error = SshProbeError::VsockMissing;
     while Instant::now() < deadline {
         if vsock.exists() {
-            attempt += 1;
+            probes += 1;
             let started = Instant::now();
-            let ready = probe(vsock, shinu_core::VSOCK_SSH_PORT, deadline);
-            probed(attempt, started.elapsed(), ready);
-            if ready {
-                return true;
+            let result = probe(vsock, deadline, budget.banner_idle);
+            report(probes, started.elapsed(), result.is_ok());
+            match result {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = error,
             }
         }
         if !is_running(dir) {
+            if probes == 0 {
+                last_error = SshProbeError::VmExited;
+            }
             break;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        std::thread::sleep(remaining.min(Duration::from_millis(50)));
     }
-    false
+    Err(SshReadyFailure {
+        elapsed: started.elapsed(),
+        probes,
+        last_error,
+    })
 }
 
 /// Per-Space boot choices. Absent CPU/memory inherit the daemon defaults;
@@ -3261,6 +3344,7 @@ pub fn start(
                 track_dirty,
                 restore.is_some_and(|files| files.anon_holes),
             );
+            let load_started = Instant::now();
             if api_with_timeout(
                 &dir,
                 "PUT",
@@ -3272,6 +3356,7 @@ pub fn start(
             {
                 return Err(Error::Internal("failed to load VM snapshot".into()));
             }
+            let load_elapsed = load_started.elapsed();
             // The private mapping keeps the inode alive. New hot captures must
             // create fresh files, never truncate a linked checkpoint inode.
             std::fs::remove_file(jail.join(JAIL_SNAP_MEM))?;
@@ -3289,7 +3374,14 @@ pub fn start(
                 touch(&dir)?;
                 return Ok((vsock, true));
             }
-            finish_restore(root, id, readiness, net_cfg, &mut network_ready)?;
+            finish_restore(
+                root,
+                id,
+                readiness,
+                net_cfg,
+                load_elapsed,
+                &mut network_ready,
+            )?;
         } else {
             ready()?;
         }
@@ -3343,23 +3435,46 @@ fn finish_restore(
     id: Uuid,
     readiness: Option<&ReadySpec>,
     net_cfg: &NetConfig,
+    load_or_resume: Duration,
     network_ready: &mut impl FnMut(Instant) -> Result<()>,
 ) -> Result<()> {
     let dir = shinu_core::vm_dir(root, id);
     let net = crate::net::net_spec(id, net_cfg);
     let vsock = vsock_path(&dir);
+    let mut thaw_elapsed = Duration::ZERO;
     restore_transaction(|step| {
         let started = Instant::now();
-        let result = restore_step(
-            &dir,
-            id,
-            step,
-            readiness,
-            net_cfg,
-            net.as_ref(),
-            &vsock,
-            network_ready,
-        );
+        let result = match step {
+            RestoreStep::Quarantine | RestoreStep::Load => Ok(()),
+            // Reassert TAP policy while the guest thaws, but do not count it
+            // toward the guest's load estimate or expose the TAP yet.
+            RestoreStep::Thaw => std::thread::scope(|scope| {
+                let policy =
+                    scope.spawn(|| reassert_tap_policy(id, net_cfg, &[], TapSetup::Existing));
+                let thaw_started = Instant::now();
+                let thawed = thaw_snapshot(&dir);
+                thaw_elapsed = thaw_started.elapsed();
+                let policy = policy
+                    .join()
+                    .unwrap_or_else(|_| Err(Error::Internal("TAP policy worker panicked".into())));
+                combine_snapshot_results(thawed, policy)
+            }),
+            RestoreStep::Ready => wait_restored_ssh(&dir, &vsock, id, load_or_resume, thaw_elapsed),
+            RestoreStep::Configure => {
+                match guest_setup(&dir, net.as_ref(), Instant::now() + Duration::from_secs(30)) {
+                    Ok(()) => Ok(()),
+                    // Pre-setup helpers and helper-less guests keep the SSH path.
+                    Err(SetupError::Unsupported) => ssh_guest_setup(&dir, &vsock, net.as_ref()),
+                    Err(SetupError::Failed(error)) => Err(error),
+                }
+            }
+            RestoreStep::Expose => expose_tap(id, net_cfg),
+            RestoreStep::ApplicationReady => match readiness {
+                Some(spec) => boot_identity(&dir)
+                    .and_then(|boot| admit_application(&dir, spec, &boot, network_ready)),
+                None => network_ready(Instant::now() + Duration::from_secs(30)),
+            },
+        };
         // Sanitized per-step timing; no guest output, argv or secrets.
         eprintln!(
             "event=restore_step vm_id={id} step={step:?} elapsed_ms={} ok={}",
@@ -3370,58 +3485,35 @@ fn finish_restore(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn restore_step(
+fn wait_restored_ssh(
     dir: &Path,
-    id: Uuid,
-    step: RestoreStep,
-    readiness: Option<&ReadySpec>,
-    net_cfg: &NetConfig,
-    net: Option<&crate::net::NetSpec>,
     vsock: &Path,
-    network_ready: &mut impl FnMut(Instant) -> Result<()>,
+    id: Uuid,
+    load_or_resume: Duration,
+    thaw: Duration,
 ) -> Result<()> {
-    match step {
-        RestoreStep::Quarantine | RestoreStep::Load => Ok(()),
-        // The TAP stays down: its policy is reasserted while the guest thaws,
-        // leaving only the link flip on the critical path after Configure.
-        RestoreStep::Thaw => std::thread::scope(|scope| {
-            let policy = scope.spawn(|| reassert_tap_policy(id, net_cfg, &[], TapSetup::Existing));
-            let thawed = thaw_snapshot(dir);
-            let policy = policy
-                .join()
-                .unwrap_or_else(|_| Err(Error::Internal("TAP policy worker panicked".into())));
-            combine_snapshot_results(thawed, policy)
-        }),
-        RestoreStep::Ready => {
-            let ready = wait_ready_observed(dir, vsock, |attempt, elapsed, ok| {
-                eprintln!(
-                    "event=restore_substep vm_id={id} step=ReadyProbe attempt={attempt} elapsed_ms={} ok={ok}",
-                    elapsed.as_millis()
-                );
-            });
-            if ready {
-                Ok(())
-            } else {
-                Err(Error::Internal(
-                    "restored guest SSH did not become ready".into(),
-                ))
-            }
-        }
-        RestoreStep::Configure => {
-            match guest_setup(dir, net, Instant::now() + Duration::from_secs(30)) {
-                Ok(()) => Ok(()),
-                // Pre-setup helpers and helper-less guests keep the SSH path.
-                Err(SetupError::Unsupported) => ssh_guest_setup(dir, vsock, net),
-                Err(SetupError::Failed(error)) => Err(error),
-            }
-        }
-        RestoreStep::Expose => expose_tap(id, net_cfg),
-        RestoreStep::ApplicationReady => match readiness {
-            Some(spec) => admit_application(dir, spec, &boot_identity(dir)?, network_ready),
-            None => network_ready(Instant::now() + Duration::from_secs(30)),
-        },
-    }
+    let cap = Duration::from_secs(u64::from(shinu_core::env_u32(
+        "SHINU_READY_MAX_SECS",
+        READY_MAX_SECS,
+    )));
+    let budget = SshReadyBudget::restored(load_or_resume.saturating_add(thaw), cap);
+    let budget_ms = budget.total.as_millis();
+    wait_ready_observed(dir, vsock, budget, |attempt, elapsed, ok| {
+        eprintln!(
+            "event=restore_substep vm_id={id} step=ReadyProbe attempt={attempt} elapsed_ms={} ok={ok}",
+            elapsed.as_millis()
+        );
+    })
+    .map_err(|failure| {
+        Error::Internal(format!(
+            "restored guest SSH did not become ready: load_or_resume_ms={} thaw_ms={} ready_ms={} budget_ms={budget_ms} probes={} last_error={}",
+            load_or_resume.as_millis(),
+            thaw.as_millis(),
+            failure.elapsed.as_millis(),
+            failure.probes,
+            failure.last_error,
+        ))
+    })
 }
 
 /// Resume only a durably loaded generation, then perform the normal admission.
@@ -3449,11 +3541,12 @@ pub fn resume(
         persisted.elapsed().as_micros()
     );
     let result = (|| {
-        let started = Instant::now();
         let console_offset = std::fs::metadata(dir.join("console.log")).map_or(0, |m| m.len());
+        let started = Instant::now();
         if api(&dir, "PATCH", "/vm", Some("{\"state\":\"Resumed\"}")).is_none() {
             return Err(Error::Internal("failed to resume loaded VM".into()));
         }
+        let resume_elapsed = started.elapsed();
         // Firecracker logs the thaw before acknowledging the resume.
         let clock = resumed_console(&dir, console_offset)
             .as_deref()
@@ -3464,9 +3557,16 @@ pub fn resume(
             );
         eprintln!(
             "event=restore_step vm_id={id} step=Resume elapsed_ms={} ok=true{clock}",
-            started.elapsed().as_millis()
+            resume_elapsed.as_millis()
         );
-        finish_restore(root, id, readiness, net_cfg, &mut network_ready)?;
+        finish_restore(
+            root,
+            id,
+            readiness,
+            net_cfg,
+            resume_elapsed,
+            &mut network_ready,
+        )?;
         settle_pending(&dir)?;
         touch(&dir)?;
         Ok((vsock_path(&dir), true))
@@ -5209,6 +5309,8 @@ mod ready_probe_tests {
     enum Guest {
         /// Accepts CONNECT, then sends the SSH banner after this delay.
         Banner(Duration),
+        /// Sends a banner in two parts separated by the given delays.
+        FragmentedBanner(Duration, Duration),
         /// Refuses CONNECT for the first `n` connections, then banners at once.
         RefuseFirst(usize),
     }
@@ -5278,6 +5380,13 @@ mod ready_probe_tests {
                                     std::thread::sleep(delay);
                                     let _ = stream.write_all(b"SSH-2.0-fake\n");
                                 }
+                                Guest::FragmentedBanner(first, second) => {
+                                    let _ = stream.write_all(b"OK 1\n");
+                                    std::thread::sleep(first);
+                                    let _ = stream.write_all(b"SSH-");
+                                    std::thread::sleep(second);
+                                    let _ = stream.write_all(b"2.0-fake\n");
+                                }
                             }
                         });
                     }
@@ -5296,9 +5405,15 @@ mod ready_probe_tests {
 
         fn wait(&self) -> (bool, Vec<(usize, bool)>) {
             let mut probes = Vec::new();
-            let ready = wait_ready_observed(&self.dir, &self.vsock, |attempt, _, ok| {
-                probes.push((attempt, ok));
-            });
+            let ready = wait_ready_observed(
+                &self.dir,
+                &self.vsock,
+                super::SshReadyBudget::BASELINE,
+                |attempt, _, ok| {
+                    probes.push((attempt, ok));
+                },
+            )
+            .is_ok();
             (ready, probes)
         }
     }
@@ -5314,6 +5429,71 @@ mod ready_probe_tests {
     }
 
     #[test]
+    fn idle_restore_gets_the_baseline() {
+        let budget =
+            super::SshReadyBudget::restored(Duration::from_millis(470), Duration::from_mins(3));
+        assert_eq!(budget.total, Duration::from_secs(30));
+        assert_eq!(budget.banner_idle, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn slow_restore_gets_more_total_and_per_connection_time() {
+        let budget =
+            super::SshReadyBudget::restored(Duration::from_millis(54_300), Duration::from_mins(3));
+        assert_eq!(budget.total, Duration::from_millis(108_600));
+        assert_eq!(budget.banner_idle, Duration::from_millis(54_300));
+    }
+
+    #[test]
+    fn even_a_dead_guest_after_slow_restore_cannot_get_more_than_the_cap() {
+        for (cap, expected) in [(180, 180), (40, 40), (20, 30)] {
+            let budget =
+                super::SshReadyBudget::restored(Duration::from_mins(15), Duration::from_secs(cap));
+            assert_eq!(budget.total, Duration::from_secs(expected));
+            assert!(
+                budget.banner_idle < budget.total,
+                "must leave time for a retry"
+            );
+        }
+    }
+
+    #[test]
+    fn an_accepted_connection_without_a_banner_exhausts_but_never_resets_the_budget() {
+        let bridge = Bridge::new(Guest::Banner(Duration::from_secs(5)));
+        let failure = wait_ready_observed(
+            &bridge.dir,
+            &bridge.vsock,
+            super::SshReadyBudget {
+                total: Duration::from_millis(450),
+                banner_idle: Duration::from_millis(150),
+            },
+            |_, _, _| {},
+        )
+        .unwrap_err();
+        assert!(
+            failure.probes >= 2,
+            "silent guest should be retried: {failure:?}"
+        );
+        assert!(matches!(
+            failure.last_error,
+            super::SshProbeError::BannerTimeout(0)
+        ));
+        assert!(failure.elapsed >= Duration::from_millis(450));
+        assert!(failure.elapsed < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn partial_banner_refreshes_only_the_connection_stall_timer() {
+        let bridge = Bridge::new(Guest::FragmentedBanner(
+            Duration::from_millis(210),
+            Duration::from_millis(210),
+        ));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        super::probe(&bridge.vsock, deadline, Duration::from_millis(350)).unwrap();
+        assert_eq!(bridge.connections.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn a_slow_banner_on_an_accepted_connection_is_awaited_not_redialled() {
         let bridge = Bridge::new(Guest::Banner(Duration::from_millis(800)));
         let started = Instant::now();
@@ -5322,6 +5502,19 @@ mod ready_probe_tests {
         assert_eq!(probes, [(1, true)], "one sshd fork, no redial");
         assert_eq!(bridge.connections.load(Ordering::SeqCst), 1);
         assert!(started.elapsed() >= Duration::from_millis(800));
+    }
+
+    #[test]
+    fn partial_banner_cannot_extend_the_absolute_deadline() {
+        let bridge = Bridge::new(Guest::FragmentedBanner(
+            Duration::from_millis(200),
+            Duration::from_millis(350),
+        ));
+        let deadline = Instant::now() + Duration::from_millis(400);
+        assert!(matches!(
+            super::probe(&bridge.vsock, deadline, Duration::from_secs(1)),
+            Err(super::SshProbeError::BannerTimeout(4))
+        ));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! external adapters; the real start, identity, admission, and cleanup code runs.
 use shinu_core::{Image, ReadySpec};
 use shinu_vm::{NetConfig, VmConfig, vm};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -23,6 +23,7 @@ enum Reply {
     Timeout,
     Hold,
     Peer,
+    Restore,
 }
 
 struct Guest {
@@ -115,6 +116,9 @@ impl Guest {
             let stopped = stopped.clone();
             let permit = permit.clone();
             std::thread::spawn(move || {
+                let mut thawed = false;
+                let mut configured = false;
+                let mut banner_sent = false;
                 while !stopped.load(Ordering::Relaxed) {
                     let Ok((mut stream, _)) = listener.accept() else {
                         std::thread::sleep(Duration::from_millis(1));
@@ -128,6 +132,19 @@ impl Guest {
                     if reader.read_line(&mut line).is_err() {
                         continue;
                     }
+                    let mode = *reply.lock().unwrap();
+                    if line == "CONNECT 2222\n" && matches!(mode, Reply::Restore) {
+                        assert!(thawed, "SSH probe attempted before restore thaw");
+                        assert!(
+                            !banner_sent,
+                            "restore abandoned a progressing SSH connection"
+                        );
+                        stream.write_all(b"OK 42\nSSH-").unwrap();
+                        std::thread::sleep(Duration::from_millis(120));
+                        stream.write_all(b"2.0-fake\n").unwrap();
+                        banner_sent = true;
+                        continue;
+                    }
                     if line != "CONNECT 2224\n" {
                         let _ = stream.write_all(b"FAILED\n");
                         continue;
@@ -138,6 +155,19 @@ impl Guest {
                     line.clear();
                     if reader.read_line(&mut line).is_err() {
                         continue;
+                    }
+                    if matches!(mode, Reply::Restore) {
+                        if line == format!("thaw {nonce}\n") {
+                            stream.write_all(b"OK\n").unwrap();
+                            thawed = true;
+                            continue;
+                        }
+                        if line.starts_with(&format!("setup {nonce} ")) {
+                            assert!(banner_sent, "setup attempted before complete SSH banner");
+                            stream.write_all(b"SETUP-OK\n").unwrap();
+                            configured = true;
+                            continue;
+                        }
                     }
                     if line == format!("capabilities {nonce}\n") {
                         let _ = stream.write_all(b"READY-1\n");
@@ -159,7 +189,8 @@ impl Guest {
                     let _ = notify.send(());
                     let mode = *reply.lock().unwrap();
                     match mode {
-                        Reply::Match => {
+                        Reply::Match | Reply::Restore => {
+                            assert!(!matches!(mode, Reply::Restore) || configured);
                             let _ = writeln!(stream, "READY {id}");
                         }
                         Reply::Wrong => {
@@ -565,4 +596,52 @@ fn resume_rejects_an_already_running_generation_without_requesting_ready() {
     ));
     assert!(guest.ids.lock().unwrap().is_empty());
     assert!(vm::is_running(&guest.dir));
+}
+
+#[test]
+fn resume_admits_a_loaded_space_after_thaw_and_a_fragmented_ssh_banner() {
+    let guest = Guest::new(Reply::Restore);
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+    std::fs::write(
+        guest.dir.join("loaded.json"),
+        format!(
+            "{{\"phase\":\"loaded\",\"boot_id\":\"{}\"}}",
+            boot_id.trim()
+        ),
+    )
+    .unwrap();
+    let api = UnixListener::bind(vm::api_path(&guest.dir)).unwrap();
+    let firecracker = std::thread::spawn(move || {
+        const RESUMED: &[u8] = b"{\"state\":\"Resumed\"}";
+        let (stream, _) = api.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut request = BufReader::new(stream);
+        let mut line = String::new();
+        request.read_line(&mut line).unwrap();
+        assert_eq!(line, "PATCH /vm HTTP/1.1\r\n");
+        loop {
+            line.clear();
+            assert_ne!(request.read_line(&mut line).unwrap(), 0);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        let mut body = [0; RESUMED.len()];
+        request.read_exact(&mut body).unwrap();
+        assert_eq!(body, RESUMED);
+        request
+            .get_mut()
+            .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+            .unwrap();
+    });
+    let (_, net) = configs();
+    let (vsock, resumed) =
+        vm::resume(&guest.root, guest.id, Some(&policy()), &net, |_| Ok(())).unwrap();
+    firecracker.join().unwrap();
+    assert!(resumed);
+    assert_eq!(vsock, vm::vsock_path(&guest.dir));
+    assert_eq!(vm::lifecycle_state(&guest.dir).unwrap(), "running");
+    assert_eq!(guest.ids.lock().unwrap().len(), 1);
 }

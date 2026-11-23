@@ -45,6 +45,7 @@ Changes are recorded in the Keep a Changelog format.
 
 ### Fixed
 
+- `shinu-snapshot-agent` builds with musl again, so `packaging/install.sh` can install the static guest helper on a fresh host.
 - `packaging/fast-ready-smoke.py` now checks the restored pooled guest's exact eth0 CIDR, MAC and default gateway (derived from its UUID, as `net_spec` does). It also requires each one to differ from the source identity captured in guest RAM. Before this, keeping the snapshot's old `172.29.*` address still passed.
 - A failed `resume` in a named network now revokes the peer ACCEPTs that running members gained toward the resumed space: start and resume share one admission wrapper that records the members its network hook actually connected and reconciles against them on failure. Cleanup errors are logged and never replace the original READY error.
 - Never reload pending Full memory after a host crash once its vCPUs may have run: `resuming` is recorded before a direct restore launch or `PATCH Resumed`, and recovery keeps pending memory only under a never-run record of the current host boot. Previously a host crash during resume could reload old guest memory over a disk the guest had already written.

@@ -1051,8 +1051,13 @@ fn require_process_view(proc_root: &Path) -> std::io::Result<()> {
     if unsafe { libc::fstatfs(proc.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
+    #[allow(
+        clippy::cast_possible_wrap,
+        clippy::unnecessary_cast,
+        reason = "statfs.f_type has different signedness on glibc and musl"
+    )]
     // SAFETY: fstatfs succeeded and initialized the structure.
-    if unsafe { stats.assume_init() }.f_type != libc::PROC_SUPER_MAGIC {
+    if unsafe { stats.assume_init() }.f_type as i64 != libc::PROC_SUPER_MAGIC as i64 {
         return Err(std::io::Error::other("process view must be on procfs"));
     }
     let pid = std::process::id().to_string();

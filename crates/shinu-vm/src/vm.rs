@@ -1052,7 +1052,9 @@ fn require_process_view(proc_root: &Path) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     // SAFETY: fstatfs succeeded and initialized the structure.
-    if unsafe { stats.assume_init() }.f_type != libc::PROC_SUPER_MAGIC {
+    let fs_type = unsafe { stats.assume_init() }.f_type;
+    // glibc declares `f_type` signed and musl unsigned; widen both losslessly.
+    if i128::from(fs_type) != i128::from(libc::PROC_SUPER_MAGIC) {
         return Err(std::io::Error::other("process view must be on procfs"));
     }
     let pid = std::process::id().to_string();
@@ -2114,6 +2116,7 @@ pub fn snapshot(
     let mut capture = snapshot_transaction(kind.is_some(), |step| match step {
         SnapshotStep::Freeze => {
             prepare_snapshot_worker(dir)?;
+            reset_time_scale(dir)?;
             let nonce = Uuid::new_v4().to_string();
             guest_snapshot_action(dir, SnapshotCommand::Rotate(&nonce))
                 .ok_or_else(|| Error::Internal("guest snapshot worker disappeared".into()))??;
@@ -3405,11 +3408,17 @@ fn restore_step(
         }
         RestoreStep::Configure => {
             match guest_setup(dir, net, Instant::now() + Duration::from_secs(30)) {
-                Ok(()) => Ok(()),
+                Ok(()) => {}
                 // Pre-setup helpers and helper-less guests keep the SSH path.
-                Err(SetupError::Unsupported) => ssh_guest_setup(dir, vsock, net),
-                Err(SetupError::Failed(error)) => Err(error),
+                Err(SetupError::Unsupported) => ssh_guest_setup(dir, vsock, net)?,
+                Err(SetupError::Failed(error)) => return Err(error),
             }
+            // Captures reset to 1x before Freeze, so this is defense in depth
+            // and must not fail an otherwise healthy restore.
+            if let Err(error) = reset_time_scale(dir) {
+                eprintln!("event=time_scale_reset vm_id={id} ok=false error={error}");
+            }
+            Ok(())
         }
         RestoreStep::Expose => expose_tap(id, net_cfg),
         RestoreStep::ApplicationReady => match readiness {
@@ -4450,7 +4459,7 @@ mod restore_transaction_tests {
 
 #[cfg(test)]
 mod guest_setup_tests {
-    use super::{SetupError, guest_setup, guest_setup_frame};
+    use super::{SetupError, TimeScaleReply, guest_setup, guest_setup_frame, guest_time_scale};
     use crate::net::NetSpec;
     use std::io::{BufRead, BufReader, Write};
     use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -4523,6 +4532,89 @@ mod guest_setup_tests {
             exchange("FAILED setup\n").0,
             Err(SetupError::Failed(_))
         ));
+    }
+
+    /// Fake helper answering one `time_scale` request.
+    fn scale_exchange(
+        reply: &'static str,
+        scale: u32,
+        sync_realtime: bool,
+    ) -> (shinu_core::Result<TimeScaleReply>, String) {
+        let dir = std::env::temp_dir().join(format!("shinu-scale-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("snapshot-worker-nonce"), NONCE).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(dir.join("vsock.sock")).unwrap();
+        let guest = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            (&stream).write_all(b"OK 1\nSHINU-SNAPSHOT-1\n").unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            (&stream).write_all(reply.as_bytes()).unwrap();
+            line
+        });
+        let result = guest_time_scale(
+            &dir,
+            scale,
+            sync_realtime,
+            Instant::now() + Duration::from_secs(5),
+        );
+        let request = guest.join().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        (result, request)
+    }
+
+    #[test]
+    fn time_scale_frames_the_contract_and_maps_unsupported_kernels() {
+        let (result, request) = scale_exchange("OK 10 0\n", 10, false);
+        assert_eq!(result.unwrap(), TimeScaleReply::Applied);
+        assert_eq!(request, format!("time_scale {NONCE} 10 0\n"));
+        let (result, request) = scale_exchange("OK 1 1\n", 1, true);
+        assert_eq!(result.unwrap(), TimeScaleReply::Applied);
+        assert_eq!(request, format!("time_scale {NONCE} 1 1\n"));
+        // An acknowledgement for some other scale never counts as applied.
+        assert!(scale_exchange("OK 2 1\n", 1, true).0.is_err());
+        assert_eq!(
+            scale_exchange("ERR time_dilation_unsupported\n", 4, true)
+                .0
+                .unwrap(),
+            TimeScaleReply::Unsupported
+        );
+        assert!(matches!(
+            scale_exchange("ERR invalid_args\n", 4, true).0,
+            Err(shinu_core::Error::Invalid(_))
+        ));
+        assert!(matches!(
+            scale_exchange("ERR frozen\n", 4, true).0,
+            Err(shinu_core::Error::Internal(_))
+        ));
+        // Helpers predating `time_scale` reject the unknown action unapplied.
+        assert_eq!(
+            scale_exchange("FAILED invalid snapshot request\n", 4, true)
+                .0
+                .unwrap(),
+            TimeScaleReply::LegacyHelper
+        );
+    }
+
+    #[test]
+    fn time_scale_rejects_out_of_range_before_contacting_the_guest() {
+        let dir = std::env::temp_dir().join(format!("shinu-scale-{}", uuid::Uuid::new_v4()));
+        for scale in [0, 11] {
+            assert!(matches!(
+                super::set_time_scale(&dir, scale, true),
+                Err(shinu_core::Error::Invalid(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn reset_passes_for_helperless_guests() {
+        // No helper nonce: nothing can have dilated this guest.
+        let dir = std::env::temp_dir().join(format!("shinu-scale-{}", uuid::Uuid::new_v4()));
+        assert!(super::reset_time_scale(&dir).is_ok());
     }
 
     #[test]

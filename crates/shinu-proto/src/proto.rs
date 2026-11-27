@@ -133,6 +133,15 @@ pub enum Req {
     Touch {
         space: String,
     },
+    /// Sets guest kernel time dilation on a running space.
+    TimeScale {
+        space: String,
+        /// Integer 1..=10; 1 is real time.
+        scale: u32,
+        /// Whether `CLOCK_REALTIME` advances with the scaled monotonic clock.
+        #[serde(default = "default_sync_realtime")]
+        sync_realtime: bool,
+    },
     Usage {
         from: Option<i64>,
         to: Option<i64>,
@@ -191,5 +200,9 @@ pub enum Req {
 }
 
 const fn default_track_dirty() -> bool {
+    true
+}
+
+const fn default_sync_realtime() -> bool {
     true
 }

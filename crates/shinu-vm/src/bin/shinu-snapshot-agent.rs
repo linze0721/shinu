@@ -690,6 +690,14 @@ fn respond(
         }
         return Ok(None);
     }
+    if !held && request.starts_with(b"time_scale ") {
+        let reply = std::str::from_utf8(request).map_or_else(
+            |_| "ERR invalid_args".into(),
+            |request| time_scale_request(paths, request, Path::new(LCB_TIME)),
+        );
+        writeln!(stream, "{reply}")?;
+        return Ok(None);
+    }
     if !held && (request.starts_with(b"ready ") || request.starts_with(b"capabilities ")) {
         match std::str::from_utf8(request)
             .map_err(std::io::Error::other)
@@ -1045,6 +1053,74 @@ mod tests {
             super::setup_request(&paths, &format!("setup {nonce} 5"), |_| panic!("frozen"))
                 .is_err()
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn time_scale_validates_args_and_writes_sync_realtime_before_scale() {
+        let (root, state, nonce) = ready_fixture();
+        let paths = super::SnapshotPaths {
+            state: &state,
+            proc_root: &root,
+            block_root: &root,
+        };
+        let sysfs = root.join("lcb_time");
+        let request = |text: String| super::time_scale_request(&paths, &text, &sysfs);
+        assert_eq!(
+            request(format!("time_scale {nonce} 4 1")),
+            "ERR time_dilation_unsupported"
+        );
+        std::fs::create_dir(&sysfs).unwrap();
+        std::fs::write(sysfs.join("scale"), "1").unwrap();
+        std::fs::write(sysfs.join("sync_realtime"), "1").unwrap();
+        for (scale, sync) in [("1", "0"), ("10", "1")] {
+            assert_eq!(
+                request(format!("time_scale {nonce} {scale} {sync}")),
+                format!("OK {scale} {sync}")
+            );
+            assert_eq!(std::fs::read_to_string(sysfs.join("scale")).unwrap(), scale);
+            assert_eq!(
+                std::fs::read_to_string(sysfs.join("sync_realtime")).unwrap(),
+                sync
+            );
+        }
+        for invalid in [
+            format!("time_scale {nonce} 0 1"),
+            format!("time_scale {nonce} 11 1"),
+            format!("time_scale {nonce} 01 1"),
+            format!("time_scale {nonce} +2 1"),
+            format!("time_scale {nonce} 2 2"),
+            format!("time_scale {nonce} 2"),
+            format!("time_scale {nonce} 2 1 extra"),
+            format!("time_scale  {nonce} 2 1"),
+        ] {
+            assert_eq!(request(invalid), "ERR invalid_args");
+        }
+        assert_eq!(std::fs::read_to_string(sysfs.join("scale")).unwrap(), "10");
+        assert_eq!(
+            request("time_scale 00000000-0000-4000-8000-000000000002 2 1".into()),
+            "ERR authentication"
+        );
+        std::fs::write(state.join("phase"), "frozen").unwrap();
+        assert_eq!(request(format!("time_scale {nonce} 2 1")), "ERR frozen");
+        assert_eq!(std::fs::read_to_string(sysfs.join("scale")).unwrap(), "10");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn time_scale_is_served_as_one_line_on_the_snapshot_port() {
+        let (root, state, nonce) = ready_fixture();
+        assert_eq!(
+            request(&state, &format!("time_scale {nonce} 0 1"), &mut Vec::new()),
+            "SHINU-SNAPSHOT-1\nERR invalid_args\n"
+        );
+        // Development hosts do not run the dilated guest kernel.
+        if !std::path::Path::new(super::LCB_TIME).join("scale").exists() {
+            assert_eq!(
+                request(&state, &format!("time_scale {nonce} 2 1"), &mut Vec::new()),
+                "SHINU-SNAPSHOT-1\nERR time_dilation_unsupported\n"
+            );
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 

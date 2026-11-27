@@ -75,6 +75,13 @@ impl Guest {
                             stream.write_all(b"SETUP-1\n").unwrap();
                             continue;
                         }
+                        if action == "time_scale" {
+                            // A pre-dilation kernel: the capture reset passes.
+                            assert_eq!(line, format!("time_scale {worker_nonce} 1 1\n"));
+                            events.lock().unwrap().push("reset".into());
+                            stream.write_all(b"ERR time_dilation_unsupported\n").unwrap();
+                            continue;
+                        }
                         if line.split_whitespace().nth(2) == Some("hold") {
                             events.lock().unwrap().push("hold".into());
                             stream.write_all(b"OK\n").unwrap();

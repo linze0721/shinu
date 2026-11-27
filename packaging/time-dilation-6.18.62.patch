@@ -1,0 +1,272 @@
+--- a/kernel/time/timekeeping_internal.h
++++ b/kernel/time/timekeeping_internal.h
+@@ -48,4 +48,8 @@
+ /* NTP specific interface to access the current seconds value */
+ long ktime_get_ntp_seconds(unsigned int id);
+ 
++/* LeapCaseBench guest kernel time dilation hooks */
++extern u32 lcb_time_get_scale(void);
++extern void hrtimer_lcb_retrigger_all(void);
++
+ #endif /* _TIMEKEEPING_INTERNAL_H */
+--- a/kernel/time/hrtimer.c
++++ b/kernel/time/hrtimer.c
+@@ -968,6 +968,11 @@
+ 	timerfd_clock_was_set();
+ }
+ 
++void hrtimer_lcb_retrigger_all(void)
++{
++	on_each_cpu(retrigger_next_event, NULL, 1);
++}
++
+ static void clock_was_set_work(struct work_struct *work)
+ {
+ 	clock_was_set(CLOCK_SET_WALL);
+--- a/kernel/time/clockevents.c
++++ b/kernel/time/clockevents.c
+@@ -15,6 +15,7 @@
+ #include <linux/device.h>
+ 
+ #include "tick-internal.h"
++#include "timekeeping_internal.h"
+ 
+ /* The registered clock event devices */
+ static LIST_HEAD(clockevent_devices);
+@@ -327,6 +328,12 @@
+ 	if (delta <= 0)
+ 		return force ? clockevents_program_min_delta(dev) : -ETIME;
+ 
++	{
++		u32 lcb_scale = lcb_time_get_scale();
++		if (unlikely(lcb_scale > 1))
++			delta = div_s64(delta, lcb_scale);
++	}
++
+ 	delta = min(delta, (int64_t) dev->max_delta_ns);
+ 	delta = max(delta, (int64_t) dev->min_delta_ns);
+ 
+--- a/kernel/time/vsyscall.c
++++ b/kernel/time/vsyscall.c
+@@ -86,6 +86,8 @@
+ 	vdso_write_begin(vdata);
+ 
+ 	clock_mode = tk->tkr_mono.clock->vdso_clock_mode;
++	if (unlikely(lcb_time_get_scale() > 1))
++		clock_mode = VDSO_CLOCKMODE_NONE;
+ 	vc[CS_HRES_COARSE].clock_mode	= clock_mode;
+ 	vc[CS_RAW].clock_mode		= clock_mode;
+ 
+--- a/kernel/time/timekeeping.c
++++ b/kernel/time/timekeeping.c
+@@ -288,11 +288,71 @@
+  * a read of the fast-timekeeper tkrs (which is protected by its own locking
+  * and update logic).
+  */
++/*
++ * LeapCaseBench kernel-level time dilation (1x..10x).
++ * Keeps hardware clocksource and clocksource_watchdog untouched.
++ */
++struct lcb_dilation_base {
++	u64 hw_base;
++	u64 virt_base;
++	u32 scale;
++};
++
++static seqcount_latch_t lcb_dilation_seq = SEQCNT_LATCH_ZERO(lcb_dilation_seq);
++static struct lcb_dilation_base lcb_dilation[2] = {
++	{ .hw_base = 0, .virt_base = 0, .scale = 1 },
++	{ .hw_base = 0, .virt_base = 0, .scale = 1 },
++};
++static atomic_t lcb_time_scale = ATOMIC_INIT(1);
++static atomic_t lcb_sync_realtime = ATOMIC_INIT(1);
++static atomic64_t lcb_virtual_offset_ns = ATOMIC64_INIT(0);
++
++u32 lcb_time_get_scale(void)
++{
++	return (u32)atomic_read(&lcb_time_scale);
++}
++
++static void lcb_dilation_write_locked(u64 hw_base, u64 virt_base, u32 scale)
++{
++	write_seqcount_latch_begin(&lcb_dilation_seq);
++	lcb_dilation[0].hw_base = hw_base;
++	lcb_dilation[0].virt_base = virt_base;
++	lcb_dilation[0].scale = scale;
++	write_seqcount_latch(&lcb_dilation_seq);
++	lcb_dilation[1].hw_base = hw_base;
++	lcb_dilation[1].virt_base = virt_base;
++	lcb_dilation[1].scale = scale;
++	write_seqcount_latch_end(&lcb_dilation_seq);
++	atomic_set(&lcb_time_scale, (int)scale);
++}
++
+ static inline u64 tk_clock_read(const struct tk_read_base *tkr)
+ {
+ 	struct clocksource *clock = READ_ONCE(tkr->clock);
++	u64 hw = clock->read(clock);
+ 
+-	return clock->read(clock);
++	if (unlikely(atomic_read(&lcb_time_scale) > 1)) {
++		unsigned int seq;
++		u64 virt;
++		u64 mask = tkr->mask;
++
++		do {
++			const struct lcb_dilation_base *b;
++
++			seq = read_seqcount_latch(&lcb_dilation_seq);
++			b = &lcb_dilation[seq & 1];
++			if (b->scale <= 1) {
++				virt = hw;
++			} else {
++				u64 d = (hw - b->hw_base) & mask;
++				if (d & ~(mask >> 1))
++					d = 0;
++				virt = (b->virt_base + d * (u64)b->scale) & mask;
++			}
++		} while (read_seqcount_latch_retry(&lcb_dilation_seq, seq));
++		return virt;
++	}
++	return hw;
+ }
+ 
+ /**
+@@ -316,6 +376,10 @@
+ 	old_clock = tk->tkr_mono.clock;
+ 	tk->tkr_mono.clock = clock;
+ 	tk->tkr_mono.mask = clock->mask;
++	if (tk->id == TIMEKEEPER_CORE && unlikely(atomic_read(&lcb_time_scale) > 1)) {
++		u64 hw_init = clock->read(clock);
++		lcb_dilation_write_locked(hw_init, hw_init, (u32)atomic_read(&lcb_time_scale));
++	}
+ 	tk->tkr_mono.cycle_last = tk_clock_read(&tk->tkr_mono);
+ 
+ 	tk->tkr_raw.clock = clock;
+@@ -3131,3 +3195,126 @@
+ 		tkd_basic_setup(&timekeeper_data[i], i, false);
+ }
+ #endif /* CONFIG_POSIX_AUX_CLOCKS */
++
++
++/*
++ * /sys/kernel/lcb_time/{scale,sync_realtime,virtual_offset_ns}
++ */
++static int lcb_time_set_scale(u32 new_scale)
++{
++	struct timekeeper *tks = &tk_core.shadow_timekeeper;
++	unsigned long flags;
++	u32 old_scale;
++	u64 hw_now, d_hw, extra_ns = 0;
++
++	if (new_scale < 1 || new_scale > 10)
++		return -EINVAL;
++
++	raw_spin_lock_irqsave(&tk_core.lock, flags);
++	old_scale = (u32)atomic_read(&lcb_time_scale);
++	if (old_scale == new_scale) {
++		raw_spin_unlock_irqrestore(&tk_core.lock, flags);
++		return 0;
++	}
++
++	/* Fold elapsed virtual cycles at old_scale into timekeeper bases first. */
++	timekeeping_forward_now(tks);
++
++	hw_now = tks->tkr_mono.clock->read(tks->tkr_mono.clock);
++	if (old_scale > 1) {
++		u64 mask = tks->tkr_mono.mask;
++		d_hw = (hw_now - lcb_dilation[0].hw_base) & mask;
++		if (d_hw & ~(mask >> 1))
++			d_hw = 0;
++		extra_ns = mul_u64_u32_shr(d_hw * (u64)(old_scale - 1),
++					  tks->tkr_mono.mult, tks->tkr_mono.shift);
++		atomic64_add((s64)extra_ns, &lcb_virtual_offset_ns);
++		if (!atomic_read(&lcb_sync_realtime) && extra_ns > 0) {
++			struct timespec64 delta = ns_to_timespec64((s64)extra_ns);
++			struct timespec64 xt = {
++				.tv_sec = tks->xtime_sec,
++				.tv_nsec = (long)(tks->tkr_mono.xtime_nsec >> tks->tkr_mono.shift),
++			};
++			xt = timespec64_sub(xt, delta);
++			tk_set_xtime(tks, &xt);
++			tk_set_wall_to_mono(tks, timespec64_add(tks->wall_to_monotonic, delta));
++		}
++	}
++
++	/* Rebase cycle_last and dilation anchors to raw hw_now for zero-jump continuity and native vDSO at 1x. */
++	tks->tkr_mono.cycle_last = hw_now;
++	tks->tkr_raw.cycle_last = hw_now;
++	lcb_dilation_write_locked(hw_now, hw_now, new_scale);
++
++	timekeeping_update_from_shadow(&tk_core, TK_CLOCK_WAS_SET);
++	raw_spin_unlock_irqrestore(&tk_core.lock, flags);
++
++	clock_was_set(CLOCK_SET_WALL | CLOCK_SET_BOOT);
++	hrtimer_lcb_retrigger_all();
++	return 0;
++}
++
++static ssize_t lcb_scale_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%u\n", lcb_time_get_scale());
++}
++
++static ssize_t lcb_scale_store(struct kobject *kobj, struct kobj_attribute *attr,
++			       const char *buf, size_t count)
++{
++	u32 val;
++	int err;
++
++	err = kstrtou32(buf, 10, &val);
++	if (err)
++		return err;
++	err = lcb_time_set_scale(val);
++	return err ? err : (ssize_t)count;
++}
++
++static ssize_t lcb_sync_realtime_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%d\n", atomic_read(&lcb_sync_realtime));
++}
++
++static ssize_t lcb_sync_realtime_store(struct kobject *kobj, struct kobj_attribute *attr,
++				       const char *buf, size_t count)
++{
++	u32 val;
++	int err;
++
++	err = kstrtou32(buf, 10, &val);
++	if (err || val > 1)
++		return -EINVAL;
++	atomic_set(&lcb_sync_realtime, (int)val);
++	return (ssize_t)count;
++}
++
++static ssize_t lcb_virtual_offset_ns_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
++{
++	return sysfs_emit(buf, "%lld\n", (long long)atomic64_read(&lcb_virtual_offset_ns));
++}
++
++static struct kobj_attribute lcb_scale_attr = __ATTR(scale, 0600, lcb_scale_show, lcb_scale_store);
++static struct kobj_attribute lcb_sync_realtime_attr = __ATTR(sync_realtime, 0600, lcb_sync_realtime_show, lcb_sync_realtime_store);
++static struct kobj_attribute lcb_virtual_offset_attr = __ATTR(virtual_offset_ns, 0444, lcb_virtual_offset_ns_show, NULL);
++
++static struct attribute *lcb_time_attrs[] = {
++	&lcb_scale_attr.attr,
++	&lcb_sync_realtime_attr.attr,
++	&lcb_virtual_offset_attr.attr,
++	NULL,
++};
++
++static const struct attribute_group lcb_time_group = {
++	.attrs = lcb_time_attrs,
++};
++
++static int __init lcb_time_sysfs_init(void)
++{
++	struct kobject *kobj = kobject_create_and_add("lcb_time", kernel_kobj);
++	if (!kobj)
++		return -ENOMEM;
++	return sysfs_create_group(kobj, &lcb_time_group);
++}
++late_initcall(lcb_time_sysfs_init);

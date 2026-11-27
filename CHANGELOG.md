@@ -25,6 +25,7 @@ Changes are recorded in the Keep a Changelog format.
 - Per-start `track_dirty` (default true) and `ckpt warm` / checkpoint warm HTTP/MCP interfaces using a persistent dedicated page-cache cgroup.
 - Physical store/MemAvailable admission floors with HTTP `capacity_watermark` errors and stable CLI exit 75.
 - Full captures punch aligned zero chunks before publication and report memory sparsity; existing Full checkpoints can be converted offline. Full restores substitute anonymous zero mappings for large holes, and warming and prefault skip holes. Optional `SHINU_KSM_MERGE=1` enables per-VMM host KSM eligibility.
+- Guest kernel time dilation: `POST /v1/spaces/{name}/time-scale` (`{"scale":1..10,"sync_realtime":true|false}`, `sync_realtime` defaults to true) drives the guest helper's authenticated `time_scale` action on vsock 2224, which writes `/sys/kernel/lcb_time/{sync_realtime,scale}`. Kernels without `lcb_time` return HTTP 501 `time_dilation_unsupported`. Hot captures reset the guest to 1x before Freeze and restores reset it after Configure, so no checkpoint, fork or pooled VM inherits dilation.
 
 ### Changed
 

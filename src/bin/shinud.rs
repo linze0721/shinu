@@ -3810,6 +3810,28 @@ fn touch_space(ctx: &Ctx<'_>, project: &str, name: String) -> shinu::Result<Valu
     Ok(json!({ "ok": true }))
 }
 
+fn time_scale_space(
+    ctx: &Ctx<'_>,
+    project: &str,
+    name: String,
+    scale: u32,
+    sync_realtime: bool,
+) -> shinu::Result<Value> {
+    let initial = find_space(ctx.db, &name, project)?;
+    let lock = ctx.registry.space_lock(initial.id);
+    let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+    let space = revalidate_space(ctx, project, initial.id, &name)?;
+    let dir = shinu::vm_dir(ctx.root, space.id);
+    if shinu::vm::lifecycle_state(&dir)? != "running" {
+        return Err(shinu::Error::Invalid(
+            "time scale requires a running space".into(),
+        ));
+    }
+    shinu::vm::set_time_scale(&dir, scale, sync_realtime)?;
+    shinu::vm::touch(&dir)?;
+    Ok(json!({ "scale": scale, "sync_realtime": sync_realtime }))
+}
+
 fn gc(ctx: &Ctx<'_>, project: &str, free_below: u64, dry_run: bool) -> shinu::Result<Value> {
     let available = shinu::avail_bytes(ctx.root)?;
     if available >= free_below {
@@ -4549,6 +4571,11 @@ fn handle(ctx: &Ctx<'_>, req: Req, project: &str) -> shinu::Result<Value> {
         Req::Stop { space } => stop_space(ctx, project, space),
         Req::Compact { space } => compact_space(ctx, project, space),
         Req::Touch { space } => touch_space(ctx, project, space),
+        Req::TimeScale {
+            space,
+            scale,
+            sync_realtime,
+        } => time_scale_space(ctx, project, space, scale, sync_realtime),
         Req::Exec { .. } => Err(shinu::Error::Invalid(
             "exec requires the streaming handler".into(),
         )),
@@ -4723,6 +4750,7 @@ enum Endpoint {
     WarmCheckpoint(String),
     Stop(String),
     Compact(String),
+    TimeScale(String),
     Exec(String),
     Lease(String),
     Proxy {
@@ -4840,6 +4868,7 @@ fn route(path: &str) -> Option<Endpoint> {
             "resume" => Some(Endpoint::Resume(name)),
             "stop" => Some(Endpoint::Stop(name)),
             "compact" => Some(Endpoint::Compact(name)),
+            "time-scale" => Some(Endpoint::TimeScale(name)),
             "lease" => Some(Endpoint::Lease(name)),
             "exec" => Some(Endpoint::Exec(name)),
             "push" => Some(Endpoint::Push(name)),
@@ -5063,6 +5092,7 @@ fn method_allowed(endpoint: &Endpoint, method: &str) -> bool {
         | Endpoint::WarmCheckpoint(_)
         | Endpoint::Stop(_)
         | Endpoint::Compact(_)
+        | Endpoint::TimeScale(_)
         | Endpoint::Exec(_)
         | Endpoint::Push(_)
         | Endpoint::Commit(_)
@@ -5281,6 +5311,25 @@ fn commit_request(body: &[u8], space: String) -> shinu::Result<Req> {
     })
 }
 
+fn time_scale_request(body: &[u8], space: String) -> shinu::Result<Req> {
+    let value = parse_body(body)?;
+    let scale = value
+        .get("scale")
+        .and_then(Value::as_u64)
+        .and_then(|scale| u32::try_from(scale).ok())
+        .filter(|scale| (1..=10).contains(scale))
+        .ok_or_else(|| shinu::Error::Invalid("scale must be an integer 1..10".into()))?;
+    let sync_realtime = match value.get("sync_realtime") {
+        None => true,
+        Some(_) => value_bool(&value, "sync_realtime")?,
+    };
+    Ok(Req::TimeScale {
+        space,
+        scale,
+        sync_realtime,
+    })
+}
+
 fn fork_request(body: &[u8], ckpt: Uuid) -> shinu::Result<Req> {
     let value = parse_body(body)?;
     Ok(Req::Fork {
@@ -5428,6 +5477,7 @@ fn request_for(
         )),
         Endpoint::Stop(space) => Ok((Req::Stop { space }, 200)),
         Endpoint::Compact(space) => Ok((Req::Compact { space }, 200)),
+        Endpoint::TimeScale(space) => Ok((time_scale_request(body, space)?, 200)),
         Endpoint::Commit(space) => Ok((commit_request(body, space)?, 201)),
         Endpoint::Log(space) => Ok((Req::Log { space }, 200)),
         Endpoint::Reflog(space) => Ok((Req::Reflog { space }, 200)),
@@ -7419,6 +7469,11 @@ fn respond_error(stream: &mut impl Write, status: u16, error: &shinu::Error) -> 
         json!({"error":error.to_string(),"code":"capacity_watermark"})
     } else if matches!(error, shinu::Error::TapBusy(_)) {
         json!({"error":error.to_string(),"code":"tap_busy"})
+    } else if matches!(error, shinu::Error::TimeDilationUnsupported) {
+        json!({
+            "code": "time_dilation_unsupported",
+            "message": "guest kernel does not support /sys/kernel/lcb_time/scale"
+        })
     } else if status >= 500 {
         eprintln!("{error}");
         json!({ "error": "internal server error" })
@@ -9617,6 +9672,7 @@ esac
                 ("capabilities", Some(&"setup")) => "SETUP-1".to_owned(),
                 ("capabilities", None) => "READY-1".to_owned(),
                 ("setup", _) => "SETUP-OK".to_owned(),
+                ("time_scale", Some(scale)) => format!("OK {scale} 1"),
                 ("ready", Some(restore_id)) => format!("READY {restore_id}"),
                 _ => panic!("unexpected helper request {line:?}"),
             };
@@ -11267,6 +11323,69 @@ eval "$(printf '%s' "$1" | sed "s#/etc/hosts#$d/hosts#g")"
             super::resize_request(br#"{"image":"arch"}"#, "demo".into()),
             Err(shinu::Error::Invalid(message)) if message.contains("immutable")
         ));
+    }
+
+    #[test]
+    fn time_scale_route_validates_scale_and_defaults_sync_realtime() {
+        let endpoint = super::route("/v1/spaces/demo/time-scale").expect("time-scale route");
+        assert!(super::method_allowed(&endpoint, "POST"));
+        assert!(!super::method_allowed(&endpoint, "GET"));
+        let parse = |body: &[u8]| {
+            super::request_for(
+                super::Endpoint::TimeScale("demo".into()),
+                "POST",
+                body,
+                None,
+                None,
+            )
+        };
+        for (body, scale, sync) in [
+            (&br#"{"scale":1}"#[..], 1, true),
+            (br#"{"scale":10,"sync_realtime":false}"#, 10, false),
+            (br#"{"scale":4,"sync_realtime":true}"#, 4, true),
+        ] {
+            let (request, status) = parse(body).expect("valid time scale");
+            assert_eq!(status, 200);
+            assert!(matches!(
+                request,
+                Req::TimeScale { space, scale: s, sync_realtime }
+                    if space == "demo" && s == scale && sync_realtime == sync
+            ));
+        }
+        for body in [
+            &br#"{"scale":0}"#[..],
+            br#"{"scale":11}"#,
+            br#"{"scale":-1}"#,
+            br#"{"scale":2.5}"#,
+            br#"{"scale":"2"}"#,
+            br#"{"scale":4294967297}"#,
+            br"{}",
+            br#"{"scale":2,"sync_realtime":1}"#,
+            b"",
+        ] {
+            let error = parse(body).unwrap_err();
+            assert_eq!(shinu::http::status_for(&error), 400, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn unsupported_time_dilation_is_a_501_with_a_stable_code() {
+        let error = shinu::Error::TimeDilationUnsupported;
+        let status = shinu::http::status_for(&error);
+        assert_eq!(status, 501);
+        let mut response = Vec::new();
+        super::respond_error(&mut response, status, &error).unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 501 Not Implemented\r\n"));
+        let body: serde_json::Value =
+            serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "code": "time_dilation_unsupported",
+                "message": "guest kernel does not support /sys/kernel/lcb_time/scale"
+            })
+        );
     }
 
     #[test]

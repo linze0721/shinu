@@ -306,6 +306,7 @@ fn reason_phrase(status: u16) -> &'static str {
         409 => "Conflict",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
+        501 => "Not Implemented",
         _ => "Unknown",
     }
 }
@@ -447,6 +448,7 @@ pub fn status_for(error: &shinu_core::Error) -> u16 {
         shinu_core::Error::Quota(_) => 429,
         shinu_core::Error::CapacityWatermark(_) => 429,
         shinu_core::Error::TapBusy(_) => 409,
+        shinu_core::Error::TimeDilationUnsupported => 501,
         shinu_core::Error::Btrfs(_)
         | shinu_core::Error::Io(_)
         | shinu_core::Error::Json(_)
@@ -761,6 +763,7 @@ mod http_tests {
         assert_eq!(status_for(&shinu_core::Error::Invalid("bad".into())), 400);
         assert_eq!(status_for(&shinu_core::Error::Quota("limit".into())), 429);
         assert_eq!(status_for(&shinu_core::Error::TapBusy("held".into())), 409);
+        assert_eq!(status_for(&shinu_core::Error::TimeDilationUnsupported), 501);
         assert_eq!(status_for(&shinu_core::Error::Btrfs("bad".into())), 500);
         assert_eq!(
             status_for(&shinu_core::Error::Io(std::io::Error::other("bad"))),

@@ -636,6 +636,54 @@ fn apply_setup(setup: &GuestSetup) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Guest kernel time dilation controls (`lcb_time` sysfs).
+const LCB_TIME: &str = "/sys/kernel/lcb_time";
+
+// Time dilation is a platform action like `setup`: authenticated by the
+// current nonce, refused while frozen, and always answered with one line.
+fn time_scale_request(paths: &SnapshotPaths<'_>, request: &str, lcb_time: &Path) -> String {
+    let words: Vec<&str> = request.split(' ').collect();
+    let ["time_scale", nonce, scale, sync_realtime] = words.as_slice() else {
+        return "ERR invalid_args".into();
+    };
+    if !matches!(
+        *scale,
+        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "10"
+    ) || !matches!(*sync_realtime, "0" | "1")
+    {
+        return "ERR invalid_args".into();
+    }
+    // Ok(None) applied the scale; Ok(Some(code)) is a refused request.
+    let result = (|| -> std::io::Result<Option<&'static str>> {
+        let _guard = lock(&paths.state.with_extension("lock"))?;
+        if !valid_nonce(nonce) || *nonce != std::fs::read_to_string(paths.state.join("nonce"))? {
+            return Ok(Some("authentication"));
+        }
+        if !matches!(
+            std::fs::read_to_string(paths.state.join("phase"))?.as_str(),
+            "thawed" | "ready"
+        ) {
+            return Ok(Some("frozen"));
+        }
+        if !lcb_time.join("scale").exists() {
+            return Ok(Some("time_dilation_unsupported"));
+        }
+        // sync_realtime first: the new scale must never run with a stale mode.
+        for (name, value) in [("sync_realtime", sync_realtime), ("scale", scale)] {
+            OpenOptions::new()
+                .write(true)
+                .open(lcb_time.join(name))?
+                .write_all(value.as_bytes())?;
+        }
+        Ok(None)
+    })();
+    match result {
+        Ok(None) => format!("OK {scale} {sync_realtime}"),
+        Ok(Some(code)) => format!("ERR {code}"),
+        Err(_) => "ERR time_scale_failed".into(),
+    }
+}
+
 fn serve(
     mut stream: File,
     paths: &SnapshotPaths<'_>,

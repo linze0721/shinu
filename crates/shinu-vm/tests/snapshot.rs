@@ -200,7 +200,9 @@ fn public_capture_never_cuts_before_freeze_or_returns_before_thaw() {
     .unwrap();
     assert_eq!(
         *guest.events.lock().unwrap(),
-        ["freeze", "pause", "create", "cut", "resume", "thaw"]
+        [
+            "reset", "freeze", "pause", "create", "cut", "resume", "thaw"
+        ]
     );
     assert!(capture.guest_snapshot_nonce.is_some());
 }
@@ -272,7 +274,9 @@ fn optional_preconnected_thaw_survives_pause_failures_and_peer_disconnect() {
         if failure.is_empty() {
             assert_eq!(
                 *observed,
-                ["freeze", "hold", "pause", "create", "cut", "resume", "thaw"]
+                [
+                    "reset", "freeze", "hold", "pause", "create", "cut", "resume", "thaw"
+                ]
             );
         }
     }

@@ -1614,6 +1614,84 @@ fn guest_setup(
     }
 }
 
+/// Guest answer to one `time_scale` request.
+#[derive(Debug, PartialEq, Eq)]
+enum TimeScaleReply {
+    Applied,
+    /// The guest kernel lacks `/sys/kernel/lcb_time/scale`; nothing changed.
+    Unsupported,
+    /// No helper, or one predating `time_scale`: nothing changed.
+    LegacyHelper,
+}
+
+fn guest_time_scale(
+    dir: &Path,
+    scale: u32,
+    sync_realtime: bool,
+    deadline: Instant,
+) -> Result<TimeScaleReply> {
+    let Ok(nonce) = std::fs::read_to_string(dir.join("snapshot-worker-nonce")) else {
+        return Ok(TimeScaleReply::LegacyHelper);
+    };
+    let Ok(mut transport) = ReadyTransport::guest(dir, deadline) else {
+        return Ok(TimeScaleReply::LegacyHelper);
+    };
+    let sync_realtime = u8::from(sync_realtime);
+    transport.write(format!("time_scale {nonce} {scale} {sync_realtime}\n").as_bytes())?;
+    let reply = transport.line()?;
+    if reply == format!("OK {scale} {sync_realtime}") {
+        return Ok(TimeScaleReply::Applied);
+    }
+    match reply {
+        "ERR time_dilation_unsupported" => Ok(TimeScaleReply::Unsupported),
+        "ERR invalid_args" => Err(Error::Invalid("guest rejected time scale arguments".into())),
+        // Older helpers reject the unknown action without applying anything.
+        reply if reply.starts_with("FAILED ") => Ok(TimeScaleReply::LegacyHelper),
+        reply => Err(Error::Internal(format!(
+            "guest time scale failed: {}",
+            reply.strip_prefix("ERR ").unwrap_or("invalid reply")
+        ))),
+    }
+}
+
+/// Sets guest kernel time dilation (`scale` 1..=10) on a running VM. A helper
+/// predating `time_scale` is upgraded once; a guest kernel without
+/// `lcb_time` yields [`Error::TimeDilationUnsupported`].
+pub fn set_time_scale(dir: &Path, scale: u32, sync_realtime: bool) -> Result<()> {
+    if !(1..=10).contains(&scale) {
+        return Err(Error::Invalid("time scale must be an integer 1..10".into()));
+    }
+    let request = || {
+        guest_time_scale(
+            dir,
+            scale,
+            sync_realtime,
+            Instant::now() + Duration::from_secs(5),
+        )
+    };
+    let mut reply = request()?;
+    if reply == TimeScaleReply::LegacyHelper {
+        // Only an explicit request upgrades the helper; capture and restore
+        // resets never install one just to reset a scale it cannot have set.
+        install_snapshot_worker(dir, None)?;
+        reply = request()?;
+    }
+    match reply {
+        TimeScaleReply::Applied => Ok(()),
+        TimeScaleReply::Unsupported => Err(Error::TimeDilationUnsupported),
+        TimeScaleReply::LegacyHelper => Err(Error::Internal(
+            "guest snapshot helper does not support time scaling".into(),
+        )),
+    }
+}
+
+/// Restores real time (`scale=1`, `sync_realtime=1`) so no checkpoint, fork
+/// or pooled VM inherits dilation. Kernels without `lcb_time` and helpers
+/// predating `time_scale` cannot be dilated, so they pass.
+fn reset_time_scale(dir: &Path) -> Result<()> {
+    guest_time_scale(dir, 1, true, Instant::now() + Duration::from_secs(5)).map(|_| ())
+}
+
 fn ssh_guest_setup(dir: &Path, vsock: &Path, net: Option<&crate::net::NetSpec>) -> Result<()> {
     let mut reconfigure = format!("set -eu; date -u -s @{}; ", now_secs());
     if let Some(spec) = net {
